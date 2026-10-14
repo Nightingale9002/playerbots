@@ -168,6 +168,8 @@ bool PlayerbotAIConfig::Initialize()
     randomGearLoweringChance = config.GetFloatDefault("AiPlayerbot.RandomGearLoweringChance", 0.15f);
     randomBotMaxLevelChance = config.GetFloatDefault("AiPlayerbot.RandomBotMaxLevelChance", 0.15f);
     rollBadItemsWithPlayer = config.GetBoolDefault("AiPlayerbot.RollBadItemsWithPlayer", false);
+    // [不抢装备 2026-10-14] 默认开启：组里有真人玩家时不参与装备竞拍
+    passRollsWithRealPlayer = config.GetBoolDefault("AiPlayerbot.PassRollsWithRealPlayer", true);
     randomBotRpgChance = config.GetFloatDefault("AiPlayerbot.RandomBotRpgChance", 0.35f);
     usePotionChance = config.GetFloatDefault("AiPlayerbot.UsePotionChance", 1.0f);
     attackEmoteChance = config.GetFloatDefault("AiPlayerbot.AttackEmoteChance", 0.0f);
@@ -776,6 +778,51 @@ bool PlayerbotAIConfig::Initialize()
             }
         }
     }
+
+    // [按副本换阶段 2026-10-14] AiPlayerbot.GearProgressionSystem.InstancePhases = "mapId:phase,mapId:phase,..."
+    // 站长口径：五人本+卡拉赞/格鲁尔/玛瑟里顿 = 0(团本前毕业)；毒蛇/风暴+祖阿曼 = 1(P1毕业)；
+    // 海山/黑庙 = 2(P2毕业)；太阳井 = 3(P4毕业)。留空则沿用原行为（按队长装备等级判断阶段）。
+    {
+        std::string instancePhases = config.GetStringDefault("AiPlayerbot.GearProgressionSystem.InstancePhases", "");
+        std::stringstream ss(instancePhases);
+        std::string pair;
+        while (std::getline(ss, pair, ','))
+        {
+            std::string::size_type colon = pair.find(':');
+            if (colon == std::string::npos)
+                continue;
+
+            uint32 mapId = (uint32)atoi(pair.substr(0, colon).c_str());
+            uint8 phase = (uint8)atoi(pair.substr(colon + 1).c_str());
+            if (mapId && phase < MAX_GEAR_PROGRESSION_LEVEL)
+                gearProgressionInstancePhases[mapId] = phase;
+        }
+
+        if (!gearProgressionInstancePhases.empty())
+            sLog.outString("GearProgression: %u instance->phase mappings loaded", (uint32)gearProgressionInstancePhases.size());
+    }
+
+    // [性能 2026-10-14] AiPlayerbot.GearProgressionSystem.CacheLevels = "70" 或 "60,70"（空=全部等级）
+    // 固定等级的服务器只建用得到的等级 ⇒ 装备缓存构建的外层组合数从 287,280 降到 4,104（70 倍）
+    {
+        std::string cacheLevels = config.GetStringDefault("AiPlayerbot.GearProgressionSystem.CacheLevels", "");
+        std::stringstream ss(cacheLevels);
+        std::string token;
+        while (std::getline(ss, token, ','))
+        {
+            uint32 lvl = (uint32)atoi(token.c_str());
+            if (lvl >= 1 && lvl <= DEFAULT_MAX_LEVEL)
+                gearProgressionCacheLevels.push_back(lvl);
+        }
+
+        if (!gearProgressionCacheLevels.empty())
+            sLog.outString("GearProgression: equipment cache will be built for %u level(s) only (CacheLevels)", (uint32)gearProgressionCacheLevels.size());
+    }
+
+    // [按阶段生成 2026-10-15] 随机生成装备时使用的默认阶段（0 = 团本前；站长口径 ilvl 100-115）⇒ 见 RandomItemMgr::Query
+    gearProgressionDefaultPhase = (uint8)config.GetIntDefault("AiPlayerbot.GearProgressionSystem.DefaultPhase", 0);
+    if (gearProgressionDefaultPhase >= MAX_GEAR_PROGRESSION_LEVEL)
+        gearProgressionDefaultPhase = 0;
 
     sLog.outString("Loading free bots.");
     selfBotLevel = BotSelfBotLevel(config.GetIntDefault("AiPlayerbot.SelfBotLevel", uint32(BotSelfBotLevel::GM_ONLY)));

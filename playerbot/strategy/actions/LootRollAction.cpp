@@ -6,6 +6,30 @@
 
 using namespace ai;
 
+// [不抢装备 2026-10-14] 判断"队里除自己以外是否有真人玩家"。
+// 两种场合都算：① 真人在指挥这个机器人（HasRealPlayerMaster）② 真人只是同队队友（随机机器人被真人组队的常见情形）。
+// 纯机器人自己组队时返回 false ⇒ 行为与改动前完全一致。
+static bool HasRealPlayerInGroup(Player* bot, PlayerbotAI* ai)
+{
+    if (!bot || !ai)
+        return false;
+
+    if (ai->HasRealPlayerMaster())
+        return true;
+
+    if (Group* group = bot->GetGroup())
+    {
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (member && member != bot && ai->IsRealPlayer(member))
+                return true;
+        }
+    }
+
+    return false;
+}
+
 bool LootStartRollAction::Execute(Event& event)
 {
     WorldPacket p(event.getPacket()); //WorldPacket packet for CMSG_LOOT_ROLL, (8+4+1)
@@ -214,6 +238,12 @@ RollVote RollAction::CalculateRollVote(ItemQualifier& itemQualifier)
         else
             needVote = ROLL_GREED;
     }
+
+    // [不抢装备 2026-10-14] 队里有真人玩家时一律 PASS，不与真人抢装备。
+    // 站长口径："不抢装备"；机器人的装备由 AiPlayerbot.GearProgressionSystem 按阶段直接给，不依赖团队掉落。
+    // 可用 AiPlayerbot.PassRollsWithRealPlayer = 0 关掉；纯机器人队不受影响。
+    if (sPlayerbotAIConfig.passRollsWithRealPlayer && needVote != ROLL_PASS && HasRealPlayerInGroup(bot, ai))
+        needVote = ROLL_PASS;
 
     bool canLoot = StoreLootAction::IsLootAllowed(itemQualifier, bot->GetPlayerbotAI());
 

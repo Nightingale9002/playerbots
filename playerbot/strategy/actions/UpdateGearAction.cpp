@@ -4,9 +4,10 @@
 #include "playerbot/RandomPlayerbotMgr.h"
 #include "playerbot/AiFactory.h"
 
-#include <set>          // [GEARPROG-EMPTY-SLOT 2026-10-15] 用于"同一个缺失组合只提示一次"
-
 using namespace ai;
+
+// [按副本换阶段 2026-10-14] 哨兵值：当前副本没有配置固定阶段
+static const uint8 NO_INSTANCE_PHASE = 0xFF;
 
 UpdateGearAction::UpdateGearAction(PlayerbotAI* ai): Action(ai, "update gear")
 {
@@ -66,25 +67,20 @@ bool UpdateGearAction::Execute(Event& event)
         }
     }
 
-    const uint8 avgProgressionLevel = GetMasterAverageProgressionLevel();
+    // [按副本换阶段 2026-10-14] 若当前副本配置了固定阶段，则整角色按该阶段换装（站长口径的"按副本难度"）
+    const uint8 instanceProgressionLevel = GetInstanceProgressionLevel();
+    const uint8 avgProgressionLevel = (instanceProgressionLevel != NO_INSTANCE_PHASE)
+        ? instanceProgressionLevel : GetMasterAverageProgressionLevel();
 
     // Get gear for the progression level
     for (uint8 slot = 0; slot < SLOT_EMPTY; slot++)
     {
-        // Get the master item phase for this slot
-        const uint8 itemProgressionLevel = GetMasterItemProgressionLevel(slot, avgProgressionLevel);
+        // Get the master item phase for this slot（副本配置了阶段时，所有部位统一用该阶段）
+        const uint8 itemProgressionLevel = (instanceProgressionLevel != NO_INSTANCE_PHASE)
+            ? instanceProgressionLevel : GetMasterItemProgressionLevel(slot, avgProgressionLevel);
 
         // Retrieve the desired item from the progression levels
         const int32 itemId = sPlayerbotAIConfig.gearProgressionSystemItems[itemProgressionLevel][cls][spec][slot];
-
-        // [GEARPROG-EMPTY-SLOT 2026-10-15] 约定：itemId <= 0 表示"这个槽位按阶段不配装备"，
-        // 不是物品编号。实测 aiplayerbot.conf 里 0.9.0.3 = 0（槽位 3 = EQUIPMENT_SLOT_BODY 衬衫，
-        // 装饰件）与 0.9.0.16 = 0（槽位 16 = EQUIPMENT_SLOT_OFFHAND，术士用法杖时为空）。
-        // 旧代码用 `itemId >= 0` 判断，于是 0 被当成物品 entry 去 equip：
-        //   CanEquipUnseenItem(bot, slot, eDest, 0) 找不到物品原型 ⇒ 失败 ⇒
-        //   TellError("Failed to equip item 0 specified in AiPlayerbot.GearProgressionSystem.0.9.0.3")
-        // 这就是聊天框里那一串告警的来源（并非"缺配置"）。
-        // 现在：>0 才装备；<=0 只清理旧件；== -1（矩阵没这一项）才提示"缺配置"，且每个组合只提示一次。
         if (itemId >= 0)
         {
             const uint32 pItemId = (uint32)itemId;
@@ -121,20 +117,12 @@ bool UpdateGearAction::Execute(Event& event)
                     ai->TellError(requester, ss.str());
                 }
             }
-            // pItemId == 0：该槽位按阶段留空，旧件已清理，无需装备也不再告警。
         }
         else
         {
-            // -1（矩阵里没有这一项）才提示"缺配置"；同一个 phase/class/spec/slot 只提示一次，
-            // 避免每个 bot 每次换装都刷同一串告警（原实现会让聊天框刷满）。
-            static std::set<uint32> reportedMissing;
-            uint32 const key = ((((uint32)itemProgressionLevel * MAX_CLASSES + (uint32)cls) * 4 + (uint32)spec) * SLOT_EMPTY) + (uint32)slot;
-            if (reportedMissing.insert(key).second)
-            {
-                std::ostringstream ss;
-                ss << "Missing configuration for AiPlayerbot.GearProgressionSystem." << std::to_string(itemProgressionLevel) << "." << std::to_string(cls) << "." << std::to_string(spec) << "." << std::to_string(slot);
-                ai->TellError(requester, ss.str());
-            }
+            std::ostringstream ss;
+            ss << "Missing configuration for AiPlayerbot.GearProgressionSystem." << std::to_string(itemProgressionLevel) << "." << std::to_string(cls) << "." << std::to_string(spec) << "." << std::to_string(slot);
+            ai->TellError(requester, ss.str());
         }
 
     }
@@ -146,6 +134,11 @@ bool UpdateGearAction::isUseful()
 {
     if (sPlayerbotAIConfig.gearProgressionSystemEnabled)
     {
+        // [进本换装 2026-10-15] 只要身处"配置了阶段的副本"里，就允许换装（不必等真人组队）。
+        // Execute() 会跳过已经穿对的部位 ⇒ 等效于"进本时触发一次阶段换装"。
+        if (GetInstanceProgressionLevel() != NO_INSTANCE_PHASE)
+            return bot->GetLevel() >= DEFAULT_MAX_LEVEL;
+
         // Only for max level random bots that are playing with a real player
         Player* master = GetMaster();
         if (master && master->isRealPlayer() && bot->IsInGroup(master) && sRandomPlayerbotMgr.IsRandomBot(bot))
@@ -155,6 +148,19 @@ bool UpdateGearAction::isUseful()
     }
 
     return false;
+}
+
+uint8 UpdateGearAction::GetInstanceProgressionLevel()
+{
+    Map* map = bot ? bot->GetMap() : nullptr;
+    if (!map || !(map->IsDungeon() || map->IsRaid()))
+        return NO_INSTANCE_PHASE;
+
+    auto itr = sPlayerbotAIConfig.gearProgressionInstancePhases.find(map->GetId());
+    if (itr == sPlayerbotAIConfig.gearProgressionInstancePhases.end())
+        return NO_INSTANCE_PHASE;
+
+    return itr->second;
 }
 
 uint8 UpdateGearAction::GetProgressionLevel(uint32 itemLevel)

@@ -4,6 +4,7 @@
 #include "Talentspec.h"
 #include "Globals/SharedDefines.h"
 #include "SystemConfig.h"
+#include <map>
 
 class Player;
 class PlayerbotMgr;
@@ -156,6 +157,15 @@ public:
     bool randomGearProgression;
     float randomGearLoweringChance;
     bool rollBadItemsWithPlayer;
+    // [不抢装备 2026-10-14] 组里有真人玩家时，机器人一律 PASS 装备竞拍（默认开启；站长口径"不抢装备"）
+    bool passRollsWithRealPlayer;
+    // [按副本换阶段 2026-10-14] mapId -> 装备阶段（AiPlayerbot.GearProgressionSystem.InstancePhases 解析结果）
+    std::map<uint32, uint8> gearProgressionInstancePhases;
+    // [性能 2026-10-14] 构建装备缓存时只建这些等级（AiPlayerbot.GearProgressionSystem.CacheLevels，逗号分隔；空=全部等级）。
+    // 固定等级的服务器（DisableRandomLevels=1 + randombotStartingLevel=70）填 "70" 可把构建耗时降约 70 倍。
+    std::vector<uint32> gearProgressionCacheLevels;
+    // [按阶段生成 2026-10-15] 随机生成装备时使用的默认阶段（AiPlayerbot.GearProgressionSystem.DefaultPhase，0=团本前）
+    uint8 gearProgressionDefaultPhase;
     float randomBotMaxLevelChance;
     float randomBotRpgChance;
     float usePotionChance;

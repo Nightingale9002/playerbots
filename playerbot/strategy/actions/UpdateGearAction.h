@@ -16,6 +16,8 @@ namespace ai
         uint8 GetProgressionLevel(uint32 itemLevel);
         uint8 GetMasterAverageProgressionLevel();
         uint8 GetMasterItemProgressionLevel(uint8 slot, uint8 avgProgressionLevel);
+        // [按副本换阶段 2026-10-14] 当前副本是否配置了固定阶段（无配置返回 NO_INSTANCE_PHASE）
+        uint8 GetInstanceProgressionLevel();
        
         void EnchantItem(Item* item);
 
