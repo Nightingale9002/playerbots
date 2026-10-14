@@ -945,7 +945,18 @@ bool WorldPosition::loadVMap(uint32 mapId, int x, int y)
     if (isVmapLoaded(mapId, x, y))
         return true;
 
-    return VMAP::VMapFactory::createOrGetVMapManager()->loadMap(sWorld.GetDataPath().c_str(), mapId, x, y);
+    // [VMAP-PATH-BOT 2026-10-15] 这里原来传的是 sWorld.GetDataPath().c_str()，**少了 "vmaps/" 这一层**：
+    //   base = "./"（DataDir） ⇒ VMapManager2::_loadMap() 里 basePath + "530.vmtree" = "./530.vmtree"
+    //   ⇒ fopen 失败 ⇒ InitMap 返回 false ⇒ VMapManager2::iNoVmapDataMaps.insert(mapId)
+    //   ⇒ **整张图在这一进程内被永久拉黑**（此后任何 loadMap 都直接 return false），
+    //     核心侧 TerrainInfo::LoadMapAndVMap() 传的虽然是对的路径也救不回来。
+    // 表现：`.los` 永远 tree=NO；vmap 高度/水位查询落回 .map（副本没有 .map ⇒ -95）
+    //      ⇒ 水/陆判据全乱 ⇒ "陆地上游泳"。
+    // 为什么"关 bot 就正常"：只有 bot 会频繁走 WorldPosition::getAreaFlag()（WorldPosition.h:299
+    // 第一步就是 loadVMap()），于是只有 bot 在跑时才会用这个错路径去 loadMap、才会把图拉黑。
+    // 核心侧 GridMap.cpp 一直是 GetDataPath() + "vmaps"，这里对齐即可（末尾补 '/' 防止拼接粘连）。
+    static std::string const vmapBasePath = sWorld.GetDataPath() + "vmaps/";
+    return VMAP::VMapFactory::createOrGetVMapManager()->loadMap(vmapBasePath.c_str(), mapId, x, y);
 }
 
 std::vector<WorldPosition> WorldPosition::fromPointsArray(const std::vector<G3D::Vector3>& path) const
