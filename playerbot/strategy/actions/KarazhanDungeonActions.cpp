@@ -39,7 +39,7 @@ bool ShadeOfAranFirePhaseStartedAction::Execute(Event& event)
 		{
 			ai->ChangeStrategy("+ranged,-close", BotState::BOT_STATE_COMBAT);
 		}
-		ai->TellPlayerNoFacing(requester, "Fire phase", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+		ai->TellPlayerNoFacing(requester,BOT_TEXT("Fire phase"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 		return true;
 	}
 	else
@@ -59,7 +59,7 @@ bool ShadeOfAranFrostPhaseStartedAction::Execute(Event& event)
 		{
 			ai->ChangeStrategy("-ranged,+close", BotState::BOT_STATE_COMBAT);
 		}
-		ai->TellPlayerNoFacing(requester, "Blizzard phase", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+		ai->TellPlayerNoFacing(requester,BOT_TEXT("Blizzard phase"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 		return true;
 	}
 	else
@@ -79,7 +79,7 @@ bool ShadeOfAranArcanePhaseStartedAction::Execute(Event& event)
 		{
 			ai->ChangeStrategy("+ranged,-close", BotState::BOT_STATE_COMBAT);
 		}
-		ai->TellPlayerNoFacing(requester, "Arcane phase", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+		ai->TellPlayerNoFacing(requester,BOT_TEXT("Arcane phase"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 		return true;
 	}
 	else
@@ -99,7 +99,7 @@ bool ShadeOfAranArcanePhaseEndedAction::Execute(Event& event)
 		{
 			ai->ChangeStrategy("+ranged,-close", BotState::BOT_STATE_COMBAT);
 		}
-		ai->TellPlayerNoFacing(requester, "Arcane phase ended", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+		ai->TellPlayerNoFacing(requester,BOT_TEXT("Arcane phase ended"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 		return true;
 	}
 	else
@@ -121,7 +121,7 @@ bool ShadeOfAranElementalsAction::Execute(Event& event)
 		{
 			ai->ChangeStrategy("+ranged,-close", BotState::BOT_STATE_COMBAT);
 		}
-		ai->TellPlayerNoFacing(requester, "Elementals are out", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+		ai->TellPlayerNoFacing(requester,BOT_TEXT("Elementals are out"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 		return true;
 	}
 	else

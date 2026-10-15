@@ -273,7 +273,7 @@ bool PetitionTurnInAction::Execute(Event& event)
     //Select a new target to travel to. 
     TravelTarget newTarget = TravelTarget(ai);
 
-    ai->TellDebug(requester, "Handing in guild petition", "debug travel");
+    ai->TellDebug(requester,BOT_TEXT("Handing in guild petition"), "debug travel");
 
     TravelTarget* oldTarget = AI_VALUE(TravelTarget*, "travel target");
 

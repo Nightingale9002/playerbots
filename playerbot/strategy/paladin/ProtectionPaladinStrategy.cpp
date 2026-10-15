@@ -602,6 +602,14 @@ void ProtectionPaladinStrategy::InitCombatTriggers(std::list<TriggerNode*>& trig
     triggers.push_back(new TriggerNode(
         "judgement",
         NextAction::array(0, new NextAction("judgement", ACTION_NORMAL + 1), NULL)));
+
+    // [防骑 2026-10-16 站长口径] 复仇之怒只对 BOSS 开（起手就开，用来顶前期仇恨）。
+    //   触发器 "avenging wrath on boss"（PaladinTriggers.cpp → AvengingWrathBossTrigger::IsActive()）
+    //   已含"身上没有该光环 + 在战斗中 + 目标是 BOSS"三重判定；
+    //   基类 PaladinBuffStrategy 里那条 "often"（随机数，平均约 25 秒才开一次）保留作兜底。
+    triggers.push_back(new TriggerNode(
+        "avenging wrath on boss",
+        NextAction::array(0, new NextAction("avenging wrath", ACTION_HIGH + 1), NULL)));
 }
 
 void ProtectionPaladinStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -615,6 +623,19 @@ void ProtectionPaladinStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& t
     triggers.push_back(new TriggerNode(
         "has greater blessing of salvation",
         NextAction::array(0, new NextAction("remove greater blessing of salvation", ACTION_EMERGENCY), NULL)));
+
+    // [防骑 2026-10-16 站长口径] 复仇者之盾 / 神圣愤怒**只在开怪那一刻用**，进战斗后不放。
+    //   "combat start" = BotStateTriggers.cpp → CombatStartTrigger::IsActive()
+    //   = "有攻击者但还没进战斗"那一小段窗口 ⇒ 正好是开怪；
+    //   一旦进入 BOT_STATE_COMBAT，这两条节点自动失效（战斗中不再读条，避免被怪打断）。
+    //   两者都不加蓝量门槛：复仇者之盾靠自身 30 秒冷却，神圣愤怒靠 30 秒冷却 + 目标类型校验。
+    triggers.push_back(new TriggerNode(
+        "combat start",
+        NextAction::array(0, new NextAction("avenger's shield", ACTION_HIGH + 2), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "combat start",
+        NextAction::array(0, new NextAction("holy wrath", ACTION_NORMAL + 4), NULL)));
 }
 
 void ProtectionPaladinStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)

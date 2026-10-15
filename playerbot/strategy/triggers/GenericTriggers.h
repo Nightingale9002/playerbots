@@ -675,6 +675,99 @@ namespace ai
         virtual bool IsActive() override;
     };
 
+    // ===========================================================================
+    // [BOSS 战策略触发器 2026-10-19] BOSS 规则缺的四类触发器。
+    //   · 全部是**新增名字**（creators 键在 TriggerContext.h），没有动任何现有触发器，
+    //     所以没有规则行引用它们时，行为与改动前完全一致。
+    //   · 每一条都做了「空限定词防崩」：绝不把空串交给 context->GetValue("")（那会返回
+    //     nullptr，再 ->Get() 就是线上崩溃 —— 文档 §6 记过的 InsideTargetValue 坑）。
+    // ===========================================================================
+
+    // `target has aura` —— 判定**当前目标**身上的光环。
+    //   为什么需要：`has aura`（HasAuraTrigger）的 GetTargetName() 恒为 "self target"，
+    //   只能查自己 ⇒ "BOSS 开反射盾/免疫/虚空形态就停手""BOSS 自身 buff 前兆"写不出。
+    //   限定词语法与 `has aura` 完全一致（spellid 分支直接复用 HasAuraTrigger::IsActive()）：
+    //     target has aura::spellid::<id>
+    //     target has aura::spellid::<id>::<equal|greater|lesser|greater or equal|lesser or equal>::<层数>
+    //     target has aura::name::<法术名>          （法术名英文小写，例：divine shield）
+    class TargetHasAuraTrigger : public HasAuraTrigger
+    {
+    public:
+        TargetHasAuraTrigger(PlayerbotAI* ai) : HasAuraTrigger(ai, "", 1) {}
+        virtual std::string GetTargetName() override { return "current target"; }
+        virtual bool IsActive() override;
+        virtual std::string getName() override;
+    };
+
+    // `enemy casting` / `enemy casting interruptible` —— 附近**敌对且正在施放非近战法术**的单位。
+    //   目标选择与缓存全部在值 `enemy casting target` / `enemy casting interruptible target` 里
+    //   （见 strategy/values/NearestUnitsValue.h），触发器只做一次值查询 ⇒ 不重复扫描、天然限流。
+    class EnemyCastingTrigger : public Trigger
+    {
+    public:
+        EnemyCastingTrigger(PlayerbotAI* ai, std::string name = "enemy casting", std::string targetValue = "enemy casting target") :
+            Trigger(ai, name, 1), targetValue(targetValue) {}
+        virtual bool IsActive() override;
+
+    protected:
+        std::string targetValue;
+    };
+
+    class EnemyCastingInterruptibleTrigger : public EnemyCastingTrigger
+    {
+    public:
+        EnemyCastingInterruptibleTrigger(PlayerbotAI* ai) :
+            EnemyCastingTrigger(ai, "enemy casting interruptible", "enemy casting interruptible target") {}
+    };
+
+    // [rules 2026-10-17] `hostile aoe incoming` —— 敌方地面 AOE 正落在自己/队友脚下（"脚下有地板"）。
+    //   为什么需要：原来只有副本专用 hazard 列表（`void zone too close` / `move away from hazard` +
+    //   `set avoid area`）能表达"躲地板"，引擎自带的 `avoid aoe` 只覆盖"自己身上已经挂了 area debuff"。
+    //   判据在值 `hostile aoe incoming` 里（`AoeValues.cpp → HostileAoeValue`），触发器只查一次值。
+    //   与 `avoid aoe` 的分工：`avoid aoe` 管"已经中招（身上有 debuff）"，本触发器管"**即将**踩到地板"。
+    class HostileAoeIncomingTrigger : public Trigger
+    {
+    public:
+        HostileAoeIncomingTrigger(PlayerbotAI* ai) : Trigger(ai, "hostile aoe incoming", 1) {}
+        virtual bool IsActive() override;
+    };
+
+    // [rules 2026-10-17] `target facing group` —— 当前目标（BOSS）**正面朝着人群**。
+    //   为什么需要：`behind target` / `not behind target` 只回答"我是不是在目标背后"，
+    //   回答不了"BOSS 的正面是不是朝着队伍" ⇒ 攻略里"坦克把 BOSS 背对人群"写不出来。
+    //   判据：目标朝向与"目标 → 队伍质心"方向的夹角 < 阈值（默认 60°），且队伍里 ≥ 2 人（含自己）。
+    //   限定词（逗号分隔，可省略）：`dist::<质心取人半径，默认 40>`、`angle::<度，默认 60>`。
+    class TargetFacingGroupTrigger : public Trigger, public Qualified
+    {
+    public:
+        TargetFacingGroupTrigger(PlayerbotAI* ai) : Trigger(ai, "target facing group", 1), Qualified() {}
+        virtual bool IsActive() override;
+
+        // 给"绕到对侧"的动作复用：目标正面是否朝着队伍质心。
+        static bool IsTargetFacingGroup(PlayerbotAI* ai, float angleDeg, float memberRadius);
+    };
+
+    // `team member too close` / `team members close` —— **队友**（不是当前目标）与自己距离 < N 码。
+    //   为什么需要：`enemy too close for melee`（EnemyInRangeTrigger）读的是 current target 到自己的
+    //   距离，不是队友间距 ⇒ "分散/别扎堆"的判定写不出。
+    //   限定词（逗号分隔，可省略）：`dist::<码数>`、`count::<人数>`；也可以只写一个裸数字当码数。
+    //   默认：`team member too close` ⇒ 1 人 / 8 码；`team members close` ⇒ 2 人 / 8 码。
+    class TeamMembersCloseTrigger : public Trigger, public Qualified
+    {
+    public:
+        TeamMembersCloseTrigger(PlayerbotAI* ai, std::string name = "team member too close", int defaultCount = 1, float defaultDistance = 8.0f) :
+            Trigger(ai, name, 1), Qualified(), defaultCount(defaultCount), defaultDistance(defaultDistance) {}
+        virtual bool IsActive() override;
+
+        // 给"散开"动作（SpreadOutAction）复用同一套判据：返回最近的那个"扎堆"队友。
+        // 空限定词 ⇒ 用 defaultCount / defaultDistance，不会去查空名字的值。
+        static bool FindCrowdedMember(PlayerbotAI* ai, const std::string& qualifier, int defaultCount, float defaultDistance, Unit*& outMember);
+
+    protected:
+        int defaultCount;
+        float defaultDistance;
+    };
+
     class TimerTrigger : public Trigger
     {
     public:

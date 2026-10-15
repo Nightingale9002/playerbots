@@ -39,6 +39,12 @@ namespace ai
     public:
         virtual T Get() = 0;
         virtual T LazyGet() = 0;
+        // [crash-fix 2026-10-16] Value<T>::GetRef() was removed on purpose.
+        // It handed out a reference into the value object's own storage (CalculatedValue::value /
+        // ManualSetValue::value). Nothing in the type system keeps that object alive: a reference
+        // taken from the shared value context could outlive an AiObjectContext::ClearValues() /
+        // ClearExpiredValues() / SharedObjectContext::ClearValue() call, or simply be invalidated by
+        // the next Calculate(). Callers must take a copy (AI_VALUE / GAI_VALUE) instead.
         virtual void Reset() {}
         virtual void Set(T value) = 0;
         operator T() { return Get(); }
@@ -79,6 +85,15 @@ namespace ai
         virtual void Reset() override { lastCheckTime = 0; }
         virtual bool Expired() override { return Expired(checkInterval / 2); }
         virtual bool Expired(uint32 interval) override { return time(0) - lastCheckTime >= interval; }
+
+        // [crash-fix 2026-10-16] 不要把引用交出去：value 是本对象成员，而本对象会被
+        // AiObjectContext::ClearValues()/ClearExpiredValues() 与 SharedObjectContext::ClearValue()
+        // 直接 delete。原来这里的 `T const& GetRef() { Get(); return value; }` 正好绕开了类型系统，
+        // 让调用方拿到一个"宿主随时会消失"的引用（线上 AI 取值链崩溃那一族）。
+        // 需要大容器的调用方请显式拷贝（一次拷贝换掉一次 use-after-free）。
+        virtual bool IsRegistered() const override { return registered; }
+        virtual void Register() override { registered = true; }
+        virtual void Unregister() override { registered = false; }
     protected:
         virtual T Calculate() = 0;
 
@@ -313,6 +328,12 @@ namespace ai
         virtual void Set(T value) override { this->value = value; }
         virtual void Update() { }
         virtual void Reset() override { value = defaultValue; }
+
+        // [crash-fix 2026-10-16] 与 CalculatedValue 同理：不把成员 value 的引用交出去
+        // （ManualSetValue::Set() 会改写它，宿主也会被 ClearValues/ClearValue delete）。
+        virtual bool IsRegistered() const override { return registered; }
+        virtual void Register() override { registered = true; }
+        virtual void Unregister() override { registered = false; }
 
     protected:
         T value;

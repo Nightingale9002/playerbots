@@ -159,7 +159,7 @@ bool BankAction::Deposit(Player* requester, Item* pItem)
 
 void BankAction::ListItems(Player* requester)
 {
-    ai->TellPlayer(requester, "=== Bank ===");
+    ai->TellPlayer(requester,BOT_TEXT("=== Bank ==="));
 
     std::map<uint32, int> items;
     std::map<uint32, bool> soulbound;

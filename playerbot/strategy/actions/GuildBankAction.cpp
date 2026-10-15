@@ -20,7 +20,7 @@ bool GuildBankAction::Execute(Event& event)
 
     if (!bot->GetGuildId() || (requester && requester->GetGuildId() != bot->GetGuildId()))
     {
-        ai->TellPlayer(requester, "I'm not in your guild!");
+        ai->TellPlayer(requester,BOT_TEXT("I'm not in your guild!"));
             return false;
     }
 

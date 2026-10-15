@@ -10,6 +10,11 @@ class Player;
 class PlayerbotMgr;
 class ChatHandler;
 
+// [diagnostic 2026-10-15] Log current process RSS (working set) with a tag.
+// Enabled only when env PB_RSS_LOG is set; no-op otherwise. Used to quantify
+// startup memory per phase on the local 32GB box before touching the cloud.
+void PlayerbotLogRss(const char* tag);
+
 #if PLATFORM == PLATFORM_WINDOWS
 inline std::string _D_AIPLAYERBOT_CONFIG = "aiplayerbot.conf";
 #else
@@ -140,6 +145,11 @@ public:
     bool enableRandomTeleports;
     bool enableMinimalMove;
     uint32 randomBotTeleportDistance;
+    // [spawn 2026-10-16] 站长口径：bot 固定出生点（沙塔斯），不再散布全世界
+    bool fixedSpawnEnabled;
+    uint32 fixedSpawnMapId;
+    float fixedSpawnX, fixedSpawnY, fixedSpawnZ, fixedSpawnO;
+    float fixedSpawnRadius;
     bool randomBotTeleportNearPlayer;
     uint32 transportTeleportType;
     uint32 randomBotTeleportNearPlayerMaxAmount;
@@ -183,6 +193,8 @@ public:
     uint32 loginDatabaseDelayMs;
     uint32 randomBotsPerInterval;
     uint32 minRandomBotsPriceChangeInterval, maxRandomBotsPriceChangeInterval;
+    // Fish location loading (world-wide fish points); off by default for this server.
+    bool enableFishLocations;
     //Auction house settings
     bool shouldQueryAHListingsOutsideOfAH;
     std::list<uint32> ahOverVendorItemIds;
@@ -206,6 +218,12 @@ public:
     uint32 randomBotMinLevel, randomBotMaxLevel;
     float randomChangeMultiplier;
     uint32 specProbability[MAX_CLASSES][10];
+    // [roster 2026-10-16] 站长口径：按「职业+种族」直接点名专精（-1 = 未指定，走原逻辑）
+    int32 specPick[MAX_CLASSES][MAX_RACES];
+    // [roster 2026-10-16] 入队时的中文自我介绍（每个专精一句，空则退回"我是<职业名>"）
+    std::string specSayCn[MAX_CLASSES][10];
+    // [gems 2026-10-16] 站长口径：优先用哪些宝石（物品id列表），仍然按插槽颜色匹配，匹配不上才放宽颜色
+    std::vector<uint32> gemIds[MAX_CLASSES];
     std::string premadeLevelSpec[MAX_CLASSES][10][91]; //lvl 10 - 100
     uint32 classRaceProbabilityTotal;
     uint32 classRaceProbability[MAX_CLASSES][MAX_RACES];
@@ -219,6 +237,13 @@ public:
     uint32 gearProgressionSystemItemLevels[MAX_GEAR_PROGRESSION_LEVEL][2];
     int32 gearProgressionSystemItems[MAX_GEAR_PROGRESSION_LEVEL][MAX_CLASSES][4][SLOT_EMPTY];
     std::string commandPrefix, commandSeparator;
+
+    // [.bot 命令闸门 2026-10-17 站长口径] 非 GM（gmlevel < SEC_GAMEMASTER）玩家的 bot 命令黑/白名单。
+    //   逗号分隔、大小写不敏感；黑名单先判（拒绝），再判白名单（不在白名单里也拒绝）。
+    //   两个面都过这里：① `.bot <子命令>`（PlayerbotHolder::HandlePlayerbotCommand）
+    //                  ② 对 bot 说话的聊天命令（PlayerbotAI::HandleCommand）
+    std::vector<std::string> playerCommandBlacklist;
+    std::vector<std::string> playerCommandWhitelist;
     std::string randomBotAccountPrefix;
     uint32 randomBotAccountCount;
     bool deleteRandomBotAccounts;
@@ -257,6 +282,76 @@ public:
     bool randomBotSayWithoutMaster;
     bool randomBotInvitePlayer;
     bool randomBotGroupNearby;
+    // [threat 2026-10-16 站长口径] 自己仇恨达到坦克仇恨的这个百分比就压着不出手（0 = 关）
+    uint8 waitForAttackThreatPercent;
+    // [threat 2026-10-18 站长口径] **仇恨基础值**：队里最高仇恨的人（不限于"坦克角色"，含真人）
+    //   还没到这个绝对仇恨值之前，非坦克一律先压着不出手（0 = 关）。
+    //   为什么需要：比例判断在"坦克仇恨很低 / 没被识别成坦克"时几乎没有约束力，开怪瞬间就会 OT。
+    float waitForAttackThreatBase;
+    // [threat 2026-10-16 站长口径] 开场"等坦克 pull back"的秒数上限（默认值，游戏内可单 bot 覆盖）
+    uint8 waitForAttackTime;
+    // [threat 2026-10-16 站长口径] 坦克离我 ≤ 这个距离且对该目标有仇恨 ⇒ 视为"已拉回来"，立刻开打
+    float waitForAttackTankBackDistance;
+    // [threat 2026-10-16 站长口径] 等坦克时保持的安全距离（站长口径：一般 15 码合适）
+    float waitForAttackSafeDistance;
+    // [pullback 2026-10-18 站长口径] 拉怪/卡视野的精细旋钮（**全部走 conf，改完重启即生效，不用重编译**）
+    //   ① 一次拉怪最长持续秒数（超时强制作废回正常战斗），原来硬编码 15
+    uint8 pullMaxTime;
+    //   ② 卡视野点离拉怪原点的最远距离（原来搜索 3/5/7/10/13 码，13 码太远 ⇒ 退太远）
+    float pullCornerMaxDistance;
+    //   ③ 到了卡视野点最多钉多久（秒）；0 = 不钉（旧的"到点就走"行为）
+    uint8 pullCornerHoldSeconds;
+    //   ④ 非坦克"跟着卡视野"（use cover）总开关
+    bool useCoverEnabled;
+    // [tank-wait 2026-10-18 站长口径] "如果有人掉队 T 不应该继续往前走"：
+    //   坦克在队伍里有人掉队(同图/同副本、活着、落在队伍参考点和自己后面超过这个距离)时停下原地等。
+    //   0 = 关（退回旧行为：坦克一直往前走）。判定/行为见 PlayerbotAI::ShouldTankWaitForGroup()。
+    bool tankWaitForGroupEnabled;
+    // [pullback 2026-10-18 站长口径] 这些 creature entry **不许当拉怪目标**（逗号分隔）。
+    //   用途：破碎大厅的"蠕动的软泥怪 17356 / 蠕动的软泥怪(1) 20565"要拉，但它死后分裂出来的
+    //   小软泥怪（Creeping Oozeling 17357 / 20566）不该一只只去拉 —— 直接写进这个名单即可，改 conf 重启生效。
+    std::unordered_set<uint32> noPullTargetEntries;
+    //   同上：拉怪"迟迟没真正开始"时的放弃秒数（默认 3；原来要干等 PullMaxTime=15 秒 ⇒ 卡住不动）
+    uint8 pullNeverStartedAbortSeconds;
+    // [killorder 2026-10-18 站长口径] **优先击杀**的 creature entry（逗号分隔）。
+    //   破碎大厅：碎手军团士兵 16700 / 副本变体 20589。命中时所有职业都会把当前目标切过去打。
+    std::unordered_set<uint32> priorityKillEntries;
+    // [wave 2026-10-18 站长口径] 波次推进：当前波离我 > 这个距离才往前走，否则停下接怪（默认 8 码）
+    float waveAdvanceSafeDistance;
+    // 队伍血量低于这个百分比就停在原地恢复（默认 60）
+    uint8 waveHoldHealthPercent;
+    // [pullback 2026-10-18 站长口径] **孤立判定只看距离，不看数量**：
+    //   目标周围 `PullIsolationRadius` 内没有别的怪、且不在巡逻路线附近 ⇒ 孤立 ⇒ 不 pullback（原地打）。
+    //   （站长原话："孤立的怪只看他离别的怪和巡逻路线够不够远，不看他有几只"。）
+    float pullIsolationRadius;
+    // [dodge 2026-10-18 站长口径] 致命地板的单跳伤害阈值（默认 2000）：
+    //   >= 这个值的地面 AOE 视为致命 ⇒ 任何情况先躲（连治疗都让路）；低于它算普通地板。
+    float lethalAoeMinDamage;
+    // [boss-pos 2026-10-18 站长口径] BOSS 战站位**不再走 conf 全局名单**：每个 BOSS 单独一套，
+    //   存 `ai_playerbot_boss_position`，游戏内 `.bot bosspos` 录入（见 playerbot/BossPositions.h）。
+    // [tank-wait 2026-10-18 站长口径] 掉队判定的距离阈值（码）：队友离坦克 > 这个值才算掉队
+    float tankWaitForGroupDistance;
+    // [tank-wait 2026-10-18 站长口径] 坦克最多等多少秒；超时后恢复前进，并给一个等长的冷却期（防卡死/防抖）
+    uint32 tankWaitForGroupTimeout;
+    // [进本跟随 2026-10-18 站长口径] bot 跟着真人 master 进本时，离"副本门 AreaTrigger"多近才走门（码，默认 30）。
+    //   原来写死 10 码 ⇒ 门口站位稍偏就不跟；现在放宽到 30（`PlayerbotAI::CheckInstanceFollow()`）。
+    float instanceFollowMaxDistance;
+    // [safe-move 2026-10-18 站长口径] "远程 DPS 乱跑引到旁边怪堆"：
+    //   战斗内移动选点前，候选点必须离"最近的其它敌对单位" > 它的仇恨半径(Unit::GetAttackDistance，
+    //   兜底 AiPlayerbot.AggroDistance) + CombatMoveSafetyMargin；不满足就退化为原地。
+    //   判定在 MovementAction::IsCombatMovePointSafe()（附近敌对单位列表按 bot 缓存 1 秒）。
+    bool combatMoveSafetyEnabled;
+    // [safe-move 2026-10-18 站长口径] 仇恨半径之外再留的余量（码，默认 5）
+    float combatMoveSafetyMargin;
+    // [pull 2026-10-18 站长口径] 坦克"开怪目标必须同一层"判据：|bot.z - target.z| 超过这个值就不当开怪目标
+    //   （多楼层副本：卡拉赞 / 黑石深渊 / 厄运之槌）。0 = 关（退回旧行为）。
+    float pullSameLevelZDistance;
+    // [pull 2026-10-18 站长口径] 2D 距离超过这个值才为候选目标做一次 navmesh 路径校验（带缓存 + 每秒限流）
+    float pullPathCheckDistance;
+    // [group 2026-10-16] 队伍里没有真人时的自动解散：0 关 / 1 只处理"真人已离开"的队伍 / 2 任何纯机器人队伍
+    uint8 autoDisbandBotOnlyGroups;
+    // [BOSS 战策略 2026-10-16] 按队伍当前目标的 BOSS entry 自动挂载 custom::boss_<entry>（见功能更新手册「副本/BOSS 战策略」）
+    bool bossStrategies;
     bool randomBotRaidNearby;
     bool randomBotGuildNearby;
     bool randomBotFormGuild;

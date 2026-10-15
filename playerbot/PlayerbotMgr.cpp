@@ -1,5 +1,8 @@
+#include <regex>
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/BossPositions.h"   // [boss-pos 2026-10-18 站长口径] 每个 BOSS 单独一套角色站位
+#include "playerbot/strategy/values/PossibleAttackTargetsValue.h"   // [prio 2026-10-18] 高危小怪表
 #include "PlayerbotDbStore.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "playerbot/RandomPlayerbotFactory.h"
@@ -29,6 +32,8 @@ PlayerbotHolder::PlayerbotHolder() : PlayerbotAIBase()
     m_holderHandlers["help"] = &PlayerbotHolder::HandleHelp;
     m_holderHandlers["reload"] = &PlayerbotHolder::HandleReload;
     m_holderHandlers["tweak"] = &PlayerbotHolder::HandleTweak;
+    m_holderHandlers["bosspos"] = &PlayerbotHolder::HandleBosspos;   // [boss-pos 2026-10-18] 每个 BOSS 的角色站位（GM）
+    m_holderHandlers["prio"] = &PlayerbotHolder::HandlePrio;         // [prio 2026-10-18] 持久化标记高危小怪（GM）
     m_holderHandlers["self"] = &PlayerbotHolder::HandleSelf;
     m_holderHandlers["spoof"] = &PlayerbotHolder::HandleSpoof;
     m_holderHandlers["p"] = &PlayerbotHolder::HandleParty;
@@ -579,7 +584,7 @@ bool PlayerbotMgr::HandlePlayerbotMgrCommand(ChatHandler* handler, char const* a
 {
 	if (!sPlayerbotAIConfig.enabled)
 	{
-		handler->PSendSysMessage("|cffff0000Playerbot system is currently disabled!");
+		handler->PSendSysMessage(BOT_TEXT("|cffff0000Playerbot system is currently disabled!").c_str());
         return false;
 	}
 
@@ -587,7 +592,7 @@ bool PlayerbotMgr::HandlePlayerbotMgrCommand(ChatHandler* handler, char const* a
 
     if (!m_session)
     {
-        handler->PSendSysMessage("You may only add bots from an active session");
+        handler->PSendSysMessage(BOT_TEXT("You may only add bots from an active session").c_str());
         return false;
     }
 
@@ -595,7 +600,7 @@ bool PlayerbotMgr::HandlePlayerbotMgrCommand(ChatHandler* handler, char const* a
     PlayerbotMgr* mgr = player->GetPlayerbotMgr();
     if (!mgr)
     {
-        handler->PSendSysMessage("you cannot control bots yet");
+        handler->PSendSysMessage(BOT_TEXT("you cannot control bots yet").c_str());
         return false;
     }
 
@@ -645,6 +650,12 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
     std::string command = params[0];
     std::string param, charname;
 
+    // [.bot 命令闸门 2026-10-17] 命令子类型写法 "cmd=sub"（见 ProcessBotCommand 里的 eqPos）按主命令判
+    std::string gatedCommand = command;
+    size_t gateEqPos = gatedCommand.find('=');
+    if (gateEqPos != std::string::npos)
+        gatedCommand = gatedCommand.substr(0, gateEqPos);
+
     if (params.size() > 1)
     {
         param = args.substr(params[0].size() + 1);
@@ -655,6 +666,10 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
     {
         if (command != prefix)
             continue;
+
+        // [.bot 命令闸门 2026-10-17] holder 级子命令（list/help/p/g/r/self/spoof/create/group/…）也过闸门
+        if (!CheckPlayerBotCommand(master, useSecurity, gatedCommand, "", ObjectGuid()))
+            return messages;
 
         messages = (this->*handler)(master, param, useSecurity);
         return messages;
@@ -777,12 +792,20 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
             param = "";
     }
 
+    bool gatedByPlayerGate = false;
     for (auto bot :  bots)
     {
         std::ostringstream out;
         out << command << ": " << bot << " - ";
 
         ObjectGuid member = sObjectMgr.GetPlayerGuidByName(bot);
+        // [.bot 命令闸门 2026-10-17] 逐个目标过闸门（黑/白名单 + 目标必须在发令者队伍里/同账号）
+        if (!CheckPlayerBotCommand(master, useSecurity, gatedCommand, bot, member))
+        {
+            gatedByPlayerGate = true;
+            continue;
+        }
+
         if (!member)
         {
             out << "character not found";
@@ -799,11 +822,112 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
         messages.push_back(out.str());
     }
 
-    if (messages.empty())
+    if (messages.empty() && !gatedByPlayerGate)
         messages.push_back("Unknown command. Use 'help' for more information.");
 
     return messages;
 }
+
+// [.bot 命令闸门 2026-10-17 站长口径] ------------------------------------------------------------------
+// 背景：`.bot` 在 Chat.cpp 里注册成 SEC_PLAYER ⇒ gmlevel 0 的玩家能对自己账号的机器人用全部子命令；
+//       原先只有 HandleSelf(`self`) / HandleBotAlways(`always`) 两处看 AiPlayerbot.SelfBotLevel。
+// 口径：非 GM（< SEC_GAMEMASTER）只放行"白名单"里的命令，黑名单里的命令一律拒绝；
+//       目标 bot 必须属于发令者（同一队伍，或同一账号的 alt bot —— 与 PlayerbotSecurity::LevelFor 同口径）。
+//       被拒时给发令者一句中文提示（BOT_TEXT: no_permission_for_bot_command），并写 [BOTCMD] 审计日志。
+// 覆盖入口：
+//       ① `.bot <子命令> ...`  → PlayerbotHolder::HandlePlayerbotCommand  （本文件）
+//       ② 对 bot 说话的聊天命令 → PlayerbotAI::HandleCommand              （那边调同一个 CheckPlayerBotCommand）
+//       `.rndbot`（控制台 CLI，master == nullptr）与 GM 不受影响。
+bool PlayerbotHolder::IsBotCommandBlacklisted(const std::string& command)
+{
+    if (command.empty())
+        return false;
+
+    std::string needle = command;
+    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+    for (const auto& blocked : sPlayerbotAIConfig.playerCommandBlacklist)
+        if (!blocked.empty() && blocked == needle)
+            return true;
+
+    return false;
+}
+
+bool PlayerbotHolder::IsBotCommandWhitelisted(const std::string& command)
+{
+    // 白名单留空 = 不做白名单过滤（只按黑名单判），避免"配置写空 ⇒ 所有命令都被拒"
+    if (sPlayerbotAIConfig.playerCommandWhitelist.empty())
+        return true;
+
+    if (command.empty())
+        return false;
+
+    std::string needle = command;
+    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+    for (const auto& allowed : sPlayerbotAIConfig.playerCommandWhitelist)
+        if (!allowed.empty() && allowed == needle)
+            return true;
+
+    return false;
+}
+
+bool PlayerbotHolder::CheckPlayerBotCommand(Player* from, AccountTypes security, const std::string& command,
+                                            const std::string& targetName, ObjectGuid targetGuid)
+{
+    // 控制台 / CLI（没有发令玩家）、GM 及以上、以及"发令者是机器人"（bot 之间互相说话）都不受玩家闸门限制
+    if (!from || !from->GetSession() || security >= SEC_GAMEMASTER)
+        return true;
+
+    if (from->GetPlayerbotAI() && !from->GetPlayerbotAI()->IsRealPlayer())
+        return true;
+
+    std::string reason;
+
+    if (IsBotCommandBlacklisted(command))
+    {
+        reason = "blacklist";
+    }
+    else if (!IsBotCommandWhitelisted(command))
+    {
+        reason = "not whitelisted";
+    }
+    else if (targetGuid && !targetGuid.IsEmpty())
+    {
+        // 目标必须属于发令者：同一账号的 alt bot（与 PlayerbotSecurity::LevelFor 一致），或与发令者同队伍
+        bool owned = false;
+        uint32 botAccount = sObjectMgr.GetPlayerAccountIdByGUID(targetGuid);
+        if (botAccount && botAccount == from->GetSession()->GetAccountId())
+            owned = true;
+
+        if (!owned)
+        {
+            Player* bot = sObjectMgr.GetPlayer(targetGuid);
+            Group* fromGroup = from->GetGroup();
+            if (bot && fromGroup && bot->GetGroup() == fromGroup)
+                owned = true;
+        }
+
+        if (!owned)
+            reason = "target not in group";
+    }
+
+    if (reason.empty())
+        return true;
+
+    std::string targetForLog = targetName.empty() ? std::string("-") : targetName;
+
+    sLog.outString("[BOTCMD] 玩家=%s gm=%u 命令=%s 目标=%s 原因=%s",
+        from->GetName(), uint32(security), command.c_str(), targetForLog.c_str(), reason.c_str());
+
+    std::string text = BOT_TEXT("no_permission_for_bot_command");
+    if (text.empty())
+        text = "你没有权限使用这个机器人命令。";
+
+    ChatHandler(from->GetSession()).PSendSysMessage("%s", text.c_str());
+    return false;
+}
+// ----------------------------------------------------------------------------------------------------
 
 uint32 PlayerbotHolder::GetAccountId(std::string name)
 {
@@ -1231,6 +1355,274 @@ std::list<std::string> PlayerbotHolder::HandleTweak(Player* master, const std::s
     if (sPlayerbotAIConfig.tweakValue > 2)
         sPlayerbotAIConfig.tweakValue = 0;
     messages.push_back("Set tweakvalue to " + std::to_string(sPlayerbotAIConfig.tweakValue));
+    return messages;
+}
+
+// [boss-pos 2026-10-18 站长口径] **游戏内指定每个 BOSS 各角色的站位**（每个 BOSS 单独一套数据）：
+//   `.bot bosspos list [entry]`
+//   `.bot bosspos set <entry> <tank|healer|melee|ranged> here [radius]`        ← 用我脚下的位置
+//   `.bot bosspos set <entry> <role> <x> <y> <z> [radius]`
+//   `.bot bosspos del <entry> <role>` / `.bot bosspos clear <entry>`
+//   写库 `ai_playerbot_boss_position` 后立即生效（缓存失效，下一 tick 就吃到新值）：**不用重启**。
+// [prio 2026-10-18 站长口径] **持久化标记高危小怪**：写 `tbccharacters.ai_playerbot_priority_target`，
+//   写完立即生效（不用重启、也不用等那 5 分钟重扫）。被标记的怪会被选怪逻辑当成高威胁优先处理。
+//   `.bot prio list`                       看现有标记
+//   `.bot prio add`                        把我**当前选中的怪**标成 priority 1
+//   `.bot prio add 16700 2 会召唤转化者`   指定 entry / 优先级 / 备注（优先级 1 最高，9 最低）
+//   `.bot prio del 16700`                  取消标记
+//   备注里的引号/反斜杠会被剔掉（防 SQL 注入），最长 180 字符。
+std::list<std::string> PlayerbotHolder::HandlePrio(Player* master, const std::string param, AccountTypes security)
+{
+    std::list<std::string> messages;
+
+    if (security < SEC_GAMEMASTER)
+    {
+        messages.push_back("You do not have permission to use this command.");
+        return messages;
+    }
+
+    std::vector<std::string> params = Qualified::getMultiQualifiers(param, " ");
+    std::string const help = "usage: .bot prio list | .bot prio add [entry] [priority] [reason] | .bot prio del [entry]";
+
+    if (params.empty() || params[0] == "help")
+    {
+        messages.push_back(help);
+        return messages;
+    }
+
+    std::string const sub = params[0];
+
+    if (sub == "list")
+    {
+        auto results = CharacterDatabase.Query("SELECT `entry`, `priority`, `source`, `reason` FROM `ai_playerbot_priority_target` ORDER BY `priority`, `entry`");
+        if (!results)
+        {
+            messages.push_back("no priority target marked yet");
+            return messages;
+        }
+
+        uint32 shown = 0;
+        do
+        {
+            Field* fields = results->Fetch();
+            messages.push_back("#" + std::to_string(fields[0].GetUInt32()) + " p" + std::to_string(fields[1].GetUInt8()) +
+                " [" + fields[2].GetString() + "] " + fields[3].GetString());
+            ++shown;
+        } while (results->NextRow() && shown < 40);
+
+        messages.push_back("shown " + std::to_string(shown));
+        return messages;
+    }
+
+    // entry：给了数字就用它；否则用 GM 当前选中的怪
+    uint32 entry = 0;
+    size_t next = 2;
+    if (params.size() > 1 && params[1] != "target" && params[1] != "here")
+        entry = (uint32)atoi(params[1].c_str());
+    else if (master && master->GetMap())
+    {
+        if (Creature* selected = master->GetMap()->GetCreature(master->GetSelectionGuid()))
+            entry = selected->GetEntry();
+    }
+
+    if (!entry)
+    {
+        messages.push_back("no entry: select a creature first, or pass an entry id");
+        return messages;
+    }
+
+    if (sub == "del")
+    {
+        CharacterDatabase.PExecute("DELETE FROM `ai_playerbot_priority_target` WHERE `entry` = %u", entry);
+        ai::prioritytarget::Reload();
+        messages.push_back("deleted priority marking of #" + std::to_string(entry));
+        return messages;
+    }
+
+    if (sub != "add")
+    {
+        messages.push_back(help);
+        return messages;
+    }
+
+    uint32 priority = 1;
+    if (params.size() > next && atoi(params[next].c_str()) > 0)
+    {
+        priority = (uint32)std::min(9, atoi(params[next].c_str()));
+        ++next;
+    }
+
+    std::string reason = "manual";
+    if (params.size() > next)
+    {
+        reason.clear();
+        for (size_t i = next; i < params.size(); ++i)
+        {
+            if (!reason.empty())
+                reason += " ";
+
+            reason += params[i];
+        }
+    }
+
+    // 只留安全字符（防 SQL 注入 / 转义问题），并限长
+    std::string safe;
+    for (char c : reason)
+    {
+        if (c == 0x27 || c == 0x22 || c == 0x5C || c == 0x60)
+            continue;
+
+        safe += c;
+        if (safe.size() >= 180)
+            break;
+    }
+
+    if (safe.empty())
+        safe = "manual";
+
+    std::string const note = "'" + safe + "'";
+    CharacterDatabase.PExecute("REPLACE INTO `ai_playerbot_priority_target` (`entry`, `priority`, `source`, `reason`) VALUES (%u, %u, 'manual', %s)",
+        entry, priority, note.c_str());
+
+    ai::prioritytarget::Reload();
+
+    messages.push_back("marked #" + std::to_string(entry) + " as priority " + std::to_string(priority) + " (effective immediately)");
+    return messages;
+}
+
+std::list<std::string> PlayerbotHolder::HandleBosspos(Player* master, const std::string param, AccountTypes security)
+{
+    std::list<std::string> messages;
+
+    if (security < SEC_GAMEMASTER)
+    {
+        messages.push_back("You do not have permission to use this command.");
+        return messages;
+    }
+
+    std::vector<std::string> params = Qualified::getMultiQualifiers(param, " ");
+
+    std::string const help = "usage: .bot bosspos list [entry] | set <entry> <tank|healer|melee|ranged> here [radius] | set <entry> <role> <x> <y> <z> [radius] | del <entry> <role> | clear <entry>";
+
+    if (params.empty() || params[0] == "help")
+    {
+        messages.push_back(help);
+        return messages;
+    }
+
+    std::string const sub = params[0];
+
+    if (sub == "list")
+    {
+        uint32 entry = params.size() > 1 ? (uint32)atoi(params[1].c_str()) : 0;
+        std::vector<bossposition::Row> rows = bossposition::List(entry);
+        if (rows.empty())
+        {
+            messages.push_back(entry ? "that boss has no position yet" : "no boss position recorded yet");
+            return messages;
+        }
+
+        for (bossposition::Row const& row : rows)
+        {
+            messages.push_back("#" + std::to_string(row.entry) + " " + bossposition::RoleName(row.role) +
+                " map " + std::to_string(row.spot.mapId) +
+                "  x " + std::to_string(row.spot.x) + "  y " + std::to_string(row.spot.y) +
+                "  z " + std::to_string(row.spot.z) + "  r " + std::to_string(row.spot.radius));
+        }
+
+        return messages;
+    }
+
+    if (params.size() < 2)
+    {
+        messages.push_back(help);
+        return messages;
+    }
+
+    uint32 const entry = (uint32)atoi(params[1].c_str());
+    if (!entry)
+    {
+        messages.push_back("bad boss entry");
+        return messages;
+    }
+
+    if (sub == "clear")
+    {
+        bossposition::Delete(entry, -1);
+        messages.push_back("cleared all positions of #" + std::to_string(entry));
+        return messages;
+    }
+
+    if (params.size() < 3)
+    {
+        messages.push_back(help);
+        return messages;
+    }
+
+    int32 const role = bossposition::RoleFromName(params[2]);
+    if (role < 0)
+    {
+        messages.push_back("bad role, use tank|healer|melee|ranged");
+        return messages;
+    }
+
+    if (sub == "del")
+    {
+        bossposition::Delete(entry, role);
+        messages.push_back("deleted #" + std::to_string(entry) + " " + bossposition::RoleName((uint32)role));
+        return messages;
+    }
+
+    if (sub != "set")
+    {
+        messages.push_back(help);
+        return messages;
+    }
+
+    if (!master || !master->IsInWorld())
+    {
+        messages.push_back("you must be in world (the map id is taken from you)");
+        return messages;
+    }
+
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float radius = bossposition::kDefaultRadius;
+
+    if (params.size() >= 4 && params[3] == "here")
+    {
+        x = master->GetPositionX();
+        y = master->GetPositionY();
+        z = master->GetPositionZ();
+
+        if (params.size() >= 5)
+            radius = (float)atof(params[4].c_str());
+    }
+    else if (params.size() >= 6)
+    {
+        x = (float)atof(params[3].c_str());
+        y = (float)atof(params[4].c_str());
+        z = (float)atof(params[5].c_str());
+
+        if (params.size() >= 7)
+            radius = (float)atof(params[6].c_str());
+    }
+    else
+    {
+        messages.push_back(help);
+        return messages;
+    }
+
+    if (!bossposition::Set(entry, master->GetMapId(), (uint32)role, x, y, z, radius))
+    {
+        messages.push_back("save failed");
+        return messages;
+    }
+
+    messages.push_back("saved #" + std::to_string(entry) + " " + bossposition::RoleName((uint32)role) +
+        " on map " + std::to_string(master->GetMapId()) +
+        "  x " + std::to_string(x) + "  y " + std::to_string(y) + "  z " + std::to_string(z) +
+        "  r " + std::to_string(radius) + "   (effective immediately)");
+
     return messages;
 }
 

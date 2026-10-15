@@ -27,7 +27,7 @@ bool TellAttackersAction::Execute(Event& event)
 {
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
 
-    ai->TellPlayer(requester, "--- Attackers ---");
+    ai->TellPlayer(requester,BOT_TEXT("--- Attackers ---"));
 
     std::list<ObjectGuid> attackers = context->GetValue<std::list<ObjectGuid>>("attackers")->Get();
     for (std::list<ObjectGuid>::iterator i = attackers.begin(); i != attackers.end(); i++)
@@ -39,7 +39,7 @@ bool TellAttackersAction::Execute(Event& event)
         ai->TellPlayer(requester, unit->GetName());
     }
 
-    ai->TellPlayer(requester, "--- Threat ---");
+    ai->TellPlayer(requester,BOT_TEXT("--- Threat ---"));
     HostileReference* ref = sServerFacade.GetHostileRefManager(bot).getFirst();
     if (!ref)
         return true;
@@ -61,7 +61,7 @@ bool TellAttackersAction::Execute(Event& event)
 bool TellPossibleAttackTargetsAction::Execute(Event& event)
 {
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
-    ai->TellPlayer(requester, "--- Attack Targets ---");
+    ai->TellPlayer(requester,BOT_TEXT("--- Attack Targets ---"));
 
     std::list<ObjectGuid> attackers = context->GetValue<std::list<ObjectGuid>>("possible attack targets")->Get();
     for (std::list<ObjectGuid>::iterator i = attackers.begin(); i != attackers.end(); i++)
@@ -73,7 +73,7 @@ bool TellPossibleAttackTargetsAction::Execute(Event& event)
         ai->TellPlayer(requester, unit->GetName());
     }
 
-    ai->TellPlayer(requester, "--- Threat ---");
+    ai->TellPlayer(requester,BOT_TEXT("--- Threat ---"));
     HostileReference *ref = sServerFacade.GetHostileRefManager(bot).getFirst();
     if (!ref)
         return true;

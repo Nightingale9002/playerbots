@@ -527,8 +527,30 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
 #endif
     }
 
+    // [heal 2026-10-17] 五人本单奶口径（站长定）：治疗专精默认开"预读-取消"与"预读预测"。
+    //   - heal interrupt：读条中的治疗若目标满血/预计过量>50%，打断当前法术（不耗蓝）⇒
+    //     实现见 HealInterruptStrategy + HealTargetFullHealthTrigger（快速治疗已豁免，见 HealthTriggers.cpp）。
+    //   - preheal：HealthTriggers/PartyMemberToHeal 改用"当前血量 − 来袭伤害"的预测血量。
+    //   只挂治疗专精（别拉到 DPS / 坦克上）。
+    switch (player->getClass())
+    {
+        case CLASS_PRIEST:  if (tab == 0 || tab == 1) combatEngine->addStrategies("heal interrupt", "preheal", NULL); break;
+        case CLASS_PALADIN: if (tab == 0)             combatEngine->addStrategies("heal interrupt", "preheal", NULL); break;
+        case CLASS_SHAMAN:  if (tab == 2)             combatEngine->addStrategies("heal interrupt", "preheal", NULL); break;
+        case CLASS_DRUID:   if (tab == 2)             combatEngine->addStrategies("heal interrupt", "preheal", NULL); break;
+        default: break;
+    }
+
+    // [threat 2026-10-16 站长口径] 非坦克默认挂"等坦克"策略：
+    //   WaitForAttackStrategy::ShouldWait() 第一行就要求 HasStrategy("wait for attack")，而全模块没人
+    //   给 bot 挂过这个策略 ⇒ 实测 DPS 一开怪就打：既不等坦克 pull back、也不看自己的仇恨。
+    //   坦克（warrior/paladin prot、feral tank、DK blood 都带 "pull back"）不挂：它们必须能立刻开怪，
+    //   ShouldWait() 里另有一道坦克豁免。
+    if (!combatEngine->HasStrategy("pull back"))
+        combatEngine->addStrategy("wait for attack");
+
     if (facade->IsRealPlayer() || sRandomPlayerbotMgr.IsFreeBot(player))
-	{
+    {
         combatEngine->addStrategy("roll");
 
         if (!player->GetGroup())

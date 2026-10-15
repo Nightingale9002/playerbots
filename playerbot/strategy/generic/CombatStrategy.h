@@ -97,7 +97,9 @@ namespace ai
 
         static bool ShouldWait(PlayerbotAI* ai);
         static uint8 GetWaitTime(PlayerbotAI* ai);
-        static float GetSafeDistance() { return sPlayerbotAIConfig.fleeDistance; }
+        // [threat 2026-10-16 站长口径] 等坦克时"保持的安全距离"改为独立配置（默认 15 码），
+        // 不再借用 fleeDistance（那是逃跑距离，改动会连带影响逃跑行为）。
+        static float GetSafeDistance() { return sPlayerbotAIConfig.waitForAttackSafeDistance; }
         static float GetSafeDistanceThreshold() { return 2.5f; }
         ReactStates GetPetReactState() const { return petReactState; }
         void SetPetReactState(ReactStates reactState) { petReactState = reactState; }

@@ -554,6 +554,11 @@ void HunterStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "kill command",
         NextAction::array(0, new NextAction("kill command", ACTION_NORMAL + 6), NULL)));
 
+    // [bm hunter 2026-10-17 站长口径] 多射卡CD：冷好就打（单体也打），优先级略高于稳固。
+    triggers.push_back(new TriggerNode(
+        "multi-shot",
+        NextAction::array(0, new NextAction("multi-shot", ACTION_NORMAL + 6), NULL)));
+
     triggers.push_back(new TriggerNode(
         "steady shot",
         NextAction::array(0, new NextAction("steady shot", ACTION_NORMAL + 5), NULL)));
@@ -679,13 +684,11 @@ void HunterAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "explosive trap",
         NextAction::array(0, new NextAction("explosive trap on target", ACTION_INTERRUPT), NULL)));
 
+    // [bm hunter 2026-10-17 站长口径] 乱射只在≥10 目标、且多射与爆炸陷阱都在冷却时才放；
+    // 周围有会破控的怪时一律不放（守卫在触发器 HunterVolleyTrigger::IsActive()）。
     triggers.push_back(new TriggerNode(
-        "ranged high aoe",
+        "volley aoe",
         NextAction::array(0, new NextAction("volley", ACTION_HIGH + 3), NULL)));
-
-    triggers.push_back(new TriggerNode(
-        "multi-shot",
-        NextAction::array(0, new NextAction("multi-shot", ACTION_HIGH), NULL)));
 }
 
 void HunterAoeStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -903,14 +906,15 @@ void HunterStingStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 
     triggers.push_back(new TriggerNode(
         "no stings",
-        NextAction::array(0, new NextAction("viper sting", ACTION_NORMAL + 5), NULL)));
+        NextAction::array(0, new NextAction("serpent sting", ACTION_NORMAL + 5), NULL)));
 }
 
 void HunterStingPvpStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // [bm hunter 2026-10-17 站长口径] PvP 用蝰蛇钉刺；PvE 仍用毒蛇钉刺（单体默认）。
     triggers.push_back(new TriggerNode(
         "no stings",
-        NextAction::array(0, new NextAction("serpent sting", ACTION_NORMAL + 4), NULL)));
+        NextAction::array(0, new NextAction("viper sting", ACTION_NORMAL + 6), NULL)));
 }
 
 void HunterStingPveStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -927,8 +931,13 @@ void HunterStingRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& trigge
 
 void HunterAspectStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // [bm hunter 2026-10-17 站长口径] 守护阈值 20/35：<20 切蝰蛇，>35 切回鹰，中间不横跳。
     triggers.push_back(new TriggerNode(
-        "aspect of the hawk",
+        "aspect of the viper low mana",
+        NextAction::array(0, new NextAction("aspect of the viper", ACTION_HIGH + 6), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "aspect of the hawk mana ok",
         NextAction::array(0, new NextAction("aspect of the hawk", ACTION_HIGH + 5), NULL)));
 }
 

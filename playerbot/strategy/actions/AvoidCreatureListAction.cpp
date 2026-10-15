@@ -16,14 +16,14 @@ bool AvoidCreatureListAction::Execute(Event& event)
     if (cmd == "reset")
     {
         avoidCreatures.clear();
-        ai->TellPlayer(requester, "The avoid creature list has been cleared");
+        ai->TellPlayer(requester,BOT_TEXT("The avoid creature list has been cleared"));
         return true;
     }
     else if (cmd.empty() || cmd == "?")
     {   
         if (avoidCreatures.empty())
         {
-            ai->TellPlayer(requester, "Avoid creature list is empty");
+            ai->TellPlayer(requester,BOT_TEXT("Avoid creature list is empty"));
         }
         else
         {
@@ -108,7 +108,7 @@ bool AvoidCreatureListAction::Execute(Event& event)
         }
         else
         {
-            ai->TellPlayer(requester, "Please specify one or more creatures to avoid");
+            ai->TellPlayer(requester,BOT_TEXT("Please specify one or more creatures to avoid"));
         }
     }
 

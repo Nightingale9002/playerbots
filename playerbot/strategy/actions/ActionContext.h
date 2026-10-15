@@ -152,6 +152,12 @@ namespace ai
             creators["pull start"] = [](PlayerbotAI* ai) { return new PullStartAction(ai); };
             creators["pull action"] = [](PlayerbotAI* ai) { return new PullAction(ai); };
             creators["return to pull position"] = [](PlayerbotAI* ai) { return new ReturnToPullPositionAction(ai); };
+            creators["corner pull position"] = [](PlayerbotAI* ai) { return new CornerPullPositionAction(ai); };
+            creators["use cover"] = [](PlayerbotAI* ai) { return new UseCoverAction(ai); };
+            creators["grab loose mob"] = [](PlayerbotAI* ai) { return new GrabLooseMobAction(ai); };
+            creators["switch to priority kill target"] = [](PlayerbotAI* ai) { return new SwitchToPriorityKillTargetAction(ai); };
+            creators["advance wave"] = [](PlayerbotAI* ai) { return new AdvanceWaveAction(ai); };
+            creators["boss position"] = [](PlayerbotAI* ai) { return new StandBossPositionAction(ai); };
             creators["pull end"] = [](PlayerbotAI* ai) { return new PullEndAction(ai); };
             creators["emote"] = [](PlayerbotAI* ai) { return new EmoteAction(ai); };
             creators["talk"] = [](PlayerbotAI* ai) { return new TalkAction(ai); };
@@ -178,6 +184,9 @@ namespace ai
             creators["check values"] = [](PlayerbotAI* ai) { return new CheckValuesAction(ai); };
             creators["set avoid area"] = [](PlayerbotAI* ai) { return new SetAvoidAreaAction(ai); };
             creators["ra"] = [](PlayerbotAI* ai) { return new RemoveAuraAction(ai); };
+            // [BOSS 战策略动作 2026-10-19] 通用"对队友驱散/净化"：
+            //   `cure team member::<法术名>::<类型 token 表>`，例 `cure team member::cleanse::magic`
+            creators["cure team member"] = [](PlayerbotAI* ai) { return new CureTeamMemberAction(ai); };
             creators["remove blessing of salvation"] = [](PlayerbotAI* ai) { return new RemoveBlessingOfSalvationAction(ai); };
             creators["remove greater blessing of salvation"] = [](PlayerbotAI* ai) { return new RemoveGreaterBlessingOfSalvationAction(ai); };
             creators["apply stone"] = [](PlayerbotAI* ai) { return new ImbueWithStoneAction(ai); };

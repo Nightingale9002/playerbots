@@ -35,7 +35,7 @@ bool LootStrategyAction::Execute(Event& event)
     {
         alwaysLootItems.clear();
         skipLootItems.clear();
-        ai->TellPlayer(requester, "My loot list is now empty");
+        ai->TellPlayer(requester,BOT_TEXT("My loot list is now empty"));
         return true;
     }    
     else

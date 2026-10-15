@@ -3,6 +3,7 @@
 #include "ActiveSpellValue.h"
 #include "NearestGameObjects.h"
 #include "LogLevelValue.h"
+#include "InDungeonValue.h"
 #include "NearestNpcsValue.h"
 #include "PossibleTargetsValue.h"
 #include "NearestAdsValue.h"
@@ -32,6 +33,7 @@
 #include "HasAvailableLootValue.h"
 #include "LastMovementValue.h"
 #include "DistanceValue.h"
+#include "BossRuleValues.h"      // [BOSS 战策略 2026-10-16] 角色值 + 触发器取值（给 val::and::{...} 复合用）
 #include "IsMovingValue.h"
 #include "IsBehindValue.h"
 #include "IsFacingValue.h"
@@ -141,6 +143,8 @@ namespace ai
             creators["nearest stealthed units"] = [](PlayerbotAI* ai) { return new NearestStealthedUnitsValue(ai); };
             creators["nearest stealthed unit"] = [](PlayerbotAI* ai) { return new NearestStealthedSingleUnitValue(ai); };
             creators["log level"] = [](PlayerbotAI* ai) { return new LogLevelValue(ai); };
+            // [corpse-run 2026-10-18 站长口径] "我在副本/团本里吗"（`DeadStrategy` 用它关掉副本里的自动释放灵魂）。
+            creators["in dungeon"] = [](PlayerbotAI* ai) { return new InDungeonValue(ai); };
             creators["friendly unit without aura"] = [](PlayerbotAI* ai) { return new FriendlyUnitWithoutAuraValue(ai); };
             creators["party member without aura"] = [](PlayerbotAI* ai) { return new PartyMemberWithoutAuraValue(ai); };
             creators["party tank without aura"] = [](PlayerbotAI* ai) { return new PartyTankWithoutAuraValue(ai); };
@@ -162,6 +166,11 @@ namespace ai
             creators["has enemy player targets"] = [](PlayerbotAI* ai) { return new HasEnemyPlayersValue(ai); };
             creators["cc target"] = [](PlayerbotAI* ai) { return new CcTargetValue(ai); };
             creators["current cc target"] = [](PlayerbotAI* ai) { return new CurrentCcTargetValue(ai); };
+            // [BOSS 战策略值 2026-10-19] 附近"敌人在读条"的目标（优先 current target，其次最近）。
+            //   限定词：dist::<码数>（默认 30）、spellid::<id>，逗号分隔可省略。
+            //   缓存 ~1 秒（checkInterval=2），见 TargetValue.h 的说明。
+            creators["enemy casting target"] = [](PlayerbotAI* ai) { return new EnemyCastingTargetValue(ai, "enemy casting target", false); };
+            creators["enemy casting interruptible target"] = [](PlayerbotAI* ai) { return new EnemyCastingTargetValue(ai, "enemy casting interruptible target", true); };
             creators["pet target"] = [](PlayerbotAI* ai) { return new PetTargetValue(ai); };
             creators["old target"] = [](PlayerbotAI* ai) { return new CurrentTargetValue(ai); };
             creators["grind target"] = [](PlayerbotAI* ai) { return new GrindTargetValue(ai); };
@@ -169,7 +178,13 @@ namespace ai
             creators["rti cc target"] = [](PlayerbotAI* ai) { return new RtiCcTargetValue(ai); };
             creators["duel target"] = [](PlayerbotAI* ai) { return new DuelTargetValue(ai); };
             creators["party member to dispel"] = [](PlayerbotAI* ai) { return new PartyMemberToDispel(ai); };
+            // [BOSS 战策略值 2026-10-19] 队里第一个中了可驱散负面光环的成员（类型限定词可读：
+            //   magic/curse/disease/poison，逗号分隔；省略 = 四种全算）。与 `cure team member` /
+            //   `team member needs cure` 配套。
+            creators["team member to cure"] = [](PlayerbotAI* ai) { return new TeamMemberToCure(ai); };
             creators["party member to protect"] = [](PlayerbotAI* ai) { return new PartyMemberToProtect(ai); };
+            // [disc 2026-10-17] Pain Suppression 预判专用值（与 to protect 隔离）
+            creators["party member to pain suppress"] = [](PlayerbotAI* ai) { return new PartyMemberToPainSuppress(ai); };
             creators["party member to remove roots"] = [](PlayerbotAI* ai) { return new PartyMemberToRemoveRoots(ai); };
             creators["health"] = [](PlayerbotAI* ai) { return new HealthValue(ai); };
             creators["rage"] = [](PlayerbotAI* ai) { return new RageValue(ai); };
@@ -221,6 +236,8 @@ namespace ai
             creators["trinkets on use"] = [](PlayerbotAI* ai) { return new EquipedUsableTrinketValue(ai); };
 
             creators["spell id"] = [](PlayerbotAI* ai) { return new SpellIdValue(ai); };
+            // [disc 2026-10-17] 治疗法术动态 rank（限定词 = 法术名），供治疗波按承伤选最小 rank
+            creators["heal rank"] = [](PlayerbotAI* ai) { return new HealRankValue(ai); };
             creators["vehicle spell id"] = [](PlayerbotAI* ai) { return new VehicleSpellIdValue(ai); };
             creators["item for spell"] = [](PlayerbotAI* ai) { return new ItemForSpellValue(ai); };
             creators["spell cast useful"] = [](PlayerbotAI* ai) { return new SpellCastUsefulValue(ai); };
@@ -291,6 +308,15 @@ namespace ai
             creators["group"] = [](PlayerbotAI* ai) { return new IsInGroupValue(ai); };
             creators["range"] = [](PlayerbotAI* ai) { return new RangeValue(ai); };
             creators["inside target"] = [](PlayerbotAI* ai) { return new InsideTargetValue(ai); };
+            // [BOSS 战策略 2026-10-16] 角色精细分工（与"集名后缀"两套并存，见 BossRuleValues.h 注释）
+            //   val::is dps / val::is tank / val::is healer / val::is melee / val::is ranged
+            //   val::and::{trigger::<触发器名>,is dps}  ← trigger 是"把任意触发器当值用"的桥
+            creators["is tank"] = [](PlayerbotAI* ai) { return new IsTankValue(ai); };
+            creators["is healer"] = [](PlayerbotAI* ai) { return new IsHealerValue(ai); };
+            creators["is dps"] = [](PlayerbotAI* ai) { return new IsDpsValue(ai); };
+            creators["is melee"] = [](PlayerbotAI* ai) { return new IsMeleeValue(ai); };
+            creators["is ranged"] = [](PlayerbotAI* ai) { return new IsRangedValue(ai); };
+            creators["trigger"] = [](PlayerbotAI* ai) { return new TriggerAsValue(ai); };
             creators["party member without item"] = [](PlayerbotAI* ai) { return new PartyMemberWithoutItemValue(ai); };
             creators["party member without food"] = [](PlayerbotAI* ai) { return new PartyMemberWithoutFoodValue(ai); };
             creators["party member without water"] = [](PlayerbotAI* ai) { return new PartyMemberWithoutWaterValue(ai); };
@@ -439,6 +465,9 @@ namespace ai
             creators["max mount speed"] = [](PlayerbotAI* ai) { return new MaxMountSpeedValue(ai); };
 
             creators["has area debuff"] = [](PlayerbotAI* ai) { return new HasAreaDebuffValue(ai); };
+            // [rules 2026-10-17] 敌方地面 AOE 正落在自己/队友脚下（"脚下有地板"）。
+            //   与 `has area debuff` 分工：那个判"已经中招"，这个判"即将踩到"。
+            creators["hostile aoe incoming"] = [](PlayerbotAI* ai) { return new HostileAoeValue(ai); };
             creators["combat start time"] = [](PlayerbotAI* ai) { return new CombatStartTimeValue(ai); };
             creators["wait for attack time"] = [](PlayerbotAI* ai) { return new WaitForAttackTimeValue(ai); };
 

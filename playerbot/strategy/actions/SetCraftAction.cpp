@@ -21,7 +21,7 @@ bool SetCraftAction::Execute(Event& event)
     if (link == "reset")
     {
         data.Reset();
-        ai->TellPlayer(requester, "I will not craft anything");
+        ai->TellPlayer(requester,BOT_TEXT("I will not craft anything"));
         return true;
     }
 
@@ -34,7 +34,7 @@ bool SetCraftAction::Execute(Event& event)
     ItemIds itemIds = chat->parseItems(link);
     if (itemIds.empty())
     {
-        ai->TellPlayer(requester, "Usage: 'craft [itemId]' or 'craft reset'");
+        ai->TellPlayer(requester,BOT_TEXT("Usage: 'craft [itemId]' or 'craft reset'"));
         return false;
     }
 
@@ -96,7 +96,7 @@ bool SetCraftAction::Execute(Event& event)
 
     if (data.required.empty())
     {
-        ai->TellPlayer(requester, "I cannot craft this");
+        ai->TellPlayer(requester,BOT_TEXT("I cannot craft this"));
         return false;
     }
 
@@ -111,7 +111,7 @@ void SetCraftAction::TellCraft(Player* requester)
     CraftData& data = AI_VALUE(CraftData&, "craft");
     if (data.IsEmpty())
     {
-        ai->TellPlayer(requester, "I will not craft anything");
+        ai->TellPlayer(requester,BOT_TEXT("I will not craft anything"));
         return;
     }
 

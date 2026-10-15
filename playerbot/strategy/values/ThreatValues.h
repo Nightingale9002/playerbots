@@ -28,6 +28,9 @@ namespace ai
     	virtual uint8 Calculate() override;
         static float GetThreat(Player* player, Unit* target);
         static float GetTankThreat(PlayerbotAI* ai, Unit* target);
+        // [threat 2026-10-18 站长口径] 队里对这个目标的**最高仇恨**（不限坦克角色，含真人）。
+        //   返回 -1 = 没有队伍 / 没有其他人；用于"仇恨基础值"判断（比例判断在没有坦克时失效）。
+        static float GetTopGroupThreat(PlayerbotAI* ai, Unit* target);
 
     protected:
     	uint8 Calculate(Unit* target);

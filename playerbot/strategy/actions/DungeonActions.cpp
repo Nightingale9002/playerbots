@@ -1,4 +1,5 @@
 #include "DungeonActions.h"
+#include "playerbot/strategy/values/AoeValues.h"
 #include "playerbot/strategy/values/PositionValue.h"
 #include "playerbot/strategy/AiObjectContext.h"
 #include "playerbot/PlayerbotAI.h"
@@ -11,6 +12,15 @@ using namespace ai;
 
 bool MoveAwayFromHazard::Execute(Event& event)
 {
+    // [heal 2026-10-18 站长口径] **正在读治疗的条时不打断**：站长实测"紧急情况加血很慢 / 治疗被打断"。
+    //   治疗读完再走（躲地板仍会在下一个 tick 重新触发）。只保护真在进行的治疗读条，不保护其它法术。
+    if (Spell* currentSpell = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+    {
+        if (currentSpell->getState() == SPELL_STATE_CASTING &&
+            currentSpell->m_spellInfo && ai->IsHealSpell(currentSpell->m_spellInfo))
+            return false;
+    }
+
     const std::list<HazardPosition>& hazards = AI_VALUE(std::list<HazardPosition>, "hazards");
 
     // Get the closest hazard to move away from

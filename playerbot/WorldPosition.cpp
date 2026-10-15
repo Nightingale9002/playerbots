@@ -932,12 +932,12 @@ void WorldPosition::loadMapAndVMaps(const WorldPosition& secondPos, uint32 insta
     }
 }
 
+// [bot-grid 2026-10-16 站长口径] 卸载由**核心**负责：某个网格引用计数归零时，
+// TerrainInfo 的清理循环会调 VMapManager2::unloadMap(mapId,x,y) 与
+// MMapManager::unloadMap(mapId,x,y)（见 src/game/Maps/GridMap.cpp 的 m_GridRef==0 分支）。
+// 模块自己不再另外卸载：模块按点加载的瓦片就落在同一个网格坐标上，网格卸载时会一并被清掉。
 void WorldPosition::unloadMapAndVMaps(uint32 mapId)
 {
-#ifndef MANGOSBOT_TWO
-    //TerrainInfoAccess* terrain = reinterpret_cast<TerrainInfoAccess*>(const_cast<TerrainInfo*>(sTerrainMgr.LoadTerrain(mapId)));
-    //terrain->UnLoadUnused();
-#endif
 }
 
 bool WorldPosition::loadVMap(uint32 mapId, int x, int y)
@@ -988,9 +988,14 @@ std::vector<WorldPosition> WorldPosition::getPathStepFrom(const WorldPosition& s
         instanceId = isSharedNavmeshMap(startPos.getMapId()) ? 0 : hasher(std::this_thread::get_id());
     else
         instanceId = bot->GetInstanceId();
-    //Load mmaps and vmaps between the two points.
-
-    loadMapAndVMaps(startPos, instanceId);
+    // [bot-grid 2026-10-16 站长口径] bot 与正常玩家一致：
+    //   * **不**做"起点到终点沿途全量加载"；走到哪个网格由**核心**按网格加载 vmap/mmap，
+    //     离开网格时核心自己卸载（GridMap.cpp 里 m_GridRef==0 的分支会调
+    //     VMapManager2::unloadMap(mapId,x,y) + MMapManager::unloadMap(mapId,x,y)）。
+    //   * 只有"没有 bot 上下文"的旅行图预计算（bot == nullptr）才需要模块自己预载，
+    //     否则跨图寻路在核心还没载格时算不出来。真 bot 跨图也交给核心。
+    if (!bot)
+        loadMapAndVMaps(startPos, instanceId);
 
     PointsArray points;
     PathType type;

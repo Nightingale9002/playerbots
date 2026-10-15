@@ -10,10 +10,25 @@
 
 namespace ai
 {
+    // [safe-move 2026-10-18 站长口径] 战斗内选点安全检查用的"附近敌对单位"（unit 可能已销毁 ⇒ 调用方判空）。
+    struct CombatHostileUnit
+    {
+        Unit* unit = nullptr;
+        float aggroRadius = 0.0f;   // Unit::GetAttackDistance(bot) = 仇恨/侦测半径
+    };
+
     class MovementAction : public Action
     {
     public:
         MovementAction(PlayerbotAI* ai, std::string name) : Action(ai, name) {}
+
+        // [safe-move 2026-10-18 站长口径] "远程 DPS 乱跑把旁边的怪引来" 的统一安全检查：
+        //   附近敌对单位列表按 bot 缓存 1 秒（见实现），候选点检查是纯内存的距离比较。
+        static std::vector<CombatHostileUnit> GetNearbyCombatHostiles(PlayerbotAI* ai, bool forceRescan = false);
+        static bool IsCombatMovePointSafe(PlayerbotAI* ai, const std::vector<CombatHostileUnit>& hostiles,
+            const WorldPosition& point, float margin = 0.0f, Unit* ignoreUnit = nullptr, Unit** outBlocker = nullptr);
+        static bool IsCombatMovePointSafe(PlayerbotAI* ai, const WorldPosition& point,
+            float margin = 0.0f, Unit* ignoreUnit = nullptr, Unit** outBlocker = nullptr);
 
         static bool MinimalMove(PlayerbotAI* ai);
         static bool UseTransport(PlayerbotAI* ai, uint32 entry, WorldPosition dockPosition, WorldPosition exitPosition, bool doTeleport);

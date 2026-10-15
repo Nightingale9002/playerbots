@@ -840,16 +840,75 @@ AiPlayerbot.AllowGuildBots = 1
 AiPlayerbot.AllowMultiAccountAltBots = 1
 
 # Delay between two short-time spells cast (Default 500)
-AiPlayerbot.GlobalCooldown = 1500
+# [pacing 2026-10-17 站长口径] 原来 1500 —— 这是 bot"反应慢"的真正瓶颈：每次施法成功都会
+# SetAIInternalUpdateDelay(GlobalCooldown)，把 AI 思考间隔顶到 1.5 秒，改 ReactDelay 也救不回来。
+AiPlayerbot.GlobalCooldown = 500
 
 # Max wait time when moving
 #AiPlayerbot.MaxWaitForMove = 5000
 
 # Delay between two bot actions (default 100)
-AiPlayerbot.ReactDelay = 500
+# [pacing 2026-10-17 站长口径] 300（原 500）。上游默认 100，但云端 2vCPU/1.87GB 取保守值。
+AiPlayerbot.ReactDelay = 300
 
 # Inactivity delay
 AiPlayerbot.PassiveDelay = 10000
+
+# [threat 2026-10-18 站长口径] 仇恨控制，两道闸门独立生效（0 = 关）：
+#   ① 比例闸门：自己对该目标的仇恨 ≥ "坦克仇恨"的这个百分比 ⇒ 不出手。
+#      它依赖 IsTank() 认出坦克；**真人当坦克 / 角色没被认出来时 GetTankThreat() 返回 -1 ⇒ 这道直接失效**，
+#      所以需要 ② 兜底。
+#AiPlayerbot.WaitForAttackThreatPercent = 90
+#   ② 基础值闸门：队里对该目标的**最高仇恨**（含真人、不限坦克角色）还没涨到这个绝对值之前，
+#      非坦克一律压着不出手。用于开怪瞬间防 OT。TBC 量级参考：坦克 ~500 TPS ⇒ 2000 ≈ 4 秒。
+#AiPlayerbot.WaitForAttackThreatBase = 2000
+#   另外两个配套值（等坦克把怪拉回来的距离/时间）：
+#AiPlayerbot.WaitForAttackTime = 5
+#AiPlayerbot.WaitForAttackTankBackDistance = 12
+#
+# [pullback 2026-10-18 站长口径] 拉怪 / 卡视野的精细旋钮（**改 conf + 重启即生效，不用重编译**）
+#   ① 一次拉怪最长持续秒数：超时强制作废、回正常战斗（小于它时靠"怪已进近战"结束）
+#AiPlayerbot.PullMaxTime = 15
+#   ② 卡视野点离拉怪原点的最远距离（搜索 3/5/7/10/13 码，这里封顶）。越小=退得越浅
+#AiPlayerbot.PullCornerMaxDistance = 8
+#   ③ 到了卡视野点最多钉多久（秒）：0 = 不钉（到点就走）、越大=越"硬卡视野"
+#AiPlayerbot.PullCornerHoldSeconds = 5
+#   ④ 非坦克"跟着卡视野"总开关（0 = 只有坦克自己卡，其他人不跟着跑）
+#AiPlayerbot.UseCover = 1
+#   ⑤ 不许当拉怪目标的 creature entry（逗号分隔；0/空 = 不过滤）。
+#      破碎大厅：拉"蠕动的软泥怪"(17356 / 副本 20565)，不一只只去拉它分裂出来的
+#      "蠕动的小软泥怪"(17357 / 20566)
+#AiPlayerbot.NoPullTargets = 17357,20566
+#   ⑥ 拉怪"迟迟没真正开始"时的放弃秒数（默认 3；原来要干等 PullMaxTime=15 秒 ⇒ 卡住不动）
+#AiPlayerbot.PullNeverStartedAbortSeconds = 3
+#
+# [killorder 2026-10-18 站长口径] 优先击杀名单（逗号分隔的 creature entry，空 = 不启用）。
+#   命中时所有职业都会把当前目标切过去（不限坦克/输出）。
+#   破碎大厅：碎手军团士兵 16700（副本变体 20589）
+#AiPlayerbot.PriorityKillTargets = 16700,20589
+#
+# [pullback 2026-10-18 站长口径] **孤立判定只看距离、不看数量**（站长原话）：
+#   目标周围这个半径内没有别的怪、且不在巡逻路线附近 ⇒ 孤立 ⇒ 不 pullback（原地打，默认 25 码）
+#AiPlayerbot.PullIsolationRadius = 25
+#
+# [boss-pos 2026-10-18 站长口径] **BOSS 战站位不在 conf 里**（站长："BOSS 战策略应该是每个 BOSS 单独的"）：
+#   每个 BOSS 单独一行数据，存 world 库 `ai_playerbot_boss_position(entry, map, bot_role, x, y, z, radius)`，
+#   粒度只按角色 tank / healer / melee / ranged；radius 同时是"不许走出 BOSS 战范围"的护栏。
+#   录入用游戏内命令（GM）：
+#     .bot bosspos list [entry]
+#     .bot bosspos set <entry> <tank|healer|melee|ranged> here [radius]
+#     .bot bosspos set <entry> <role> <x> <y> <z> [radius]
+#     .bot bosspos del <entry> <role>   /   .bot bosspos clear <entry>
+#   写完立即生效（不用重启、不用改 conf）。实现见 playerbot/BossPositions.h →
+#   StandBossPositionAction（动作名 "boss position"），开关 = 表里有没有这个 BOSS 的行。
+#
+# [dodge 2026-10-18 站长口径] 致命地板阈值：一跳伤害 ≥ 这个值（或带 INSTAKILL 效果）算致命 ⇒
+#   任何情况先躲（连治疗都让路）；低于它算普通地板，只有"队里有人危急血且正在读治疗"时才允许读完这一发。
+#AiPlayerbot.LethalAoeMinDamage = 2000
+#
+# [进本跟随 2026-10-18 站长口径] bot 跟着真人 master 进本时，离"副本门 AreaTrigger"多近才走门（码，默认 30）。
+#   原来写死 10 码 ⇒ 门口站位稍偏就不跟。（PlayerbotAI::CheckInstanceFollow()）
+#AiPlayerbot.InstanceFollowDistance = 30
 
 # Minimum delay between repeating actions (chat messages, emotes etc)
 AiPlayerbot.RepeatDelay = 5000
@@ -878,6 +937,16 @@ AiPlayerbot.ShootDistance = 26.0
 #AiPlayerbot.GroupMemberGatheringDistance = 10.0
 #gathering distance when bot is a group member (not leader) and has active player master (if player is group leader)
 #AiPlayerbot.GroupMemberGatheringDistanceWithActiveMaster = 5.0
+#tank-wait: if a group member falls behind (same map/instance, alive, further than this from the tank), the tank stops and waits
+# [pacing 2026-10-17 站长口径] 打开：坦克不能把人甩在后面自己往前走
+AiPlayerbot.TankWaitForGroup = 1
+AiPlayerbot.TankWaitForGroupDistance = 30.0
+#max seconds the tank waits before moving on again (then an equal cooldown, so it cannot get stuck)
+#AiPlayerbot.TankWaitForGroupTimeout = 20
+#combat-move safety: in combat, only reposition/flee to a spot that is outside the aggro radius of every other hostile (avoids pulling nearby packs)
+#AiPlayerbot.CombatMoveSafety = 1
+#extra margin (yards) kept beyond that aggro radius
+#AiPlayerbot.CombatMoveSafetyMargin = 5.0
 #AiPlayerbot.FleeDistance = 15.0
 #AiPlayerbot.TooCloseDistance = 5.0
 #AiPlayerbot.MeleeDistance = 1.5

@@ -212,6 +212,26 @@ namespace ai
             Unit* target = ai->GetUnit(AI_VALUE(ObjectGuid, GetTargetName()));
             if (target && target->GetMaxNegativeAuraModifier(SPELL_AURA_MOD_HEALING_PCT) <= -100)
                 return false;
+
+            // [heal 2026-10-18 站长口径] **不要刷必然过量的治疗**（站长："血量很高就在读快速治疗"）：
+            //   这一发落地时，目标缺口（把"正在挨的打"也算进去 ⇒ 允许预读）如果连估算治疗量的 60% 都吃不下，
+            //   那它基本全是过量 ⇒ 不读。`estAmount` 是各治疗法术自己给的估算值（% of max health）。
+            //   例外：目标血量已经低于危急线 ⇒ 照读（救急不吃这条）。
+            if (target && target->GetMaxHealth() > 0 &&
+                target->GetHealthPercent() >= (float)sPlayerbotAIConfig.criticalHealth)
+            {
+                float missing = (float)(target->GetMaxHealth() - target->GetHealth()) * 100.0f / (float)target->GetMaxHealth();
+                float incoming = 0.0f;
+                if (ai->HasStrategy("preheal", BotState::BOT_STATE_COMBAT))
+                {
+                    uint32 inc = AI_VALUE2(uint32, "incoming damage", GetTargetName());
+                    incoming = (float)inc * 100.0f / (float)target->GetMaxHealth();
+                }
+
+                if (missing + incoming < (float)estAmount * 0.6f)
+                    return false;
+            }
+
             return CastAuraSpellAction::isUseful();
         }
 
@@ -283,6 +303,37 @@ namespace ai
 
     protected:
         uint32 dispelType;
+    };
+
+    //---------------------------------------------------------------------------------------------------------------------
+
+    // [BOSS 战策略动作 2026-10-19] `cure team member` —— 通用"对队友驱散/净化"动作。
+    //   为什么需要：原来只有各职业自己的 `cure poison on party` / `cleanse magic on party` /
+    //   `cure disease on party`（都只在各自职业的 ActionContext 注册），共享 ActionContext 里
+    //   没有任何通用名字 ⇒ BOSS 规则行写不出"给被点名的队友驱散"。
+    //   限定词：`<法术名>::<驱散类型 token 表>`（类型表可省略；tokens 同值 `team member to cure`）：
+    //     cure team member::cleanse::magic            圣骑净化
+    //     cure team member::dispel magic::magic       法师/牧师驱散魔法
+    //     cure team member::cure poison::poison       德鲁伊/萨满解毒
+    //     cure team member::cure disease::disease     德鲁伊/萨满/圣骑解疾病
+    //   法术名走引擎既有的 spell id 解析（CastSpellAction::SetSpellName），**不新造法术表**；
+    //   没写限定词 / 法术名解析不出 spell id 时，CastSpellAction::isPossible() 里 `if (!spellId) return false;`
+    //   会让动作直接不可用 ⇒ 空限定词不会误解、更不会崩。
+    //   目标 = 值 `team member to cure::<类型 token 表>`，与触发器 `team member needs cure` 同一个值
+    //   （两边写同样的 token 表时，动作拿到的就是触发器看到的那个队友）。
+    class CureTeamMemberAction : public CastSpellAction, public Qualified
+    {
+    public:
+        CureTeamMemberAction(PlayerbotAI* ai) : CastSpellAction(ai, "cure team member"), Qualified() {}
+        virtual void Qualify(const std::string& qualifier) override;
+
+    protected:
+        virtual std::string GetTargetName() override { return "team member to cure"; }
+        virtual std::string GetTargetQualifier() override { return targetQualifier; }
+        virtual std::string GetReachActionName() override { return "reach party member to heal"; }
+
+    private:
+        std::string targetQualifier;
     };
 
     //---------------------------------------------------------------------------------------------------------------------

@@ -35,7 +35,7 @@ bool UseMeetingStoneAction::Execute(Event& event)
 
     if (sServerFacade.IsInCombat(bot))
     {
-        ai->TellPlayerNoFacing(requester, "I am in combat");
+        ai->TellPlayerNoFacing(requester, BOT_TEXT("I am in combat"));
         return false;
     }
 
@@ -95,7 +95,7 @@ bool SummonAction::Execute(Event& event)
 
     if (SummonUsingGos(requester, bot, requester) || SummonUsingNpcs(requester, bot, requester))
     {
-        ai->TellPlayerNoFacing(requester, "Welcome!");
+        ai->TellPlayerNoFacing(requester, BOT_TEXT("Welcome!"));
         return true;
     }
 
@@ -116,7 +116,7 @@ bool SummonAction::SummonUsingGos(Player* requester, Player *summoner, Player *p
             return Teleport(requester, summoner, player);
     }
 
-    ai->TellPlayerNoFacing(requester, summoner == bot ? "There is no meeting stone nearby" : "There is no meeting stone near you");
+    ai->TellPlayerNoFacing(requester, summoner == bot ? BOT_TEXT("There is no meeting stone nearby") : BOT_TEXT("There is no meeting stone near you"));
     return false;
 }
 
@@ -136,13 +136,13 @@ bool SummonAction::SummonUsingNpcs(Player* requester, Player *summoner, Player *
         {
             if (!player->HasItemCount(6948, 1, false))
             {
-                ai->TellPlayerNoFacing(requester, player == bot ? "I have no hearthstone" : "You have no hearthstone");
+                ai->TellPlayerNoFacing(requester, player == bot ? BOT_TEXT("I have no hearthstone") : BOT_TEXT("You have no hearthstone"));
                 return false;
             }
 
             if (!sServerFacade.IsSpellReady(player, 8690))
             {
-                ai->TellPlayerNoFacing(requester, player == bot ? "My hearthstone is not ready" : "Your hearthstone is not ready");
+                ai->TellPlayerNoFacing(requester, player == bot ? BOT_TEXT("My hearthstone is not ready") : BOT_TEXT("Your hearthstone is not ready"));
                 return false;
             }
 
@@ -164,7 +164,7 @@ bool SummonAction::SummonUsingNpcs(Player* requester, Player *summoner, Player *
         }
     }
 
-    ai->TellPlayerNoFacing(requester, summoner == bot ? "There are no innkeepers nearby" : "There are no innkeepers near you");
+    ai->TellPlayerNoFacing(requester, summoner == bot ? BOT_TEXT("There are no innkeepers nearby") : BOT_TEXT("There are no innkeepers near you"));
     return false;
 }
 
@@ -253,7 +253,7 @@ bool SummonAction::Teleport(Player* requester, Player *summoner, Player *player)
                 }
 
                 if (resurrectPlayer)
-                    ai->TellPlayerNoFacing(requester, "I live, again!");
+                    ai->TellPlayerNoFacing(requester, BOT_TEXT("I live, again!"));
                     
                 if(ai->HasStrategy("stay", BotState::BOT_STATE_NON_COMBAT))
                     SET_AI_VALUE2(PositionEntry, "pos", "stay", PositionEntry(x, y, z, mapId));
@@ -266,7 +266,7 @@ bool SummonAction::Teleport(Player* requester, Player *summoner, Player *player)
     }
 
     if(summoner != player)
-        ai->TellPlayerNoFacing(requester, "Not enough place to summon");
+        ai->TellPlayerNoFacing(requester, BOT_TEXT("Not enough place to summon"));
     return false;
 }
 

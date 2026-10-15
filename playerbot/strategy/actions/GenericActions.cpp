@@ -418,12 +418,12 @@ bool SetPetAction::Execute(Event& event)
                 }
                 else
                 {
-                    ai->TellPlayer(requester, "I can't set to autocast that spell.");
+                    ai->TellPlayer(requester,BOT_TEXT("I can't set to autocast that spell."));
                 }
             }
             else
             {
-                ai->TellPlayer(requester, "Please specify a pet spell to set the autocast.");
+                ai->TellPlayer(requester,BOT_TEXT("Please specify a pet spell to set the autocast."));
             }
         }
         else if (command == "aggressive")
@@ -441,7 +441,7 @@ bool SetPetAction::Execute(Event& event)
             bot->GetSession()->HandlePetAction(packet);
             bot->PetSpellInitialize();
 
-            ai->TellPlayer(requester, "Setting pet to aggressive mode");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to aggressive mode"));
             return true;
         }
         else if (command == "defensive")
@@ -459,7 +459,7 @@ bool SetPetAction::Execute(Event& event)
             bot->GetSession()->HandlePetAction(packet);
             bot->PetSpellInitialize();
 
-            ai->TellPlayer(requester, "Setting pet to defensive mode");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to defensive mode"));
             return true;
         }
         else if (command == "passive")
@@ -477,7 +477,7 @@ bool SetPetAction::Execute(Event& event)
             bot->GetSession()->HandlePetAction(packet);
             bot->PetSpellInitialize();
 
-            ai->TellPlayer(requester, "Setting pet to passive mode");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to passive mode"));
             return true;
         }
         else if (command == "follow")
@@ -495,7 +495,7 @@ bool SetPetAction::Execute(Event& event)
             data << targetGuid;
             bot->GetSession()->HandlePetAction(data);
 
-            ai->TellPlayer(requester, "Setting pet to follow me");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to follow me"));
             return true;
         }
         else if (command == "stay")
@@ -513,7 +513,7 @@ bool SetPetAction::Execute(Event& event)
             data << targetGuid;
             bot->GetSession()->HandlePetAction(data);
 
-            ai->TellPlayer(requester, "Setting pet to stay in place");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to stay in place"));
             return true;
         }
         else if (command == "attack")
@@ -526,7 +526,7 @@ bool SetPetAction::Execute(Event& event)
                     pet->AI() && pet->AI()->HasReactState(REACT_PASSIVE) &&
                     pet->GetEntry() == PET_IMP && pet->HasAura(PHASE_SHIFT))
                 {
-                    ai->TellPlayer(requester, "Pet has Phase Shift active, cannot attack");
+                    ai->TellPlayer(requester,BOT_TEXT("Pet has Phase Shift active, cannot attack"));
                     return false;
                 }
 
@@ -543,12 +543,12 @@ bool SetPetAction::Execute(Event& event)
                 data << targetGuid;
                 bot->GetSession()->HandlePetAction(data);
 
-                ai->TellPlayer(requester, "Sending pet to attack");
+                ai->TellPlayer(requester,BOT_TEXT("Sending pet to attack"));
                 return true;
             }
             else
             {
-                ai->TellPlayer(requester, "Please select a target to attack");
+                ai->TellPlayer(requester,BOT_TEXT("Please select a target to attack"));
             }
         }
         else if (command == "dismiss")
@@ -559,12 +559,12 @@ bool SetPetAction::Execute(Event& event)
                 {
                     ai->ChangeStrategy("-pet", BotState::BOT_STATE_COMBAT);
                     ai->ChangeStrategy("-pet", BotState::BOT_STATE_NON_COMBAT);
-                    ai->TellPlayer(requester, "Dismissing pet");
+                    ai->TellPlayer(requester,BOT_TEXT("Dismissing pet"));
                     return true;
                 }
                 else
                 {
-                    ai->TellPlayer(requester, "I can't dismiss my pet");
+                    ai->TellPlayer(requester,BOT_TEXT("I can't dismiss my pet"));
                 }
             }
             else
@@ -586,7 +586,7 @@ bool SetPetAction::Execute(Event& event)
                 ai->ChangeStrategy("+pet", BotState::BOT_STATE_NON_COMBAT);
                 ai->ChangeStrategy("-pet", BotState::BOT_STATE_COMBAT);
                 ai->ChangeStrategy("-pet", BotState::BOT_STATE_NON_COMBAT);
-                ai->TellPlayer(requester, "Dismissing pet");
+                ai->TellPlayer(requester,BOT_TEXT("Dismissing pet"));
 
                 return true;
             }
@@ -611,12 +611,12 @@ bool SetPetAction::Execute(Event& event)
             }
             else
             {
-                ai->TellPlayer(requester, "Please specify a pet command (Like autocast).");
+                ai->TellPlayer(requester,BOT_TEXT("Please specify a pet command (Like autocast)."));
             }
         }
         else
         {
-            ai->TellPlayer(requester, "Please specify a pet command (Like autocast).");
+            ai->TellPlayer(requester,BOT_TEXT("Please specify a pet command (Like autocast)."));
         }
     }
     else if (command == "call")
@@ -625,17 +625,17 @@ bool SetPetAction::Execute(Event& event)
         {
             ai->ChangeStrategy("+pet", BotState::BOT_STATE_COMBAT);
             ai->ChangeStrategy("+pet", BotState::BOT_STATE_NON_COMBAT);
-            ai->TellPlayer(requester, "Calling my pet");
+            ai->TellPlayer(requester,BOT_TEXT("Calling my pet"));
             return true;
         }
         else
         {
-            ai->TellPlayer(requester, "I can't call any pets");
+            ai->TellPlayer(requester,BOT_TEXT("I can't call any pets"));
         }
     }
     else
     {
-        ai->TellPlayer(requester, "I don't have any pets");
+        ai->TellPlayer(requester,BOT_TEXT("I don't have any pets"));
     }
 
     return false;

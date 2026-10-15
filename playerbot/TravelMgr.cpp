@@ -1,4 +1,4 @@
-#include "playerbot/TravelMgr.h"
+﻿#include "playerbot/TravelMgr.h"
 #include <ctime>
 #include <cstdio>
 #include <numeric>
@@ -962,7 +962,7 @@ void TravelTarget::CheckStatus()
         Player* member = groupMember.GetPlayer();
         if (!member || (ai->IsSafe(member) && member->GetGroup() != bot->GetGroup()))
         {
-            ai->TellDebug(ai->GetMaster(), "Travel target expired because it was from a player that is no longer in the group.", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("Travel target expired because it was from a player that is no longer in the group."), "debug travel");
             SetStatus(TravelStatus::TRAVEL_STATUS_EXPIRED);
             return;
         }
@@ -970,14 +970,14 @@ void TravelTarget::CheckStatus()
 
     if (!ai->HasStrategy("travel", BotState::BOT_STATE_NON_COMBAT) && !ai->HasStrategy("travel once", BotState::BOT_STATE_NON_COMBAT))
     {
-        ai->TellDebug(ai->GetMaster(), "The target is clearing because it was a travel once destination.", "debug travel");
+        ai->TellDebug(ai->GetMaster(),BOT_TEXT("The target is clearing because it was a travel once destination."), "debug travel");
         sTravelMgr.SetNullTravelTarget(this);
         return;
     }
 
     if (statusTime != 0 && GetTimeLeft() <= 0 && !IsForced())
     {
-        ai->TellDebug(ai->GetMaster(), "Travel target expired because the status time was exceeded.", "debug travel");
+        ai->TellDebug(ai->GetMaster(),BOT_TEXT("Travel target expired because the status time was exceeded."), "debug travel");
         SetStatus(TravelStatus::TRAVEL_STATUS_EXPIRED);
         ai->GetAiObjectContext()->ClearValues("no active travel destinations");
         return;
@@ -991,13 +991,13 @@ void TravelTarget::CheckStatus()
         {
             if (ai->HasStrategy("travel once", BotState::BOT_STATE_NON_COMBAT))
             {
-                ai->TellDebug(ai->GetMaster(), "The target is clearing because it was a travel once destination.", "debug travel");
+                ai->TellDebug(ai->GetMaster(),BOT_TEXT("The target is clearing because it was a travel once destination."), "debug travel");
                 ai->ChangeStrategy("nc -travel once", BotState::BOT_STATE_NON_COMBAT);
                 sTravelMgr.SetNullTravelTarget(this);
                 return;
             }
 
-            ai->TellDebug(ai->GetMaster(), "The target is starting to work because the destination has been reached.", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("The target is starting to work because the destination has been reached."), "debug travel");
             SetStatus(TravelStatus::TRAVEL_STATUS_WORK);
             return;
         }
@@ -1011,7 +1011,7 @@ void TravelTarget::CheckStatus()
 
         if (destinationInactive || conditionsInactive)
         {
-            ai->TellDebug(ai->GetMaster(), "The target is cooling down because the destination was no longer active or the conditions are no longer true.", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("The target is cooling down because the destination was no longer active or the conditions are no longer true."), "debug travel");
             forced = false;
             SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
             return;
@@ -1311,14 +1311,34 @@ void TravelMgr::LoadQuestTravelTable()
     sLog.outString("Loading trainable spells.");
     GAI_VALUE(trainableSpellMap*, "trainable spell map");
     GAI_VALUE(std::vector<MountValue>, "full mount list");
+    PlayerbotLogRss("  travel: trainable spells + mounts");
     
     sLog.outString("Loading object locations.");
 
+    // [crash-fix 2026-10-16] 这里原来用 GAI_VALUE_REF 取 entry guidps 的**引用**（省一次整表拷贝）。
+    // 引用指向共享值对象内部成员，而该对象可能被 ClearValue()/ClearValues() delete ⇒ 引用悬垂。
+    // 改回 GAI_VALUE 取一份拷贝：启动期一次拷贝，换掉一整类 use-after-free。
     EntryGuidps guidpMap = GAI_VALUE(EntryGuidps, "entry guidps");
+    {
+        size_t points = 0;
+        for (auto& entryPair : guidpMap)
+            points += entryPair.second.size();
+        sLog.outString("[SZ] entry guidps: %zu entries / %zu positions / sizeof(AsyncGuidPosition)=%zu",
+            guidpMap.size(), points, sizeof(AsyncGuidPosition));
+    }
+    PlayerbotLogRss("  travel: entry guidps");
 
     sLog.outString("Finding possible travel destinations.");
 
+    // [crash-fix 2026-10-16] 同上：不取引用，按值拷贝。
     EntryQuestRelationMap eMap = GAI_VALUE(EntryQuestRelationMap, "entry quest relation");
+    {
+        size_t pairs = 0;
+        for (auto& entryPair : eMap)
+            pairs += entryPair.second.size();
+        sLog.outString("[SZ] entry quest relation: %zu entries / %zu (entry,quest) pairs", eMap.size(), pairs);
+    }
+    PlayerbotLogRss("  travel: entry quest relation");
 
     sLog.outString("Creating travel destinations.");
 
@@ -1371,6 +1391,7 @@ void TravelMgr::LoadQuestTravelTable()
     }       
 
     sLog.outString("Loading all travel locations.");
+    PlayerbotLogRss("  travel: quest destinations");
 
     for (auto& [entry, purpose] : GAI_VALUE(EntryTravelPurposeMap, "entry travel purpose"))
     {
@@ -1429,12 +1450,27 @@ void TravelMgr::LoadQuestTravelTable()
 
     sLog.outString("Loading Explore locations.");
 
+    // [降峰 2026-10-15] 探索点只在**配置的 bot 地图**（AiPlayerbot.RandomBotMaps，本站 = 530 外域）里收。
+    // 原先收全世界 ⇒ 旅行图节点数爆炸，紧接着的 "Calculating coverage" 要对所有节点两两算路径（O(N²)），
+    // 实测启动峰值 RSS 2.7GB，是 2GB 云主机被 OOM-killer 连坐杀服务的主因。
+    auto isBotMap = [](uint32 mapId)
+    {
+        return std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), mapId)
+            != sPlayerbotAIConfig.randomBotMaps.end();
+    };
+
+    // [A/B 诊断 2026-10-15] 同 TravelValues.cpp：FetchArea() 会强制载入 vmap ⇒ 启动期整图载入。
+    static bool const noFetchArea = std::getenv("PB_NO_FETCH_AREA") != nullptr;
+
     //Explore points
     for (auto& creatureDataPair : WorldPosition().getCreaturesNear())
     {
         ExploreTravelDestination* loc;
 
         AsyncGuidPosition point(creatureDataPair);
+
+        if (!isBotMap(point.getMapId()))
+            continue;
 
         if (!point.isValid())
             continue;
@@ -1447,7 +1483,8 @@ void TravelMgr::LoadQuestTravelTable()
         if (!area->exploreFlag)
             continue;
 
-        point.FetchArea();
+        if (!noFetchArea)
+            point.FetchArea();
 
         pointsMap.insert_or_assign(point.GetRawValue(), point);
 
@@ -1456,6 +1493,15 @@ void TravelMgr::LoadQuestTravelTable()
     }
 
     GetPopulatedGrids();
+    PlayerbotLogRss("  travel: explore points");
+    {
+        size_t destCount = 0;
+        for (auto& purposePair : destinationMap)
+            for (auto& idPair : purposePair.second)
+                destCount += idPair.second.size();
+        sLog.outString("[SZ] travel destinations=%zu pointsMap=%zu (sizeof(TravelDestination)=%zu)",
+            destCount, pointsMap.size(), sizeof(TravelDestination));
+    }
 
     //Analyse log files
     if (sPlayerbotAIConfig.hasLog("log_analysis.csv"))
@@ -1552,8 +1598,10 @@ void TravelMgr::LoadQuestTravelTable()
     sTravelNodeMap.printMap();
     sTravelNodeMap.printNodeStore();
     sTravelNodeMap.saveNodeStore();
+    PlayerbotLogRss("  travel: travel nodes");
 
     LoadFishLocations();
+    PlayerbotLogRss("  travel: fish locations");
 
     if (sPlayerbotAIConfig.hasLog("map_offsets.csv"))
     {
@@ -2347,13 +2395,23 @@ uint32 TravelMgr::GetFishZone(const AsyncGuidPosition& pos) const
 
 void TravelMgr::LoadFishLocations()
 {
-    sLog.outString("Loading Fish locations.");
-
     fishPoints.clear();
     fishMap.clear();
     destinationMap[TravelDestinationPurpose::GatherFishing].clear();
 
-    auto result = WorldDatabase.Query("SELECT `name`, `map_id`, `position_x`, `position_y`, `position_z`, `orientation`, `description` FROM `ai_playerbot_named_location` WHERE `name` LIKE 'FISH_LOCATION%'");
+    // [必要功能裁剪 2026-10-15] 本站 bot 不钓鱼：全世界 88,141 个鱼点在启动期被全量载入
+    // （每个点还要建一个 GatherTravelDestination + 挂进 fishMap）。默认关闭；
+    // 打开时也只收 AiPlayerbot.RandomBotMaps 里的地图（bot 根本到不了别的图）。
+    if (!sPlayerbotAIConfig.enableFishLocations)
+    {
+        sLog.outString("Fish locations disabled (AiPlayerbot.EnableFishLocations = 0)");
+        return;
+    }
+
+    sLog.outString("Loading Fish locations.");
+
+    auto result = WorldDatabase.PQuery("SELECT `name`, `map_id`, `position_x`, `position_y`, `position_z`, `orientation`, `description` FROM `ai_playerbot_named_location` WHERE `name` LIKE 'FISH_LOCATION%%' AND `map_id` IN (%s)",
+        sPlayerbotAIConfig.randomBotMapsAsString.c_str());
 
     if (!result)
     {
@@ -2409,6 +2467,10 @@ void TravelMgr::GetFishLocations()
 
     for (int32 mapId = 1000; mapId >= 0; mapId--)
     {       
+        // [必要功能裁剪 2026-10-15] 只生成 bot 地图的鱼点（生成全世界等于白烧 CPU/内存，存下来也没人用）
+        if (std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), (uint32)mapId) == sPlayerbotAIConfig.randomBotMaps.end())
+            continue;
+
         bool hashFishing = false;
         for (uint32 i = 0; i < sAreaStore.GetNumRows(); ++i)    // areaflag numbered from 0
         {
@@ -2606,6 +2668,11 @@ void TravelMgr::SaveFishLocations()
 
 WorldPosition* TravelMgr::GetFishSpot(WorldPosition start, bool onlyNearestGrid)
 {
+    // [防护 2026-10-15] 鱼点可被配置关闭（AiPlayerbot.EnableFishLocations=0）⇒ 表为空时
+    // WorldPointSquareContainer::GetNextPoint 会在空容器上取随机子方块（UB）。
+    if (fishPoints.empty())
+        return nullptr;
+
     //0% Different map, 25% different grid, 25% different cell, 100% different point (inside cell)
     std::list<uint8> chances = { 0, 25, 25, 100 };
 

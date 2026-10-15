@@ -96,8 +96,8 @@ bool GlyphAction::Execute(Event& event)
     }
     else
     {
-        ai->TellPlayer(requester, "Correct usage: glyph [glyph item link/remove] (optional slotnumber)", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
-        ai->TellPlayer(requester, "glyph all/wanted/equiped for list of glyphs", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester,BOT_TEXT("Correct usage: glyph [glyph item link/remove] (optional slotnumber)"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester,BOT_TEXT("glyph all/wanted/equiped for list of glyphs"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         return false;
     }
 

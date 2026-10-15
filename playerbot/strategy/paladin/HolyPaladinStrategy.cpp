@@ -530,36 +530,37 @@ void HolyPaladinStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 
     triggers.push_back(new TriggerNode(
         "party member critical health",
-        NextAction::array(0, new NextAction("lay on hands on party", ACTION_CRITICAL_HEAL), NULL)));
+        NextAction::array(0, new NextAction("lay on hands on party", ACTION_CRITICAL_HEAL),
+                             new NextAction("holy shock on party", ACTION_CRITICAL_HEAL - 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "protect party member",
         NextAction::array(0, new NextAction("blessing of protection on party", ACTION_CRITICAL_HEAL), NULL)));
 
+    // [heal 2026-10-17] 五人本单奶口径（站长定）：圣光术只给坦克（20~70% 持续 DTPS 才抬得住）；
+    //   非坦克低血用闪现填充、不放生 DPS；神圣震击收窄到 critical 紧急档（始终不用于常规低血）。
+    triggers.push_back(new TriggerNode(
+        "party member tank low health",
+        NextAction::array(0, new NextAction("holy light on party", ACTION_MEDIUM_HEAL + 5), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "party member tank medium health",
+        NextAction::array(0, new NextAction("holy light on party", ACTION_MEDIUM_HEAL + 4), NULL)));
+
     triggers.push_back(new TriggerNode(
         "party member low health",
-        NextAction::array(0, new NextAction("divine favor", ACTION_MEDIUM_HEAL + 6), 
-                             new NextAction("holy shock on party", ACTION_MEDIUM_HEAL + 5), 
-                             new NextAction("holy light on party", ACTION_MEDIUM_HEAL + 4), NULL)));
+        NextAction::array(0, new NextAction("flash of light on party", ACTION_MEDIUM_HEAL + 3), NULL)));
 
     triggers.push_back(new TriggerNode(
         "low health",
-        NextAction::array(0, new NextAction("divine favor", ACTION_MEDIUM_HEAL + 3), 
-                             new NextAction("holy shock", ACTION_MEDIUM_HEAL + 2), 
+        NextAction::array(0, new NextAction("divine favor", ACTION_MEDIUM_HEAL + 3),
                              new NextAction("holy light", ACTION_MEDIUM_HEAL + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "critical health",
         NextAction::array(0, new NextAction("divine shield", ACTION_EMERGENCY + 1),
-            new NextAction("holy light", ACTION_EMERGENCY), NULL)));
-
-    triggers.push_back(new TriggerNode(
-        "low health",
-        NextAction::array(0, new NextAction("holy light", ACTION_MEDIUM_HEAL), NULL)));
-
-    triggers.push_back(new TriggerNode(
-        "party member low health",
-        NextAction::array(0, new NextAction("holy light on party", ACTION_MEDIUM_HEAL), NULL)));
+            new NextAction("holy shock", ACTION_EMERGENCY),
+            new NextAction("holy light", ACTION_EMERGENCY - 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "medium health",

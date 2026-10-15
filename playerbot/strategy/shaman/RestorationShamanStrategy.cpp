@@ -360,25 +360,36 @@ void RestorationShamanTotemsStrategy::InitCombatTriggers(std::list<TriggerNode*>
 {
     ShamanTotemsStrategy::InitCombatTriggers(triggers);
 
+    // [totem 2026-10-17] 空气：按队伍属性权重三选一（近战→风怒 / 猎人→优雅 / 法系→空气之怒）。
     triggers.push_back(new TriggerNode(
-        "air totem",
+        "air totem windfury",
         NextAction::array(0, new NextAction("windfury totem", ACTION_HIGH + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
-        "air totem",
-        NextAction::array(0, new NextAction("wrath of air totem", ACTION_HIGH), NULL)));
+        "air totem grace",
+        NextAction::array(0, new NextAction("grace of air totem", ACTION_HIGH + 1), NULL)));
 
+    triggers.push_back(new TriggerNode(
+        "air totem wrath",
+        NextAction::array(0, new NextAction("wrath of air totem", ACTION_HIGH + 1), NULL)));
+
+    // 水：默认法力之泉（原为治疗之泉）。
     triggers.push_back(new TriggerNode(
         "water totem",
-        NextAction::array(0, new NextAction("healing stream totem", ACTION_HIGH), NULL)));
+        NextAction::array(0, new NextAction("mana spring totem", ACTION_HIGH), NULL)));
 
+    // 大地：有近战收益→力量，否则石肤（力量对猎人无收益）。
     triggers.push_back(new TriggerNode(
-        "earth totem",
+        "earth totem strength",
         NextAction::array(0, new NextAction("strength of earth totem", ACTION_HIGH), NULL)));
 
     triggers.push_back(new TriggerNode(
+        "earth totem stoneskin",
+        NextAction::array(0, new NextAction("stoneskin totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
         "fire totem",
-        NextAction::array(0, new NextAction("searing totem", ACTION_HIGH), NULL)));
+        NextAction::array(0, new NextAction("flametongue totem", ACTION_HIGH), NULL)));
 }
 
 void RestorationShamanTotemsStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -931,6 +942,11 @@ void RestorationShamanBuffPveStrategy::InitCombatTriggers(std::list<TriggerNode*
     triggers.push_back(new TriggerNode(
         "shaman weapon",
         NextAction::array(0, new NextAction("earthliving weapon", ACTION_HIGH), NULL)));
+
+    // [heal 2026-10-17] 站长口径：五人本也要"大地盾常驻坦克、消失即补"（原来只在 raid 变体里挂）。
+    triggers.push_back(new TriggerNode(
+        "earth shield on party tank",
+        NextAction::array(0, new NextAction("earth shield on party tank", ACTION_HIGH), NULL)));
 }
 
 void RestorationShamanBuffPveStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -941,6 +957,10 @@ void RestorationShamanBuffPveStrategy::InitNonCombatTriggers(std::list<TriggerNo
     triggers.push_back(new TriggerNode(
         "shaman weapon",
         NextAction::array(0, new NextAction("earthliving weapon", ACTION_NORMAL), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "earth shield on party tank",
+        NextAction::array(0, new NextAction("earth shield on party tank", ACTION_NORMAL), NULL)));
 }
 
 void RestorationShamanBuffPvpStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)

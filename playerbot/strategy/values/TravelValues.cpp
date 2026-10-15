@@ -1,4 +1,4 @@
-#include "playerbot/playerbot.h"
+﻿#include "playerbot/playerbot.h"
 #include "TravelValues.h"
 #include "QuestValues.h"
 #include "SharedValueContext.h"
@@ -12,12 +12,41 @@ EntryGuidps EntryGuidpsValue::Calculate()
 {
     EntryGuidps guidps;
 
+    // [判定实验 2026-10-15] PB_SKIP_ENTRY_GUIDPS=1 时直接返回空表，用于量化本值的内存占用。
+    // 本机剖析显示 "Loading object locations" 阶段 RSS 从 ~603MB 涨到 ~1.1GB，疑似主要在此。
+    if (std::getenv("PB_SKIP_ENTRY_GUIDPS"))
+    {
+        sLog.outString("[EXP] EntryGuidps skipped by PB_SKIP_ENTRY_GUIDPS");
+        return guidps;
+    }
+
+    // [降峰 2026-10-15] 只收录**配置的 bot 地图**（AiPlayerbot.RandomBotMaps，本站 = 530 外域）。
+    // 原逻辑把全世界所有生物/游戏对象的位置都收进内存（数万～数十万条 AsyncGuidPosition），
+    // 是本服启动内存峰值 ~1.3GB 的主要来源；而 bot 只在配置地图活动，其它地图的对象永远用不到。
+    auto isBotMap = [](uint32 mapId)
+    {
+        return std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), mapId)
+            != sPlayerbotAIConfig.randomBotMaps.end();
+    };
+
+    // [A/B 诊断 2026-10-15] FetchArea() 会对每个位置调 getAreaFlag() ⇒ loadVMap()，
+    // 等于把整张 bot 地图的 vmap/terrain 在启动期全部拉进内存（本机实测该阶段 +334MB，
+    // 之后又被 sTerrainMgr.Update(24h) 整段释放 ⇒ 纯瞬时峰值）。
+    // AsyncGuidPosition::getAreaFlag() 本身是惰性的（有缓存用缓存，没有就现场算），
+    // 所以跳过 FetchArea 不改变语义，只是把 vmap 载入推迟到真正需要的时候。
+    // PB_NO_FETCH_AREA=1 时跳过，用于 A/B 量化。
+    static bool const noFetchArea = std::getenv("PB_NO_FETCH_AREA") != nullptr;
+
     for (auto& creatureDataPair : WorldPosition().getCreaturesNear())
     {
         AsyncGuidPosition aGuidP(creatureDataPair);
+        if (!isBotMap(aGuidP.getMapId()))
+            continue;
+
         if (aGuidP.isValid() && !aGuidP.IsEventUnspawned())
         {
-            aGuidP.FetchArea();
+            if (!noFetchArea)
+                aGuidP.FetchArea();
             guidps[aGuidP.GetEntry()].push_back(aGuidP);
         }
     }
@@ -25,9 +54,13 @@ EntryGuidps EntryGuidpsValue::Calculate()
     for (auto& goDataPair : WorldPosition().getGameObjectsNear())
     {
         AsyncGuidPosition aGuidP(goDataPair);
+        if (!isBotMap(aGuidP.getMapId()))
+            continue;
+
         if (aGuidP.isValid() && !aGuidP.IsEventUnspawned())
         {
-            aGuidP.FetchArea();
+            if (!noFetchArea)
+                aGuidP.FetchArea();
             guidps[-((int32)aGuidP.GetEntry())].push_back(aGuidP);
         }
     }
@@ -37,6 +70,11 @@ EntryGuidps EntryGuidpsValue::Calculate()
 
 EntryTravelPurposeMap EntryTravelPurposeMapValue::Calculate()
 {
+    // [crash-fix 2026-10-16] 这里原来用 GAI_VALUE_REF 取两个大表的**引用**（"零拷贝"）。那是错的：
+    // 引用指向共享值对象内部成员，而该对象由 sSharedObjectContext 持有，随时可能被
+    // ClearValue()/ClearValues() delete（本服启动期就有 ClearValue("entry guidps")）。
+    // 一旦宿主消失，引用立刻悬垂；线上 AI 取值链崩溃（跳进 std::string 缓冲区）正是这一族。
+    // 所以改回按值拷贝：本函数只在启动期跑一次，几 MB 的拷贝换掉一整类 use-after-free，值。
     EntryQuestRelationMap relationMap = GAI_VALUE(EntryQuestRelationMap, "entry quest relation");
     EntryGuidps guidpMap = GAI_VALUE(EntryGuidps, "entry guidps");
 
@@ -132,7 +170,8 @@ EntryTravelPurposeMap EntryTravelPurposeMapValue::Calculate()
         {
             if (cInfo->Rank == 1)
             {
-                if (guidpMap[entry].size() == 1)
+                auto guidpItr = guidpMap.find(entry);
+                if (guidpItr != guidpMap.end() && guidpItr->second.size() == 1)
                     purpose |= (uint32)TravelDestinationPurpose::Boss;
             }
             else

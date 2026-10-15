@@ -115,6 +115,20 @@ namespace ai
         TargetCriticalHealthTrigger(PlayerbotAI* ai) : TargetLowHealthTrigger(ai, 20) {}
     };
 
+    // [BOSS 战策略触发器 2026-10-19] `target health below` —— **通用**目标血量档触发器。
+    //   为什么需要：原来只有 `target critical health`（写死 20%），25/40/50/66 这些档没有，
+    //   又不该每档写一个类。这里复用现有"目标血量百分比"取值（AI_VALUE2(uint8,"health","current target")），
+    //   只把档位交给限定词：
+    //     target health below::<n>               → 目标血量 < n%      （n = 1..99）
+    //     target health below::<n>::<m>          → m% <= 目标血量 < n% （做"66→40 这段"这种阶段区间）
+    //   限定词**必填**：缺省或非法 ⇒ 直接 false（不崩、也不会退化成"任何掉血都触发"）。
+    class TargetHealthBelowTrigger : public TargetLowHealthTrigger, public Qualified
+    {
+    public:
+        TargetHealthBelowTrigger(PlayerbotAI* ai) : TargetLowHealthTrigger(ai, 100.0f, 0.0f), Qualified() {}
+        virtual bool IsActive() override;
+    };
+
 	class PartyMemberDeadTrigger : public Trigger 
     {
 	public:

@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "EquipAction.h"
 
+#include "playerbot/PlayerbotFactory.h"
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/strategy/values/ItemCountValue.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
@@ -80,7 +81,7 @@ bool EquipAction::Execute(Event& event)
 
 void EquipAction::ListItems(Player* requester)
 {
-    ai->TellPlayer(requester, "=== Equip ===");
+    ai->TellPlayer(requester,BOT_TEXT("=== Equip ==="));
 
     std::map<uint32, int> items;
     std::map<uint32, bool> soulbound;
@@ -233,7 +234,7 @@ void EquipAction::EquipItemToSlot(Player* requester, Item* item, uint8 targetSlo
     uint8 destSlot = dest & 0xFF;
     if (destSlot != targetSlot)
     {
-        ai->TellPlayer(requester, "Cannot equip this item to the specified slot.");
+        ai->TellPlayer(requester,BOT_TEXT("Cannot equip this item to the specified slot."));
         return;
     }
 
@@ -259,6 +260,11 @@ void EquipAction::EquipItemToSlot(Player* requester, Item* item, uint8 targetSlo
     std::map<std::string, std::string> args;
     args["%item"] = chat->formatItem(item);
     ai->TellPlayer(requester, BOT_TEXT2("equip_command", args), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+
+    // [gems 2026-10-17 站长口径] 换装后补插空槽宝石（只补空槽 ⇒ 幂等，不拆已有宝石）
+    uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
+    if (filledGems)
+        sLog.outString("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
 }
 
 void EquipAction::EquipItem(PlayerbotAI* ai, Player* requester, Item* item, bool silent)
@@ -334,6 +340,13 @@ void EquipAction::EquipItem(PlayerbotAI* ai, Player* requester, Item* item, bool
         args["%item"] = ChatHelper::formatItem(item);
         ai->TellPlayer(requester, BOT_TEXT2("equip_command", args), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
     }
+
+    // [gems 2026-10-17 站长口径] 换装后补插空槽宝石。放在这个"单件装备"的公共函数里 ⇒ 覆盖所有入口：
+    // 自动拾取升级（EquipUpgradesAction → EquipItem）、对话命令 .bot equip（EquipItems → EquipItem）、
+    // 钓鱼竿互换（FishAction → EquipItem）。只补空槽（onlyEmpty=true）⇒ 幂等，不拆已有宝石。
+    uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
+    if (filledGems)
+        sLog.outString("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
 }
 
 bool EquipUpgradesAction::Execute(Event& event)
@@ -478,6 +491,8 @@ bool EquipUpgradesAction::Execute(Event& event)
         }
     }
 
+    // [gems 2026-10-17 站长口径] MH/OH 互换只是把已插好的装备挪位置（宝石跟着物品走），无需再补；
+    // 循环里每件装备在 EquipAction::EquipItem() 里已经补过了。
     return didEquip;
 }
 

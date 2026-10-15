@@ -1,5 +1,7 @@
 #pragma once
 
+#include "BattleGroundTactics.h"   // ArenaTactics 定义在此，本头文件用到它（原依赖调用方的传递包含）
+
 #include "AcceptInvitationAction.h"
 #include "PassLeadershipToMasterAction.h"
 #include "TellMasterAction.h"

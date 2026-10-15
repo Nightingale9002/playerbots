@@ -106,8 +106,22 @@ ObjectGuid PartyMemberToHeal::Calculate()
                 incomingDamage = getIncomingdamage(player);
 
             uint8 health = (((player->GetHealth() - incomingDamage) * 100.0f) / player->GetMaxHealth());
-            if (isTank || (health < sPlayerbotAIConfig.almostFullHealth && !IsTargetOfSpellCast(player, predicate)))
-            { 
+            // [heal 2026-10-18 站长口径] **坦克不再无条件塞进治疗名单**（站长："治疗只会一直刷过量"）：
+            //   原来 `isTank` 直接短路，血量 100% 也算"需要治疗" ⇒ 坦克身上永远挂着治疗目标，
+            //   两个治疗同时刷同一个坦克就是一半过量。现在坦克也要过"血量没满 + 没别人在读治疗"这两关，
+            //   只有掉到危急线以下才不管有没有别人在读（救急优先）。
+            if (isTank)
+            {
+                // 坦克：血量没满（或有伤害要来）且没别人在读治疗 ⇒ 算需要治疗；
+                //   掉到危急线以下 ⇒ 不管有没有别人读，立即救。
+                bool tankHurt = player->GetHealth() < player->GetMaxHealth() || incomingDamage > 0;
+                if ((tankHurt && !IsTargetOfSpellCast(player, predicate)) || player->GetHealthPercent() < sPlayerbotAIConfig.criticalHealth)
+                {
+                    needHeals.push_back(player);
+                }
+            }
+            else if (health < sPlayerbotAIConfig.almostFullHealth && !IsTargetOfSpellCast(player, predicate))
+            {
                 needHeals.push_back(player);
             }
 
@@ -299,6 +313,66 @@ ObjectGuid PartyMemberToProtect::Calculate()
 
     Unit* unit = needProtect[0];
     return unit ? unit->GetObjectGuid() : ObjectGuid();
+}
+
+ObjectGuid PartyMemberToPainSuppress::Calculate()
+{
+    Group* group = bot->GetGroup();
+    if (!group)
+        return ObjectGuid();
+
+    Unit* best = nullptr;
+    float bestScore = 0.0f;
+
+    for (GroupReference* gref = group->GetFirstMember(); gref; gref = gref->next())
+    {
+        Player* member = gref->getSource();
+        if (!member || member == bot)
+            continue;
+
+        if (!sServerFacade.IsAlive(member))
+            continue;
+
+        if (member->GetMap() != bot->GetMap())
+            continue;
+
+        if (sServerFacade.GetDistance2d(member, bot) > 30.0f)
+            continue;
+
+        // PS 不可叠加：已处于 PS 中的目标跳过
+        if (ai->HasAura("pain suppression", member))
+            continue;
+
+        bool isTank = ai->IsTank(member);
+
+        // 只保护坦克，或正在被攻击的成员；未被攻击的目标不消耗这个长 CD 技能。
+        if (!isTank && member->getAttackers().empty())
+            continue;
+
+        float maxHp = member->GetMaxHealth();
+        if (maxHp <= 0)
+            continue;
+
+        // 预判：当前血量 - 预计承伤 = 8 秒窗口内的最低血量
+        float predicted = (float(member->GetHealth()) - float(getIncomingdamage(member))) / maxHp * 100.0f;
+        if (predicted < 0.0f)
+            predicted = 0.0f;
+
+        // 坦克对尖刺更敏感，阈值放宽；其他成员更严格，避免滥用。
+        float threshold = isTank ? 45.0f : 30.0f;
+        if (predicted >= threshold)
+            continue;
+
+        // 越接近阈值越紧急；坦克额外加权，保证坦克优先于 DPS。
+        float score = (threshold - predicted) + (isTank ? 10.0f : 0.0f);
+        if (score > bestScore)
+        {
+            bestScore = score;
+            best = member;
+        }
+    }
+
+    return best ? best->GetObjectGuid() : ObjectGuid();
 }
 
 ObjectGuid PartyMemberToRemoveRoots::Calculate()

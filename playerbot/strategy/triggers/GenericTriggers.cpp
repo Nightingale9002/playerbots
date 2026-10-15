@@ -451,7 +451,38 @@ bool ItemCountTrigger::IsActive()
 
 bool InterruptSpellTrigger::IsActive()
 {
-	return SpellTrigger::IsActive() && ai->IsInterruptableSpellCasting(GetTarget(), getName());
+	if (!SpellTrigger::IsActive())
+		return false;
+
+	if (ai->IsInterruptableSpellCasting(GetTarget(), getName()))
+		return true;
+
+	// [interrupt 2026-10-16 站长口径] 原来只检查"当前目标"能否打断 ⇒ 治疗职业（当前目标常是队友）
+	// 或主目标是不会施法的近战怪时，永远不打断。这里补一条：从"可攻击目标"里找一个正在施放
+	// **可打断法术**的敌人，把它切成当前目标再打断（各职业的打断动作都打"当前目标"）。
+	// 注意：不限制"只有有益法术才打断" —— 敌人的伤害吟唱同样要打断。
+	if (!context->GetValue<uint32>("spell id", getName())->Get())
+		return false;
+
+	Unit* bot = ai->GetBot();
+	std::list<ObjectGuid> const attackers = AI_VALUE(std::list<ObjectGuid>, "possible attack targets");
+	for (ObjectGuid const& guid : attackers)
+	{
+		Unit* unit = ai->GetUnit(guid);
+		if (!unit || unit == GetTarget())
+			continue;
+
+		if (sServerFacade.GetDistance2d(bot, unit) > ai->GetRange("spell"))
+			continue;
+
+		if (!ai->IsInterruptableSpellCasting(unit, getName()))
+			continue;
+
+		context->GetValue<ObjectGuid>("current target")->Set(guid);
+		return true;
+	}
+
+	return false;
 }
 
 bool DeflectSpellTrigger::IsActive()
@@ -577,6 +608,153 @@ bool HasNoAuraTrigger::IsActive()
     return !ai->HasAura(getName(), GetTarget());
 }
 
+// ===========================================================================
+// [BOSS 战策略触发器 2026-10-19] 见 GenericTriggers.h 顶部同一段注释。
+// ===========================================================================
+
+bool TargetHasAuraTrigger::IsActive()
+{
+    // 空限定词防崩：绝不 context->GetValue("")->Get()。同时值对象本身也要判空。
+    const std::string qualifier = getQualifier();
+    if (qualifier.empty())
+        return false;
+
+    Value<ObjectGuid>* targetValue = context->GetValue<ObjectGuid>("current target");
+    if (!targetValue)
+        return false;
+
+    Unit* target = ai->GetUnit(targetValue->Get());
+    if (!target || !target->IsInWorld())
+        return false;
+
+    // `name::<法术名>` 分支（按名字查，方便规则作者；spellid:: 分支仍走 HasAuraTrigger 原解析）
+    static const std::string namePrefix = "name::";
+    if (qualifier.size() > namePrefix.size() && qualifier.compare(0, namePrefix.size(), namePrefix) == 0)
+    {
+        std::string spellName = qualifier.substr(namePrefix.size());
+        if (spellName.empty())
+            return false;
+
+        return ai->HasAura(spellName, target);
+    }
+
+    return HasAuraTrigger::IsActive();
+}
+
+std::string TargetHasAuraTrigger::getName()
+{
+    std::ostringstream ss;
+    ss << "target has aura with " << getQualifier();
+    return ss.str();
+}
+
+bool EnemyCastingTrigger::IsActive()
+{
+    Value<ObjectGuid>* value = context->GetValue<ObjectGuid>(targetValue);
+    if (!value)
+        return false;
+
+    return !value->Get().IsEmpty();
+}
+
+bool TeamMembersCloseTrigger::FindCrowdedMember(PlayerbotAI* ai, const std::string& qualifier, int defaultCount, float defaultDistance, Unit*& outMember)
+{
+    outMember = nullptr;
+
+    int count = defaultCount;
+    float distance = defaultDistance;
+
+    if (!qualifier.empty())
+    {
+        std::vector<std::string> tokens = Qualified::getMultiQualifiers(qualifier, ",");
+        for (std::vector<std::string>::const_iterator i = tokens.begin(); i != tokens.end(); ++i)
+        {
+            std::string token = *i;
+            if (token.empty())
+                continue;
+
+            // 裸数字 = 码数（写起来最短：`team member too close::5`）
+            if (Qualified::isValidNumberString(token))
+            {
+                distance = (float)atof(token.c_str());
+                continue;
+            }
+
+            std::vector<std::string> parts = Qualified::getMultiQualifiers(token, "::");
+            if (parts.size() != 2 || !Qualified::isValidNumberString(parts[1]))
+                continue;
+
+            if (parts[0] == "dist" || parts[0] == "distance")
+                distance = (float)atof(parts[1].c_str());
+            else if (parts[0] == "count")
+                count = atoi(parts[1].c_str());
+        }
+    }
+
+    if (distance <= 0.0f || count < 1)
+        return false;
+
+    Player* bot = ai->GetBot();
+    if (!bot)
+        return false;
+
+    int closeCount = 0;
+    Unit* closest = nullptr;
+    float closestDistance = 0.0f;
+
+    // 只遍历**自己队伍**（最多 40 人），不做任何全图扫描；每个成员一次 2D 距离。
+    Group* group = bot->GetGroup();
+    if (group)
+    {
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (!member || member == bot || member->GetMapId() != bot->GetMapId() || !member->IsAlive())
+                continue;
+
+            float dist = sServerFacade.GetDistance2d(bot, member);
+            if (dist >= distance)
+                continue;
+
+            closeCount++;
+            if (!closest || dist < closestDistance)
+            {
+                closest = member;
+                closestDistance = dist;
+            }
+        }
+    }
+
+    // 没组队时主号也算队友（单机带 bot 的常见形态）
+    Player* master = ai->GetMaster();
+    if (master && master != bot && master->GetMapId() == bot->GetMapId() && master->IsAlive() &&
+        (!group || !master->IsInGroup(bot)))
+    {
+        float dist = sServerFacade.GetDistance2d(bot, master);
+        if (dist < distance)
+        {
+            closeCount++;
+            if (!closest || dist < closestDistance)
+            {
+                closest = master;
+                closestDistance = dist;
+            }
+        }
+    }
+
+    if (closeCount < count)
+        return false;
+
+    outMember = closest;
+    return true;
+}
+
+bool TeamMembersCloseTrigger::IsActive()
+{
+    Unit* member = nullptr;
+    return FindCrowdedMember(ai, getQualifier(), defaultCount, defaultDistance, member);
+}
+
 bool TankAssistTrigger::IsActive()
 {
     if (!AI_VALUE(bool, "has attackers"))
@@ -591,6 +769,21 @@ bool TankAssistTrigger::IsActive()
     if (enemy)
     {
         return currentTarget != enemy;
+    }
+
+    // [pull 2026-10-18 站长口径] 坦克被怪打、而当前目标不是"正在打我那些怪"之一时，允许立刻切目标：
+    //   典型就是"正跑去开一个走不到/在另一层的目标，路上被别的怪缠住"——不切的话坦克会一路跑，
+    //   路上打它的怪永远不还手。切过去由 TankTargetValue 负责挑（先交战、再近战、再距离近）。
+    //   注意：currentTarget 自己就在"打我那些怪"里时不算（正常拉住当前目标，不折腾）；
+    //   另外只有 tank assist 真的会挑到别的目标时才切，避免每 tick 空转。
+    {
+        const std::list<ObjectGuid>& attackers = AI_VALUE(std::list<ObjectGuid>, "attackers targeting me");
+        if (!attackers.empty() && std::find(attackers.begin(), attackers.end(), currentTarget->GetObjectGuid()) == attackers.end())
+        {
+            Unit* switchTarget = ai->GetUnit(AI_VALUE(ObjectGuid, "tank target"));
+            if (switchTarget && switchTarget != currentTarget)
+                return true;
+        }
     }
 
     Unit* tankTarget = ai->GetUnit(AI_VALUE(ObjectGuid, "tank target"));
@@ -648,6 +841,120 @@ bool IsNotBehindTargetTrigger::IsActive()
 bool IsNotFacingTargetTrigger::IsActive()
 {
     return !AI_VALUE2(bool, "facing", "current target");
+}
+
+// [rules 2026-10-17] `hostile aoe incoming`：敌方地面 AOE 正落在自己/队友脚下。
+//   判据全在值里（AoeValues.cpp → HostileAoeValue::GetHostileAoeCenter），这里只查一次。
+// [dodge 2026-10-17 方案A] 触发器一旦被策略引用就会每 tick 求值 ⇒ 顺手把敌方地面 AOE
+//   **登记进 `stored hazards`**，喂给既有的 `move away from hazard`
+//   （HazardsValue 只读 stored hazards、自己不检测；原先只有副本预置 BOSS 危险物会写它）。
+//   这样"躲技能"= 检测(本触发器) → hazards → MoveAwayFromHazard 走位，全用既有零件。
+bool HostileAoeIncomingTrigger::IsActive()
+{
+    const bool incoming = AI_VALUE(bool, "hostile aoe incoming");
+
+    if (incoming)
+        HostileAoeValue::RegisterHostileAoeHazards(ai, true);
+
+    return incoming;
+}
+
+// [rules 2026-10-17] `target facing group`：当前目标正面朝着队伍质心。
+bool TargetFacingGroupTrigger::IsActive()
+{
+    // 解析限定词（空限定词走默认值，绝不把空串交给 GetValue）
+    float angleDeg = 60.0f;
+    float memberRadius = 40.0f;
+
+    std::vector<std::string> tokens = Qualified::getMultiQualifiers(getQualifier(), ",");
+    for (const std::string& token : tokens)
+    {
+        if (token.empty())
+            continue;
+
+        size_t pos = token.find("::");
+        std::string key = (pos == std::string::npos) ? token : token.substr(0, pos);
+        std::string value = (pos == std::string::npos) ? std::string() : token.substr(pos + 2);
+
+        if (key == "dist" && !value.empty())
+            memberRadius = (float)atof(value.c_str());
+        else if (key == "angle" && !value.empty())
+            angleDeg = (float)atof(value.c_str());
+    }
+
+    if (angleDeg <= 0.0f || angleDeg > 180.0f)
+        angleDeg = 60.0f;
+    if (memberRadius <= 0.0f)
+        memberRadius = 40.0f;
+
+    return IsTargetFacingGroup(ai, angleDeg, memberRadius);
+}
+
+bool TargetFacingGroupTrigger::IsTargetFacingGroup(PlayerbotAI* ai, float angleDeg, float memberRadius)
+{
+    if (!ai)
+        return false;
+
+    Player* bot = ai->GetBot();
+    if (!bot || !bot->IsInWorld() || !bot->GetGroup())
+        return false;
+
+    // 这是 static 成员函数，不能用 AI_VALUE 宏（宏体会引用成员 `context`）；显式走值接口。
+    // 用 ::AiValueOr 而不是 "GetValue(...)->Get()"：后者对未注册的名字会拿到 nullptr 再解引用
+    // （文档 §6 记过的 InsideTargetValue 坑，AoeValues.cpp 的 HasAreaDebuffValue 就是那种写法）。
+    AiObjectContext* ctx = ai->GetAiObjectContext();
+    if (!ctx)
+        return false;
+
+    Unit* target = ai->GetUnit(::AiValueOr<ObjectGuid>(ctx, "current target"));
+    if (!target || !target->IsInWorld() || !sServerFacade.IsAlive(target))
+        return false;
+
+    if (target->GetMapId() != bot->GetMapId())
+        return false;
+
+    // 队伍质心（只算同地图、活着、且在 memberRadius 内的成员）
+    float sumX = 0.0f, sumY = 0.0f;
+    uint32 count = 0;
+
+    for (GroupReference* ref = bot->GetGroup()->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->getSource();
+        if (!member || !member->IsInWorld() || !sServerFacade.IsAlive(member))
+            continue;
+
+        if (member->GetMapId() != target->GetMapId())
+            continue;
+
+        if (target->GetDistance(member) > memberRadius)
+            continue;
+
+        sumX += member->GetPositionX();
+        sumY += member->GetPositionY();
+        ++count;
+    }
+
+    // 人太少说明不了"面向人群"（单人也可能是坦克自己）
+    if (count < 2)
+        return false;
+
+    float centerX = sumX / count;
+    float centerY = sumY / count;
+
+    // 目标 → 质心 的方向角，与目标朝向比较
+    float dx = centerX - target->GetPositionX();
+    float dy = centerY - target->GetPositionY();
+    if (fabs(dx) < 0.01f && fabs(dy) < 0.01f)
+        return false;
+
+    float toGroup = atan2(dy, dx);
+    float diff = fabs(toGroup - target->GetOrientation());
+
+    // 归一化到 [0, PI]
+    while (diff > M_PI)
+        diff = fabs(diff - 2 * M_PI);
+
+    return diff <= (angleDeg * M_PI / 180.0f);
 }
 
 bool HasCcTargetTrigger::IsActive()

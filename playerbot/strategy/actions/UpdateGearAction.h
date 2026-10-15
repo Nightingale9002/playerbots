@@ -21,6 +21,11 @@ namespace ai
        
         void EnchantItem(Item* item);
 
+        // [成对槽位 2026-10-17] 成对槽位（戒指1/2、饰品1/2）配了同一件唯一/已装备物品时，
+        // 复用 RandomItemMgr 的"按槽位+专精权重"取件接口另挑一件同 InventoryType 的替代品。
+        // 挑不到返回 0（调用方跳过该格，不硬装）。
+        uint32 PickAlternativeItem(uint8 slot, uint32 desiredItemId);
+
     private:
         std::vector<EnchantTemplate> enchants;
     };

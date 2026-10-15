@@ -1,5 +1,5 @@
-
 #include "playerbot/playerbot.h"
+#include "PullActions.h"
 #include "playerbot/strategy/values/PositionValue.h"
 #include "playerbot/strategy/values/FreeMoveValues.h"
 #include "PositionAction.h"
@@ -44,7 +44,7 @@ bool PositionAction::Execute(Event& event)
     std::vector<std::string> params = split(param, ' ');
     if (params.size() != 2)
     {
-        ai->TellPlayer(requester, "Whisper position <name> ?/set/reset");
+        ai->TellPlayer(requester,BOT_TEXT("Whisper position <name> ?/set/reset"));
         return false;
     }
 
@@ -214,6 +214,10 @@ bool ReturnToPullPositionAction::isPossible()
             Unit* target = strategy->GetTarget();
             if (target)
             {
+                // [pullback 2026-10-18 站长口径] **孤立（只看距离、不看数量）⇒ 不 pullback**。
+                if (target->IsCreature() && PullPackIsIsolated(ai, (Creature*)target))
+                    return false;
+
                 if (target->GetTarget() == bot)
                 {
                     const float distance = bot->GetDistance(stayPosition.x, stayPosition.y, stayPosition.z);

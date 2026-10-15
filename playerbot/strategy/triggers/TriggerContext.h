@@ -43,10 +43,16 @@ namespace ai
             creators["timer"] = [](PlayerbotAI* ai) { return new TimerTrigger(ai); };
             creators["random"] = [](PlayerbotAI* ai) { return new RandomTrigger(ai, "random", 20); };
             creators["seldom"] = [](PlayerbotAI* ai) { return new RandomTrigger(ai, "seldom", 300); };
+            // [emote 2026-10-18 站长口径] "表情/闲聊太多" ⇒ 新增两档更稀的随机触发器：
+            //   rare ≈ 1/100、very rare ≈ 1/600（每 5 秒掷一次，`AiPlayerbot.RepeatDelay` 节流）。
+            creators["rare"] = [](PlayerbotAI* ai) { return new RandomTrigger(ai, "rare", 100); };
+            creators["very rare"] = [](PlayerbotAI* ai) { return new RandomTrigger(ai, "very rare", 600); };
             creators["often"] = [](PlayerbotAI* ai) { return new RandomTrigger(ai, "often", 5); };
             creators["very often"] = [](PlayerbotAI* ai) { return new TimeTrigger(ai, "very often", 5); };
 
             creators["target critical health"] = [](PlayerbotAI* ai) { return new TargetCriticalHealthTrigger(ai); };
+            // [BOSS 战策略触发器 2026-10-19] 通用目标血量档：`target health below::<n>[::<m>]`
+            creators["target health below"] = [](PlayerbotAI* ai) { return new TargetHealthBelowTrigger(ai); };
 
             creators["critical health"] = [](PlayerbotAI* ai) { return new CriticalHealthTrigger(ai); };
             creators["low health"] = [](PlayerbotAI* ai) { return new LowHealthTrigger(ai); };
@@ -63,6 +69,14 @@ namespace ai
             creators["party member low health"] = [](PlayerbotAI* ai) { return new PartyMemberLowHealthTrigger(ai); };
             creators["party member medium health"] = [](PlayerbotAI* ai) { return new PartyMemberMediumHealthTrigger(ai); };
             creators["party member almost full health"] = [](PlayerbotAI* ai) { return new PartyMemberAlmostFullHealthTrigger(ai); };
+
+            // [heal 2026-10-17] 坦克专用血量档（复用 PartyMemberLowHealthTrigger + isTankRequired）：
+            //   目标仍取 "party member to heal"（最低血），但目标不是坦克 ⇒ 不触发。
+            //   用于"圣光术仅坦克"这类只给坦克上的大治疗（见 HolyPaladinStrategy TBC）。
+            creators["party member tank critical health"] = [](PlayerbotAI* ai) { return new PartyMemberLowHealthTrigger(ai, "party member tank critical health", sPlayerbotAIConfig.criticalHealth, 0, true); };
+            creators["party member tank low health"] = [](PlayerbotAI* ai) { return new PartyMemberLowHealthTrigger(ai, "party member tank low health", sPlayerbotAIConfig.lowHealth, sPlayerbotAIConfig.criticalHealth, true); };
+            creators["party member tank medium health"] = [](PlayerbotAI* ai) { return new PartyMemberLowHealthTrigger(ai, "party member tank medium health", sPlayerbotAIConfig.mediumHealth, sPlayerbotAIConfig.lowHealth, true); };
+            creators["party member tank almost full health"] = [](PlayerbotAI* ai) { return new PartyMemberLowHealthTrigger(ai, "party member tank almost full health", sPlayerbotAIConfig.almostFullHealth, sPlayerbotAIConfig.mediumHealth, true); };
 
             creators["protect party member"] = [](PlayerbotAI* ai) { return new ProtectPartyMemberTrigger(ai); };
 
@@ -91,6 +105,13 @@ namespace ai
 
             creators["pull start"] = [](PlayerbotAI* ai) { return new PullStartTrigger(ai); };
             creators["pull end"] = [](PlayerbotAI* ai) { return new PullEndTrigger(ai); };
+            creators["pull pack has ranged"] = [](PlayerbotAI* ai) { return new PullPackHasRangedTrigger(ai); };
+            creators["enemy ranged out of melee"] = [](PlayerbotAI* ai) { return new EnemyRangedOutOfMeleeTrigger(ai); };
+            creators["loose mob on party"] = [](PlayerbotAI* ai) { return new LooseMobOnPartyTrigger(ai); };
+            creators["priority kill target available"] = [](PlayerbotAI* ai) { return new PriorityKillTargetAvailableTrigger(ai); };
+            creators["dungeon wave advance"] = [](PlayerbotAI* ai) { return new DungeonWaveAdvanceTrigger(ai); };
+            creators["boss position"] = [](PlayerbotAI* ai) { return new BossPositionTrigger(ai); };
+            creators["dungeon tank pull"] = [](PlayerbotAI* ai) { return new DungeonTankPullTrigger(ai); };
             creators["dps assist"] = [](PlayerbotAI* ai) { return new DpsAssistTrigger(ai); };
             creators["tank assist"] = [](PlayerbotAI* ai) { return new TankAssistTrigger(ai); };
             creators["lose aggro"] = [](PlayerbotAI* ai) { return new LoseAggroTrigger(ai); };
@@ -107,6 +128,26 @@ namespace ai
 
             creators["has area debuff"] = [](PlayerbotAI* ai) { return new HasAreaDebuffTrigger(ai); };
             creators["has aura"] = [](PlayerbotAI* ai) { return new HasAuraTrigger(ai); };
+
+            // -------------------------------------------------------------------
+            // [BOSS 战策略触发器 2026-10-19] BOSS 规则要用的四类新触发器。
+            //   实现见 GenericTriggers.h/.cpp、HealthTriggers.h/.cpp、CureTriggers.h/.cpp。
+            // -------------------------------------------------------------------
+            // 当前目标身上的光环（`has aura` 只能查自己）
+            creators["target has aura"] = [](PlayerbotAI* ai) { return new TargetHasAuraTrigger(ai); };
+            // 附近有敌人在读条（值 `enemy casting target` 做扫描/缓存；可选限定词 dist::/spellid::）
+            creators["enemy casting"] = [](PlayerbotAI* ai) { return new EnemyCastingTrigger(ai); };
+            creators["enemy casting interruptible"] = [](PlayerbotAI* ai) { return new EnemyCastingInterruptibleTrigger(ai); };
+            // [rules 2026-10-17] 敌方地面 AOE 正落在自己/队友脚下（"脚下有地板"）⇒ 配 `move away from hazard`。
+            //   与自带的 `avoid aoe` 分工：那个管"身上已经挂了 area debuff"，这个管"即将踩到"。
+            creators["hostile aoe incoming"] = [](PlayerbotAI* ai) { return new HostileAoeIncomingTrigger(ai); };
+            // [rules 2026-10-17] 当前目标正面朝着人群（"坦克把 BOSS 背对人群"，写在 _tank 集里）。
+            creators["target facing group"] = [](PlayerbotAI* ai) { return new TargetFacingGroupTrigger(ai); };
+            // 队友（不是当前目标）和自己太近 —— "分散/别扎堆"
+            creators["team member too close"] = [](PlayerbotAI* ai) { return new TeamMembersCloseTrigger(ai, "team member too close", 1, 8.0f); };
+            creators["team members close"] = [](PlayerbotAI* ai) { return new TeamMembersCloseTrigger(ai, "team members close", 2, 8.0f); };
+            // 队里有人中了可驱散的负面光环（配合动作 `cure team member`）
+            creators["team member needs cure"] = [](PlayerbotAI* ai) { return new TeamMemberNeedsCureTrigger(ai); };
 
             creators["potion cooldown"] = [](PlayerbotAI* ai) { return new PotionCooldownTrigger(ai); };
 

@@ -84,6 +84,15 @@ public:
         static bool HandlePlayerbotConsoleCommand(ChatHandler* handler, char const* args);
         bool IsRandomBot(Player* bot);
         bool IsRandomBot(uint32 bot);
+        // [roster 2026-10-16 站长口径] 点名的 12 个专精"至少必须有"：同一 职业/种族 组合只让一只在线 bot 占点名
+        bool IsRosterSpecHolder(Player* bot);
+        // [always 2026-10-17 站长口径] 本站点名"常在线"（event='always' 且 value=ACTIVE）的角色数；
+        //   onlyOffline=true 时只数**当前没在线**的那些。
+        //   登录侧用后者给常在线角色**预留席位**：
+        //     轮换 bot 的可登录上限 = maxAllowedBotCount - 缺席的常在线数
+        //   语义（站长拍板："always 名单优先占位：轮换 bot 数 = MaxRandomBots - always 数"）：
+        //   always 名单优先占位，掉线后能立刻把自己的名额抢回来，不会被轮换 bot 占死。
+        uint32 CountAlwaysOnlineChars(bool onlyOffline);
         bool IsFreeBot(Player* bot) { return IsRandomBot(bot) || sPlayerbotAIConfig.IsFreeAltBot(bot); }
         bool IsFreeBot(uint32 bot) { return IsRandomBot(bot) || sPlayerbotAIConfig.IsFreeAltBot(bot); }
         void InstaRandomize(Player* bot);
@@ -142,6 +151,10 @@ public:
         void SaveCurTime();
         void SyncEventTimers();
         void AddOfflineGroupBots();
+        // [spawn 2026-10-16] 固定出生点：所有"随机传送"统一收口到这里（返回 true = 已按固定点处理）
+        bool TeleportToFixedSpawn(Player* bot);
+        // [group 2026-10-16] "队伍里没有真人"时的自动解散（AiPlayerbot.AutoDisbandBotOnlyGroups）
+        void DisbandBotOnlyGroups();
         static Item* CreateTempItem(uint32 item, uint32 count, Player const* player, uint32 randomPropertyId = 0);
         static InventoryResult CanEquipUnseenItem(Player* player, uint8 slot, uint16& dest, uint32 item);
 
@@ -186,6 +199,9 @@ public:
         time_t PlayersCheckTimer;
         time_t EventTimeSyncTimer;
         time_t OfflineGroupBotsTimer;
+        time_t BotOnlyGroupCheckTimer = 0;
+        std::map<uint32, time_t> botOnlyGroupRealPlayerSeen;   // groupId -> 最后一次见到真人的时间
+        std::map<uint32, time_t> botOnlyGroupNoPlayerSince;    // groupId -> 第一次见到"没有真人"的时间
         uint32 AddRandomBots();
         bool ProcessBot(uint32 bot);
         void ScheduleRandomize(uint32 bot, uint32 time);

@@ -159,6 +159,16 @@ endif()
 
 add_library(${LIBRARY_NAME} STATIC ${LIBRARY_SRCS})
 
+# [2026-10-18] MSVC 必须显式 /utf-8：本模块源码是 UTF-8（无 BOM），MSVC 默认按系统代码页(936)读源码，
+#   中文紧邻引号时 GBK 引导字节会把引号吃掉 ⇒ C2001「常量中有换行」（未改动的旧文件也会中招）。
+#   gcc/clang 默认 UTF-8，不受影响；此选项仅 MSVC 生效，故对云端 Linux 构建无影响。
+if(MSVC)
+  target_compile_options(${LIBRARY_NAME} PRIVATE "/utf-8")
+endif()
+
+# [2026-10-15] 模块的 -O0 降级已移除（它是为 2GB 云主机降**编译**内存而加，
+# 但会让**运行时**内存更大；编译改在 WSL/本地大内存机器进行）
+
 target_link_libraries(${LIBRARY_NAME}
   PRIVATE shared
   PRIVATE Detour

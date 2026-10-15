@@ -757,6 +757,11 @@ public:
 private:
     bool UpdateAIReaction(uint32 elapsed, bool minimal, bool isStunned);
     void UpdateFaceTarget(uint32 elapsed, bool minimal);
+    // [进本跟随 2026-10-17 站长口径] bot 在副本门口(<=10码)时跟着真人 master 一起进本；状态驱动+限流。
+    void CheckInstanceFollow();
+    // [tank-wait 2026-10-18 站长口径] "如果有人掉队 T 不应该继续往前走"：
+    //   队伍里有人掉队时坦克停下原地等（判定/超时/提示见实现）。
+    bool ShouldTankWaitForGroup();
 
 protected:
 	Player* bot;
@@ -801,6 +806,10 @@ protected:
     bool m_recordIncommingMessages = false;
     std::vector<std::string> m_recordedMessages;
     Event lastEvent;
+    time_t lastInstanceFollow = 0;      // [进本跟随 2026-10-17] 限流时间戳（约 2 秒一次）
+    uint32 instanceFollowTrigger = 0;   // [进本跟随 2026-10-17] 已锁定的副本门 AreaTrigger id
+    time_t tankWaitForGroupStart = 0;   // [tank-wait 2026-10-18] 当前"等掉队队友"周期的起点（0 = 没在等）
+    time_t tankWaitForGroupResumeAt = 0;// [tank-wait 2026-10-18] 超时后恢复前进的冷却截止时刻
 
 public:
     void RecordMessages(bool record, bool incomming = false) { m_recordMessages = record; m_recordIncommingMessages = incomming; if (!record) m_recordedMessages.clear(); }

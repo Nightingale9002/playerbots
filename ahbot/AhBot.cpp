@@ -24,6 +24,38 @@
 
 using namespace ahbot;
 
+void AhBotLogRss(char const* tag);
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+#endif
+
+// [A/B diagnostic 2026-10-15] AhBot memory probes (env AHBOT_RSS_LOG=1). ASCII only.
+void AhBotLogRss(char const* tag)
+{
+    static bool const enabled = (std::getenv("AHBOT_RSS_LOG") != nullptr);
+    if (!enabled)
+        return;
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    uint32 rssMb = K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? (uint32)(pmc.WorkingSetSize / (1024 * 1024)) : 0;
+#else
+    uint32 rssMb = 0;
+    if (FILE* f = fopen("/proc/self/statm", "r"))
+    {
+        unsigned long total = 0, resident = 0;
+        if (fscanf(f, "%lu %lu", &total, &resident) == 2)
+            rssMb = (uint32)((resident * (unsigned long)sysconf(_SC_PAGESIZE)) / (1024 * 1024));
+        fclose(f);
+    }
+#endif
+    sLog.outString("[AHRSS] %-46s %6u MB", tag, rssMb);
+}
+
 bool AhBot::HandleAhBotCommand(ChatHandler* handler, char const* args)
 {
     auctionbot.HandleCommand(args);
@@ -36,6 +68,7 @@ std::map<uint32, uint32> AhBot::factions;
 
 void AhBot::Init()
 {
+    AhBotLogRss("Init: enter");
     sLog.outString("Initializing AhBot by ike3");
 
     if (!sAhBotConfig.Initialize())
@@ -49,7 +82,9 @@ void AhBot::Init()
     factions[6] = 2;
     factions[7] = 3;
 
+    AhBotLogRss("Init: before availableItems.Init");
     availableItems.Init();
+    AhBotLogRss("Init: after availableItems.Init");
 
     sLog.outString("AhBot configuration loaded");
 }
@@ -91,6 +126,14 @@ void activateAhbotThread()
 
 void AhBot::Update()
 {
+    {
+        static uint32 ahrssUpd = 0;
+        if (++ahrssUpd <= 5)
+        {
+            char t[128]; snprintf(t, sizeof(t), "Update #%u (bidders=%zu allBidders=%zu)", ahrssUpd, bidders.size(), allBidders.size());
+            AhBotLogRss(t);
+        }
+    }
     if (!sAhBotConfig.enabled)
         return;
 
@@ -121,6 +164,7 @@ void AhBot::ForceUpdate()
 	if (updating)
 		return;
 
+    AhBotLogRss("ForceUpdate: enter");
     std::string msg = "AhBot is now checking auctions in the background";
 	sLog.outString("%s", msg.c_str());
 	//ostringstream out1; out1 << "|c070cc700 " << msg << " |r";
@@ -136,13 +180,19 @@ void AhBot::ForceUpdate()
 		return;
 	}
 
+    AhBotLogRss("ForceUpdate: after LoadRandomBots");
 	CheckCategoryMultipliers();
+    AhBotLogRss("ForceUpdate: after CheckCategoryMultipliers");
 
 	int answered = 0, added = 0;
 	for (int i = 0; i < MAX_AUCTIONS; i++)
 	{
 		InAuctionItemsBag inAuctionItems(auctionIds[i]);
 		inAuctionItems.Init(true);
+		{
+			char t[128]; snprintf(t, sizeof(t), "ForceUpdate: house %d bag loaded", i);
+			AhBotLogRss(t);
+		}
 
 		for (int j = 0; j < CategoryList::instance.size(); j++)
 		{
@@ -150,9 +200,15 @@ void AhBot::ForceUpdate()
 			answered += Answer(i, category, &inAuctionItems);
 			added += AddAuctions(i, category, &inAuctionItems);
 		}
+		{
+			char t[128]; snprintf(t, sizeof(t), "ForceUpdate: house %d categories done (answered=%d added=%d)", i, answered, added);
+			AhBotLogRss(t);
+		}
 	}
 
+	AhBotLogRss("ForceUpdate: before CleanupHistory");
 	CleanupHistory();
+	AhBotLogRss("ForceUpdate: exit");
 
 	sLog.outString("AhBot auction check finished. %d auctions answered, %d new auctions added. Next check in %d seconds",
 		answered, added, sAhBotConfig.updateInterval);
@@ -185,6 +241,15 @@ struct SortByPricePredicate
 std::vector<AuctionEntry*> AhBot::LoadAuctions(const AuctionHouseObject::AuctionEntryMap& auctionEntryMap,
         Category*& category, int& auction)
 {
+    {
+        static uint32 ahrssLa = 0; static uint32 ahrssTotal = 0;
+        ahrssTotal += (uint32)auctionEntryMap.size();
+        if (++ahrssLa <= 4 || (ahrssLa % 100) == 0)
+        {
+            char t[160]; snprintf(t, sizeof(t), "LoadAuctions #%u map=%zu cumulative=%u cat=%s", ahrssLa, auctionEntryMap.size(), ahrssTotal, category->GetDisplayName().c_str());
+            AhBotLogRss(t);
+        }
+    }
     std::vector<AuctionEntry*> entries;
     for (AuctionHouseObject::AuctionEntryMap::const_iterator itr = auctionEntryMap.begin();
             itr != auctionEntryMap.end(); ++itr)
@@ -1173,6 +1238,7 @@ void AhBot::Dump()
 
 void AhBot::CleanupPropositions()
 {
+    AhBotLogRss("CleanupPropositions: enter");
     uint32 deliverTime = time(0) - 3600 * 24 * 2;
     auto result = CharacterDatabase.PQuery("select id, receiver from mail where subject like 'AH Proposition%%' and deliver_time <= '%u'", deliverTime);
     if (!result)

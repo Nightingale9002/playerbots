@@ -2,6 +2,7 @@
 
 #include "playerbot/strategy/actions/GenericActions.h"
 #include "playerbot/strategy/actions/ChangeStrategyAction.h"
+#include "playerbot/PlayerbotAIConfig.h"
 
 namespace ai
 {
@@ -28,6 +29,24 @@ namespace ai
     {
     public:
         CastHealingWaveOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "healing wave") {}
+
+        // [disc 2026-10-17] 治疗波动态 rank：按目标缺血量 + 预计承伤选“能满足的最小 rank”（省蓝、平滑）。
+        //   value 返回 0（目标未知 / 只有一个 rank）时回退到原二值逻辑（按 mana save level 取最高/第 N 高）。
+        virtual bool Execute(Event& event) override
+        {
+            uint32 rankId = AI_VALUE2(uint32, "heal rank", GetSpellName());
+            if (rankId)
+            {
+                uint32 spellDuration = sPlayerbotAIConfig.globalCoolDown;
+                if (ai->CastSpell(rankId, GetTarget(), nullptr, false, &spellDuration))
+                {
+                    SetDuration(spellDuration);
+                    return true;
+                }
+                return false;
+            }
+            return HealPartyMemberAction::Execute(event);
+        }
     };
 
     class CastChainHealAction : public CastAoeHealSpellAction 
@@ -230,7 +249,7 @@ namespace ai
 
         virtual bool isUseful() override
         {
-            return (!bot->GetGroup() || ai->HasStrategy("totem air wrath", BotState::BOT_STATE_COMBAT)) && CastTotemAction::isUseful();
+            return CastTotemAction::isUseful();
         }
 	};
 
@@ -307,7 +326,7 @@ namespace ai
 
         virtual bool isUseful() override
         {
-            return (!bot->GetGroup() || ai->HasStrategy("totem air grace", BotState::BOT_STATE_COMBAT)) && CastTotemAction::isUseful();
+            return CastTotemAction::isUseful();
         }
     };
 

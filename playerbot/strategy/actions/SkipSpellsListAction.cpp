@@ -16,14 +16,14 @@ bool SkipSpellsListAction::Execute(Event& event)
     if (cmd == "reset")
     {
         skipSpells.clear();
-        ai->TellPlayer(requester, "The ignored spell list has been cleared");
+        ai->TellPlayer(requester,BOT_TEXT("The ignored spell list has been cleared"));
         return true;
     }
     else if (cmd.empty() || cmd == "?")
     {   
         if (skipSpells.empty())
         {
-            ai->TellPlayer(requester, "Ignored spell list is empty");
+            ai->TellPlayer(requester,BOT_TEXT("Ignored spell list is empty"));
         }
         else
         {
@@ -108,7 +108,7 @@ bool SkipSpellsListAction::Execute(Event& event)
         }
         else
         {
-            ai->TellPlayer(requester, "Please specify one or more spells to ignore");
+            ai->TellPlayer(requester,BOT_TEXT("Please specify one or more spells to ignore"));
         }
     }
 

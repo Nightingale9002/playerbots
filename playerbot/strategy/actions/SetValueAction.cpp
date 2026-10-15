@@ -49,16 +49,16 @@ bool SetValueAction::Execute(Event& event)
 
             if (type == -1)
             {
-                ai->TellPlayer(requester, "Prefered group size reset to random:", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester, BOT_TEXT("Prefered group size reset to random:"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 value = std::to_string((uint8)ai->GetGrouperType());
             }
 
             if (type == 0)
-            ai->TellPlayer(requester, "Prefered group size set to solo.", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayer(requester, BOT_TEXT("Prefered group size set to solo."), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             else if (type == 1)
-                ai->TellPlayer(requester, "Prefered group size set to allow others to invite.", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester, BOT_TEXT("Prefered group size set to allow others to invite."), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             else
-                ai->TellPlayer(requester, "Prefered group size set to invite up to " + value, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);    
+                ai->TellPlayer(requester, BOT_TEXT2("Prefered group size set to invite up to %value", (std::map<std::string, std::string>{ {"%value", value} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);    
 
             return true;
             break;
@@ -102,11 +102,11 @@ bool SetValueAction::Execute(Event& event)
 
         if (type == -1)
         {
-            ai->TellPlayer(requester, "Prefered guild size reset to random:", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayer(requester, BOT_TEXT("Prefered guild size reset to random:"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             value = std::to_string((uint8)ai->GetGuilderType());
         }
 
-        ai->TellPlayer(requester, "Prefered guild size set to " + std::to_string(type), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester, BOT_TEXT2("Prefered guild size set to %type", (std::map<std::string, std::string>{ {"%type", std::to_string(type)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         return true;
     }
     else if (param.find("rpg style ") == 0)
@@ -132,16 +132,16 @@ bool SetValueAction::Execute(Event& event)
 
         if (style == -1)
         {
-            ai->TellPlayer(requester, "Prefered rpg style reset to random:", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayer(requester, BOT_TEXT("Prefered rpg style reset to random:"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             value = std::to_string((uint8)ai->GetFixedBotNumber(BotTypeNumber::RPG_STYLE_NUMBER, 100));
         }
 
-        ai->TellPlayer(requester, "Prefered rpg style set to " + std::to_string(style), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester, BOT_TEXT2("Prefered rpg style set to %style", (std::map<std::string, std::string>{ {"%style", std::to_string(style)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         return true;
     }
 
-    ai->TellPlayer(requester, "Correct usage: set value <value name> <value>", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
-    ai->TellPlayer(requester, "Values supported: group size, guild size", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+    ai->TellPlayer(requester, BOT_TEXT("Correct usage: set value <value name> <value>"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+    ai->TellPlayer(requester, BOT_TEXT("Values supported: group size, guild size"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 
     return true;
 }

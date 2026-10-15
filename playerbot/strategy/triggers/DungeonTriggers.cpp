@@ -333,3 +333,35 @@ bool ItemBuffReadyTrigger::IsActive()
 
     return false;
 }
+
+// [tank-pull 2026-10-18 站长口径] 坦克在副本里自己开怪（详见 DungeonTriggers.h）。
+bool DungeonTankPullTrigger::IsActive()
+{
+    Player* bot = ai->GetBot();
+    if (!bot || !bot->IsInWorld() || bot->IsInCombat() || !bot->IsAlive())
+        return false;
+
+    if (!ai->IsTank(bot))
+        return false;
+
+    if (!bot->GetMap() || (!bot->GetMap()->IsDungeon() && !bot->GetMap()->IsRaid()))
+        return false;
+
+    // 已经有目标 / 正在打 ⇒ 交给正常战斗链
+    if (!AI_VALUE(ObjectGuid, "current target").IsEmpty())
+        return false;
+
+    // 队伍已经在打（坦克自己还没进战斗的瞬间）⇒ 别再多拉一波
+    if (Group* group = bot->GetGroup())
+    {
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (member && member != bot && member->IsInWorld() && member->IsInCombat())
+                return false;
+        }
+    }
+
+    // 有可拉的目标才触发（`grind target` = GrindTargetValue，坦克在副本里走推进路线/可达判定）
+    return !AI_VALUE(ObjectGuid, "grind target").IsEmpty();
+}

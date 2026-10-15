@@ -55,7 +55,13 @@ namespace ai
 	MELEE_DEBUFF_ACTION_R(CastJudgementOfWisdomAction, "judgement of wisdom", 10.0f);
 	MELEE_DEBUFF_ACTION_R(CastJudgementOfJusticeAction, "judgement of justice", 10.0f);
 
-	SPELL_ACTION(CastHolyShockAction, "holy shock");
+	// [heal 2026-10-17] 自身神圣震击原本继承 CastSpellAction（目标="current target"⇒打到敌人身上），
+	//   改继承 CastHealingSpellAction（目标="self target"）⇒ 自身紧急时震击回血才成立。
+	class CastHolyShockAction : public CastHealingSpellAction
+	{
+	public:
+		CastHolyShockAction(PlayerbotAI* ai) : CastHealingSpellAction(ai, "holy shock") {}
+	};
 	HEAL_PARTY_ACTION(CastHolyShockOnPartyAction, "holy shock");
 
 	// consecration

@@ -294,6 +294,7 @@ namespace ai
                 creators["divine favor"] = [](PlayerbotAI* ai) { return new DivineFavorTrigger(ai); };
                 creators["turn undead"] = [](PlayerbotAI* ai) { return new TurnUndeadTrigger(ai); };
                 creators["avenger's shield"] = [](PlayerbotAI* ai) { return new AvengerShieldTrigger(ai); };
+                creators["avenging wrath on boss"] = [](PlayerbotAI* ai) { return new AvengingWrathBossTrigger(ai); };
                 creators["consecration"] = [](PlayerbotAI* ai) { return new ConsecrationTrigger(ai); };
                 creators["exorcism"] = [](PlayerbotAI* ai) { return new ExorcismTrigger(ai); };
                 creators["repentance on enemy healer"] = [](PlayerbotAI* ai) { return new RepentanceOnHealerTrigger(ai); };

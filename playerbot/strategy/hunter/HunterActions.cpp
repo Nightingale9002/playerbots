@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/strategy/actions/GenericActions.h"
 #include "HunterActions.h"
+#include "HunterTriggers.h"
 
 using namespace ai;
 
@@ -32,6 +33,19 @@ bool CastAutoShotAction::isUseful()
     return ai->HasStrategy("ranged", BotState::BOT_STATE_COMBAT) && AI_VALUE(uint32, "active spell") != AI_VALUE2(uint32, "spell id", getName());
 }
 
+// [hunter-weave 2026-10-18 站长口径] **瞬发输出技能要让开平射**（见 HunterTriggers.h）。
+//   TBC：任何远程特殊技能都会把平射的挥砍计时重置 ⇒ 每个 GCD 都放瞬发 = 平射永远打不出去。
+//   只在"平射刚打出去"的窗口里放，技能中间自然就穿插上平射了。
+//   （CC/嘲讽类不吃这条：`scatter shot` / `distracting shot` / `concussive shot` 要即时。）
+bool CastArcaneShotAction::isUseful()
+{
+    return CastSpellAction::isUseful() && !HunterShouldLetAutoShotLand(bot);
+}
+
+bool CastMultiShotAction::isUseful()
+{
+    return CastSpellAction::isUseful() && !HunterShouldLetAutoShotLand(bot);
+}
 bool HunterEquipAmmoAction::Execute(Event& event)
 {
     // Get ranged weapon

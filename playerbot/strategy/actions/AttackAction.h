@@ -19,6 +19,10 @@ namespace ai
         bool PetAttack(Player* requester, Unit* target);
         bool IsTargetValid(Player* requester, Unit* target);
 
+        // [threat 2026-10-17 站长口径] 副本/团本专用门禁：非坦克不许打"坦克还没建立仇恨"的目标。
+        // 返回 true = 现在还不该打这个目标。野外恒为 false（不限制）。
+        bool IsWaitingForTankThreat(Unit* target);
+
 #ifdef GenerateBotHelp
         virtual std::string GetHelpName() { return "attack"; }
         virtual std::string GetHelpDescription()

@@ -797,3 +797,26 @@ bool CastItemTargetAction::HasSpellCooldown(uint32 itemId)
 
     return false;
 }
+
+// ===========================================================================
+// [BOSS 战策略动作 2026-10-19] `cure team member`（见 GenericSpellActions.h）
+//   限定词 = `<法术名>::<驱散类型 token 表>`，用 `::` 切：
+//     第 1 段 = 法术名（交给 CastSpellAction::SetSpellName 走引擎既有 spell id 解析）
+//     第 2 段 = 目标值 `team member to cure::<这一段>` 的类型 token 表（原样透传，保证与
+//              触发器 `team member needs cure::<同一段>` 命中同一个值对象）
+//   空限定词 / 只给了空法术名 ⇒ 什么都不做（spellId 保持 0 ⇒ isPossible() 返回 false）。
+// ===========================================================================
+void CureTeamMemberAction::Qualify(const std::string& qualifier)
+{
+    Qualified::Qualify(qualifier);
+
+    std::vector<std::string> parts = Qualified::getMultiQualifiers(qualifier, "::");
+    if (parts.empty() || parts[0].empty())
+        return;
+
+    SetSpellName(parts[0]);
+
+    if (parts.size() >= 2)
+        targetQualifier = parts[1];
+}
+

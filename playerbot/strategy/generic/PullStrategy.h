@@ -13,7 +13,8 @@ namespace ai
         std::string getName() override { return "pull"; }
 
         static PullStrategy* Get(PlayerbotAI* ai);
-        static uint8 GetMaxPullTime() { return 15; }
+        // [pullback 2026-10-18 站长口径] 改成读 conf（AiPlayerbot.PullMaxTime），不再硬编码 15。
+        static uint8 GetMaxPullTime();
         const time_t& GetPullStartTime() const { return pullStartTime; }
         
         bool CanDoPullAction(Unit* target);

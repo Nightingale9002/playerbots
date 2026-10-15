@@ -29,8 +29,25 @@ namespace ai
     public:
         virtual std::string getName() { return name; }
 
+        // [crash-fix 2026-10-16] 存活登记 / 归属标记。
+        // 背景：AiObjectContext 的 ClearValues()/ClearExpiredValues() 和 SharedObjectContext::ClearValue()
+        // 都会 delete 掉 value/trigger/action 对象；任何在此之前抓住裸指针的代码，之后就可能踩到
+        // 已被释放、又被 std::string 之类复用的内存（线上表现为间接跳转跳到字符串缓冲区执行）。
+        // IsRegistered() 让"这个对象还在登记表里"变成可查询事实；IsOwnedBy() 防止共享对象被本地
+        // context 的 Erase() 误删（双重释放 / 悬垂）。
+        virtual bool IsRegistered() const { return registered; }
+        virtual void Register() { registered = true; }
+        virtual void Unregister() { registered = false; }
+
+        void SetOwner(void* context) { owner = context; }
+        bool IsOwnedBy(void* context) const { return owner == context; }
+
     protected:
         std::string name;
+        // 默认为 true：绝大多数对象由 NamedObjectContext/NamedObjectFactoryList 建出来并长期持有；
+        // 只有被 Erase()/ClearValue() 摘掉的才会变成 false（WeakRef 失效）。
+        bool registered = true;
+        void* owner = nullptr;
     };
 }
 

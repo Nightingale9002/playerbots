@@ -134,7 +134,7 @@ bool ChangeTalentsAction::Execute(Event& event)
 
             if (!specPath)
             {
-                ai->TellPlayer(requester, "Default talent spec for this class was not fount. Please check your config",PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester,BOT_TEXT("Default talent spec for this class was not fount. Please check your config"),PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 return false;
             }
 
@@ -265,6 +265,26 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
     uint32 specId = specNo ? specNo - 1 : 0;
     std::string specLink = sRandomPlayerbotMgr.GetData(bot->GetGUIDLow(), "specLink");
     uint8 cls = bot->getClass();
+
+    // [roster 2026-10-16 站长口径] conf 里 AiPlayerbot.PremadeSpecPick.<cls>.<race> 点名的专精
+    // **优先于历史 specNo**，而且对**已经存在的 bot 也生效**（否则满级 bot 会永远保持旧专精：
+    // 天赋点已花完 ⇒ CalculateTalentsPoints()==0 ⇒ 原来根本不会再进这里）。
+    // 注意 specNo 事件存的是"premade 专精序号 + 1"（TalentPath 列表下标），不是天赋页 tabpage。
+    {
+        // [roster 2026-10-16 站长口径] 只有"本组合的点名持有者"才套点名专精；多出来的 bot 走随机
+        int32 const picked = sRandomPlayerbotMgr.IsRosterSpecHolder(bot)
+            ? sPlayerbotAIConfig.specPick[cls][bot->getRace()] : -1;
+        if (picked >= 0 && specNo != uint32(picked + 1))
+        {
+            sLog.outString("[ROSTER] %s(%u/%u) 专精 %u -> 点名专精 %d（重建天赋）",
+                bot->GetName(), cls, bot->getRace(), specNo, picked);
+            specNo = uint32(picked + 1);
+            specId = uint32(picked);
+            specLink.clear();
+            sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specNo", specNo);
+            sRandomPlayerbotMgr.SetValue(bot->GetGUIDLow(), "specLink", 0);
+        }
+    }
 
     //Continue the current spec
     if (specNo > 0)
@@ -407,7 +427,23 @@ bool AutoSetTalentsAction::Execute(Event& event)
         return false;
     }
 
-    if (bot->CalculateTalentsPoints() <= 0)
+    // [roster 2026-10-16] 站长的点名专精要覆盖"已存在的 bot"：这种 bot 天赋点早就花完
+    // （CalculateTalentsPoints()==0），光靠下面的门禁永远换不了专精。
+    // AutoSelectTalents() 里会先 CropTalents() 把与目标不符的点退回来，所以没有剩余点数也能换。
+    bool needRespec = false;
+    {
+        uint8 const cls = bot->getClass();
+        // [roster 2026-10-16 站长口径] 只有"本组合的点名持有者"才套点名专精；多出来的 bot 走随机
+        int32 const picked = sRandomPlayerbotMgr.IsRosterSpecHolder(bot)
+            ? sPlayerbotAIConfig.specPick[cls][bot->getRace()] : -1;
+        if (picked >= 0)
+        {
+            uint32 const stored = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
+            needRespec = (stored != uint32(picked + 1));
+        }
+    }
+
+    if (bot->CalculateTalentsPoints() <= 0 && !needRespec)
     {
         return false;
     }

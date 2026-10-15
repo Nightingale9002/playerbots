@@ -291,6 +291,44 @@ namespace ai
         bool inMovement;
     };
 
+    // [totem 2026-10-17] 恢复萨满「按队伍属性权重选图腾」：
+    //   对每名队员按角色/职业累加三类空气图腾收益分，取最高者决定空气图腾；
+    //   大地图腾仅在有近战收益时用力量（力量对猎人无收益 ⇒ 无近战用石肤）。
+    //   权重：近战DPS → windfury/strength；猎人 → grace；法系/治疗 → wrath；
+    //         敏捷近战(盗贼/德鲁伊/萨满) 额外加 grace。
+    //   平手时按 windfury > grace > wrath。
+    struct PartyTotemWeight
+    {
+        int windfury = 0;
+        int grace = 0;
+        int wrath = 0;
+        int strength = 0;
+    };
+
+    PartyTotemWeight GetPartyTotemWeight(PlayerbotAI* ai, Player* bot);
+
+    // which: 0 = windfury, 1 = grace of air, 2 = wrath of air
+    class AirTotemWeightTrigger : public Trigger
+    {
+    public:
+        AirTotemWeightTrigger(PlayerbotAI* ai, std::string name, int which) : Trigger(ai, name, 5), which(which) {}
+        virtual bool IsActive() override;
+
+    private:
+        int which;
+    };
+
+    // strength: true = 力量图腾(近战收益 > 0), false = 石肤图腾(无近战)
+    class EarthTotemWeightTrigger : public Trigger
+    {
+    public:
+        EarthTotemWeightTrigger(PlayerbotAI* ai, std::string name, bool strength) : Trigger(ai, name, 5), strength(strength) {}
+        virtual bool IsActive() override;
+
+    private:
+        bool strength;
+    };
+
     class WindShearInterruptSpellTrigger : public InterruptSpellTrigger
     {
     public:

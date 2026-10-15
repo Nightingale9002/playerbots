@@ -392,9 +392,11 @@ void DisciplinePriestStrategy::InitCombatTriggers(std::list<TriggerNode*>& trigg
 {
     PriestStrategy::InitCombatTriggers(triggers);
 
+    // [disc 2026-10-17] PS 改为预判式：触发/目标都走“预测承伤”驱动的专属 value，不再复用
+    //   "protect party member"（那是 BoP/Intervene 的“正在挨打才保护”语义）。
     triggers.push_back(new TriggerNode(
-        "protect party member",
-        NextAction::array(0, new NextAction("pain suppression on party", ACTION_EMERGENCY), NULL)));
+        "pain suppression",
+        NextAction::array(0, new NextAction("pain suppression on protectee", ACTION_EMERGENCY), NULL)));
 
     triggers.push_back(new TriggerNode(
         "party member critical health",

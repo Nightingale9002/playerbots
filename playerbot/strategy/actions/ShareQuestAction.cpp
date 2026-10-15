@@ -30,7 +30,7 @@ bool ShareQuestAction::Execute(Event& event)
             WorldPacket p;
             p << entry;
             bot->GetSession()->HandlePushQuestToParty(p);
-            ai->TellPlayer(requester, "Quest shared", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayer(requester,BOT_TEXT("Quest shared"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             return true;
         }
     }
@@ -97,7 +97,7 @@ bool AutoShareQuestAction::Execute(Event& event)
         WorldPacket p;
         p << logQuest;
         bot->GetSession()->HandlePushQuestToParty(p);
-        ai->TellPlayer(requester, "Quest shared", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester,BOT_TEXT("Quest shared"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         shared = true;
     }
 

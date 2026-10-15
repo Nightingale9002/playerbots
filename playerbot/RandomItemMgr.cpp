@@ -1,4 +1,4 @@
-
+﻿
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "RandomItemMgr.h"
@@ -14,6 +14,8 @@
 #include "Entities/ItemEnchantmentMgr.h"
 
 #include "strategy/values/SharedValueContext.h"
+
+
 
 char * strstri (const char* str1, const char* str2);
 
@@ -138,13 +140,24 @@ RandomItemMgr::RandomItemMgr()
 void RandomItemMgr::Init()
 {
     BuildItemInfoCache();
+    PlayerbotLogRss("  item: BuildItemInfoCache");
+    // [cap 2026-10-16] 上限表要在权重使用之前加载（达标降权，方案B）
+    LoadWeightCaps();
+    PlayerbotLogRss("  item: LoadWeightCaps");
     BuildEquipCache();
+    PlayerbotLogRss("  item: BuildEquipCache");
     BuildAmmoCache();
+    PlayerbotLogRss("  item: BuildAmmoCache");
     BuildPotionCache();
+    PlayerbotLogRss("  item: BuildPotionCache");
     BuildFoodCache();
+    PlayerbotLogRss("  item: BuildFoodCache");
     BuildTradeCache();
+    PlayerbotLogRss("  item: BuildTradeCache");
     LoadRandomEnchantments();
+    PlayerbotLogRss("  item: LoadRandomEnchantments");
     BuildRandomItemCache();
+    PlayerbotLogRss("  item: BuildRandomItemCache");
 #ifdef MANGOSBOT_TWO
     BuildGlyphCache();
 #endif
@@ -996,6 +1009,50 @@ void RandomItemMgr::BuildItemInfoCache()
         } while (result->NextRow());
     }
 
+    // [启动加速 2026-10-15] 先把 DB 里已有的 item_info 缓存读进来，只对**缺失项**重算。
+    // 原先每次启动都对全部物品（9 万条 × 32 专精）重算权重：在 2 核 1.87GB 的云端要几十分钟，
+    // 内存峰值也高（RSS 1.3GB）；改后第二次起启动只需几秒。
+    std::map<uint32, ItemInfoEntry*> cachedEntries;
+    if (auto cacheRes = CharacterDatabase.PQuery(
+            "SELECT id, quality, slot, source, sourceId, team, faction, factionRepRank, minLevel, "
+            "scale_1, scale_2, scale_3, scale_4, scale_5, scale_6, scale_7, scale_8, scale_9, scale_10, "
+            "scale_11, scale_12, scale_13, scale_14, scale_15, scale_16, scale_17, scale_18, scale_19, scale_20, "
+            "scale_21, scale_22, scale_23, scale_24, scale_25, scale_26, scale_27, scale_28, scale_29, scale_30, "
+            "scale_31, scale_32 FROM ai_playerbot_item_info_cache"))
+    {
+        do
+        {
+            Field* fields = cacheRes->Fetch();
+            ItemInfoEntry* entry = new ItemInfoEntry;
+            entry->itemId = fields[0].GetUInt32();
+            entry->quality = fields[1].GetUInt32();
+            entry->slot = fields[2].GetUInt32();
+            entry->source = fields[3].GetUInt32();
+            entry->sourceIds.push_back(fields[4].GetUInt32());
+            entry->team = fields[5].GetUInt32();
+            entry->repFaction = fields[6].GetUInt32();
+            entry->repRank = fields[7].GetUInt32();
+            entry->minLevel = fields[8].GetUInt32();
+
+            uint32 bestSpec = ITEM_SPEC_NONE;
+            uint32 bestWeight = 0;
+            for (uint32 i = 1; i <= MAX_STAT_SCALES; ++i)
+            {
+                uint32 const w = fields[8 + i].GetUInt32();
+                entry->weights[i] = w;
+                if (w > bestWeight)
+                {
+                    bestWeight = w;
+                    bestSpec = i;
+                }
+            }
+            entry->itemSpec = (ItemSpecType)bestSpec;
+
+            cachedEntries[entry->itemId] = entry;
+        } while (cacheRes->NextRow());
+    }
+
+    sLog.outString("Stat weights cache: %u entries loaded from ai_playerbot_item_info_cache", (uint32)cachedEntries.size());
     sLog.outString("Calculating stat weights for %d items...", sItemStorage.GetMaxEntry());
     BarGoLink bar(sItemStorage.GetMaxEntry());
 
@@ -1009,6 +1066,16 @@ void RandomItemMgr::BuildItemInfoCache()
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
         if (!proto)
             continue;
+
+        // [启动加速 2026-10-15] 该物品已有缓存 ⇒ 直接采用，既不重算也不重写 DB
+        {
+            std::map<uint32, ItemInfoEntry*>::iterator cached = cachedEntries.find(itemId);
+            if (cached != cachedEntries.end())
+            {
+                itemInfoCache[itemId] = cached->second;
+                continue;
+            }
+        }
 
         // skip non armor/weapon
         if (proto->Class != ITEM_CLASS_WEAPON &&
@@ -1493,7 +1560,7 @@ void RandomItemMgr::BuildItemInfoCache()
     delete dropMap;
 }
 
-uint32 RandomItemMgr::CalculateStatWeight(uint8 playerclass, uint8 spec, ItemPrototype const* proto, ItemSpecType& itSpec)
+uint32 RandomItemMgr::CalculateStatWeight(uint8 playerclass, uint8 spec, ItemPrototype const* proto, ItemSpecType& itSpec, Player* player)
 {
     uint32 specType = ITEM_SPEC_NONE;
     uint32 statWeight = 0;
@@ -2232,7 +2299,7 @@ uint32 RandomItemMgr::CalculateBestRandomEnchantId(uint8 playerclass, uint8 spec
     return bestId;
 }
 
-uint32 RandomItemMgr::CalculateEnchantWeight(uint8 playerclass, uint8 spec, uint32 enchantId)
+uint32 RandomItemMgr::CalculateEnchantWeight(uint8 playerclass, uint8 spec, uint32 enchantId, Player* player)
 {
     if (!enchantId)
         return 0;
@@ -2264,6 +2331,10 @@ uint32 RandomItemMgr::CalculateEnchantWeight(uint8 playerclass, uint8 spec, uint
 
             if (!spellInfo)
                 continue;
+
+            // [gem 2026-10-16] 攻强宝石的附魔里同时有"近战攻强/远程攻强"两条同样数值的光环，
+            // 只算一次，否则 +16AP 会被当成 +32AP，权重翻倍。
+            bool apCounted = false;
 
             for (uint32 j = 0; j < MAX_EFFECT_INDEX; ++j)
             {
@@ -2353,6 +2424,20 @@ uint32 RandomItemMgr::CalculateEnchantWeight(uint8 playerclass, uint8 spec, uint
                 {
                     weight += CalculateSingleStatWeight(playerclass, spec, "splheal", spellInfo->EffectBasePoints[j] + 1);
                 }
+                // [gem 2026-10-16] TBC 的"攻强/远程攻强/回蓝"宝石也是 EQUIP_SPELL 型附魔，
+                // 原来这两类光环没处理 ⇒ 攻强宝石(如 Bright Living Ruby +16AP)、mp5 宝石权重恒为 0，
+                // 物理职业和治疗的宝石只能靠力量/敏捷/int 凑，选出来的宝石与专精不符。
+                if (!apCounted &&
+                    (spellInfo->EffectApplyAuraName[j] == SPELL_AURA_MOD_ATTACK_POWER ||
+                     spellInfo->EffectApplyAuraName[j] == SPELL_AURA_MOD_RANGED_ATTACK_POWER))
+                {
+                    apCounted = true;
+                    weight += CalculateSingleStatWeight(playerclass, spec, "atkpwr", spellInfo->EffectBasePoints[j] + 1);
+                }
+                if (spellInfo->EffectApplyAuraName[j] == SPELL_AURA_MOD_POWER_REGEN)
+                {
+                    weight += CalculateSingleStatWeight(playerclass, spec, "manargn", spellInfo->EffectBasePoints[j] + 1);
+                }
 #endif
 
 
@@ -2419,7 +2504,7 @@ uint32 RandomItemMgr::CalculateGemWeight(uint8 playerclass, uint8 spec, uint32 g
 #endif
 }
 
-uint32 RandomItemMgr::CalculateSocketWeight(uint8 playerclass, ItemQualifier& qualifier, uint8 spec)
+uint32 RandomItemMgr::CalculateSocketWeight(uint8 playerclass, ItemQualifier& qualifier, uint8 spec, Player* player)
 {
 #ifdef MANGOSBOT_ZERO
     return 0;
@@ -2480,6 +2565,7 @@ uint32 RandomItemMgr::CalculateSocketWeight(uint8 playerclass, ItemQualifier& qu
 
 uint32 RandomItemMgr::ItemStatWeight(Player* player, ItemQualifier& qualifier)
 {
+    WeightPlayerScope const scope(player);      // [cap 2026-10-16] 达标降权上下文
     ItemSpecType itSpec;
     uint32 weight = CalculateStatWeight(player->getClass(), GetPlayerSpecId(player), qualifier.GetProto(), itSpec);
     if(qualifier.GetEnchantId())
@@ -2506,7 +2592,7 @@ uint32 RandomItemMgr::ItemStatWeight(Player* player, Item* item)
     return ItemStatWeight(player, itemQualifier);
 }
 
-uint32 RandomItemMgr::CalculateSingleStatWeight(uint8 playerclass, uint8 spec, std::string stat, uint32 value)
+uint32 RandomItemMgr::CalculateSingleStatWeight(uint8 playerclass, uint8 spec, std::string stat, uint32 value, Player* player)
 {
     uint32 statWeight = 0;
     for (std::vector<WeightScaleStat>::iterator i = m_weightScales[spec].stats.begin(); i != m_weightScales[spec].stats.end(); ++i)
@@ -2516,11 +2602,164 @@ uint32 RandomItemMgr::CalculateSingleStatWeight(uint8 playerclass, uint8 spec, s
             statWeight = i->weight * value;
             if (statWeight)
                 sLog.outDetail("stat: %s, val: %d, weight: %d, total: %d, class: %d, spec: %s", stat.c_str(), value, i->weight, statWeight, playerclass, m_weightScales[spec].info.name.c_str());
-            return statWeight;
+            break;
         }
     }
 
+    // [cap 2026-10-16] 站长口径（方案B）：上限型属性达标后降权（表在 ai_playerbot_weightscale_caps）
+    Player* const ctx = player ? player : m_weightPlayer;
+    if (statWeight && ctx)
+        statWeight = ApplyWeightCap(ctx, spec, stat, statWeight);
+
     return statWeight;
+}
+
+// [cap 2026-10-16] 属性名 -> 核心的战斗等级字段（用于判断"是否已达标"）
+static bool GetCombatRatingForStat(std::string const& stat, CombatRating& cr)
+{
+    if (stat == "hitrtng")             { cr = CR_HIT_MELEE;      return true; }
+    if (stat == "spellhitrtng")        { cr = CR_HIT_SPELL;      return true; }
+    if (stat == "exprtng")             { cr = CR_EXPERTISE;      return true; }
+    if (stat == "defrtng")             { cr = CR_DEFENSE_SKILL;  return true; }
+    if (stat == "dodgertng")           { cr = CR_DODGE;          return true; }
+    if (stat == "parryrtng")           { cr = CR_PARRY;          return true; }
+    if (stat == "blockrtng")           { cr = CR_BLOCK;          return true; }
+    if (stat == "critstrkrtng")        { cr = CR_CRIT_MELEE;     return true; }
+    if (stat == "spellcritstrkrtng")   { cr = CR_CRIT_SPELL;     return true; }
+    if (stat == "hastertng")           { cr = CR_HASTE_MELEE;    return true; }
+    if (stat == "spellhastertng")      { cr = CR_HASTE_SPELL;    return true; }
+    // 韧性等级：本核心把 ITEM_MOD_RESILIENCE_RATING(35) 记在 CR_CRIT_TAKEN_* 上（见 Player::_ApplyItemMods）
+    if (stat == "resirtng")            { cr = CR_CRIT_TAKEN_MELEE; return true; }
+    // 破甲等级(TBC 的 ITEM_MOD 44)在本核心没有对应的 CombatRating 枚举（只有 WotLK 才有
+    // CR_ARMOR_PENETRATION），所以破甲不做"达标降权"，直接返回 false。
+    return false;
+}
+
+// [cap 2026-10-16] 四维 = 未命中 + 闪避 + 招架 + 格挡（单位：万分之一，10240 = 102.4%）
+// 站长口径：
+//   * 防骑（spec 5）：未命中 = 5% + (防御技能 - 365) × 0.04%；格挡按"开神盾后"计（Holy Shield +30%）
+//   * 其它：未命中 = 5% + (防御技能 - 350) × 0.04%
+//   防御技能 = 防御等级 / 2.4 + 350（1 防御技能 = 2.4 防御等级，站长给的 2.37 取核心值 2.4）
+uint32 RandomItemMgr::GetAvoidanceBasisPoints(Player* player, uint32 spec)
+{
+    if (!player)
+        return 0;
+
+    uint32 const defRating = player->GetUInt32Value(static_cast<uint16>(PLAYER_FIELD_COMBAT_RATING_1) + static_cast<uint16>(CR_DEFENSE_SKILL));
+    float const defSkill = 350.0f + defRating / 2.4f;
+
+    float const baseSkill = (spec == 5) ? 365.0f : 350.0f;
+    float const miss = 5.0f + std::max(0.0f, defSkill - baseSkill) * 0.04f;
+    float const dodge = player->GetRatingBonusValue(CR_DODGE);
+    float const parry = player->GetRatingBonusValue(CR_PARRY);
+    float block = player->GetRatingBonusValue(CR_BLOCK);
+    if (spec == 5)
+        block += 30.0f;                 // Holy Shield：防骑按"开神盾后格挡"算免碾
+
+    float const total = miss + dodge + parry + block;
+    if (total <= 0.0f)
+        return 0;
+
+    return uint32(total * 100.0f);      // % -> 万分之一
+}
+
+// [cap 2026-10-16] 若该 (专精,属性) 有上限记录且角色当前等级值已达标，就用记录里的"达标后权重"
+uint32 RandomItemMgr::ApplyWeightCap(Player* player, uint32 spec, std::string const& stat, uint32 precapWeight)
+{
+    if (!player || m_weightCaps.empty())
+        return precapWeight;
+
+    auto itr = m_weightCaps.find(std::make_pair(spec, stat));
+    if (itr == m_weightCaps.end())
+        return precapWeight;
+
+    // 读一个属性的当前值：普通属性读战斗等级；armor 读护甲值
+    auto valueOf = [player](std::string const& name, uint32& out) -> bool
+    {
+        if (name == "armor")
+        {
+            int32 const armor = player->GetArmor();
+            out = armor > 0 ? uint32(armor) : 0;
+            return true;
+        }
+        CombatRating cr;
+        if (!GetCombatRatingForStat(name, cr))
+            return false;
+        out = player->GetUInt32Value(static_cast<uint16>(PLAYER_FIELD_COMBAT_RATING_1) + static_cast<uint16>(cr));
+        return true;
+    };
+
+    // ① 该属性自己的上限（可用 altField 备选途径达标，取"或"）
+    if (itr->second.cap)
+    {
+        uint32 current = 0;
+        bool const haveCurrent = valueOf(stat, current);
+
+        // 二级硬上限（如防战精准 56）：到顶后收益归零，优先判断
+        if (haveCurrent && itr->second.cap2 && current >= itr->second.cap2)
+            return itr->second.capped2;
+
+        if (haveCurrent && current >= itr->second.cap)
+            return itr->second.capped;
+
+        if (!itr->second.altField.empty() && itr->second.altCap)
+        {
+            uint32 alt = 0;
+            if (valueOf(itr->second.altField, alt) && alt >= itr->second.altCap)
+                return itr->second.capped;
+        }
+
+        return precapWeight;
+    }
+
+    // ② cap == 0：该属性由"四维"统一门控（闪避/招架/格挡）——四维达标后一起降权
+    auto avoid = m_weightCaps.find(std::make_pair(spec, std::string("avoid4")));
+    if (avoid != m_weightCaps.end() && avoid->second.cap &&
+        GetAvoidanceBasisPoints(player, spec) >= avoid->second.cap)
+        return itr->second.capped;
+
+    return precapWeight;
+}
+
+// [cap 2026-10-16] 上限表：ai_playerbot_weightscale_caps(id=专精, field=属性名, cap=达标等级值,
+//   capped=达标后权重, alt_field/alt_cap=备选达标途径[可为空])
+void RandomItemMgr::LoadWeightCaps()
+{
+    m_weightCaps.clear();
+
+    auto results = WorldDatabase.PQuery("select id, field, cap, capped, alt_field, alt_cap, cap2, capped2 from ai_playerbot_weightscale_caps");
+    if (!results)
+    {
+        sLog.outString("No weight caps table (ai_playerbot_weightscale_caps) - cap-aware weighting off");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = results->Fetch();
+        uint32 id = fields[0].GetUInt32();
+        std::string field = fields[1].GetString();
+        WeightCap cap;
+        cap.cap = fields[2].GetUInt32();
+        cap.capped = fields[3].GetUInt32();
+        cap.altField = fields[4].GetString();
+        cap.altCap = fields[5].GetUInt32();
+        cap.cap2 = fields[6].GetUInt32();
+        cap.capped2 = fields[7].GetUInt32();
+        m_weightCaps[std::make_pair(id, field)] = cap;
+        count++;
+    } while (results->NextRow());
+
+    sLog.outString("Loaded %u weight caps (cap-aware weighting)", count);
+}
+
+bool RandomItemMgr::HasWeightCaps(uint32 spec)
+{
+    for (auto const& itr : m_weightCaps)
+        if (itr.first.first == spec)
+            return true;
+    return false;
 }
 
 bool CheckItemSpec(uint8 spec, ItemSpecType itSpec)
@@ -2720,6 +2959,16 @@ uint32 RandomItemMgr::GetPlayerSpecId(Player* player)
         if (itr.second.info.name == specName && itr.second.info.classId == player->getClass())
             return itr.second.info.id;
     }
+    return 0;
+}
+
+// [gear 2026-10-16] 兜底：本职业已定义的第一个专精 id（GetPlayerSpecId 判不出专精时用，
+// 避免 InitEquipment() 直接 return 导致"装备插槽全空"）
+uint32 RandomItemMgr::GetDefaultSpecIdForClass(uint8 cls)
+{
+    for (auto const& itr : m_weightScales)
+        if (itr.second.info.id && itr.second.info.classId == cls)
+            return itr.second.info.id;
     return 0;
 }
 
@@ -3171,6 +3420,8 @@ uint32 RandomItemMgr::GetLiveStatWeight(Player* player, uint32 itemId, uint32 sp
     if (!itemInfoCache[itemId])
         return 0;
 
+    WeightPlayerScope const scope(player);      // [cap 2026-10-16] 达标降权上下文
+
     uint32 statWeight = 0;
     specId = specId ? specId : GetPlayerSpecId(player);
     if (specId == 0)
@@ -3184,6 +3435,21 @@ uint32 RandomItemMgr::GetLiveStatWeight(Player* player, uint32 itemId, uint32 sp
         return 0;
 
     statWeight = info->weights[specId];
+
+    // [cap 2026-10-16] 站长口径（方案B：表 + 代码达标降权）：
+    // 命中/精准/防御这类"上限型"属性的价值随角色当前等级值变化，
+    // 而 info->weights[] 是启动时算好的、与角色无关的缓存 ⇒ 有上限记录的专精改用现场计算。
+    if (HasWeightCaps(specId))
+    {
+        ItemPrototype const* capProto = sObjectMgr.GetItemPrototype(itemId);
+        if (capProto)
+        {
+            ItemSpecType capSpec = ITEM_SPEC_NONE;
+            uint32 const liveWeight = CalculateStatWeight(player->getClass(), specId, capProto, capSpec, player);
+            if (liveWeight)
+                statWeight = liveWeight;
+        }
+    }
 
     // skip higher lvl
     if (info->minLevel > player->GetLevel())
@@ -3506,31 +3772,83 @@ RandomItemList RandomItemMgr::Query(uint32 level, uint8 clazz, uint8 spec, uint8
     BotEquipKey key(level, clazz, spec, slot, quality);
     RandomItemList items = equipCache[key];
 
-    // [按阶段生成 2026-10-15] 满级机器人"随机生成"装备时，只取**默认阶段** ilvl 区间内的候选。
-    // 否则候选取的是历史上所有史诗装 —— 实测出现过 T2/T3（ilvl 76/85）与 S4（ilvl 159）混穿。
-    // 默认阶段 = AiPlayerbot.GearProgressionSystem.DefaultPhase（0 = 团本前，站长口径 ilvl 100-115）。
-    // 只对满级生效：低级机器人的等级与阶段 ilvl 区间不匹配，保持原行为。
+    // [按阶段生成 2026-10-15 / 站长口径] 满级机器人"随机生成"装备时的取件规则：
+    //   ① 物品的**要求等级 ≥ 68**（否则会出现 ilvl 52-63 的旧世界装混入）
+    //   ② 品质只允许**蓝装(3) / 紫装(4)**（模块按品质取件，低品质在高级区间几乎没候选）
+    //   ③ **硬上限 ilvl ≤ 默认阶段(野外=前团本)的上限**：这条是"野外只穿前团本"的唯一保证，
+    //      区间内优先；区间内没有 ⇒ 放宽到"≤ 上限"的任何合格物品（仍然不许 T5/T6 混进来）
+    //      还没有 ⇒ 跨品质合并同一 (等级,职业,专精,部位) 再按规则筛
+    // 只对满级生效：低级机器人的等级与阶段区间不匹配，保持原行为。
     if (level >= DEFAULT_MAX_LEVEL)
     {
         uint8 const phase = sPlayerbotAIConfig.gearProgressionDefaultPhase;
+        uint32 minIlvl = 0;
+        uint32 maxIlvl = 9999999;
         if (phase < MAX_GEAR_PROGRESSION_LEVEL)
         {
-            uint32 const minIlvl = sPlayerbotAIConfig.gearProgressionSystemItemLevels[phase][0];
-            uint32 const maxIlvl = sPlayerbotAIConfig.gearProgressionSystemItemLevels[phase][1];
-            if (minIlvl > 0 || maxIlvl < 9999999)
+            minIlvl = sPlayerbotAIConfig.gearProgressionSystemItemLevels[phase][0];
+            maxIlvl = sPlayerbotAIConfig.gearProgressionSystemItemLevels[phase][1];
+        }
+
+        RandomItemList inBand, qualified;
+        for (RandomItemList::const_iterator itr = items.begin(); itr != items.end(); ++itr)
+        {
+            ItemPrototype const* proto = sObjectMgr.GetItemPrototype(*itr);
+            if (!proto)
+                continue;
+
+            if (proto->RequiredLevel < 68)
+                continue;
+
+            if (proto->Quality != ITEM_QUALITY_RARE && proto->Quality != ITEM_QUALITY_EPIC)
+                continue;
+
+            // [gear 2026-10-16] 硬上限：野外(默认阶段)不允许高于阶段上限的装备
+            if (proto->ItemLevel > maxIlvl)
+                continue;
+
+            qualified.push_back(*itr);
+
+            if (proto->ItemLevel >= minIlvl)
+                inBand.push_back(*itr);
+        }
+
+        if (!inBand.empty())
+        {
+            items.swap(inBand);
+        }
+        else if (!qualified.empty())
+        {
+            items.swap(qualified);
+        }
+        else
+        {
+            // 该品质没有合格候选 ⇒ 跨品质合并同一 (等级,职业,专精,部位) 再按规则筛
+            RandomItemList crossQuality;
+            for (BotEquipCache::const_iterator q = equipCache.begin(); q != equipCache.end(); ++q)
             {
-                RandomItemList filtered;
-                for (RandomItemList::const_iterator itr = items.begin(); itr != items.end(); ++itr)
+                if (q->first.level != level || q->first.clazz != clazz || q->first.spec != spec || q->first.slot != slot)
+                    continue;
+
+                for (RandomItemList::const_iterator itr = q->second.begin(); itr != q->second.end(); ++itr)
                 {
                     ItemPrototype const* proto = sObjectMgr.GetItemPrototype(*itr);
-                    if (proto && proto->ItemLevel >= minIlvl && proto->ItemLevel < maxIlvl)
-                        filtered.push_back(*itr);
-                }
+                    if (!proto || proto->RequiredLevel < 68)
+                        continue;
 
-                // 过滤后为空则回退原始候选，避免"无装可穿"
-                if (!filtered.empty())
-                    items.swap(filtered);
+                    if (proto->Quality != ITEM_QUALITY_RARE && proto->Quality != ITEM_QUALITY_EPIC)
+                        continue;
+
+                    // [gear 2026-10-16] 同样受阶段上限约束
+                    if (proto->ItemLevel > maxIlvl)
+                        continue;
+
+                    crossQuality.push_back(*itr);
+                }
             }
+
+            if (!crossQuality.empty())
+                items.swap(crossQuality);
         }
     }
 

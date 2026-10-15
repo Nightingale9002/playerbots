@@ -187,6 +187,7 @@ namespace ai
                 creators["shadowform"] = [](PlayerbotAI* ai) { return new ShadowformTrigger(ai); };
                 creators["power infusion"] = [](PlayerbotAI* ai) { return new PowerInfusionTrigger(ai); };
                 creators["inner focus"] = [](PlayerbotAI* ai) { return new InnerFocusTrigger(ai); };
+                creators["pain suppression"] = [](PlayerbotAI* ai) { return new PainSuppressionTrigger(ai); };
                 creators["shadow protection"] = [](PlayerbotAI* ai) { return new ShadowProtectionTrigger(ai); };
                 creators["shadow protection on party"] = [](PlayerbotAI* ai) { return new ShadowProtectionOnPartyTrigger(ai); };
                 creators["prayer of shadow protection on party"] = [](PlayerbotAI* ai) { return new PrayerOfShadowProtectionOnPartyTrigger(ai); };
@@ -289,6 +290,7 @@ namespace ai
                 creators["mass dispel"] = [](PlayerbotAI* ai) { return new CastMassDispelAction(ai); };
                 creators["pain suppression"] = [](PlayerbotAI* ai) { return new CastPainSuppressionAction(ai); };
                 creators["pain suppression on party"] = [](PlayerbotAI* ai) { return new CastPainSuppressionProtectAction(ai); };
+                creators["pain suppression on protectee"] = [](PlayerbotAI* ai) { return new CastPainSuppressionOnProtecteeAction(ai); };
                 creators["prayer of mending"] = [](PlayerbotAI* ai) { return new CastPrayerOfMendingAction(ai); };
                 creators["binding heal"] = [](PlayerbotAI* ai) { return new CastBindingHealAction(ai); };
                 creators["holy fire"] = [](PlayerbotAI* ai) { return new CastHolyFireAction(ai); };

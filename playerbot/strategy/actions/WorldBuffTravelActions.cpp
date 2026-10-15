@@ -325,7 +325,7 @@ bool WorldBuffTravelApplyAction::TrySummonFarAwayMembers(WorldBuffTravelStep ste
     {
         if (SummonPlayerToSummoner(bot, toSummon, ai))
         {
-            ai->TellPlayer(GetMaster(), "Summoning " + std::string(toSummon->GetName()) + " to the group!");
+            ai->TellPlayer(GetMaster(), BOT_TEXT2("Summoning %summonName to the group!", (std::map<std::string, std::string>{ {"%summonName", std::string(toSummon->GetName())} })));
 
             // Sync the summoned member's step to the warlock's step
             PlayerbotAI* memberAI = toSummon->GetPlayerbotAI();
@@ -363,82 +363,82 @@ void WorldBuffTravelApplyAction::ApplyBuffsForStep(WorldBuffTravelStep step)
     {
     case WorldBuffTravelStep::STEP_STORMWIND:
         ApplyBuffToSelfAndRealPlayers(SPELL_RALLYING_CRY);
-        ai->TellPlayer(GetMaster(), "Gained Rallying Cry of the Dragonslayer!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Gained Rallying Cry of the Dragonslayer!"));
         break;
     case WorldBuffTravelStep::STEP_GRYPHON_MASTER:
         // Alliance only
         if (!TakeFlightFromMaster(NPC_DUNGAR_LONGDRINK, TAXI_NODE_BOOTY_BAY))
         {
-            ai->TellPlayer(GetMaster(), "Failed to take flight from Dungar Longdrink.");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Failed to take flight from Dungar Longdrink."));
             return;
         }
-        ai->TellPlayer(GetMaster(), "Taking flight to Booty Bay!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Taking flight to Booty Bay!"));
         break;
     case WorldBuffTravelStep::STEP_BOOTY_BAY:
         ApplyBuffToSelfAndRealPlayers(SPELL_SPIRIT_OF_ZANDALAR);
-        ai->TellPlayer(GetMaster(), "Gained Spirit of Zandalar!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Gained Spirit of Zandalar!"));
         break;
     case WorldBuffTravelStep::STEP_BRAGOK:
         if (horde)
         {
             if (!TakeFlightFromMaster(NPC_BRAGOK, TAXI_NODE_CAMP_MOJACHE))
             {
-                ai->TellPlayer(GetMaster(), "Failed to take flight from Bragok.");
+                ai->TellPlayer(GetMaster(), BOT_TEXT("Failed to take flight from Bragok."));
                 return;
             }
-            ai->TellPlayer(GetMaster(), "Taking flight to Camp Mojache!");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Taking flight to Camp Mojache!"));
         }
         else
         {
             if (!TakeFlightFromMaster(NPC_BRAGOK, TAXI_NODE_THALANAAR))
             {
-                ai->TellPlayer(GetMaster(), "Failed to take flight from Bragok.");
+                ai->TellPlayer(GetMaster(), BOT_TEXT("Failed to take flight from Bragok."));
                 return;
             }
-            ai->TellPlayer(GetMaster(), "Taking flight to Thalanaar!");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Taking flight to Thalanaar!"));
         }
         break;
     case WorldBuffTravelStep::STEP_THYSSIANA:
         if (horde)
         {
             // Horde only
-            ai->TellPlayer(GetMaster(), "Arrived at Shyn in Camp Mojache. Heading to Dire Maul...");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Arrived at Shyn in Camp Mojache. Heading to Dire Maul..."));
         }
         else
         {
             if (!TakeFlightFromMaster(NPC_THYSSIANA, TAXI_NODE_FEATHERMOON))
             {
-                ai->TellPlayer(GetMaster(), "Failed to take flight from Thyssiana.");
+                ai->TellPlayer(GetMaster(), BOT_TEXT("Failed to take flight from Thyssiana."));
                 return;
             }
-            ai->TellPlayer(GetMaster(), "Taking flight to Feathermoon Stronghold!");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Taking flight to Feathermoon Stronghold!"));
         }
         break;
     case WorldBuffTravelStep::STEP_FEATHERMOON:
         // Alliance only
-        ai->TellPlayer(GetMaster(), "Arrived at Feathermoon Stronghold. Heading to Feralas mainland...");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Arrived at Feathermoon Stronghold. Heading to Feralas mainland..."));
         break;
     case WorldBuffTravelStep::STEP_FORGOTTEN_COAST:
         if (horde)
-            ai->TellPlayer(GetMaster(), "Reached Dire Maul in Feralas. Heading to Dire Maul North...");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Reached Dire Maul in Feralas. Heading to Dire Maul North..."));
         else
-            ai->TellPlayer(GetMaster(), "Reached Feralas mainland. Heading to Dire Maul...");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Reached Feralas mainland. Heading to Dire Maul..."));
         break;
     case WorldBuffTravelStep::STEP_DM_TRAVEL:
         ApplyBuffToSelfAndRealPlayers(SPELL_DM_TRIBUTE_FENGUS);
         ApplyBuffToSelfAndRealPlayers(SPELL_DM_TRIBUTE_SLIPKIK);
         ApplyBuffToSelfAndRealPlayers(SPELL_DM_TRIBUTE_GORDOK);
-        ai->TellPlayer(GetMaster(), "Entered Dire Maul North. Gained all Dire Maul Tribute buffs!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Entered Dire Maul North. Gained all Dire Maul Tribute buffs!"));
         break;
     case WorldBuffTravelStep::STEP_FELWOOD:
     {
         const char* npcName = horde ? "Brakkar" : "Mishellena";
-        ai->TellPlayer(GetMaster(), std::string("Arrived at ") + npcName + ". Searching for a Songflower...");
+        ai->TellPlayer(GetMaster(), BOT_TEXT2("Arrived at %npcName. Searching for a Songflower...", (std::map<std::string, std::string>{ {"%npcName", npcName} })));
         break;
     }
     case WorldBuffTravelStep::STEP_SONGFLOWER:
         ApplyBuffToSelfAndRealPlayers(SPELL_SONGFLOWER);
-        ai->TellPlayer(GetMaster(), "Gained Songflower Serenade!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Gained Songflower Serenade!"));
         break;
     default:
         break;
@@ -465,7 +465,7 @@ void WorldBuffTravelApplyAction::AdvanceStep()
     WorldBuffTravelStep nextNeeded = GetFirstNeededStep(bot);
     if (static_cast<uint8>(nextNeeded) > step)
     {
-        ai->TellPlayer(GetMaster(), "Already have upcoming buffs, skipping ahead...");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Already have upcoming buffs, skipping ahead..."));
         step = static_cast<uint8>(nextNeeded);
     }
 
@@ -497,7 +497,7 @@ bool WorldBuffTravelApplyAction::Execute(Event& event)
 
     if (TrySummonFarAwayMembers(step))
     {
-        ai->TellPlayer(GetMaster(), "Waiting for summoned members to arrive before applying buffs...");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Waiting for summoned members to arrive before applying buffs..."));
         return true;
     }
 
@@ -526,11 +526,11 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
             GameObjectData const* goData = sObjectMgr.GetGOData(GO_DM_NORTH_DOOR_GUID);
             if (!goData)
             {
-                ai->TellPlayer(GetMaster(), "Cannot find Dire Maul North door spawn data");
+                ai->TellPlayer(GetMaster(), BOT_TEXT("Cannot find Dire Maul North door spawn data"));
                 return false;
             }
 
-            ai->TellPlayer(GetMaster(), "Regrouping at Dire Maul North for portal...");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Regrouping at Dire Maul North for portal..."));
             return MoveTo(goData->mapid, goData->posX, goData->posY, goData->posZ);
         }
 
@@ -544,12 +544,12 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
             const GameObjectData* goData = FindClosestSongflowerSpawn(bot);
             if (!goData)
             {
-                ai->TellPlayer(GetMaster(), "Cannot find any Songflower spawn to regroup at");
+                ai->TellPlayer(GetMaster(), BOT_TEXT("Cannot find any Songflower spawn to regroup at"));
                 return false;
             }
 
             const char* portalName = GetHomePortalKeyword(bot);
-            ai->TellPlayer(GetMaster(), std::string("Regrouping at Songflower waiting for Portal: ") + portalName + "...");
+            ai->TellPlayer(GetMaster(), BOT_TEXT2("Regrouping at Songflower waiting for Portal: %portalName...", (std::map<std::string, std::string>{ {"%portalName", portalName} })));
             return MoveTo(goData->mapid, goData->posX, goData->posY, goData->posZ);
         }
 
@@ -568,11 +568,11 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
         GameObjectData const* goData = sObjectMgr.GetGOData(GO_DM_NORTH_DOOR_GUID);
         if (!goData)
         {
-            ai->TellPlayer(GetMaster(), "Cannot find Dire Maul North door spawn data");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Cannot find Dire Maul North door spawn data"));
             return false;
         }
 
-        ai->TellPlayer(GetMaster(), "Traveling to Dire Maul North for world buffs");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Traveling to Dire Maul North for world buffs"));
         return MoveTo(goData->mapid, goData->posX, goData->posY, goData->posZ);
     }
 
@@ -581,11 +581,11 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
         const GameObjectData* goData = FindClosestSongflowerSpawn(bot);
         if (!goData)
         {
-            ai->TellPlayer(GetMaster(), "Cannot find any Songflower spawn data");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Cannot find any Songflower spawn data"));
             return false;
         }
 
-        ai->TellPlayer(GetMaster(), "Traveling to nearest Songflower for world buffs");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Traveling to nearest Songflower for world buffs"));
         return MoveTo(goData->mapid, goData->posX, goData->posY, goData->posZ);
     }
 
@@ -630,11 +630,11 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
 
         if (!finder.best)
         {
-            ai->TellPlayer(GetMaster(), "Cannot find Bonfire spawn data in Feralas");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("Cannot find Bonfire spawn data in Feralas"));
             return false;
         }
 
-        ai->TellPlayer(GetMaster(), "Traveling to the Dire Maul in Feralas");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Traveling to the Dire Maul in Feralas"));
         return MoveTo(finder.best->mapid, finder.best->posX, finder.best->posY, finder.best->posZ);
     }
 
@@ -651,12 +651,12 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
             GameObjectData const* goData = sObjectMgr.GetGOData(GO_DM_NORTH_DOOR_GUID);
             if (!goData)
             {
-                ai->TellPlayer(GetMaster(), "Cannot find Dire Maul North door");
+                ai->TellPlayer(GetMaster(), BOT_TEXT("Cannot find Dire Maul North door"));
                 return false;
             }
 
             const char* portalName = horde ? "Orgrimmar" : "Darnassus";
-            ai->TellPlayer(GetMaster(), std::string("Regrouping at Dire Maul North before portal to ") + portalName + "...");
+            ai->TellPlayer(GetMaster(), BOT_TEXT2("Regrouping at Dire Maul North before portal to %portalName...", (std::map<std::string, std::string>{ {"%portalName", portalName} })));
             return MoveTo(goData->mapid, goData->posX, goData->posY, goData->posZ);
         }
     }
@@ -671,7 +671,7 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
 
     if (dests.empty())
     {
-        ai->TellPlayer(GetMaster(), std::string("Cannot find travel destination for ") + name);
+        ai->TellPlayer(GetMaster(), BOT_TEXT2("Cannot find travel destination for %name", (std::map<std::string, std::string>{ {"%name", name} })));
         return false;
     }
 
@@ -692,13 +692,13 @@ bool WorldBuffTravelSetTargetAction::Execute(Event& event)
     RESET_AI_VALUE(ObjectGuid, "attack target");
     RESET_AI_VALUE(bool, "travel target active");
 
-    ai->TellPlayer(GetMaster(), std::string("Traveling to ") + name + " for world buffs");
+    ai->TellPlayer(GetMaster(), BOT_TEXT2("Traveling to %name for world buffs", (std::map<std::string, std::string>{ {"%name", name} })));
     return true;
 }
 
 bool WorldBuffTravelDMBuffedAction::Execute(Event& event)
 {
-    ai->TellPlayer(GetMaster(), "Got all DM Tribute buffs! Leaving the instance...");
+    ai->TellPlayer(GetMaster(), BOT_TEXT("Got all DM Tribute buffs! Leaving the instance..."));
     context->GetValue<uint8>("world buff travel step")->Set(
         static_cast<uint8>(WorldBuffTravelStep::STEP_DM_EXIT));
     return true;
@@ -707,7 +707,7 @@ bool WorldBuffTravelDMBuffedAction::Execute(Event& event)
 bool WorldBuffTravelDMExitedAction::Execute(Event& event)
 {
     const char* portalName = IsHordeFaction(bot) ? "Orgrimmar" : "Darnassus";
-    ai->TellPlayer(GetMaster(), std::string("Exited Dire Maul. Waiting for Portal: ") + portalName + "...");
+    ai->TellPlayer(GetMaster(), BOT_TEXT2("Exited Dire Maul. Waiting for Portal: %portalName...", (std::map<std::string, std::string>{ {"%portalName", portalName} })));
     context->GetValue<uint8>("world buff travel step")->Set(
         static_cast<uint8>(WorldBuffTravelStep::STEP_DM_PORTAL));
     return true;
@@ -729,7 +729,7 @@ bool WorldBuffTravelDMCastPortalAction::Execute(Event& event)
     std::list<ObjectGuid> gos = AI_VALUE(std::list<ObjectGuid>, "nearest game objects no los");
     if (FindNearbyPortalGO(ai, bot, gos, keyword))
     {
-        ai->TellPlayer(GetMaster(), std::string("Portal to ") + keyword + " is already open!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT2("Portal to %keyword is already open!", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
         return true;
     }
 
@@ -741,11 +741,11 @@ bool WorldBuffTravelDMCastPortalAction::Execute(Event& event)
 
     if (ai->CastSpell(portalSpell, bot))
     {
-        ai->TellPlayer(GetMaster(), std::string("Casting Portal: ") + keyword + " for the group!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT2("Casting Portal: %keyword for the group!", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
         return true;
     }
 
-    ai->TellPlayer(GetMaster(), std::string("Cannot cast Portal: ") + keyword + " yet...");
+    ai->TellPlayer(GetMaster(), BOT_TEXT2("Cannot cast Portal: %keyword yet...", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
     return false;
 }
 
@@ -772,13 +772,13 @@ bool WorldBuffTravelDMTakePortalAction::Execute(Event& event)
         *packet << portalGO->GetObjectGuid();
         bot->GetSession()->QueuePacket(std::move(packet));
 
-        ai->TellPlayer(GetMaster(), std::string("Taking the portal to ") + keyword + "!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT2("Taking the portal to %keyword!", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
         context->GetValue<uint8>("world buff travel step")->Set(
             static_cast<uint8>(WorldBuffTravelStep::STEP_FELWOOD));
         return true;
     }
 
-    ai->TellPlayer(GetMaster(), std::string("Waiting for a mage to open Portal: ") + keyword + "...");
+    ai->TellPlayer(GetMaster(), BOT_TEXT2("Waiting for a mage to open Portal: %keyword...", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
     return false;
 }
 
@@ -798,7 +798,7 @@ bool WorldBuffTravelCastPortalAction::Execute(Event& event)
     std::list<ObjectGuid> gos = AI_VALUE(std::list<ObjectGuid>, "nearest game objects no los");
     if (FindNearbyPortalGO(ai, bot, gos, keyword))
     {
-        ai->TellPlayer(GetMaster(), std::string("Portal to ") + keyword + " is already open!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT2("Portal to %keyword is already open!", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
         return true;
     }
 
@@ -810,11 +810,11 @@ bool WorldBuffTravelCastPortalAction::Execute(Event& event)
 
     if (ai->CastSpell(portalSpell, bot))
     {
-        ai->TellPlayer(GetMaster(), std::string("Casting Portal: ") + keyword + " for the group!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT2("Casting Portal: %keyword for the group!", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
         return true;
     }
 
-    ai->TellPlayer(GetMaster(), std::string("Cannot cast Portal: ") + keyword + " yet...");
+    ai->TellPlayer(GetMaster(), BOT_TEXT2("Cannot cast Portal: %keyword yet...", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
     return false;
 }
 
@@ -841,13 +841,13 @@ bool WorldBuffTravelTakePortalAction::Execute(Event& event)
         *packet << portalGO->GetObjectGuid();
         bot->GetSession()->QueuePacket(std::move(packet));
 
-        ai->TellPlayer(GetMaster(), "Taking the portal home!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Taking the portal home!"));
         context->GetValue<uint8>("world buff travel step")->Set(
             static_cast<uint8>(WorldBuffTravelStep::STEP_DONE));
         return true;
     }
 
-    ai->TellPlayer(GetMaster(), std::string("Waiting for a mage to open Portal: ") + keyword + "...");
+    ai->TellPlayer(GetMaster(), BOT_TEXT2("Waiting for a mage to open Portal: %keyword...", (std::map<std::string, std::string>{ {"%keyword", keyword} })));
     return false;
 }
 
@@ -860,10 +860,10 @@ bool WorldBuffTravelFinishAction::Execute(Event& event)
     if (IsHordeFaction(bot) && !bot->HasAura(SPELL_WARCHIEFS_BLESSING))
     {
         PlayerbotAI::AddAura(bot, SPELL_WARCHIEFS_BLESSING);
-        ai->TellPlayer(GetMaster(), "Gained Warchief's Blessing!");
+        ai->TellPlayer(GetMaster(), BOT_TEXT("Gained Warchief's Blessing!"));
     }
 
-    ai->TellPlayer(GetMaster(), "World buff collection complete!");
+    ai->TellPlayer(GetMaster(), BOT_TEXT("World buff collection complete!"));
     ai->ChangeStrategy("-wbuff travel", BotState::BOT_STATE_NON_COMBAT);
     return true;
 }

@@ -1043,6 +1043,11 @@ void PriestBoostStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     BoostStrategy::InitCombatTriggers(triggers);
 
+    // [disc 2026-10-17] Power Infusion 是 TBC 戒律核心辅助（给法系/高蓝耗目标），此前 TBC 未挂载。
+    triggers.push_back(new TriggerNode(
+        "power infusion",
+        NextAction::array(0, new NextAction("power infusion", ACTION_HIGH), NULL)));
+
     triggers.push_back(new TriggerNode(
         "inner focus",
         NextAction::array(0, new NextAction("inner focus", ACTION_HIGH), NULL)));

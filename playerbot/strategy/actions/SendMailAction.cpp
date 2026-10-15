@@ -36,7 +36,7 @@ bool SendMailAction::Execute(Event& event)
     ItemIds ids = chat->parseItems(text);
     if (ids.size() > 1)
     {
-        bot->Whisper("You can not request more than one item", LANG_UNIVERSAL, tellTo->GetObjectGuid());
+        bot->Whisper(BOT_TEXT("You can not request more than one item"), LANG_UNIVERSAL, tellTo->GetObjectGuid());
         return false;
     }
 
@@ -48,7 +48,7 @@ bool SendMailAction::Execute(Event& event)
 
         if (randomBot)
         {
-            bot->Whisper("I cannot send money", LANG_UNIVERSAL, tellTo->GetObjectGuid());
+            bot->Whisper(BOT_TEXT("I cannot send money"), LANG_UNIVERSAL, tellTo->GetObjectGuid());
             return false;
         }
 

@@ -41,14 +41,14 @@ void ListQuestsAction::ListQuests(Player* requester, QuestListFilter filter, Que
     bool showCompleted = filter & QUEST_LIST_FILTER_COMPLETED;
 
     if (showIncompleted)
-        ai->TellPlayer(requester, "--- Incompleted quests ---");
+        ai->TellPlayer(requester,BOT_TEXT("--- Incompleted quests ---"));
     int incompleteCount = ListQuests(requester, false, !showIncompleted, travelDetail, onlyQuestIds);
 
     if (showCompleted)
-        ai->TellPlayer(requester, "--- Completed quests ---");
+        ai->TellPlayer(requester,BOT_TEXT("--- Completed quests ---"));
     int completeCount = ListQuests(requester, true, !showCompleted, travelDetail, onlyQuestIds);
 
-    ai->TellPlayer(requester, "--- Summary ---");
+    ai->TellPlayer(requester,BOT_TEXT("--- Summary ---"));
     std::ostringstream out;
     out << "Total: " << (completeCount + incompleteCount) << " / 25 (incompleted: " << incompleteCount << ", completed: " << completeCount << ")";
     ai->TellPlayer(requester, out);

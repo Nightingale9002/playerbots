@@ -183,4 +183,15 @@ namespace ai
     private:
         uint32 buffID;
     };
+
+    // [tank-pull 2026-10-18 站长口径] **坦克在副本/团本里自己开怪**：
+    //   坦克 + 没在战斗 + 手里没有目标 + 视野里有可拉的怪（"grind target" 非空）⇒ 自己去拉。
+    //   为什么单独一条：`attack anything` 原本只挂在 `grind` 策略（野外刷怪）下，
+    //   副本里 bot 带着 follow/其它策略时不一定有那条线 ⇒ 坦克就站着不开怪。
+    class DungeonTankPullTrigger : public Trigger
+    {
+    public:
+        DungeonTankPullTrigger(PlayerbotAI* ai) : Trigger(ai, "dungeon tank pull", 2) {}
+        bool IsActive() override;
+    };
 }

@@ -16,8 +16,216 @@
 #include "Entities/Vehicle.h"
 #endif
 #include "playerbot/strategy/generic/CombatStrategy.h"
+#include "Grids/GridNotifiers.h"
+#include "Grids/GridNotifiersImpl.h"
+#include "Grids/CellImpl.h"
+#include <mutex>
+#include <map>
+#include <vector>
+#include <utility>
 
 using namespace ai;
+
+namespace
+{
+    // [safe-move 2026-10-18 站长口径] "附近敌对单位"扫描结果的按 bot 缓存（默认 1 秒）。
+    //   只缓存 GUID+仇恨半径（不缓存 Unit*，避免单位在缓存期内销毁变成野指针）。
+    const time_t COMBAT_HOSTILE_CACHE_SECONDS = 1;
+    const size_t COMBAT_HOSTILE_CACHE_MAX_BOTS = 2048;
+
+    struct CombatHostileCacheEntry
+    {
+        time_t stamp = 0;
+        std::vector<std::pair<ObjectGuid, float> > units;
+    };
+
+    std::map<ObjectGuid, CombatHostileCacheEntry> s_combatHostileCache;
+    std::mutex s_combatHostileCacheMutex;
+
+    // 这个怪是不是"已经在打我们"（机器人本人或队友/队友的宠物）
+    bool IsHostileEngagedWithGroup(PlayerbotAI* ai, Unit* unit)
+    {
+        Player* bot = ai ? ai->GetBot() : nullptr;
+        if (!bot || !unit)
+            return false;
+
+        if (unit->getThreatManager().getThreat(bot) > 0.0f)
+            return true;
+
+        Unit* victim = unit->GetVictim();
+        if (!victim)
+            return false;
+
+        if (victim == bot)
+            return true;
+
+        Group* group = bot->GetGroup();
+        if (!group)
+            return false;
+
+        if (group->IsMember(victim->GetObjectGuid()))
+            return true;
+
+        // 队友的宠物/召唤物
+        if (Unit* owner = victim->GetOwner())
+        {
+            if (group->IsMember(owner->GetObjectGuid()))
+                return true;
+        }
+
+        return false;
+    }
+}
+
+std::vector<CombatHostileUnit> MovementAction::GetNearbyCombatHostiles(PlayerbotAI* ai, bool forceRescan)
+{
+    std::vector<CombatHostileUnit> result;
+
+    Player* bot = ai ? ai->GetBot() : nullptr;
+    if (!bot || !bot->IsInWorld())
+        return result;
+
+    const ObjectGuid botGuid = bot->GetObjectGuid();
+    const time_t now = time(0);
+
+    std::vector<std::pair<ObjectGuid, float> > cached;
+    bool cacheHit = false;
+
+    if (!forceRescan)
+    {
+        std::lock_guard<std::mutex> lock(s_combatHostileCacheMutex);
+
+        auto it = s_combatHostileCache.find(botGuid);
+        if (it != s_combatHostileCache.end() && (now - it->second.stamp) < COMBAT_HOSTILE_CACHE_SECONDS)
+        {
+            cached = it->second.units;   // 限流：1 秒内不再做全范围扫描
+            cacheHit = true;
+        }
+    }
+
+    if (!cacheHit)
+    {
+        // 扫一圈"附近"（sightDistance），只留下敌对可攻击的 NPC 怪（敌对玩家不走仇恨半径这套）
+        const float range = sPlayerbotAIConfig.sightDistance;
+
+        std::list<Unit*> units;
+        MaNGOS::AnyUnitInObjectRangeCheck u_check(bot, range);
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(units, u_check);
+        Cell::VisitAllObjects(bot, searcher, range);
+
+        for (Unit* unit : units)
+        {
+            if (!unit || unit == bot)
+                continue;
+
+            if (!unit->IsCreature())
+                continue;
+
+            if (!sServerFacade.IsAlive(unit))
+                continue;
+
+            if (!bot->CanAttack(unit))
+                continue;
+
+            if (unit->GetMapId() != bot->GetMapId() || unit->GetInstanceId() != bot->GetInstanceId())
+                continue;
+
+            cached.push_back(std::make_pair(unit->GetObjectGuid(), unit->GetAttackDistance(bot)));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(s_combatHostileCacheMutex);
+
+            if (s_combatHostileCache.size() > COMBAT_HOSTILE_CACHE_MAX_BOTS)
+            {
+                for (auto it = s_combatHostileCache.begin(); it != s_combatHostileCache.end(); )
+                    it = (now - it->second.stamp > 60) ? s_combatHostileCache.erase(it) : ++it;
+            }
+
+            CombatHostileCacheEntry entry;
+            entry.stamp = now;
+            entry.units = cached;
+            s_combatHostileCache[botGuid] = entry;
+        }
+    }
+
+    result.reserve(cached.size());
+    for (auto& hostile : cached)
+    {
+        Unit* unit = ai->GetUnit(hostile.first);
+        if (!unit)
+            continue;
+
+        CombatHostileUnit entry;
+        entry.unit = unit;
+        entry.aggroRadius = hostile.second;
+        result.push_back(entry);
+    }
+
+    return result;
+}
+
+bool MovementAction::IsCombatMovePointSafe(PlayerbotAI* ai, const std::vector<CombatHostileUnit>& hostiles,
+    const WorldPosition& point, float margin, Unit* ignoreUnit, Unit** outBlocker)
+{
+    if (outBlocker)
+        *outBlocker = nullptr;
+
+    if (!sPlayerbotAIConfig.combatMoveSafetyEnabled)
+        return true;
+
+    Player* bot = ai ? ai->GetBot() : nullptr;
+    if (!bot || !point)
+        return true;
+
+    // 跨图/无坐标的候选点不做判定（例如跨图传送），交给原有的路径检查
+    if (!point.getMapId() || point.getMapId() != bot->GetMapId())
+        return true;
+
+    const float aggroFloor = sPlayerbotAIConfig.aggroDistance;
+    const WorldPosition pointPosition(point);
+
+    for (const CombatHostileUnit& hostile : hostiles)
+    {
+        Unit* unit = hostile.unit;
+        if (!unit || unit == bot || unit == ignoreUnit)
+            continue;
+
+        if (unit->GetMapId() != bot->GetMapId() || unit->GetInstanceId() != bot->GetInstanceId())
+            continue;
+
+        float radius;
+        if (IsHostileEngagedWithGroup(ai, unit))
+        {
+            // 已经在打我们/我们队伍的怪：仇恨半径已无意义，只需不撞进它的近战范围
+            radius = ATTACK_DISTANCE + margin;
+        }
+        else
+        {
+            // 还没被引到的怪：仇恨半径（GetAttackDistance）与配置兜底值取大，再加余量
+            radius = std::max(hostile.aggroRadius, aggroFloor) + margin;
+        }
+
+        if (WorldPosition(unit).sqDistance(pointPosition) <= radius * radius)
+        {
+            if (outBlocker)
+                *outBlocker = unit;
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool MovementAction::IsCombatMovePointSafe(PlayerbotAI* ai, const WorldPosition& point,
+    float margin, Unit* ignoreUnit, Unit** outBlocker)
+{
+    if (!sPlayerbotAIConfig.combatMoveSafetyEnabled)
+        return true;
+
+    return IsCombatMovePointSafe(ai, GetNearbyCombatHostiles(ai), point, margin, ignoreUnit, outBlocker);
+}
 
 void MovementAction::CreateWp(Player* wpOwner, float x, float y, float z, float o, uint32 entry, bool important)
 {
@@ -59,6 +267,16 @@ bool MovementAction::MoveNear(WorldObject* target, float distance)
     distance += target->GetObjectBoundingRadius();
 #endif
 
+    // [safe-move 2026-10-18 站长口径] 战斗中"重新站位/接近队友"也走统一安全检查：
+    //   候选角度里跳过会踩进别的怪仇恨半径的点；一个都没有就返 false（原地，不硬跑）。
+    //   只在自身处于战斗时生效，避免影响野外正常漫游/拾取。
+    std::vector<CombatHostileUnit> hostiles;
+    const bool combatMoveSafety = sPlayerbotAIConfig.combatMoveSafetyEnabled && bot->IsInCombat();
+    if (combatMoveSafety)
+        hostiles = GetNearbyCombatHostiles(ai);
+
+    Unit* ignoreUnit = target->IsUnit() ? static_cast<Unit*>(target) : nullptr;
+
     float x = target->GetPositionX();
     float y = target->GetPositionY();
     float z = target->GetPositionZ();
@@ -76,6 +294,10 @@ bool MovementAction::MoveNear(WorldObject* target, float distance)
 #endif
         if (!bot->IsWithinLOS(x, y, z + bot->GetCollisionHeight(), true))
             continue;
+
+        if (combatMoveSafety && !IsCombatMovePointSafe(ai, hostiles, WorldPosition(target->GetMapId(), x, y, z), sPlayerbotAIConfig.combatMoveSafetyMargin, ignoreUnit))
+            continue;
+
         bool moved = MoveTo(target->GetMapId(), x, y, z);
         if (moved)
             return true;
@@ -497,7 +719,7 @@ bool MovementAction::UseTransport(PlayerbotAI* ai, uint32 entry, WorldPosition d
     }
 
     if (transportName.empty())
-        ai->TellDebug(ai->GetMaster(), "Waiting for transport on different map.", "debug move");
+        ai->TellDebug(ai->GetMaster(), BOT_TEXT("Waiting for transport on different map."), "debug move");
     else
         ai->TellDebug(ai->GetMaster(), "Waiting for transport " + std::string(transportName) + " at " + std::to_string((uint32)sqrt(minDist)) + "y from docking.", "debug move");
 
@@ -723,6 +945,20 @@ TravelPath MovementAction::ResolveMovePath(const WorldPosition& startPosition, c
         // No route. MovePoint ignores the map, and the navmesh pathfinder can't build a path this long, so the bot
         // would walk a straight line toward the destination's coordinates and height, through terrain and under the map.
         if (startPosition.getMapId() != endPosition.getMapId() || (!bot->InBattleGround() && sServerFacade.IsDistanceGreaterThan(totalDistance, sPlayerbotAIConfig.sightDistance * 3)))
+        {
+            if (mover == bot)
+                ai->StopMoving();
+            else
+                mover->InterruptMoving(true);
+
+            return outMovePath;
+        }
+
+        // [pull 2026-10-18 站长口径] 近距离没有路网路径时的"拉直线"只在能看见终点时才走：
+        //   终点在墙后 / 别的层时直接拉直线就是"无视路上的怪直接跑过去穿地形"（坦克追另一层的怪最明显）。
+        //   远距离（> sightDistance）没路时已经直接 StopMoving，这里补近距离这一段。
+        if (!bot->InBattleGround() && sServerFacade.IsDistanceGreaterThan(totalDistance, sPlayerbotAIConfig.sightDistance) &&
+            !startPosition.IsInLineOfSight(endPosition))
         {
             if (mover == bot)
                 ai->StopMoving();
@@ -1481,7 +1717,7 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
                         else
                             mover->InterruptMoving(true);
                         if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
-                            ai->TellPlayerNoFacing(GetMaster(), "I have no path");
+                            ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT("I have no path"));
                         return false;
                     }
 
@@ -1566,7 +1802,7 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
             lastMove.setPath(movePath);
 
             if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayerNoFacing(GetMaster(), "Too far from path. Rebuilding.");
+                ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT("Too far from path. Rebuilding."));
             return true;
         }
 
@@ -1899,7 +2135,7 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
         lastMove.setPath(movePath);
 
         if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
-            ai->TellPlayerNoFacing(GetMaster(), "No point. Rebuilding.");
+            ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT("No point. Rebuilding."));
 
         return false;
     }
@@ -1961,7 +2197,7 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
                         continue;
 
                     if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
-                        ai->TellPlayerNoFacing(GetMaster(), "Found " + chat->formatWorldobject(unit) + " stopping early.");
+                        ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT2("Found %object stopping early.", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
 
                     movePosition = point;
                     foundAggro = true;
@@ -1979,7 +2215,7 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
         lastMove.setPath(movePath);
 
         if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
-            ai->TellPlayerNoFacing(GetMaster(), "No point. Rebuilding.");
+            ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT("No point. Rebuilding."));
         return false;
     }
 
@@ -1988,7 +2224,7 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
         movePosition.setZ(movePosition.getHeight(true));
 
         if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
-            ai->TellPlayerNoFacing(GetMaster(), "Setting movePosition to water surface.");
+            ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT("Setting movePosition to water surface."));
     }
 
     //Visual waypoints
@@ -2895,6 +3131,9 @@ bool MovementAction::Flee(Unit *target)
         const float maxFleeDistance = isTarget ? 40.0f : ai->GetRange("spell") * 1.5;
         const float minRangedTargetDistance = ai->GetRange("spell") / 2 + ai->GetRange("follow");
 
+        // [safe-move 2026-10-18 站长口径] 逃跑点也要过"别引到旁边怪堆"的统一检查（当前目标不算，它已经引到了）
+        const std::vector<CombatHostileUnit> safeMoveHostiles = sPlayerbotAIConfig.combatMoveSafetyEnabled ? GetNearbyCombatHostiles(ai) : std::vector<CombatHostileUnit>();
+
         for (GroupReference* gref = group->GetFirstMember(); gref; gref = gref->next())
         {
             Player* groupMember = gref->getSource();
@@ -2906,6 +3145,11 @@ bool MovementAction::Flee(Unit *target)
             // Don't flee to group member if too close or too far
             float const distanceToGroupMember = sServerFacade.GetDistance2d(bot, groupMember);
             if (distanceToGroupMember < minFleeDistance || distanceToGroupMember > maxFleeDistance)
+                continue;
+
+            // Don't flee to a spot that would drag us into some other mob's aggro radius
+            if (sPlayerbotAIConfig.combatMoveSafetyEnabled &&
+                !IsCombatMovePointSafe(ai, safeMoveHostiles, WorldPosition(groupMember), sPlayerbotAIConfig.combatMoveSafetyMargin, target))
                 continue;
 
             if (PlayerbotAI* groupMemberBotAi = groupMember->GetPlayerbotAI())
@@ -2965,15 +3209,19 @@ bool MovementAction::Flee(Unit *target)
                 float const distanceToMaster = sServerFacade.GetDistance2d(bot, master);
                 if (distanceToMaster > minFleeDistance && distanceToMaster < maxFleeDistance)
                 {
-                    if(isRanged)
+                    // [safe-move 2026-10-18 站长口径] 也不要跑到 master 旁边的怪堆里
+                    const bool masterSpotSafe = !sPlayerbotAIConfig.combatMoveSafetyEnabled ||
+                        IsCombatMovePointSafe(ai, safeMoveHostiles, WorldPosition(master), sPlayerbotAIConfig.combatMoveSafetyMargin, target);
+
+                    if (isRanged)
                     {
                         const float distanceToTarget = sServerFacade.GetDistance2d(master, target);
-                        if (distanceToTarget > minRangedTargetDistance)
+                        if (distanceToTarget > minRangedTargetDistance && masterSpotSafe)
                         {
                             fleeTarget = master;
                         }
                     }
-                    else
+                    else if (masterSpotSafe)
                     {
                         fleeTarget = master;
                     }
@@ -3057,6 +3305,13 @@ bool MovementAction::Flee(Unit *target)
         if (!manager.CalculateDestination(&rx, &ry, &rz))
         {
             ai->TellError(GetMaster(), "Nowhere to flee");
+            return false;
+        }
+
+        // [safe-move 2026-10-18 站长口径] 逃跑落点再兜一道统一安全检查：会引到旁边怪堆就原地不动（不硬跑）
+        if (sPlayerbotAIConfig.combatMoveSafetyEnabled &&
+            !IsCombatMovePointSafe(ai, GetNearbyCombatHostiles(ai), WorldPosition(bot->GetMapId(), rx, ry, rz), sPlayerbotAIConfig.combatMoveSafetyMargin, target))
+        {
             return false;
         }
 
@@ -3273,11 +3528,11 @@ bool MoveToLootAction::Execute(Event& event)
 
             if (!wo)
             {
-                ai->TellPlayerNoFacing(GetMaster(), "Can not move to loot " + std::to_string(loot.guid) +  " because it no longer exists.");
+                ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT2("Can not move to loot %guid because it no longer exists.", (std::map<std::string, std::string>{ {"%guid", std::to_string(loot.guid)} })));
             }
             else
             {
-                ai->TellPlayerNoFacing(GetMaster(), "Can not move to loot " + ChatHelper::formatWorldobject(wo) + " because it is not possible to loot.");
+                ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT2("Can not move to loot %object because it is not possible to loot.", (std::map<std::string, std::string>{ {"%object", ChatHelper::formatWorldobject(wo)} })));
             }
         }
 

@@ -171,6 +171,12 @@ PullStrategy* PullStrategy::Get(PlayerbotAI* ai)
     return ai ? ai->GetStrategy<PullStrategy>("pull", BotState::BOT_STATE_COMBAT) : nullptr;
 }
 
+// [pullback 2026-10-18 站长口径] 一次拉怪最长秒数走 conf（原来硬编码 15）
+uint8 PullStrategy::GetMaxPullTime()
+{
+    return sPlayerbotAIConfig.pullMaxTime;
+}
+
 Unit* PullStrategy::GetTarget() const
 {
     AiObjectContext* context = ai->GetAiObjectContext();
@@ -242,6 +248,7 @@ float PullMultiplier::GetValue(Action* action)
             (action->getName() == "pull start") ||
             (action->getName() == "pull action") ||
             (action->getName() == "return to pull position") ||
+            (action->getName() == "corner pull position") ||
             (action->getName() == "pull end"))
         {
             return 1.0f;
@@ -267,6 +274,11 @@ void PossibleAdsStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 
 void PullBackStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // [corner pull 2026-10-18 站长口径] 这一波含远程怪时，退回"卡视野点"而不是原拉怪点，逼远程怪进近战聚堆。
+    triggers.push_back(new TriggerNode(
+        "pull pack has ranged",
+        NextAction::array(0, new NextAction("corner pull position", static_cast<float>(ACTION_MOVE) + 6.0f), NULL)));
+
     triggers.push_back(new TriggerNode(
         "return to pull position",
         NextAction::array(0, new NextAction("return to pull position", static_cast<float>(ACTION_MOVE) + 5.0f), NULL)));

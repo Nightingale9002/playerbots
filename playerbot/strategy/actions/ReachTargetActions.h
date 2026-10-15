@@ -187,7 +187,9 @@ namespace ai
             ReachTargetAction::Qualify(qualifier);
 
             // Reduce the range slightly for a more accurate pull (moving targets can get out of reach)
-            const float threshold = 5.0f;
+            // [pull 2026-10-18 站长口径] 5 → 2：站长实测"坦克不是在最远距离拉，而是走进怪物仇恨范围"。
+            //   原来提前 5 码就停，等于白送 5 码；现在只在最远射程内留 2 码余量（防止目标走动脱距）。
+            const float threshold = 2.0f;
             range = range > threshold ? range - threshold : range;
         }
 

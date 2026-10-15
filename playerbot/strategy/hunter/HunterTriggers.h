@@ -4,6 +4,31 @@
 
 namespace ai
 {
+    // [bm hunter 2026-10-17 站长口径] AOE 前先确认**技能真能打到的那一簇**里没有"受伤害会脱离控制"
+    // 的怪（可破控），否则多射/乱射/爆炸陷阱会把被控制的怪打醒。判据复用
+    // PossibleAttackTargetsValue::HasBreakableCC，范围用"多目标选择"的同一份判断
+    // （AoeCountValue::FindMaxDensity），即挑出来的那一簇。
+    //
+    // 早期版本是"40 码内有没有被控的怪"——但这三个技能的实际覆盖都远小于 40 码
+    // （多射=前方锥形 3 目标、乱射=落点 8 码圈、爆炸陷阱=落点一圈），
+    // 40 码扫描会把隔着半张地图的一只羊也算进来，导致技能整段被禁用。
+    bool HunterHasBreakableCCInAoeCluster(Player* bot, float range);
+
+    // 取法术的实际施放距离（取不到时用 fallback）。用来把上面的破控判据限制在技能真能覆盖的范围。
+    float HunterSpellRange(PlayerbotAI* ai, std::string spellName, float fallback);
+
+    // [bm hunter 2026-10-17 站长口径] 平射禁飞区：离下一发平射不到 0.5 秒时**不开始读条**
+    // （稳固/瞄准这类读条会把这一发平射顶到后面，等于白丢一发）。只看"正要打出"的窗口
+    // （timer > 0），所以不会在"没有平射在跑"的时候把读条锁死。
+    bool HunterRangedSwingTooSoon(Player* bot);
+
+// [hunter-weave 2026-10-18 站长口径] **平射穿插**：只在"刚打出一发平射"的窗口里放瞬发技能。
+//   为什么：TBC 里任何远程特殊技能都会把平射的挥砍计时重置成"武器速度"⇒ 机器人每个 GCD 都放瞬发时，
+//   平射计时永远重置、**一发平射也打不出去**（站长："不会在技能中间穿插平射"）。
+//   判据：`getAttackTimer(RANGED_ATTACK)` 刚被重置（接近 `GetAttackTime()`）⇒ 放技能不吃亏；
+//   还在等平射（剩余时间少）⇒ 先让这一发打出去。没有平射在跑（timer=0）⇒ 不拦。
+bool HunterShouldLetAutoShotLand(Player* bot);
+
     HAS_AURA_TRIGGER_TIME(FeignDeathTrigger, "feign death", 2);
 
     BEGIN_TRIGGER(HunterNoStingsActiveTrigger, Trigger)
@@ -80,6 +105,7 @@ namespace ai
     {
     public:
         HuntersMarkTrigger(PlayerbotAI* ai) : DebuffTrigger(ai, "hunter's mark") {}
+        virtual bool IsActive() override;
     };
 
     class FreezingTrapTrigger : public HasCcTargetTrigger
@@ -126,10 +152,12 @@ namespace ai
         uint32 spellId;
     };
 
-    class ExplosiveTrapTrigger : public RangedMediumAoeTrigger
+    // [bm hunter 2026-10-17 站长口径] 爆炸陷阱只在≥7 目标时放（原来 3），
+    // 且"多目标选择"那一簇里没有破控怪（范围 = 陷阱的实际施放距离，不再是 40 码）。
+    class ExplosiveTrapTrigger : public AoeTrigger
     {
     public:
-        ExplosiveTrapTrigger(PlayerbotAI* ai, std::string spell = "explosive trap") : RangedMediumAoeTrigger(ai)
+        ExplosiveTrapTrigger(PlayerbotAI* ai, std::string spell = "explosive trap") : AoeTrigger(ai, 7)
         {
             spellId = AI_VALUE2(uint32, "spell id", spell);
         }
@@ -144,11 +172,63 @@ namespace ai
             }
 #endif
 
-            return sServerFacade.IsSpellReady(bot, spellId) && RangedMediumAoeTrigger::IsActive();
+            return sServerFacade.IsSpellReady(bot, spellId) && AoeTrigger::IsActive() &&
+                !HunterHasBreakableCCInAoeCluster(bot, HunterSpellRange(ai, "explosive trap", 30.0f));
         }
 
     private:
         uint32 spellId;
+    };
+
+    // [bm hunter 2026-10-17 站长口径] 乱射只在≥10 目标、且爆炸陷阱与多射都在冷却时放；
+    // 破控判据同多射（只看"多目标选择"那一簇，范围 = 乱射的实际施放距离）。
+    class HunterVolleyTrigger : public AoeTrigger
+    {
+    public:
+        HunterVolleyTrigger(PlayerbotAI* ai) : AoeTrigger(ai, 10)
+        {
+            multishotId = AI_VALUE2(uint32, "spell id", "multi-shot");
+            explosiveTrapId = AI_VALUE2(uint32, "spell id", "explosive trap");
+        }
+
+        bool IsActive() override
+        {
+            if (!AoeTrigger::IsActive())
+                return false;
+
+            if (HunterHasBreakableCCInAoeCluster(bot, HunterSpellRange(ai, "volley", 30.0f)))
+                return false;
+
+            return !sServerFacade.IsSpellReady(bot, multishotId) && !sServerFacade.IsSpellReady(bot, explosiveTrapId);
+        }
+
+    private:
+        uint32 multishotId;
+        uint32 explosiveTrapId;
+    };
+
+    // [bm hunter 2026-10-17 站长口径] 守护阈值 20/35：<20 切蝰蛇，>35 切回鹰（中间不横跳）。
+    class AspectOfTheViperLowManaTrigger : public Trigger
+    {
+    public:
+        AspectOfTheViperLowManaTrigger(PlayerbotAI* ai) : Trigger(ai, "aspect of the viper low mana") {}
+
+        bool IsActive() override
+        {
+            return bot->HasSpell(34074) && AI_VALUE2(uint8, "mana", "self target") < 20 &&
+                !ai->HasAura("aspect of the viper", bot);
+        }
+    };
+
+    class AspectOfTheHawkManaOkTrigger : public Trigger
+    {
+    public:
+        AspectOfTheHawkManaOkTrigger(PlayerbotAI* ai) : Trigger(ai, "aspect of the hawk mana ok") {}
+
+        bool IsActive() override
+        {
+            return AI_VALUE2(uint8, "mana", "self target") >= 35 && !ai->HasAura("aspect of the hawk", bot);
+        }
     };
 
     class RapidFireTrigger : public BuffTrigger
@@ -307,6 +387,37 @@ private:
     CAN_CAST_TRIGGER(MongooseBiteCastTrigger, "mongoose bite");
     BOOST_TRIGGER(BestialWrathBoostTrigger, "bestial wrath");
 
+    // [bm hunter 2026-10-17 站长口径] 多射卡CD（单体也打），但"多目标选择"的那一簇里有破控怪时不打。
+    class HunterMultishotCanCastTrigger : public MultishotCanCastTrigger
+    {
+    public:
+        HunterMultishotCanCastTrigger(PlayerbotAI* ai) : MultishotCanCastTrigger(ai) {}
+
+        bool IsActive() override
+        {
+            if (!MultishotCanCastTrigger::IsActive())
+                return false;
+
+            float maxRange = 35.0f, minRange = 0.0f;
+            if (!ai->GetSpellRange("multi-shot", &maxRange, &minRange) || maxRange <= 0.0f)
+                maxRange = 35.0f;
+
+            return !HunterHasBreakableCCInAoeCluster(bot, maxRange);
+        }
+    };
+
+    // [bm hunter 2026-10-17 站长口径] 读条技能（稳固）要让开平射：离下一发平射 <0.5 秒时不开始读条。
+    class HunterSteadyShotCanCastTrigger : public SteadyShotCanCastTrigger
+    {
+    public:
+        HunterSteadyShotCanCastTrigger(PlayerbotAI* ai) : SteadyShotCanCastTrigger(ai) {}
+
+        bool IsActive() override
+        {
+            return SteadyShotCanCastTrigger::IsActive() && !HunterRangedSwingTooSoon(bot);
+        }
+    };
+
     INTERRUPT_TRIGGER(SilencingShotInterruptTrigger, "silencing shot");
     INTERRUPT_HEALER_TRIGGER(SilencingShotInterruptHealerTrigger, "silencing shot");
 
@@ -330,6 +441,10 @@ private:
         virtual bool IsActive() override
         {
             if (!bot->HasSpell(19434) || !bot->IsSpellReady(19434))
+                return false;
+
+            // [bm hunter 2026-10-17 站长口径] 瞄准是长读条，离下一发平射 <0.5 秒时不开始读。
+            if (HunterRangedSwingTooSoon(bot))
                 return false;
 
             Unit* target = GetTarget();

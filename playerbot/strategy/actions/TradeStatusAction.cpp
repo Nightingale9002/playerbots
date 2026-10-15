@@ -126,7 +126,7 @@ void TradeStatusAction::BeginTrade()
     ListItemsVisitor visitor;
     ai->InventoryIterateItems(&visitor, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
 
-    ai->TellPlayer(trader, "=== Inventory ===");
+    ai->TellPlayer(trader, BOT_TEXT("=== Inventory ==="));
     ai->InventoryTellItems(trader, visitor.items, visitor.soulbound);
 
     if (sRandomPlayerbotMgr.IsRandomBot(bot))
@@ -178,11 +178,11 @@ bool TradeStatusAction::CheckTrade()
             std::string name = trader->GetName();
             if (bot->GetGroup() && bot->GetGroup()->IsMember(bot->GetTrader()->GetObjectGuid()) && ai->HasRealPlayerMaster())
             {
-                ai->TellPlayerNoFacing(trader, "Thank you " + name + ".", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayerNoFacing(trader, BOT_TEXT2("Thank you %name.", (std::map<std::string, std::string>{ {"%name", name} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             }
             else
             {
-                bot->Say("Thank you " + name + ".", (bot->GetTeam() == ALLIANCE ? LANG_COMMON : LANG_ORCISH));
+                bot->Say(BOT_TEXT2("Thank you %name.", (std::map<std::string, std::string>{ {"%name", name} })), (bot->GetTeam() == ALLIANCE ? LANG_COMMON : LANG_ORCISH));
             }
         }
         return isGettingItem;
@@ -253,7 +253,7 @@ bool TradeStatusAction::CheckTrade()
         {
             if (moneyDelta < 0)
             {
-                ai->TellPlayer(trader, "You can use discount to buy items only");
+                ai->TellPlayer(trader, BOT_TEXT("You can use discount to buy items only"));
                 ai->PlaySound(TEXTEMOTE_NO);
                 return false;
             }
@@ -270,16 +270,16 @@ bool TradeStatusAction::CheckTrade()
         sRandomPlayerbotMgr.AddTradeDiscount(bot, trader, delta);
         switch (urand(0, 4)) {
         case 0:
-            ai->TellPlayer(trader, "A pleasure doing business with you");
+            ai->TellPlayer(trader, BOT_TEXT("A pleasure doing business with you"));
             break;
         case 1:
-            ai->TellPlayer(trader, "Fair trade");
+            ai->TellPlayer(trader, BOT_TEXT("Fair trade"));
             break;
         case 2:
-            ai->TellPlayer(trader, "Thanks");
+            ai->TellPlayer(trader, BOT_TEXT("Thanks"));
             break;
         case 3:
-            ai->TellPlayer(trader, "Off with you");
+            ai->TellPlayer(trader, BOT_TEXT("Off with you"));
             break;
         }
         ai->PlaySound(TEXTEMOTE_THANK);

@@ -285,6 +285,11 @@ namespace ai
                 creators["earth totem"] = [](PlayerbotAI* ai) { return new EarthTotemTrigger(ai); };
                 creators["water totem"] = [](PlayerbotAI* ai) { return new WaterTotemTrigger(ai); };
                 creators["air totem"] = [](PlayerbotAI* ai) { return new AirTotemTrigger(ai); };
+                creators["air totem windfury"] = [](PlayerbotAI* ai) { return new AirTotemWeightTrigger(ai, "air totem windfury", 0); };
+                creators["air totem grace"] = [](PlayerbotAI* ai) { return new AirTotemWeightTrigger(ai, "air totem grace", 1); };
+                creators["air totem wrath"] = [](PlayerbotAI* ai) { return new AirTotemWeightTrigger(ai, "air totem wrath", 2); };
+                creators["earth totem strength"] = [](PlayerbotAI* ai) { return new EarthTotemWeightTrigger(ai, "earth totem strength", true); };
+                creators["earth totem stoneskin"] = [](PlayerbotAI* ai) { return new EarthTotemWeightTrigger(ai, "earth totem stoneskin", false); };
                 creators["place totems"] = [](PlayerbotAI* ai) { return new ChatCommandTrigger(ai, "place totems"); };
                 creators["call of the elements"] = [](PlayerbotAI* ai) { return new TotemsAreNotSummonedTrigger(ai); };
                 creators["call of the ancestors"] = [](PlayerbotAI* ai) { return new TotemsAreNotSummonedTrigger(ai); };

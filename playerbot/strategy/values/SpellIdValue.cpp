@@ -214,6 +214,73 @@ uint32 SpellIdValue::Calculate()
     return saveMana > 1 && !isBuff ? lowestSpellId : highestSpellId;
 }
 
+HealRankValue::HealRankValue(PlayerbotAI* ai) : CalculatedValue<uint32>(ai, "heal rank", 10), Qualified()
+{
+}
+
+uint32 HealRankValue::Calculate()
+{
+    if (qualifier.empty())
+        return 0;
+
+    // 施法目标 = 治疗对象；目标无法确定时不介入（回退二值逻辑）。
+    Unit* target = ai->GetUnit(AI_VALUE(ObjectGuid, "party member to heal"));
+    if (!target)
+        return 0;
+
+    // 先用二值逻辑选出一个“机器人确实学会”的 id，再沿 rank 链收集全部已学 rank（升序）。
+    uint32 knownId = AI_VALUE2(uint32, "spell id", qualifier);
+    if (!knownId)
+        return 0;
+
+    std::vector<uint32> ranks;
+    for (uint32 id = sSpellMgr.GetFirstSpellInChain(knownId); id; id = sSpellMgr.GetNextSpellInChain(id))
+    {
+        if (bot->HasSpell(id))
+            ranks.push_back(id);
+    }
+
+    if (ranks.size() < 2)
+        return 0; // 只有一个 rank，动态选择无意义，交给二值逻辑
+
+    // 估算每个 rank 的基础治疗量（不含法伤加成，仅用于 rank 间相对比较）。
+    std::vector<float> healAmount(ranks.size(), 0.0f);
+    for (size_t r = 0; r < ranks.size(); ++r)
+    {
+        const SpellEntry* pSpellInfo = sServerFacade.LookupSpellInfo(ranks[r]);
+        if (!pSpellInfo)
+            continue;
+
+        float amount = 0.0f;
+        for (int32 i = EFFECT_INDEX_0; i <= EFFECT_INDEX_2; ++i)
+        {
+            if (pSpellInfo->Effect[i] == SPELL_EFFECT_HEAL)
+            {
+                amount += float(pSpellInfo->EffectBasePoints[i] + 1);
+                if (pSpellInfo->EffectDieSides[i] > 1)
+                    amount += float(pSpellInfo->EffectDieSides[i]) / 2.0f;
+            }
+        }
+        healAmount[r] = amount;
+    }
+
+    // 目标缺血量 + 预计 8 秒内承伤 ≈ 这一口需要补的血量。
+    float deficit = float(target->GetMaxHealth()) - float(target->GetHealth());
+    deficit += float(AI_VALUE2(uint32, "incoming damage", "party member to heal"));
+    if (deficit <= 0.0f)
+        return ranks.front(); // 目标满血：用最低 rank（最省蓝）
+
+    // 选能满足需求的最小 rank（留 10% 缓冲避免临界过载）；都满足不了则用最高 rank。
+    float needed = deficit * 0.9f;
+    for (size_t r = 0; r < ranks.size(); ++r)
+    {
+        if (healAmount[r] >= needed)
+            return ranks[r];
+    }
+
+    return ranks.back();
+}
+
 uint32 VehicleSpellIdValue::Calculate()
 {
 #ifdef MANGOSBOT_TWO

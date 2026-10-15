@@ -65,7 +65,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
         if (creature->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE))
         {
             if (debug)
-                ai->TellDebug(ai->GetMaster(), "Creature flag lootable.", "debug loot");
+                ai->TellDebug(ai->GetMaster(),BOT_TEXT("Creature flag lootable."), "debug loot");
 
             this->guid = guid;
         }
@@ -78,17 +78,17 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
             if (ai->HasSkill((SkillType)skillId) && bot->GetSkillValue(skillId) >= reqSkillValue)
             {
                 if (debug)
-                    ai->TellDebug(ai->GetMaster(), "Creature flag skinnable and has skill.", "debug loot");
+                    ai->TellDebug(ai->GetMaster(),BOT_TEXT("Creature flag skinnable and has skill."), "debug loot");
                 this->guid = guid;
             }
 
             if (debug)
-                ai->TellDebug(ai->GetMaster(), "Creature flag skinnable not enough skill.", "debug loot");
+                ai->TellDebug(ai->GetMaster(),BOT_TEXT("Creature flag skinnable not enough skill."), "debug loot");
             return;
         }
 
         if (debug)
-            ai->TellDebug(ai->GetMaster(), "Creature without loot or skin flag.", "debug loot");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("Creature without loot or skin flag."), "debug loot");
 
         return;
     }
@@ -106,7 +106,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
             if (ItemUsageValue::IsNeededForQuest(bot, itemId))
             {
                 if (debug)
-                    ai->TellDebug(ai->GetMaster(), "GO has item needed for quest.", "debug loot");
+                    ai->TellDebug(ai->GetMaster(),BOT_TEXT("GO has item needed for quest."), "debug loot");
                 this->guid = guid;
                 return;
             }
@@ -130,7 +130,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
         if (isQuestItemOnly)
         {
             if (debug)
-                ai->TellDebug(ai->GetMaster(), "Go has only quests items we don't need.", "debug loot");
+                ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go has only quests items we don't need."), "debug loot");
             return;
         }
 
@@ -139,7 +139,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
         if (skipGoLootList.find(goId) != skipGoLootList.end())
         {
             if (debug)
-                ai->TellDebug(ai->GetMaster(), "Go in skip go loot list.", "debug loot");
+                ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go in skip go loot list."), "debug loot");
             return;
         }
 
@@ -148,7 +148,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
         if (!lockInfo)
         {
             if (debug)
-                ai->TellDebug(ai->GetMaster(), "Go has no lockid.", "debug loot");
+                ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go has no lockid."), "debug loot");
             return;
         }
 
@@ -160,7 +160,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
                     if (lockInfo->Index[i] > 0)
                     {
                         if (debug)
-                            ai->TellDebug(ai->GetMaster(), "Go has lock with key requirement.", "debug loot");
+                            ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go has lock with key requirement."), "debug loot");
                         reqItem = lockInfo->Index[i];
                         this->guid = guid;
                     }
@@ -169,13 +169,13 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
                     if (goId == 13891 || goId == 19535) // Serpentbloom
                     {
                         if (debug)
-                            ai->TellDebug(ai->GetMaster(), "Go is serpentbloom.", "debug loot");
+                            ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go is serpentbloom."), "debug loot");
                         this->guid = guid;
                     }
                     else if (SkillByLockType(LockType(lockInfo->Index[i])) > 0)
                     {
                         if (debug)
-                            ai->TellDebug(ai->GetMaster(), "Go requires skill.", "debug loot");
+                            ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go requires skill."), "debug loot");
                         skillId = SkillByLockType(LockType(lockInfo->Index[i]));
                         reqSkillValue = std::max((uint32)1, lockInfo->Skill[i]);
                         this->guid = guid;
@@ -183,7 +183,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
                     break;
                 case LOCK_KEY_NONE:
                     if (debug)
-                        ai->TellDebug(ai->GetMaster(), "Go has open lock.", "debug loot");
+                        ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go has open lock."), "debug loot");
                     this->guid = guid;
                     break;
             }
@@ -191,7 +191,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
     }
 
     if (debug && guid && !this->guid)
-        ai->TellDebug(ai->GetMaster(), "Go has bad lock.", "debug loot");
+        ai->TellDebug(ai->GetMaster(),BOT_TEXT("Go has bad lock."), "debug loot");
 }
 
 WorldObject* LootObject::GetWorldObject(Player* bot)

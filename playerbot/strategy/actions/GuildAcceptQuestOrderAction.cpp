@@ -58,7 +58,7 @@ bool GuildAcceptQuestOrderAction::Execute(Event& event)
 
         if (candidates.empty())
         {
-            ai->TellDebug(ai->GetMaster(), "Quest log full but no droppable quests found for guild order", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("Quest log full but no droppable quests found for guild order"), "debug travel");
             return false;
         }
 

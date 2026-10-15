@@ -57,6 +57,15 @@ public:
 #endif
 
     std::list<std::string> HandleGroup(Player* master, const std::string param, AccountTypes security);
+
+    // [.bot 命令闸门 2026-10-17 站长口径] 非 GM 玩家的 bot 命令统一闸门（黑名单 / 白名单 / 目标归属 / 审计日志）。
+    //   from == nullptr（控制台 CLI）或 security >= SEC_GAMEMASTER ⇒ 直接放行。
+    //   否则：黑名单命中、或不在白名单、或目标 bot 不属于发令者（同队伍或同账号）⇒ 拒绝：
+    //   给发令者一句中文 BOT_TEXT 提示，并写审计日志 sLog.outString("[BOTCMD] ...")。
+    static bool IsBotCommandBlacklisted(const std::string& command);
+    static bool IsBotCommandWhitelisted(const std::string& command);
+    static bool CheckPlayerBotCommand(Player* from, AccountTypes security, const std::string& command,
+                                      const std::string& targetName, ObjectGuid targetGuid);
 protected:
     virtual void OnBotLoginInternal(Player * const bot) = 0;
     virtual void OnBotDeleted(uint32 botGuid, uint32 accountId);
@@ -75,6 +84,11 @@ private:
     std::list<std::string> HandleHelp(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleReload(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleTweak(Player* master, const std::string param, AccountTypes security);
+    std::list<std::string> HandleBosspos(Player* master, const std::string param, AccountTypes security);
+    std::list<std::string> HandlePrio(Player* master, const std::string param, AccountTypes security);
+    // [boss-pos 2026-10-18 站长口径] **游戏内指定每个 BOSS 各角色的站位**（每个 BOSS 单独一套数据）：
+    //   `.bot bosspos list [entry]` / `set <entry> <tank|healer|melee|ranged> [here|x y z] [radius]`
+    //   / `del <entry> <role>` / `clear <entry>`；写库 `ai_playerbot_boss_position` 后立即生效（不用重启）。
     std::list<std::string> HandleSelf(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleSpoof(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleParty(Player* master, const std::string param, AccountTypes security);

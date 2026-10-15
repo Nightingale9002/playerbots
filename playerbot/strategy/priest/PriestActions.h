@@ -7,8 +7,27 @@ namespace ai
     BUFF_ACTION(CastPowerWordFortitudeAction, "power word: fortitude");
     BUFF_PARTY_ACTION(CastPowerWordFortitudeOnPartyAction, "power word: fortitude");
     GREATER_BUFF_PARTY_ACTION(CastPrayerOfFortitudeOnPartyAction, "prayer of fortitude", "power word: fortitude");
-    BUFF_ACTION(CastPowerWordShieldAction, "power word: shield");
-    HEAL_PARTY_ACTION(CastPowerWordShieldOnPartyAction, "power word: shield");
+
+    // [disc 2026-10-17] 盾受 Weakened Soul 影响（15s，TBC 各等级盾共用），不能无脑连套：
+    //   已带 weakened soul 的目标必须跳过，否则服务器拒绝、机器人每 tick 重试空转。
+    class CastPowerWordShieldAction : public CastBuffSpellAction
+    {
+    public:
+        CastPowerWordShieldAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "power word: shield") {}
+        virtual bool isUseful() override { return CastBuffSpellAction::isUseful() && !ai->HasAura("weakened soul", bot); }
+    };
+
+    class CastPowerWordShieldOnPartyAction : public HealPartyMemberAction
+    {
+    public:
+        CastPowerWordShieldOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "power word: shield") {}
+        virtual bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            return HealPartyMemberAction::isUseful() && !(target && ai->HasAura("weakened soul", target));
+        }
+    };
+
     BUFF_ACTION(CastInnerFireAction, "inner fire");
     CURE_ACTION(CastDispelMagicAction, "dispel magic");
     CURE_PARTY_ACTION(CastDispelMagicOnPartyAction, "dispel magic", DISPEL_MAGIC);
@@ -27,6 +46,24 @@ namespace ai
     // disc 2.4.3 talents
     BUFF_ACTION(CastPainSuppressionAction, "pain suppression");
     PROTECT_ACTION(CastPainSuppressionProtectAction, "pain suppression");
+
+    // [disc 2026-10-17] 预判式 Pain Suppression（TBC 戒律 41 点终极天赋）。
+    //   独立于 PROTECT_ACTION/CastProtectSpellAction：PS 是“伤害落地前减伤”，与 BoP/Intervene 的
+    //   “正在挨打才保护”语义相反，故目标取自专属 value "party member to pain suppress"。
+    class CastPainSuppressionOnProtecteeAction : public CastSpellAction
+    {
+    public:
+        CastPainSuppressionOnProtecteeAction(PlayerbotAI* ai) : CastSpellAction(ai, "pain suppression") {}
+        virtual std::string GetTargetName() override { return "party member to pain suppress"; }
+        virtual bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            return CastSpellAction::isUseful() && !(target && ai->HasAura("pain suppression", target));
+        }
+
+    protected:
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
+    };
 
     // holy
     HEAL_ACTION(CastLesserHealAction, "lesser heal");

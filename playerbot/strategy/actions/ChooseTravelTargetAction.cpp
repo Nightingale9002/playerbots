@@ -75,7 +75,7 @@ bool ChooseTravelTargetAction::Execute(Event& event)
     if (!SetBestTarget(requester, &newTarget, destinationList))
     {
         SET_AI_VALUE2(bool, "no active travel destinations", futureTravelPurpose, true);
-        ai->TellDebug(ai->GetMaster(), "No target set", "debug travel");
+        ai->TellDebug(ai->GetMaster(),BOT_TEXT("No target set"), "debug travel");
         return false;
     }
 
@@ -336,7 +336,7 @@ bool ChooseTravelTargetAction::SetBestTarget(Player* requester, TravelTarget* ta
                 WorldPosition center(requester ? requester : bot);
                 if (position->distance(center) > distance * 2 && position->distance(center) > 100)
                 {
-                    ai->TellDebug(requester, "We had some destinations but we moved too far since. Trying to get a new list.", "debug travel");
+                    ai->TellDebug(requester,BOT_TEXT("We had some destinations but we moved too far since. Trying to get a new list."), "debug travel");
                     return false;
                 }
 
@@ -528,7 +528,7 @@ bool ChooseGroupTravelTargetAction::Execute(Event& event)
 
         if (!groupTarget->GetDestination()->IsActive(player, PlayerTravelInfo(player)) || !groupTarget->IsConditionsActive())
         {
-            player->GetPlayerbotAI()->TellDebug(requester,"Target is cooling down because a group member found it to be inactive.", "debug travel");
+            player->GetPlayerbotAI()->TellDebug(requester,BOT_TEXT("Target is cooling down because a group member found it to be inactive."), "debug travel");
             groupTarget->SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
             continue;
         }
@@ -598,7 +598,7 @@ bool RefreshTravelTargetAction::Execute(Event& event)
 
     if (target->IsMaxRetry(false))
     {
-        ai->TellDebug(requester, "Old destination was tried too many times.", "debug travel");
+        ai->TellDebug(requester,BOT_TEXT("Old destination was tried too many times."), "debug travel");
         return false;
     }
 
@@ -607,7 +607,7 @@ bool RefreshTravelTargetAction::Execute(Event& event)
 
     if (!target->IsDestinationActive()) //Is the destination still valid?
     {
-        ai->TellDebug(requester, "Old destination was no longer valid.", "debug travel");
+        ai->TellDebug(requester,BOT_TEXT("Old destination was no longer valid."), "debug travel");
         return false;
     }
 
@@ -625,7 +625,7 @@ bool RefreshTravelTargetAction::Execute(Event& event)
 
     if (!newPosition)
     {
-        ai->TellDebug(requester, "No new locations found for old destination.", "debug travel");
+        ai->TellDebug(requester,BOT_TEXT("No new locations found for old destination."), "debug travel");
         return false;
     }
 
@@ -645,7 +645,7 @@ bool RefreshTravelTargetAction::Execute(Event& event)
     context->ClearValues("no active travel destinations");
     SET_AI_VALUE2(std::string, "manual string", "future travel detail", std::string());
 
-    ai->TellDebug(requester, "Refreshed travel target", "debug travel");
+    ai->TellDebug(requester,BOT_TEXT("Refreshed travel target"), "debug travel");
     ReportTravelTarget(bot, requester, target, target);
 
     return false;
@@ -687,7 +687,7 @@ bool ResetTargetAction::Execute(Event& event)
     oldTarget->SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
     oldTarget->SetExpireIn(60000); //1 minute;
 
-    ai->TellDebug(requester, "Cleared travel target fetches", "debug travel");
+    ai->TellDebug(requester,BOT_TEXT("Cleared travel target fetches"), "debug travel");
 
     return true;
 }
@@ -864,7 +864,7 @@ bool RequestNamedTravelTargetAction::Execute(Event& event)
 
         if (meetingLocation.empty())
         {
-            ai->TellDebug(ai->GetMaster(), "No meeting location found in guild MOTD", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("No meeting location found in guild MOTD"), "debug travel");
             return false;
         }
 
@@ -892,7 +892,7 @@ bool RequestNamedTravelTargetAction::Execute(Event& event)
 
         if (!order.IsTravelOrder())
         {
-            ai->TellDebug(ai->GetMaster(), "No valid guild travel order found", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("No valid guild travel order found"), "debug travel");
             return false;
         }
 
@@ -905,7 +905,7 @@ bool RequestNamedTravelTargetAction::Execute(Event& event)
             uint32 questId = order.questId;
             if (!questId)
             {
-                ai->TellDebug(ai->GetMaster(), "QuestReward order has no questId", "debug travel");
+                ai->TellDebug(ai->GetMaster(),BOT_TEXT("QuestReward order has no questId"), "debug travel");
                 return false;
             }
 
@@ -1244,7 +1244,7 @@ bool RequestNamedTravelTargetAction::Execute(Event& event)
 
         if (reagentVendorEntries.empty())
         {
-            ai->TellDebug(ai->GetMaster(), "No reagent vendor entries found", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("No reagent vendor entries found"), "debug travel");
             return false;
         }
 
@@ -1343,7 +1343,7 @@ bool RequestQuestTravelTargetAction::Execute(Event& event)
 {
     WorldPosition center = event.getOwner() ? event.getOwner() : (GetMaster() ? GetMaster() : bot);
 
-    ai->TellDebug(ai->GetMaster(), "Getting new destination ranges for travel quest", "debug travel");
+    ai->TellDebug(ai->GetMaster(),BOT_TEXT("Getting new destination ranges for travel quest"), "debug travel");
 
     std::vector<std::tuple<uint32, int32, float>> destinationFetches = { {(uint32)TravelDestinationPurpose::QuestGiver, 0, 400 + bot->GetLevel() * 10} };
 

@@ -230,8 +230,11 @@ namespace ai
                 creators["scatter shot on snare target"] = [](PlayerbotAI* ai) { return new ScatterShotSnareTrigger(ai); };
                 creators["chimera shot"] = [](PlayerbotAI* ai) { return new ChimeraShotCanCastTrigger(ai); };
                 creators["explosive shot"] = [](PlayerbotAI* ai) { return new ExplosiveShotCanCastTrigger(ai); };
-                creators["multi-shot"] = [](PlayerbotAI* ai) { return new MultishotCanCastTrigger(ai); };
-                creators["steady shot"] = [](PlayerbotAI* ai) { return new SteadyShotCanCastTrigger(ai); };
+                creators["multi-shot"] = [](PlayerbotAI* ai) { return new HunterMultishotCanCastTrigger(ai); };
+                creators["volley aoe"] = [](PlayerbotAI* ai) { return new HunterVolleyTrigger(ai); };
+                creators["aspect of the viper low mana"] = [](PlayerbotAI* ai) { return new AspectOfTheViperLowManaTrigger(ai); };
+                creators["aspect of the hawk mana ok"] = [](PlayerbotAI* ai) { return new AspectOfTheHawkManaOkTrigger(ai); };
+                creators["steady shot"] = [](PlayerbotAI* ai) { return new HunterSteadyShotCanCastTrigger(ai); };
                 creators["intimidation on snare target"] = [](PlayerbotAI* ai) { return new IntimidationSnareTrigger(ai); };
                 creators["counterattack"] = [](PlayerbotAI* ai) { return new CounterattackCanCastTrigger(ai); };
                 creators["wyvern sting"] = [](PlayerbotAI* ai) { return new WybernStingSnareTrigger(ai); };

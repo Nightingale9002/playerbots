@@ -33,6 +33,16 @@ namespace ai
     CAN_CAST_TRIGGER(MindBlastTrigger, "mind blast");
     CAN_CAST_TRIGGER(SmiteTrigger, "smite");
 
+    // [disc 2026-10-17] 预判式 Pain Suppression 专用触发器：由“预测承伤”驱动的 value 决定，
+    //   与 BoP/Intervene 的 "protect party member" 语义隔离。
+    class PainSuppressionTrigger : public Trigger
+    {
+    public:
+        PainSuppressionTrigger(PlayerbotAI* ai) : Trigger(ai, "pain suppression") {}
+        virtual std::string GetTargetName() override { return "party member to pain suppress"; }
+        virtual bool IsActive() override { return ai->GetUnit(AI_VALUE(ObjectGuid, "party member to pain suppress")) != nullptr; }
+    };
+
     class ShadowguardTrigger : public BuffTrigger
     {
     public:
