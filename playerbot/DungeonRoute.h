@@ -201,6 +201,8 @@ namespace dungeonroute
         std::vector<BossSpawn> bosses;           // 静态 boss 刷点（可能同 entry 多刷点）
         std::vector<RouteLink> links;            // 跳点/升降台连接点
         std::vector<BossSwitch> switches;        // boss 战后开关（门禁面板/桥控制台）
+        // [2026-10-19 站长口径] 动态巡逻：不绝对按波次表，运行到附近再动态决策
+        std::set<uint32> patrolGuids;             // 本图巡逻怪 guid（ai_playerbot_patrol）
         uint16 maxOrd = 0;
     };
 
@@ -210,6 +212,7 @@ namespace dungeonroute
         uint32 entry = 0;
         uint16 ord = 0;              // 目标所属波次（0 = boss 阶段）
         bool boss = false;
+        bool dynamic = false;        // 动态巡逻目标（不按波次表，遇到就清）
         bool hasPullPoint = false;
         float px = 0, py = 0, pz = 0;
     };
@@ -386,6 +389,19 @@ namespace dungeonroute
                 b.guid = f[4].GetUInt32();
                 route.bosses.push_back(b);
             } while (bosses->NextRow());
+        }
+
+        // [2026-10-19] 动态巡逻：只取 guid 集合；运行期遇到（可见/近）才动态决定拉不拉。
+        {
+            std::unique_ptr<QueryResult> patrols = WorldDatabase.PQuery(
+                "SELECT DISTINCT `guid` FROM `ai_playerbot_patrol` WHERE `map` = '%u'", mapId);
+            if (patrols)
+            {
+                do
+                {
+                    route.patrolGuids.insert(patrols->Fetch()[0].GetUInt32());
+                } while (patrols->NextRow());
+            }
         }
 
         // [2026-10-19] 跳点 / 升降台连接点（表不存在时静默为空）
@@ -1168,6 +1184,47 @@ namespace dungeonroute
             st.lockUntil = nowMs + LOCK_MS;
         }
 
+        // [2026-10-19 站长口径] 动态巡逻波次：不绝对按波次表 —— 附近（40 码内可见）有巡逻怪时，
+        //   若它比当前波目标更近（或当前波没目标）⇒ 先动态清它；清完再回波次推进。
+        Member patrolM;
+        float patrolDist = 1e18f;
+        for (uint32 pg : route.patrolGuids)
+        {
+            Creature* pc = map->GetCreature(pg);
+            if (!pc || !pc->IsAlive() || pc->IsInWater() || !SessionCanFight(bot, pc))
+                continue;
+            float const pd = bot->GetDistance(pc);
+            if (pd > 40.0f || !IsVisible(bot, pc))
+                continue;
+            if (pd < patrolDist)
+            {
+                patrolDist = pd;
+                patrolM.guid = pg;
+                patrolM.entry = pc->GetEntry();
+            }
+        }
+        if (patrolM.guid && (!nearestM.guid || patrolDist <= nearestAliveDist))
+        {
+            Creature* pc = map->GetCreature(patrolM.guid);
+            out = Target();
+            out.guid = patrolM.guid;
+            out.entry = patrolM.entry;
+            out.ord = 0;
+            out.boss = false;
+            out.dynamic = true;
+            if (pc && patrolDist <= STOP_DIST)
+            {
+                out.px = bot->GetPositionX();
+                out.py = bot->GetPositionY();
+                out.pz = bot->GetPositionZ();
+                out.hasPullPoint = true;
+                return true;
+            }
+            if (pc)
+                MakeApproachPoint(bot, pc->GetPositionX(), pc->GetPositionY(), pc->GetPositionZ(), out);
+            return pc != nullptr;
+        }
+
         // ① 有活目标
         if (nearestM.guid)
         {
@@ -1375,7 +1432,12 @@ namespace dungeonroute
         //    [模式A] 不再要求等于当前 ord（就近推进时可能同时接触两波）。
         auto it = route->guidOrd.find(unit->GetGUIDLow());
         if (it == route->guidOrd.end())
+        {
+            // [2026-10-19 站长口径] 动态巡逻不属于固定波次：遇到就可以打，不按波次表卡死。
+            if (route->patrolGuids.count(unit->GetGUIDLow()))
+                return true;
             return false;
+        }
 
         BotState& st = StateOf(bot);
         uint16 const waveOrd = it->second;
