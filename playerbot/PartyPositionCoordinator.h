@@ -39,17 +39,22 @@
 #include "Grids/GridNotifiers.h"
 #include "Grids/GridNotifiersImpl.h"
 #include "Grids/CellImpl.h"
+#include "playerbot/AiFactory.h"
+#include "playerbot/strategy/AiObjectContext.h"
+#include "playerbot/strategy/values/HazardsValue.h"
+#include "Database/DatabaseEnv.h"
 
 namespace partypos
 {
     enum Role : uint8
     {
         ROLE_TANK = 0,
-        ROLE_MELEE = 1,
-        ROLE_RANGED = 2,
-        ROLE_HEALER = 3,
-        ROLE_SANDBAG = 4,
-        ROLE_NONE = 5,
+        ROLE_MELEE = 1,      // 近战输出（≤5 码）
+        ROLE_MID = 2,        // 中距离输出（24-30 码：暗牧/奥法/术士/鸟德/元素萨等）
+        ROLE_RANGED = 3,     // 远距离输出（36-40 码：猎人）
+        ROLE_HEALER = 4,     // 治疗（36-40 码）
+        ROLE_SANDBAG = 5,
+        ROLE_NONE = 6,
     };
 
     enum Mode : uint8
@@ -64,6 +69,7 @@ namespace partypos
         MODE_LOS_PULL = 7,    // 卡视角拉怪（坦克把怪拉过来）
         MODE_LOS_BACKLINE = 8,// 只有远程/治疗卡视野
         MODE_LOS_BREAK = 9,   // 断读条卡视野
+        MODE_DEFAULT = 10,    // 兜底阵型（未登记 ai_playerbot_boss_ability 的 BOSS）
     };
 
     struct Slot
@@ -91,6 +97,7 @@ namespace partypos
     // 硬约束参数（后续可用配置/数据调）
     const float LEASH_DIST = 40.0f;       // 距 BOSS 最远（不脱战）
     const float MIN_BOSS_DIST = 3.0f;     // 距 BOSS 最近（不贴脸）
+    const float HAZARD_MARGIN = 2.0f;     // 槽位/路径离地面 AOE 的余量（码）
     const float IDLE_MOB_MARGIN = 8.0f;   // 与"未参战怪"的额外安全余量
 
     std::mutex& PlanMutex();
@@ -125,6 +132,7 @@ namespace partypos
             case MODE_LOS_PULL:  return "los_pull";
             case MODE_LOS_BACKLINE: return "los_backline";
             case MODE_LOS_BREAK: return "los_break";
+            case MODE_DEFAULT:   return "default";
             default:             return "none";
         }
     }
@@ -497,6 +505,71 @@ namespace partypos
     }
 
     // 附近敌对单位扫描（只取"未参战"的用于安全距离；参战的由触发链路处理）
+    // ---- 硬约束：当前地面 AOE（hazards）不能站、不能穿 -----------------------
+    inline bool SafeFromHazards(Player* bot, float x, float y)
+    {
+        if (!bot)
+            return true;
+        PlayerbotAI* ai = bot->GetPlayerbotAI();
+        if (!ai)
+            return true;
+        Value<std::list<HazardPosition>>* value =
+            ai->GetAiObjectContext()->GetValue<std::list<HazardPosition>>("hazards");
+        if (!value)
+            return true;
+        for (HazardPosition const& hp : value->Get())
+        {
+            if (hp.first.mapid != bot->GetMapId())
+                continue;
+            if (Dist2d(x, y, hp.first.coord_x, hp.first.coord_y) < hp.second + HAZARD_MARGIN)
+                return false;
+        }
+        return true;
+    }
+
+    // 槽位被 hazard 覆盖时就近找安全点（3/5/8 码，8 方向）
+    inline bool AdjustForHazards(Player* bot, float& x, float& y)
+    {
+        if (SafeFromHazards(bot, x, y))
+            return true;
+
+        static float const radius[] = { 3.0f, 5.0f, 8.0f };
+        for (float r : radius)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                float a = float(i) * 3.14159265f / 4.0f;
+                float nx = x + r * cosf(a);
+                float ny = y + r * sinf(a);
+                if (SafeFromHazards(bot, nx, ny))
+                {
+                    x = nx;
+                    y = ny;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 路径 hazard 校验（给 MoveToPartySlotAction 用）
+    inline bool PathSafeFromHazards(Player* bot, float x1, float y1, float z1,
+                                    float x2, float y2, float z2)
+    {
+        if (!SafeFromHazards(bot, x1, y1) || !SafeFromHazards(bot, x2, y2))
+            return false;
+        const int steps = 8;
+        for (int i = 1; i < steps; ++i)
+        {
+            float f = float(i) / float(steps);
+            float x = x1 + (x2 - x1) * f;
+            float y = y1 + (y2 - y1) * f;
+            if (!SafeFromHazards(bot, x, y))
+                return false;
+        }
+        return true;
+    }
+
     inline std::list<Unit*> ScanHostiles(Player* leader, float radius)
     {
         std::list<Unit*> units;
@@ -548,23 +621,40 @@ namespace partypos
         return false;
     }
 
+    // [跑位分带 2026-10-19 站长口径]
+    //   T  → 由 Compute 里真实坦克判定（正面拉住 BOSS）
+    //   近战 → 4.5 码（打背）
+    //   中距离 → 24-30 码（暗牧/奥法/术士/鸟德/元素萨 等）
+    //   远程 → 36-40 码（猎人）
+    //   治疗 → 36-40 码
     inline uint8 RoleOf(Player* member, Unit* boss)
     {
         if (!member || !boss)
             return ROLE_NONE;
 
+        if (PlayerbotAI::IsHeal(member))
+            return ROLE_HEALER;
+        if (PlayerbotAI::IsTank(member))
+            return ROLE_MELEE;          // 非当前坦克的副坦按近战带站（坦克位由 Compute 指定）
+
+        int spec = AiFactory::GetPlayerSpecTab(member);
         switch (member->getClass())
         {
             case CLASS_HUNTER:
+                return ROLE_RANGED;     // 36-40 码
             case CLASS_MAGE:
             case CLASS_WARLOCK:
-                return ROLE_RANGED;
+                return ROLE_MID;        // 24-30 码
             case CLASS_PRIEST:
-                return ROLE_HEALER;
-            case CLASS_PALADIN:
-            case CLASS_SHAMAN:
+                return ROLE_MID;        // 暗牧 24-30（治疗已在上面分流）
             case CLASS_DRUID:
-                return member->GetDistance(boss) > 10.0f ? ROLE_HEALER : ROLE_MELEE;
+                return spec == 1 ? ROLE_MELEE : ROLE_MID;   // 野性=近战，平衡=中距离
+            case CLASS_SHAMAN:
+                return spec == 1 ? ROLE_MELEE : ROLE_MID;   // 增强=近战，元素/恢复(治疗已分流)=中距离
+            case CLASS_PALADIN:
+                return spec == 2 ? ROLE_MELEE : ROLE_MID;   // 惩戒=近战，其它(治疗已分流)=中距离
+            case CLASS_WARRIOR:
+            case CLASS_ROGUE:
             default:
                 return ROLE_MELEE;
         }
@@ -574,10 +664,12 @@ namespace partypos
     {
         switch (role)
         {
-            case ROLE_MELEE:  return 4.0f;
-            case ROLE_RANGED: return 26.0f;
-            case ROLE_HEALER: return 22.0f;
-            default:          return 20.0f;
+            case ROLE_MELEE:   return 4.5f;
+            case ROLE_MID:     return 27.0f;   // 24-30 码
+            case ROLE_RANGED:  return 38.0f;   // 36-40 码
+            case ROLE_HEALER:  return 38.0f;   // 36-40 码
+            case ROLE_SANDBAG: return 32.0f;
+            default:           return 27.0f;
         }
     }
 
@@ -604,6 +696,57 @@ namespace partypos
         return false;
     }
 
+    // ---- 未登记阵型数据的 BOSS 兜底（2026-10-19 站长口径）------------------
+    //   数据源：tbccharacters.ai_playerbot_boss_strategy（登记表，5 分钟重扫）
+    //   判定：登记表 / ScriptName "boss_" / 世界 BOSS（rank>=3）⇒ 进默认阵型
+    inline std::set<uint32>& RegisteredBosses() { static std::set<uint32> s; return s; }
+
+    inline void EnsureRegisteredBosses()
+    {
+        static bool tried = false;
+        static time_t loadedAt = 0;
+        time_t now = time(0);
+        if (tried && now - loadedAt < 300)
+            return;
+        tried = true;
+        loadedAt = now;
+
+        std::set<uint32> set;
+        std::unique_ptr<QueryResult> res = CharacterDatabase.Query("SELECT entry FROM ai_playerbot_boss_strategy");
+        if (res)
+        {
+            do
+            {
+                set.insert(res->Fetch()[0].GetUInt32());
+            } while (res->NextRow());
+        }
+
+        std::scoped_lock lock(PlanMutex());
+        RegisteredBosses() = set;
+    }
+
+    inline bool IsBossLike(Unit* unit)
+    {
+        Creature* creature = dynamic_cast<Creature*>(unit);
+        if (!creature)
+            return false;
+        CreatureInfo const* info = creature->GetCreatureInfo();
+        if (!info)
+            return false;
+
+        {
+            std::scoped_lock lock(PlanMutex());
+            if (RegisteredBosses().count(creature->GetEntry()))
+                return true;
+        }
+
+        std::string script = creature->GetScriptName();
+        if (script.size() > 5 && script.compare(0, 5, "boss_") == 0)
+            return true;
+
+        return info->Rank >= 3;      // CREATURE_ELITE_WORLDBOSS
+    }
+
     inline bool Compute(Player* leader)
     {
         if (!leader || !leader->IsInWorld())
@@ -614,8 +757,7 @@ namespace partypos
             return false;
 
         std::map<uint8, std::set<uint32>> const& modeEntries = ModeEntries();
-        if (modeEntries.empty())
-            return false;
+        EnsureRegisteredBosses();
 
         // 1) 危险怪：队里任何人正在被它打，且 entry 命中某模式（按优先级 los > frontal > knockback > stack > spread）
         Unit* danger = nullptr;
@@ -646,6 +788,11 @@ namespace partypos
                         danger = attacker;
                         mode = want;
                     }
+                }
+                if (!danger && IsBossLike(attacker))    // 未登记阵型的 BOSS ⇒ 默认阵型
+                {
+                    danger = attacker;
+                    mode = MODE_DEFAULT;
                 }
                 if (danger)
                     break;
@@ -849,6 +996,15 @@ namespace partypos
                 y = by + band * sinf(a);
                 z = bz;
             }
+            else if (mode == MODE_DEFAULT)
+            {
+                // 默认阵型：非坦克在 BOSS 背后按角色分带（近战 4.5 / 中距离 27 / 远程+治疗 38），横向错开
+                float band = RoleBand(role);
+                float lateral = float(spreadIndex++ - (nonTank - 1) / 2.0f) * 2.2f;
+                x = bx - fx * band - fy * lateral;
+                y = by - fy * band + fx * lateral;
+                z = bz;
+            }
             else
             {
                 float band = RoleBand(role);
@@ -865,6 +1021,8 @@ namespace partypos
 
             if (!AdjustForIdleHostiles(leader, hostiles, x, y))             // 硬约束④（不引到未参战怪）
                 continue;                                                   // 找不到安全点 ⇒ 这格不下发
+            if (!AdjustForHazards(member, x, y))                            // 硬约束：不站在地面 AOE 里
+                continue;
 
             // 硬约束③：场地几何 —— 同层 + 不在实体里 + 直线可走（全用服务端 terrain/vmap 数据）
             float groundZ = z;
@@ -969,6 +1127,7 @@ namespace partypos
         }
 
         EnsureModeEntries();
+        EnsureRegisteredBosses();
         Compute(bot);
     }
 }

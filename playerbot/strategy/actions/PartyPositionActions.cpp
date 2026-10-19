@@ -50,6 +50,13 @@ bool MoveToPartySlotAction::Execute(Event& event)
             }
         }
     }
+    if (!partypos::PathSafeFromHazards(bot, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                       slot.x, slot.y, slot.z))
+    {
+        sLog.outDebug("[POSITION] path crosses hazard (bot=%s) -> skip move", bot->GetName());
+        return false;
+    }
+
 
     return MoveTo(bot->GetMapId(), slot.x, slot.y, slot.z);
 }
