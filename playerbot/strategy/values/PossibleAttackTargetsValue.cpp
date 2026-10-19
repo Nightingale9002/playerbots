@@ -32,18 +32,27 @@ using namespace MaNGOS;
 // ===========================================================================
 // [aggro 2026-10-17 站长口径] **攻略点名的重点小怪**表（数据优先于一切启发式）。
 //
-// 表：`tbccharacters.ai_playerbot_priority_target`（见 dev/179_重点小怪优先级表.sql）
+// 表：`tbccharacters.ai_playerbot_priority_target`（现 dev/182_机器人相关_整合.sql）
 //   entry / priority / source / reason
-//   priority 1 = 攻略把它的技能标了 [打断] 或 [重要]（例：血警卫修理工 19633 的"强效治疗术 务必打断"）
-//   priority 2 = 攻略「重点小怪」章节点名
+//   [2026-10-19 口径·定稿] 数字越大越优先，含义分档（站长原文）：
+//     priority 5 = 任何情况必须**立刻转火击杀**（压过一切；吃控制也不降级）
+//     priority 3 = 有读条类控制技能、瞬发治疗、不可驱散伤害类 dot、本身高伤害或者有高伤害技能
+//                  ⇒ **优先控制，如果控制不够则优先击杀**
+//     priority 2 = 有伤害类 dot，**没有对应驱散**的情况下优先击杀（队里有对应驱散 ⇒ 不优先）
+//     priority 1 = 有读条类治疗，只需要**打断**；打断好就不用优先击杀（击杀优先级 0，交给打断逻辑）
+//     priority 4 = **优先控制，最后击杀**
+//     通用规则：**吃控制的怪，控制能替我们处理 ⇒ 优先级降到最后，不能打醒控制**
 //
 // 为什么要有它（站长原话）：**"并不是每个有技能的怪都是高威胁"** —— 所以高威胁名单不能靠
 //   引擎扫技能表推出来（那样会把 487 个"有治疗/召唤"的怪全算进去），必须用**人工校订过的攻略名单**。
 //   引擎自己的"观察它施放过高威胁技能"只作为**名字不在表里**时的回落。
 //
 // 口径映射（表里的 priority 越大越优先，与 ThreatTier 同级语义）：
-//   表 priority 1 -> ThreatTier 5（与骷髅标记同级：人工明确要处理）
-//   表 priority 2 -> ThreatTier 4（与"有高威胁技能"同级）
+//   表 priority 5 -> ThreatTier 5（不降级，必须立刻杀）
+//   表 priority 3 -> ThreatTier 4/3（吃控制降 1 级；控制够就先控，控制不够则优先击杀）
+//   表 priority 2 -> ThreatTier 0/3（队里有驱散 ⇒ 0；否则 3，吃控制再降）
+//   表 priority 1 -> ThreatTier 0（只交给打断逻辑）
+//   表 priority 4 -> ThreatTier 1（击杀放到最后；优先控制由 CcTargetValue 负责）
 //
 // 刷新：每 kPriorityRefreshSeconds 秒重读一次 ⇒ 改数据不用重启（与 BossStrategyHook 同范式）。
 //   多地图线程会同时调到这里 ⇒ 用 mutex；读路径走 thread_local 缓存，避免每 tick 抢锁。
@@ -1229,8 +1238,9 @@ int PossibleAttackTargetsValue::ThreatTier(Unit* target, Player* bot)
                 return 0;
 
             case 4:
-                // 需要优先控制：击杀优先级仍算高档（4），但 CcTargetValue 会优先把它选成控制目标
-                return 4;
+                // [2026-10-19 口径] 优先控制、**最后击杀**：击杀档位压到最低（1），
+                // 由 CcTargetValue（needsControl = prio==4）优先把它选成控制目标。
+                return 1;
 
             default:
                 return 4;
