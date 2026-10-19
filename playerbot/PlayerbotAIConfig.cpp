@@ -1352,6 +1352,9 @@ void PlayerbotAIConfig::logEvent(PlayerbotAI* ai, std::string eventName, std::st
         char const* role = PlayerbotAI::IsTank(bot) ? "tank" : (PlayerbotAI::IsHeal(bot) ? "heal" : "dps");
         out << role;
 
+        // [rewards 2026-10-19] 队伍列（追加在最后）：坦克/治疗的“保住队友不死”需要按队伍统计。
+        out << "," << (bot->GetGroup() ? bot->GetGroup()->GetId() : 0);
+
         log("bot_events.csv", out.str().c_str());
     }
 };
