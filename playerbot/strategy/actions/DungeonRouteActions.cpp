@@ -98,51 +98,8 @@ bool DungeonRouteMoveAction::Execute(Event& event)
             return true;
     }
 
-    // [2026-10-19] ② 卡住自救：位置 2.5 秒没动，且目标不远/同层 ⇒ 朝目标小跳一次（矮台/碎石/缺口）
-    if (sPlayerbotAIConfig.routeJumpAssist)
-    {
-        dungeonroute::BotState& st = dungeonroute::StateOf(bot);
-        uint32 const now = WorldTimer::getMSTime();
-        float const bx = bot->GetPositionX();
-        float const by = bot->GetPositionY();
-        float const bz = bot->GetPositionZ();
-
-        float const dx = bx - st.moveLastX;
-        float const dy = by - st.moveLastY;
-        float const dz = bz - st.moveLastZ;
-        if (!st.moveProgressAt || (dx * dx + dy * dy + dz * dz) > 6.25f)   // 移动了 >2.5 码 = 有进展
-        {
-            st.moveLastX = bx;
-            st.moveLastY = by;
-            st.moveLastZ = bz;
-            st.moveProgressAt = now ? now : 1;
-        }
-        else if (WorldTimer::getMSTimeDiff(st.moveProgressAt, now) > 2500)
-        {
-            st.moveProgressAt = now;
-            float const dist = bot->GetDistance(target.px, target.py, target.pz);
-            if (dist > 4.0f)
-            {
-                // [2026-10-19] 远处也自救：navmesh 缺块时朝目标"跳跃推进"（每次 ~8 码，2.5 秒一次），
-                //   否则大距离（>25 码）会一直不算卡住、原地站到 90 秒超时。
-                float vx = target.px - bx;
-                float vy = target.py - by;
-                float len = std::sqrt(vx * vx + vy * vy);
-                if (len < 1.0f)
-                    len = 1.0f;
-                float const step = std::min(10.0f, std::max(2.0f, dist - 2.0f));
-                float const jx = bx + vx / len * step;
-                float const jy = by + vy / len * step;
-                float const jz = (std::fabs(target.pz - bz) <= 8.0f) ? target.pz : bz;
-                bot->GetMotionMaster()->MoveJump(jx, jy, jz, 9.0f, 4.0f);
-                st.jumpUntil = now + 1500;
-                sLog.outString("[DUNGEONROUTE] %s 卡住 ⇒ 朝目标跳跃推进 %.0f 码（dist=%.1f dz=%.1f）",
-                    bot->GetName(), step, dist, target.pz - bz);
-                return true;
-            }
-        }
-    }
-
+    // [2026-10-19 站长口径] 完全取消自动“跳跃推进”，统一 mmap 寻路：
+    //   目标太远/不同层时不跳，交给 mmap；真走不过去由卡住保护/波次放弃处理。
     return MoveTo(map->GetId(), target.px, target.py, target.pz);
 }
 
