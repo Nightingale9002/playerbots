@@ -63,6 +63,17 @@ namespace dw
         if (key == "position.mode.spread")       return 30.0f;
         if (key == "position.mode.wall")         return 20.0f;
 
+        // [跑位 2026-10-19] 每种阵型一条权重（以后靠权重选站位）
+        if (key == "position.mode.role_bands")    return 10.0f;
+        // [跑位 2026-10-19] 距离带：上限 + 下限（码）
+        if (key == "position.band.min_range")     return 12.0f;
+        if (key == "position.band.melee")         return 4.5f;
+        if (key == "position.band.mid_range")     return 20.0f;   // 暗牧/奥法
+        if (key == "position.band.ranged")        return 30.0f;   // 其它远程
+        if (key == "position.band.healer")        return 30.0f;   // 治疗
+        // 有近战 AOE 的 BOSS：远程/治疗不能站太近（默认 18 码）
+        if (key == "position.melee_aoe_min")      return 18.0f;
+
         return 0.0f;
     }
 

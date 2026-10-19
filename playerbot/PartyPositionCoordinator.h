@@ -69,7 +69,7 @@ namespace partypos
         MODE_LOS_PULL = 7,    // 卡视角拉怪（坦克把怪拉过来）
         MODE_LOS_BACKLINE = 8,// 只有远程/治疗卡视野
         MODE_LOS_BREAK = 9,   // 断读条卡视野
-        MODE_DEFAULT = 10,    // 兜底阵型（未登记 ai_playerbot_boss_ability 的 BOSS）
+        MODE_ROLE_BANDS = 10, // 分带阵型（独立策略；未登记 BOSS 的兜底）（未登记 ai_playerbot_boss_ability 的 BOSS）
     };
 
     struct Slot
@@ -132,7 +132,7 @@ namespace partypos
             case MODE_LOS_PULL:  return "los_pull";
             case MODE_LOS_BACKLINE: return "los_backline";
             case MODE_LOS_BREAK: return "los_break";
-            case MODE_DEFAULT:   return "default";
+            case MODE_ROLE_BANDS: return "role_bands";
             default:             return "none";
         }
     }
@@ -392,6 +392,68 @@ namespace partypos
     }
 
     // 从 world 库加载"按模式分类的触发 entry"，每 300s 刷新；表不存在则静默
+    inline float RoleBand(uint8 role)
+    {
+        switch (role)
+        {
+            case ROLE_MELEE:   return dw::Get("position.band.melee");
+            case ROLE_MID:     return dw::Get("position.band.mid_range");
+            case ROLE_RANGED:  return dw::Get("position.band.ranged");
+            case ROLE_HEALER:  return dw::Get("position.band.healer");
+            case ROLE_SANDBAG: return 32.0f;
+            default:           return dw::Get("position.band.ranged");
+        }
+    }
+
+    // ---- 有近战 AOE 的 BOSS（数据：ai_playerbot_boss_ability.category='melee_aoe'）----
+    inline std::set<uint32>& MeleeAoeBosses() { static std::set<uint32> s; return s; }
+
+    inline void SetMeleeAoeBosses(std::set<uint32> const& s)
+    {
+        std::scoped_lock lock(PlanMutex());
+        MeleeAoeBosses() = s;
+    }
+
+    inline bool IsMeleeAoeBoss(uint32 entry)
+    {
+        std::scoped_lock lock(PlanMutex());
+        return MeleeAoeBosses().count(entry) != 0;
+    }
+
+    // 远程/治疗的下限（默认 12；近战 AOE 的 BOSS 抬高）
+    inline float RoleMinDistance(uint8 role, uint32 bossEntry)
+    {
+        if (role != ROLE_MID && role != ROLE_RANGED && role != ROLE_HEALER)
+            return 0.0f;
+        float lower = dw::Get("position.band.min_range");
+        if (IsMeleeAoeBoss(bossEntry))
+            lower = std::max(lower, dw::Get("position.melee_aoe_min"));
+        return lower;
+    }
+
+    // 把 (x,y) 夹进 [下限, 上限] 环带（只对中距/远程/治疗；近战/坦克不动）
+    inline void FitRoleBand(uint8 role, uint32 bossEntry, float bx, float by, float& x, float& y)
+    {
+        if (role != ROLE_MID && role != ROLE_RANGED && role != ROLE_HEALER)
+            return;
+        float upper = RoleBand(role);
+        float lower = RoleMinDistance(role, bossEntry);
+        if (upper < lower)
+            upper = lower;
+
+        float dx = x - bx, dy = y - by;
+        float d = sqrtf(dx * dx + dy * dy);
+        if (d < 1e-3f) { dx = 1.0f; dy = 0.0f; d = 1.0f; }
+        float want = d;
+        if (want > upper) want = upper;
+        if (want < lower) want = lower;
+        if (fabsf(want - d) > 0.01f)
+        {
+            x = bx + dx / d * want;
+            y = by + dy / d * want;
+        }
+    }
+
     inline void EnsureModeEntries()
     {
         static std::mutex m;
@@ -431,6 +493,7 @@ namespace partypos
                 else if (category == "los_pull") mode = MODE_LOS_PULL;
                 else if (category == "los_backline") mode = MODE_LOS_BACKLINE;
                 else if (category == "los_break") mode = MODE_LOS_BREAK;
+                else if (category == "role_bands" || category == "default") mode = MODE_ROLE_BANDS;
                 if (!mode)
                     continue;
                 if (uint32 boss = fields[1].GetUInt32())
@@ -481,6 +544,20 @@ namespace partypos
             } while (fres->NextRow());
         }
         SetFacingRules(facingRules);
+
+        std::set<uint32> meleeAoe;
+        std::unique_ptr<QueryResult> ares = WorldDatabase.Query(
+            "SELECT DISTINCT `boss_entry`,`owner_entry` FROM `ai_playerbot_boss_ability` WHERE `category` = 'melee_aoe'");
+        if (ares)
+        {
+            do
+            {
+                Field* fields = ares->Fetch();
+                if (uint32 boss = fields[0].GetUInt32()) meleeAoe.insert(boss);
+                if (uint32 owner = fields[1].GetUInt32()) meleeAoe.insert(owner);
+            } while (ares->NextRow());
+        }
+        SetMeleeAoeBosses(meleeAoe);
 
         SetModeEntries(entries);
         uint32 count = 0;
@@ -621,12 +698,10 @@ namespace partypos
         return false;
     }
 
-    // [跑位分带 2026-10-19 站长口径]
-    //   T  → 由 Compute 里真实坦克判定（正面拉住 BOSS）
-    //   近战 → 4.5 码（打背）
-    //   中距离 → 24-30 码（暗牧/奥法/术士/鸟德/元素萨 等）
-    //   远程 → 36-40 码（猎人）
-    //   治疗 → 36-40 码
+    // [跑位分带 2026-10-19 站长口径 v2]
+    //   中距离 = 只有暗牧 / 奥法（上限 20 码）
+    //   远程   = 其余远程输出 + 治疗（上限 30 码）
+    //   下限统一 12 码；有近战 AOE 的 BOSS 再抬高最近距离
     inline uint8 RoleOf(Player* member, Unit* boss)
     {
         if (!member || !boss)
@@ -635,24 +710,24 @@ namespace partypos
         if (PlayerbotAI::IsHeal(member))
             return ROLE_HEALER;
         if (PlayerbotAI::IsTank(member))
-            return ROLE_MELEE;          // 非当前坦克的副坦按近战带站（坦克位由 Compute 指定）
+            return ROLE_MELEE;
 
         int spec = AiFactory::GetPlayerSpecTab(member);
         switch (member->getClass())
         {
-            case CLASS_HUNTER:
-                return ROLE_RANGED;     // 36-40 码
             case CLASS_MAGE:
-            case CLASS_WARLOCK:
-                return ROLE_MID;        // 24-30 码
+                return spec == 0 ? ROLE_MID : ROLE_RANGED;   // 奥术=中距，火焰/冰霜=远程
             case CLASS_PRIEST:
-                return ROLE_MID;        // 暗牧 24-30（治疗已在上面分流）
+                return spec == 2 ? ROLE_MID : ROLE_RANGED;   // 暗影=中距，戒律/神圣=远程
+            case CLASS_HUNTER:
+            case CLASS_WARLOCK:
+                return ROLE_RANGED;
             case CLASS_DRUID:
-                return spec == 1 ? ROLE_MELEE : ROLE_MID;   // 野性=近战，平衡=中距离
+                return spec == 1 ? ROLE_MELEE : ROLE_RANGED; // 野性=近战，平衡=远程
             case CLASS_SHAMAN:
-                return spec == 1 ? ROLE_MELEE : ROLE_MID;   // 增强=近战，元素/恢复(治疗已分流)=中距离
+                return spec == 1 ? ROLE_MELEE : ROLE_RANGED; // 增强=近战，元素=远程
             case CLASS_PALADIN:
-                return spec == 2 ? ROLE_MELEE : ROLE_MID;   // 惩戒=近战，其它(治疗已分流)=中距离
+                return spec == 2 ? ROLE_MELEE : ROLE_RANGED; // 惩戒=近战
             case CLASS_WARRIOR:
             case CLASS_ROGUE:
             default:
@@ -660,18 +735,6 @@ namespace partypos
         }
     }
 
-    inline float RoleBand(uint8 role)
-    {
-        switch (role)
-        {
-            case ROLE_MELEE:   return 4.5f;
-            case ROLE_MID:     return 27.0f;   // 24-30 码
-            case ROLE_RANGED:  return 38.0f;   // 36-40 码
-            case ROLE_HEALER:  return 38.0f;   // 36-40 码
-            case ROLE_SANDBAG: return 32.0f;
-            default:           return 27.0f;
-        }
-    }
 
     inline bool SlotFor(Player* bot, Slot& out)
     {
@@ -773,7 +836,8 @@ namespace partypos
                     continue;
                 // [决策参数化 2026-10-18] 模式选择也走权重表（position.mode.*）
                 static uint8 const candidates[] = { MODE_LOS_ALL, MODE_LOS_PULL, MODE_LOS_BACKLINE, MODE_LOS_BREAK,
-                                                    MODE_FRONTAL, MODE_KNOCKBACK, MODE_STACK, MODE_SPREAD, MODE_WALL };
+                                                    MODE_FRONTAL, MODE_KNOCKBACK, MODE_STACK, MODE_SPREAD, MODE_WALL,
+                                                    MODE_ROLE_BANDS };
                 float bestModeScore = -1e18f;
                 for (uint8 want : candidates)
                 {
@@ -792,7 +856,7 @@ namespace partypos
                 if (!danger && IsBossLike(attacker))    // 未登记阵型的 BOSS ⇒ 默认阵型
                 {
                     danger = attacker;
-                    mode = MODE_DEFAULT;
+                    mode = MODE_ROLE_BANDS;
                 }
                 if (danger)
                     break;
@@ -996,7 +1060,7 @@ namespace partypos
                 y = by + band * sinf(a);
                 z = bz;
             }
-            else if (mode == MODE_DEFAULT)
+            else if (mode == MODE_ROLE_BANDS)
             {
                 // 默认阵型：非坦克在 BOSS 背后按角色分带（近战 4.5 / 中距离 27 / 远程+治疗 38），横向错开
                 float band = RoleBand(role);
@@ -1017,12 +1081,21 @@ namespace partypos
             if (member != tank)
                 EnforceSectors(bx, by, facing, avoidMask, x, y);
 
+            // [跑位 2026-10-19] 通用分带阵型才夹距离带（stack/knockback 等特殊队形保持原样）
+            if (mode == MODE_SPREAD || mode == MODE_ROLE_BANDS)
+                FitRoleBand(role, danger->GetEntry(), bx, by, x, y);
+
             ClampToLeash(bx, by, x, y);                                     // 硬约束①（不跑出战斗范围）
 
             if (!AdjustForIdleHostiles(leader, hostiles, x, y))             // 硬约束④（不引到未参战怪）
                 continue;                                                   // 找不到安全点 ⇒ 这格不下发
             if (!AdjustForHazards(member, x, y))                            // 硬约束：不站在地面 AOE 里
                 continue;
+
+            if (mode == MODE_SPREAD || mode == MODE_ROLE_BANDS)             // 安全点挪动后仍保持距离带
+                FitRoleBand(role, danger->GetEntry(), bx, by, x, y);
+            if (!SafeFromIdleHostiles(leader, x, y, hostiles) || !SafeFromHazards(member, x, y))
+                continue;                                                   // 夹带后不满足安全 ⇒ 这格不下发
 
             // 硬约束③：场地几何 —— 同层 + 不在实体里 + 直线可走（全用服务端 terrain/vmap 数据）
             float groundZ = z;
