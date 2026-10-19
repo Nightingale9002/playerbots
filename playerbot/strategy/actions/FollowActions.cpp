@@ -147,7 +147,7 @@ bool FleeToMasterAction::Execute(Event& event)
     if (distance > sPlayerbotAIConfig.reactDistance && bot->IsInCombat())
     {
         if (!urand(0, scale))
-            ai->TellPlayerNoFacing(requester, "I'm heading to your location but I'm in combat", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("I'm heading to your location but I'm in combat"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             //ai->TellPlayer(BOT_TEXT("wait_travel_combat"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
     }
     else if (distance < sPlayerbotAIConfig.reactDistance * 3)

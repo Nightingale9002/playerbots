@@ -135,6 +135,35 @@ namespace ai
         ObjectGuid Calculate() override;
     };
 
+    // ===========================================================================
+    // [BOSS 战策略 2026-10-19] `enemy casting target` / `enemy casting interruptible target`
+    //   附近**敌对且正在施放非近战法术**的单位，优先 current target，其次取最近的。
+    //   为什么需要：原来只有卡拉赞等副本专用触发器，打断全靠各职业策略自己判断
+    //   ⇒ 规则行写不出"指定某只怪在读条就打断/控场"。
+    //   限定词（逗号分隔，可省略）：
+    //     dist::<码数>       扫描半径（默认 30 码；只接受正数）
+    //     spellid::<id>      只认这一个法术 id
+    //   性能（每条都是刻意做的）：
+    //     · 先看 current target —— 命中就直接返回，**不做范围扫描**（最热路径）；
+    //     · 范围扫描用 Cell::VisitAllObjects(range) —— 只走与半径相交的格子，不是全图扫描；
+    //     · 缓存 = ObjectGuidCalculatedValue 的 checkInterval=2：引擎侧
+    //       CalculatedValue::Get 的 `now - lastCheckTime >= checkInterval/2` ⇒ 约每 1 秒最多重算一次。
+    //       （注意 checkInterval=1 等于**不缓存**：第三个判据 `>= checkInterval/2 == 0` 恒真。）
+    //     · 空限定词 / 半径非法 ⇒ 用默认值或直接返回空 guid，绝不去 GetValue("")。
+    class EnemyCastingTargetValue : public ObjectGuidCalculatedValue, public Qualified
+    {
+    public:
+        EnemyCastingTargetValue(PlayerbotAI* ai, std::string name = "enemy casting target", bool interruptibleOnly = false) :
+            // [2026-10-18 站长口径] "所有威胁等级都要 1s 内打断高危技能" ⇒ 刷新间隔 1（≈0.5s），
+            //   原来 2（≈1s）会吃掉一半的反应窗口。
+            ObjectGuidCalculatedValue(ai, name, 1), Qualified(), interruptibleOnly(interruptibleOnly) {}
+
+        virtual ObjectGuid Calculate() override;
+
+    private:
+        bool interruptibleOnly;
+    };
+
     class FriendlyManualTargetsValue : public ManualSetValue<std::list<ObjectGuid>>
     {
     public:

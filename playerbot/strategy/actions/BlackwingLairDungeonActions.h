@@ -52,7 +52,7 @@ namespace ai
             
             if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
             {
-                ai->TellPlayerNoFacing(GetMaster(), "Moving to Suppression Device at " + std::to_string((int)closestDist) + " yards");
+                ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT2("Moving to Suppression Device at %distance yards", (std::map<std::string, std::string>{ {"%distance", std::to_string((int)closestDist)} })));
             }
 
             return MoveTo(closest.getMapId(), closest.getX(), closest.getY(), closest.getZ());
@@ -139,7 +139,7 @@ namespace ai
 
                 if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
                 {
-                    ai->TellPlayerNoFacing(GetMaster(), "Deactivating Suppression Device");
+                    ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT("Deactivating Suppression Device"));
                 }
 
                 return true;
@@ -198,7 +198,7 @@ namespace ai
 
             if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
             {
-                ai->TellPlayerNoFacing(GetMaster(), "Casting Disarm Trap on Suppression Device");
+                ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT("Casting Disarm Trap on Suppression Device"));
             }
 
             return ai->CastSpell(SPELL_DISARM_TRAP, closestGo);

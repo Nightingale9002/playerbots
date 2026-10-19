@@ -40,7 +40,7 @@ bool QuestRewardAction::Execute(Event& event)
         ai->TellPlayer(requester, out);
     }
     else {
-        ai->TellPlayer(requester, "Usage: quest reward [auto|list|ask|reset|?]");
+        ai->TellPlayer(requester,BOT_TEXT("Usage: quest reward [auto|list|ask|reset|?]"));
     }
 
     return true;

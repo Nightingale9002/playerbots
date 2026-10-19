@@ -49,6 +49,12 @@ public:
 
     static ObjectGuid GetRandomBot();
     static void Init();
+    // [gems 2026-10-17 站长口径] 把 InitGems() 的"补插宝石"抽成可复用的静态函数（不依赖建造链）：
+    //   onlyEmpty = true  ⇒ 幂等补插：只补空槽，已插满的物品整件跳过、绝不拆掉已有宝石
+    //                       （老 bot 一次性补插 / 每次换装后补插都用这个）
+    //   onlyEmpty = false ⇒ 建号与全套换装用（与原 InitGems() 一致：按专精权重重选并纠正插错的槽）
+    // 返回值 = 本次真正写入的宝石颗数（0 表示什么都没动，调用方据此决定是否打日志）。
+    static uint32 FillGems(Player* bot, bool onlyEmpty = true);
     void Refresh();
     void Randomize(bool incremental, bool syncWithMaster);
     static std::list<uint32> classQuestIds;
@@ -56,9 +62,9 @@ public:
     void InitSkills();
     void EnchantEquipment();
     void EquipGear() { InitEquipment(false, false); InitGems(); }
-    void EquipGearBest() { return InitEquipment(false, false, false); }
-    void EquipGearPartialUpgrade() { return InitEquipment(false, false, true, true); }
-    void UpgradeGear(bool syncWithMaster) { return InitEquipment(!syncWithMaster, syncWithMaster); }
+    void EquipGearBest() { InitEquipment(false, false, false); FillGems(bot, true); }
+    void EquipGearPartialUpgrade() { InitEquipment(false, false, true, true); FillGems(bot, true); }
+    void UpgradeGear(bool syncWithMaster) { InitEquipment(!syncWithMaster, syncWithMaster); FillGems(bot, true); }
     void AddReagents() { return InitReagents(); }
     void AddPotions() { return InitPotions(); }
     void AddConsumes() { return AddConsumables(); }

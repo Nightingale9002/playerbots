@@ -1,4 +1,4 @@
-#include "TravelNode.h"
+﻿#include "TravelNode.h"
 #include "playerbot/TravelMgr.h"
 
 #include <iomanip>
@@ -3197,8 +3197,45 @@ void TravelNodeMap::generateAll()
     }
 
     sLog.outString("-Calculating coverage"); //This prevents crashes when bots from multiple maps try to calculate this on the fly.
+    // [降峰 2026-10-15] 收窄为"只预热配置地图的节点 + 只算同地图可达(mapOnly)"，不做全量 all-pairs：
+    // 原实现对每个节点都调 hasRouteTo(node)（mapOnly=false）⇒ 每节点一份全世界 routes 表，
+    // 实测启动峰值 +413MB 且接近 O(N²)。bot 只在配置地图活动，跨地图靠传送即可。
+    auto isBotMap = [](uint32 mapId)
+    {
+        return std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), mapId)
+            != sPlayerbotAIConfig.randomBotMaps.end();
+    };
     for (auto& node : getNodes())
-        node->hasRouteTo(node);
+    {
+        if (!isBotMap(node->getMapId()))
+            continue;
+
+        node->hasRouteTo(node, true);
+    }
+}
+
+// [懒加载 2026-10-15] 按需加载某条路径的坐标点（供 TravelNodePath::getPath()/getComplete() 调用）
+void TravelNodePath::loadPathPoints()
+{
+    if (complete || !fromNodeId)
+        return;
+
+    complete = true;   // 先标记，避免重复查询/递归
+
+    auto result = WorldDatabase.PQuery(
+        "SELECT map_id, x, y, z FROM ai_playerbot_travelnode_path WHERE node_id = %u AND to_node_id = %u ORDER BY nr",
+        fromNodeId, toNodeId);
+
+    if (result)
+    {
+        do
+        {
+            Field* fields = result->Fetch();
+            path.push_back(WorldPosition(fields[0].GetUInt32(), fields[1].GetFloat(), fields[2].GetFloat(), fields[3].GetFloat()));
+        } while (result->NextRow());
+    }
+
+    calculateCost(true);
 }
 
 void TravelNodeMap::printMap()
@@ -3472,6 +3509,10 @@ void TravelNodeMap::loadNodeStore()
 
                 startNode->setPathTo(endNode, TravelNodePath(fields[4].GetFloat(), fields[6].GetFloat(), fields[2].GetUInt8(), fields[3].GetUInt64(), fields[7].GetBool(), { fields[8].GetUInt8(),fields[9].GetUInt8(),fields[10].GetUInt8() }, fields[5].GetFloat()), true);
 
+                // [懒加载 2026-10-15] 记下端点 id，供坐标点按需加载
+                if (TravelNodePath* lazyPath = startNode->getPathTo(endNode))
+                    lazyPath->setNodeIds(fields[0].GetUInt32(), fields[1].GetUInt32());
+
                 if (!fields[7].GetBool())
                     hasToGen = true;
 
@@ -3488,7 +3529,11 @@ void TravelNodeMap::loadNodeStore()
 
     {
         //                     0        1           2   3      4   5  6
-        std::string query = "SELECT node_id, to_node_id, nr, map_id, x, y, z FROM ai_playerbot_travelnode_path order by node_id, to_node_id, nr";
+        // [懒加载 2026-10-15] 启动时**不**加载路径点（外域 18.6 万点常驻内存 = 内存大户）；
+        // 改为 TravelNodePath::getPath()/getComplete() 第一次被用到时调用 loadPathPoints() 查库，
+        // 于是内存只与"实际走过的路径"成正比，与 bot 分布在几个地图无关。
+        // 需要恢复全量加载：把 WHERE 1=0 换成 `order by node_id, to_node_id, nr` 即可。
+        std::string query = "SELECT node_id, to_node_id, nr, map_id, x, y, z FROM ai_playerbot_travelnode_path WHERE 1=0";
 
         auto result = WorldDatabase.PQuery("%s", query.c_str());
 

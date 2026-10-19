@@ -69,7 +69,7 @@ bool GossipHelloAction::Execute(Event& event)
 	}
 	else if (!bot->GetPlayerMenu())
 	{
-	    ai->TellPlayerNoFacing(requester, "I need to talk first");
+	    ai->TellPlayerNoFacing(requester,BOT_TEXT("I need to talk first"));
 	    return false;
 	}
 	else

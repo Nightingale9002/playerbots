@@ -502,4 +502,16 @@ namespace ai
 
     DEBUFF_TRIGGER(AvengerShieldTrigger, "avenger's shield");
     BOOST_TRIGGER(DivineIlluminationBoostTrigger, "divine illumination");
+
+    // [防骑 2026-10-16 站长口径] 复仇之怒**只对 BOSS 起手开**：
+    //   判定 = 自己在战斗中 + 自己身上没有复仇之怒 + 当前目标（或可能的攻击目标）是 BOSS
+    //   （BOSS 判定复用 ProtSealAction 的 sObjectMgr.IsEncounter() 口径）。
+    //   注意：不继承 BoostTrigger —— 它有一条 "没有真人 master 时只按 balance 判定" 的分支，
+    //   会把 BOSS 门禁绕过去（纯机器人队伍就等于又变回"随便开"）。
+    class AvengingWrathBossTrigger : public BuffTrigger
+    {
+    public:
+        AvengingWrathBossTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "avenging wrath") {}
+        virtual bool IsActive() override;
+    };
 }

@@ -167,7 +167,7 @@ bool EmoteActionBase::ReceiveEmote(Player* requester, Player* source, uint32 emo
         if (requester == source)
         {
             ai->ChangeStrategy("-follow,+stay", BotState::BOT_STATE_NON_COMBAT);
-            ai->TellPlayerNoFacing(requester, "Fine.. I'll stay right here..", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("Fine.. I'll stay right here.."), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         }
         break;
     case TEXTEMOTE_BECKON:
@@ -175,7 +175,7 @@ bool EmoteActionBase::ReceiveEmote(Player* requester, Player* source, uint32 emo
         if (requester == source)
         {
             ai->ChangeStrategy("+follow", BotState::BOT_STATE_NON_COMBAT);
-            ai->TellPlayerNoFacing(requester, "Wherever you go, I'll follow..", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("Wherever you go, I'll follow.."), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         }
         break;
     case TEXTEMOTE_WAVE:

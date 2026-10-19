@@ -97,7 +97,9 @@ namespace ai
 
         static bool ShouldWait(PlayerbotAI* ai);
         static uint8 GetWaitTime(PlayerbotAI* ai);
-        static float GetSafeDistance() { return sPlayerbotAIConfig.fleeDistance; }
+        // [threat 2026-10-16 站长口径] 等坦克时"保持的安全距离"改为独立配置（默认 15 码），
+        // 不再借用 fleeDistance（那是逃跑距离，改动会连带影响逃跑行为）。
+        static float GetSafeDistance() { return sPlayerbotAIConfig.waitForAttackSafeDistance; }
         static float GetSafeDistanceThreshold() { return 2.5f; }
         ReactStates GetPetReactState() const { return petReactState; }
         void SetPetReactState(ReactStates reactState) { petReactState = reactState; }
@@ -158,4 +160,72 @@ namespace ai
         }
 #endif
     };
+
+    // [pull-gate 2026-10-19 站长口径] "坦克乱开怪"：
+    //   还没进战斗时，附近敌对数量达到 AiPlayerbot.PullHostileLimit 就不主动开怪（默认 3 只 / 15 码）。
+    //   只影响"开怪"这一刻：一旦已经进战斗就不再生效，避免战斗中反复被压住。
+    //   与 wait for attack 的区别：那条只看"仇恨/坦克有没有 pull back"，这条看"这一堆怪能不能碰"。
+    class PullGateStrategy : public Strategy
+    {
+    public:
+        PullGateStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "pull gate"; }
+
+#ifdef GenerateBotHelp
+        virtual std::string GetHelpName() { return "pull gate"; }
+        virtual std::string GetHelpDescription()
+        {
+            return "This strategy stops the bot from starting a fight when too many hostiles are nearby (AI cannot fight a whole pack).";
+        }
+#endif
+
+    private:
+        void InitCombatTriggers(std::list<TriggerNode*>& triggers) override;
+    };
+
+    // [defend-self 2026-10-19 站长口径] "一直挨打也不知道跑"。
+    //   与 kite 的区别（站长指出复用 kite 是错的）：
+    //     · kite 的判据是 `has aggro`，单刷时几乎恒真，挂上去会让 bot 见到怪就跑 —— 那是**风筝**战术；
+    //     · 这条只管"我不该扛却被打到残血"：非坦克 + 正在被近战打 + 血量 < AiPlayerbot.SelfDefendHealth，
+    //       才允许一次脱离近战（动作复用现有的 `flee`，受 AiPlayerbot.FleeingEnabled 约束）。
+    class DefendSelfStrategy : public Strategy
+    {
+    public:
+        DefendSelfStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "defend self"; }
+
+#ifdef GenerateBotHelp
+        virtual std::string GetHelpName() { return "defend self"; }
+        virtual std::string GetHelpDescription()
+        {
+            return "This strategy makes a non-tank bot step out of melee when it is being hit and low health.";
+        }
+#endif
+
+    private:
+        void InitCombatTriggers(std::list<TriggerNode*>& triggers) override;
+    };
+
+    // [tank 2026-10-19 站长口径] 坦克救场：把"正在打队友、坦克没仇恨"的怪接过来。
+    //   站长原话："缺的是「选中它并嘲讽」，如果嘲讽 cd 也可以做其他高仇恨技能"
+    //   ⇒ 动作 `pick up loose mob` 内部：换成该目标 → 试遍本职业嘲讽技；嘲讽都在 CD 就返回 false，
+    //     让普通仇恨循环去打这个新目标。
+    class TankPickUpStrategy : public Strategy
+    {
+    public:
+        TankPickUpStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "tank pick up"; }
+
+#ifdef GenerateBotHelp
+        virtual std::string GetHelpName() { return "tank pick up"; }
+        virtual std::string GetHelpDescription()
+        {
+            return "This strategy makes the tank grab mobs that are hitting party members but have no tank threat.";
+        }
+#endif
+
+    private:
+        void InitCombatTriggers(std::list<TriggerNode*>& triggers) override;
+    };
 }
+

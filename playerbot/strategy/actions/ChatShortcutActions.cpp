@@ -200,7 +200,7 @@ bool GoawayChatShortcutAction::Execute(Event& event)
 
     PrintStrategies(ai, event);
 
-    ai->TellPlayerNoFacing(requester, "Running away");
+    ai->TellPlayerNoFacing(requester,BOT_TEXT("Running away"));
     return true;
 }
 
@@ -245,6 +245,6 @@ bool MaxDpsChatShortcutAction::Execute(Event& event)
 
     ai->Reset();
     ai->ChangeStrategy("-threat,-conserve mana,-cast time,+dps debuff,+boost", BotState::BOT_STATE_COMBAT);
-    ai->TellPlayerNoFacing(requester, "Max DPS!");
+    ai->TellPlayerNoFacing(requester,BOT_TEXT("Max DPS!"));
     return true;
 }

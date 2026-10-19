@@ -54,7 +54,7 @@ bool GoAction::Execute(Event& event)
         DestinationList dests = ChooseTravelTargetAction::FindDestination(bot, destination);
         if (dests.empty())
         {
-            ai->TellPlayerNoFacing(requester, "I don't know how to travel to " + destination);
+            ai->TellPlayerNoFacing(requester, BOT_TEXT2("I don't know how to travel to %destination", (std::map<std::string, std::string>{ {"%destination", destination} })));
             return false;
         }
 
@@ -64,7 +64,7 @@ bool GoAction::Execute(Event& event)
 
         if (!dest)
         {
-            ai->TellPlayerNoFacing(requester, "I don't know how to travel to " + destination);
+            ai->TellPlayerNoFacing(requester, BOT_TEXT2("I don't know how to travel to %destination", (std::map<std::string, std::string>{ {"%destination", destination} })));
             return false;
         }
         return TellHowToGo(dest, requester);
@@ -94,7 +94,7 @@ bool GoAction::Execute(Event& event)
 
             if (dests.empty())
             {
-                ai->TellPlayerNoFacing(requester, "I don't know how to travel to " + destination);
+                ai->TellPlayerNoFacing(requester, BOT_TEXT2("I don't know how to travel to %destination", (std::map<std::string, std::string>{ {"%destination", destination} })));
                 return false;
             }
 
@@ -105,7 +105,7 @@ bool GoAction::Execute(Event& event)
 
             if (!dest)
             {
-                ai->TellPlayerNoFacing(requester, "I don't know how to travel to " + destination);
+                ai->TellPlayerNoFacing(requester, BOT_TEXT2("I don't know how to travel to %destination", (std::map<std::string, std::string>{ {"%destination", destination} })));
                 return false;
             }
 
@@ -116,7 +116,7 @@ bool GoAction::Execute(Event& event)
                 return TellHowToGo(dest, requester);
 
             if (bot->IsTaxiFlying())
-                ai->TellPlayerNoFacing(requester, "I am currently on a taxi.");
+                ai->TellPlayerNoFacing(requester, BOT_TEXT("I am currently on a taxi."));
 
             return TravelTo(dest, requester);
 
@@ -124,7 +124,7 @@ bool GoAction::Execute(Event& event)
     }
 
     if (bot->IsTaxiFlying())
-        ai->TellPlayerNoFacing(requester, "I am currently on a taxi.");
+        ai->TellPlayerNoFacing(requester, BOT_TEXT("I am currently on a taxi."));
 
     if (param.find("travel") != std::string::npos && param.size()> 7)
     {
@@ -137,7 +137,7 @@ bool GoAction::Execute(Event& event)
 
         if (dests.empty())
         {
-            ai->TellPlayerNoFacing(requester, "I don't know how to travel to " + destination);
+            ai->TellPlayerNoFacing(requester, BOT_TEXT2("I don't know how to travel to %destination", (std::map<std::string, std::string>{ {"%destination", destination} })));
             return false;
         }
 
@@ -536,7 +536,7 @@ bool GoAction::TellHowToGo(TravelDestination* dest, Player* requester) const
 
     if (!point)
     {
-        ai->TellPlayerNoFacing(requester, "I don't know how to travel to " + dest->GetTitle());
+        ai->TellPlayerNoFacing(requester, BOT_TEXT2("I don't know how to travel to %title", (std::map<std::string, std::string>{ {"%title", dest->GetTitle()} })));
         return false;
     }
 
@@ -545,7 +545,7 @@ bool GoAction::TellHowToGo(TravelDestination* dest, Player* requester) const
 
     if (route.isEmpty())
     {
-        ai->TellPlayerNoFacing(requester, "I don't know how to travel to " + dest->GetTitle());
+        ai->TellPlayerNoFacing(requester, BOT_TEXT2("I don't know how to travel to %title", (std::map<std::string, std::string>{ {"%title", dest->GetTitle()} })));
         return false;
     }
 
@@ -583,18 +583,18 @@ bool GoAction::TellHowToGo(TravelDestination* dest, Player* requester) const
         }
 
         if (nearNode)
-            ai->TellPlayerNoFacing(requester, "We are now near " + nearNode->getName() + ".");
+            ai->TellPlayerNoFacing(requester, BOT_TEXT2("We are now near %name.", (std::map<std::string, std::string>{ {"%name", nearNode->getName()} })));
 
-        ai->TellPlayerNoFacing(requester, "if we want to travel to " + dest->GetTitle());
+        ai->TellPlayerNoFacing(requester, BOT_TEXT2("if we want to travel to %title", (std::map<std::string, std::string>{ {"%title", dest->GetTitle()} })));
         if (nextNode->getPosition()->getAreaName(true, true) != botPos.getAreaName(true, true))
-            ai->TellPlayerNoFacing(requester, "we should head to " + nextNode->getName() + " in " + nextNode->getPosition()->getAreaName(true, true));
+            ai->TellPlayerNoFacing(requester, BOT_TEXT2("we should head to %name in %area", (std::map<std::string, std::string>{ {"%area", nextNode->getPosition()->getAreaName(true, true)}, {"%name", nextNode->getName()} })));
         else
-            ai->TellPlayerNoFacing(requester, "we should head to " + nextNode->getName());
+            ai->TellPlayerNoFacing(requester, BOT_TEXT2("we should head to %name", (std::map<std::string, std::string>{ {"%name", nextNode->getName()} })));
 
         pointAngle = botPos.getAngleTo(poi);
     }
     else
-        ai->TellPlayerNoFacing(requester, "We are near " + dest->GetTitle());
+        ai->TellPlayerNoFacing(requester, BOT_TEXT2("We are near %title", (std::map<std::string, std::string>{ {"%title", dest->GetTitle()} })));
 
     ai->TellPlayer(requester, "it is " + std::to_string(uint32(round(poi.distance(botPos)))) + " yards to the " + ChatHelper::formatAngle(pointAngle));
     sServerFacade.SetFacingTo(bot, pointAngle, true);

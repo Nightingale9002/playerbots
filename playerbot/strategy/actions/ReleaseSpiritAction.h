@@ -9,6 +9,37 @@
 
 namespace ai
 {
+    // [corpse-run 2026-10-17 站长口径] 队伍里现在还有没有"活着的、能复活的职业"。
+    //   能复活的职业 = 牧师 / 骑士 / 萨满（站长点名这三类）。
+    //   判据用职业 + 存活 + 与 bot 同地图：不同地图的复活者救不到副本里的尸体，
+    //   不能让他"看着有人会复活"就一直躺尸。
+    //   用途：副本里 bot 死后，若队里没有活着的复活职业 ⇒ 不要傻等，直接释放灵魂跑尸。
+    inline bool GroupHasLivingRezzer(Player* bot)
+    {
+        Group* group = bot->GetGroup();
+        if (!group)
+            return false;
+
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (!member || member == bot)
+                continue;
+
+            if (member->getClass() != CLASS_PRIEST && member->getClass() != CLASS_PALADIN &&
+                member->getClass() != CLASS_SHAMAN)
+                continue;
+
+            if (sServerFacade.UnitIsDead(member) || !sServerFacade.IsAlive(member))
+                continue;
+
+            if (member->GetMapId() == bot->GetMapId())
+                return true;
+        }
+
+        return false;
+    }
+
     class ReleaseSpiritAction : public ChatCommandAction
     {
     public:
@@ -23,15 +54,15 @@ namespace ai
 
             if (bot->GetCorpse() && bot->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GHOST))
             {
-                ai->TellPlayerNoFacing(requester, "I am already a spirit", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("I am already a spirit"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 return false;
             }
 
             WorldPacket& p = event.getPacket();
             if (!p.empty() && p.GetOpcode() == CMSG_REPOP_REQUEST)
-                ai->TellPlayerNoFacing(requester, "Releasing...", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("Releasing..."), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             else
-                ai->TellPlayerNoFacing(requester, "Meet me at the graveyard", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("Meet me at the graveyard"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 
             sLog.outDetail("Bot #%d %s:%d <%s> released", bot->GetGUIDLow(), bot->GetTeam() == ALLIANCE ? "A" : "H", bot->GetLevel(), bot->GetName());
 
@@ -107,7 +138,13 @@ namespace ai
                 return true;
 
             if (ai->HasActivePlayerMaster() && ai->GetGroupMaster()->GetMapId() == bot->GetMapId() && (bot->GetMap()->IsRaid() || bot->GetMap()->IsDungeon()))
+            {
+                // [corpse-run 2026-10-17 站长口径] 上游原版在副本里**一律不释放灵魂**（原地等真人复活）。
+                //   [2026-10-17 二次确认] 本站也一律不释放：**副本里永不自动释放尸体** ——
+                //   躺尸等真人复活 / 重置副本，不要再让 bot 自己跑尸（跑回去半路人就没了，反而拖住整队）。
+                //   GroupHasLivingRezzer() 保留备用，但不再参与本判定；野外与战场逻辑不受影响。
                 return false;
+            }
 
             if(sServerFacade.UnitIsDead(ai->GetGroupMaster()))
                 return true;

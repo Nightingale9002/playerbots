@@ -40,6 +40,10 @@ namespace ai
         ObjectGuid focusMobGuid;                
         bool focusMobKilled;                    
         std::vector<ObjectGuid> spawnedBots;    
+        // [bottest 2026-10-19 站长口径"不新建角色，直接拉在线的 bot 入队"]
+        //   借用来的 bot（本来就在线的随机机器人）不能像新建的那样被 despawn 删掉，
+        //   否则会把世界里的机器人账号/角色一起删掉。despawn 时只把他们退出队伍。
+        std::set<ObjectGuid> borrowedBots;
         std::vector<std::string> monitors;      
         std::vector<std::string> deferredCleanups;
         size_t cleanupPc;

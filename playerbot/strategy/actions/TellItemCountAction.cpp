@@ -41,7 +41,7 @@ bool TellItemCountAction::Execute(Event& event)
             soulbound[proto->ItemId] = (*i)->IsSoulBound();
             equiped[proto->ItemId] = (*i)->GetBagSlot() == INVENTORY_SLOT_BAG_0 && (*i)->GetSlot() < EQUIPMENT_SLOT_END;
             if (hasEquip == false && equiped[proto->ItemId])
-                ai->TellPlayer(requester, "=== Equipment ===");
+                ai->TellPlayer(requester,BOT_TEXT("=== Equipment ==="));
 
             hasEquip = hasEquip || equiped[proto->ItemId];
 
@@ -61,7 +61,7 @@ bool TellItemCountAction::Execute(Event& event)
             return true;
 
         if(!itemMap.empty())
-            ai->TellPlayer(requester, "=== Inventory ===");
+            ai->TellPlayer(requester,BOT_TEXT("=== Inventory ==="));
         for (std::map<uint32, uint32>::iterator i = itemMap.begin(); i != itemMap.end(); ++i)
         {
             if (equiped[i->first] && i->second == 1)

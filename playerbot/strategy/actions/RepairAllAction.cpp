@@ -87,6 +87,6 @@ bool RepairAllAction::Execute(Event& event)
         return durability < 100 && AI_VALUE(uint8, "durability inventory") > durability;
     }
 
-    ai->TellPlayerNoFacing(requester, "Cannot find any npc to repair at");
+    ai->TellPlayerNoFacing(requester,BOT_TEXT("Cannot find any npc to repair at"));
     return false;
 }

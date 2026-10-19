@@ -304,3 +304,31 @@ bool ExorcismTrigger::IsActive()
 
     return false;
 }
+
+// [防骑 2026-10-16 站长口径] 复仇之怒只对 BOSS 起手开
+bool AvengingWrathBossTrigger::IsActive()
+{
+    if (!BuffTrigger::IsActive())
+        return false;
+
+    if (!AI_VALUE2(bool, "combat", "self target"))
+        return false;
+
+    Unit* target = GetTarget();
+    if (target && !target->IsPlayer() &&
+        sObjectMgr.IsEncounter(target->GetEntry(), target->GetMapId()))
+        return true;
+
+    std::list<ObjectGuid> possibleTargets = AI_VALUE(std::list<ObjectGuid>, "possible attack targets");
+    for (std::list<ObjectGuid>::iterator i = possibleTargets.begin(); i != possibleTargets.end(); ++i)
+    {
+        Unit* unit = ai->GetUnit(*i);
+        if (!unit || !sServerFacade.IsAlive(unit) || unit->IsPlayer())
+            continue;
+
+        if (sObjectMgr.IsEncounter(unit->GetEntry(), unit->GetMapId()))
+            return true;
+    }
+
+    return false;
+}

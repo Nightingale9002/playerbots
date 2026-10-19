@@ -35,12 +35,23 @@ bool MoveToFishAction::Execute(Event& event)
         fishSpot = *target->GetPosition();
 
         if (AI_VALUE(TravelTarget*, "travel target") != target) //Do not fish ontop of master.
-            fishSpot = *sTravelMgr.GetFishSpot(bot, true);
+        {
+            // Fish locations can be disabled (AiPlayerbot.EnableFishLocations=0): GetFishSpot may return null.
+            WorldPosition* travelFishSpot = sTravelMgr.GetFishSpot(bot, true);
+            if (!travelFishSpot)
+                return false;
+
+            fishSpot = *travelFishSpot;
+        }
     }
     
     if (!fishSpot) //Get any fish spot.
     {
-        fishSpot = *sTravelMgr.GetFishSpot(bot);
+        WorldPosition* anyFishSpot = sTravelMgr.GetFishSpot(bot);
+        if (!anyFishSpot)
+            return false;
+
+        fishSpot = *anyFishSpot;
 
         TravelPath movePath = sTravelNodeMap.getFullPath(bot, fishSpot, bot);
 

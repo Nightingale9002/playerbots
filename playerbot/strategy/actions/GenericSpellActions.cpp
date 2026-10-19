@@ -154,6 +154,28 @@ bool CastSpellAction::isUseful()
     if (!spellTarget->IsInWorld() || spellTarget->GetMapId() != bot->GetMapId())
         return false;
 
+    // [感知层 2026-10-19] 隔墙（没有视线）不施法。
+    //   服务端本来也会拒绝（Spell::CheckCast 有自己的 LOS 判定），但 bot 会**一直重试**：
+    //   每次重试都吃掉一次全局冷却、还可能把施法状态机搅乱 ⇒ 干脆在"能不能做"这一层挡掉。
+    //   例外：自施法（buff / 形态）不需要视线；`anywhere` 类法术（图腾、部分传送）按规则不看 LOS。
+    if (spellTarget != bot)
+    {
+        const SpellEntry* losSpellInfo = sServerFacade.LookupSpellInfo(spellId);
+        if (!losSpellInfo || losSpellInfo->rangeIndex != SPELL_RANGE_IDX_ANYWHERE)
+        {
+            if (spellTarget == ai->GetUnit(AI_VALUE(ObjectGuid, "current target")))
+            {
+                // 走感知值（约 1 秒缓存，避免每个动作都做一次 vmap 射线）
+                if (AI_VALUE(bool, "wall between me and target"))
+                    return false;
+            }
+            else if (!bot->IsWithinLOSInMap(spellTarget))
+            {
+                return false;
+            }
+        }
+    }
+
     const SpellEntry* pSpellInfo = sServerFacade.LookupSpellInfo(spellId);
     if (pSpellInfo)
     {
@@ -523,8 +545,13 @@ bool InterruptCurrentSpellAction::Execute(Event& event)
         Spell* currentSpell = bot->GetCurrentSpell((CurrentSpellTypes)type);
         if (currentSpell && currentSpell->CanBeInterrupted())
         {
+            // [BOT-METRICS 2026-10-17] 先取 id：InterruptSpell() 之后 spell 对象可能已释放，
+            // 原代码在 InterruptSpell 之后才读 currentSpell->m_spellInfo->Id（潜在 UAF）。
+            // 同时记一次打断，用于量化打断能力。
+            const uint32 interruptedSpellId = currentSpell->m_spellInfo->Id;
+            sPlayerbotAIConfig.logEvent(ai, "bm_interrupt", std::to_string(interruptedSpellId));
             bot->InterruptSpell((CurrentSpellTypes)type);
-            ai->SpellInterrupted(currentSpell->m_spellInfo->Id);
+            ai->SpellInterrupted(interruptedSpellId);
             interrupted = true;
         }
     }
@@ -797,3 +824,26 @@ bool CastItemTargetAction::HasSpellCooldown(uint32 itemId)
 
     return false;
 }
+
+// ===========================================================================
+// [BOSS 战策略动作 2026-10-19] `cure team member`（见 GenericSpellActions.h）
+//   限定词 = `<法术名>::<驱散类型 token 表>`，用 `::` 切：
+//     第 1 段 = 法术名（交给 CastSpellAction::SetSpellName 走引擎既有 spell id 解析）
+//     第 2 段 = 目标值 `team member to cure::<这一段>` 的类型 token 表（原样透传，保证与
+//              触发器 `team member needs cure::<同一段>` 命中同一个值对象）
+//   空限定词 / 只给了空法术名 ⇒ 什么都不做（spellId 保持 0 ⇒ isPossible() 返回 false）。
+// ===========================================================================
+void CureTeamMemberAction::Qualify(const std::string& qualifier)
+{
+    Qualified::Qualify(qualifier);
+
+    std::vector<std::string> parts = Qualified::getMultiQualifiers(qualifier, "::");
+    if (parts.empty() || parts[0].empty())
+        return;
+
+    SetSpellName(parts[0]);
+
+    if (parts.size() >= 2)
+        targetQualifier = parts[1];
+}
+

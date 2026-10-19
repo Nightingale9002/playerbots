@@ -23,15 +23,15 @@ bool RTSCAction::Execute(Event& event)
 	if (command != "reset" && !requester->HasSpell(RTSC_MOVE_SPELL))
 	{
 		requester->learnSpell(RTSC_MOVE_SPELL, false);
-		ai->TellPlayerNoFacing(requester, "RTS control enabled.");
-		ai->TellPlayerNoFacing(requester, "Aedm (Awesome energetic do move) spell trained.");
+		ai->TellPlayerNoFacing(requester, BOT_TEXT("RTS control enabled."));
+		ai->TellPlayerNoFacing(requester, BOT_TEXT("Aedm (Awesome energetic do move) spell trained."));
 	}
 	else if (command == "reset")
 	{
 		if (requester->HasSpell(RTSC_MOVE_SPELL))
 		{
 			requester->removeSpell(RTSC_MOVE_SPELL);
-			ai->TellPlayerNoFacing(requester, "RTS control spell removed.");
+			ai->TellPlayerNoFacing(requester, BOT_TEXT("RTS control spell removed."));
 		}
 
 		RESET_AI_VALUE(bool, "RTSC selected");
@@ -109,7 +109,7 @@ bool RTSCAction::Execute(Event& event)
 
 		if (args.size() < 3)
 		{
-			ai->TellPlayerNoFacing(requester, "rtsc file needs atleast 2 parameters: rtsc file save/load file_name optional:position_name_part optional:bot_name_part");
+			ai->TellPlayerNoFacing(requester, BOT_TEXT("rtsc file needs atleast 2 parameters: rtsc file save/load file_name optional:position_name_part optional:bot_name_part"));
 			return false;
 		}
 		if (args.size() < 4)
@@ -187,7 +187,7 @@ bool RTSCAction::Execute(Event& event)
 				}
 
 				if(cnt)
-					ai->TellPlayerNoFacing(requester, playerName + " " + std::to_string(cnt) + " points saved to " + fileName);
+					ai->TellPlayerNoFacing(requester, BOT_TEXT2("%player %count points saved to %file", (std::map<std::string, std::string>{ {"%count", std::to_string(cnt)}, {"%player", playerName}, {"%file", fileName} })));
 			}
 		}
 		else
@@ -262,7 +262,7 @@ bool RTSCAction::Execute(Event& event)
 				} while (in.good());
 
 				if (cnt)
-					ai->TellPlayerNoFacing(requester, playerName + " " + std::to_string(cnt) + " points loaded from " + fileName);
+					ai->TellPlayerNoFacing(requester, BOT_TEXT2("%player %count points loaded from %file", (std::map<std::string, std::string>{ {"%count", std::to_string(cnt)}, {"%player", playerName}, {"%file", fileName} })));
 			}
 		}
 

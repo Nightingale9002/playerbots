@@ -4,6 +4,7 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/RandomPlayerbotMgr.h"
 #include "playerbot/ServerFacade.h"
+#include "playerbot/DungeonRoute.h"
 #include "AttackersValue.h"
 #include "PossibleAttackTargetsValue.h"
 #include "playerbot/strategy/actions/ChooseTargetActions.h"
@@ -38,6 +39,9 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
     if (master && (master == bot || master->GetMapId() != bot->GetMapId() || master->IsBeingTeleported() || !master->GetPlayerbotAI()))
         master = nullptr;
 
+    // [pull 2026-10-18 站长口径] 坦克开怪目标要过"同一层 + 可达"判据（见 PossibleAttackTargetsValue::CanReachTarget()）。
+    const bool checkSameLevel = ai->IsTank(bot) && sPlayerbotAIConfig.pullSameLevelZDistance > 0.0f;
+
     std::list<ObjectGuid> attackers = context->GetValue<std::list<ObjectGuid>>("possible attack targets")->Get();
     for (std::list<ObjectGuid>::iterator i = attackers.begin(); i != attackers.end(); i++)
     {
@@ -45,10 +49,25 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
         if (!unit || !sServerFacade.IsAlive(unit))
             continue;
 
+        // [副本推进 2026-10-18 站长口径] verified 副本按波推进：只把"当前波 + 已经打我们的"当开怪目标
+        //   （见 playerbot/DungeonRoute.h；未验证的图 / 关掉开关时恒为 true，行为不变）
+        if (!dungeonroute::AllowAttack(bot, unit))
+            continue;
+
         if (!bot->InBattleGround() && !CanFreeMoveValue::CanFreeTarget(ai, GuidPosition(unit)))
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
                 ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + "(hostile) ignored (out of free range).");
+            continue;
+        }
+
+        // [pull 2026-10-18 站长口径] 坦克的开怪目标必须"同一层且走得到"：多楼层副本（卡拉赞 / 黑石深渊 /
+        //   厄运之槌）里"看得见但其实是另一层"的怪以前会被选中 ⇒ 坦克直奔过去（路径断了也不停），
+        //   路上打它的怪也不还手。判据见 PossibleAttackTargetsValue::CanReachTarget()。
+        if (checkSameLevel && !PossibleAttackTargetsValue::CanReachTarget(unit, bot))
+        {
+            if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (not on the same floor or unreachable).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
@@ -94,6 +113,10 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
     {
         Unit* unit = ai->GetUnit(*tIter);
         if (!unit)
+            continue;
+
+        // [副本推进 2026-10-18 站长口径] 同第一个循环：verified 副本里不把"还没轮到的波"当开怪目标
+        if (!dungeonroute::AllowAttack(bot, unit))
             continue;
 
 #ifdef MANGOSBOT_TWO 
@@ -155,14 +178,23 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
         if (abs(bot->GetPositionZ() - unit->GetPositionZ()) > sPlayerbotAIConfig.spellDistance)
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (to far above/below).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (to far above/below).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
+            continue;
+        }
+
+        // [pull 2026-10-18 站长口径] 坦克开怪目标的"同一层 + 可达"判据（上面那条只挡了 Δz > spellDistance 的极端情况，
+        //   多楼层副本里差一层往往不到 26 码，"看得见但走不到"仍然会被选中）。见 PossibleAttackTargetsValue::CanReachTarget()。
+        if (checkSameLevel && !PossibleAttackTargetsValue::CanReachTarget(unit, bot))
+        {
+            if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (not on the same floor or unreachable).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
         if (!bot->InBattleGround() && !CanFreeMoveValue::CanFreeTarget(ai, GuidPosition(unit))) //Do not grind mobs far away from master.
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (out of free range).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (out of free range).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
@@ -172,14 +204,14 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
             sServerFacade.GetDistance2d(master, unit) > sPlayerbotAIConfig.proximityDistance)
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (far from master).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (far from master).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
         if (!bot->InBattleGround() && (int)unit->GetLevel() - (int)bot->GetLevel() > 4 && !unit->GetObjectGuid().IsPlayer())
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (" + std::to_string((int)unit->GetLevel() - (int)bot->GetLevel()) + " levels above bot).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (%levels levels above bot).", (std::map<std::string, std::string>{ {"%levels", std::to_string((int)unit->GetLevel() - (int)bot->GetLevel())}, {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
@@ -188,28 +220,28 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
             !AI_VALUE2(bool, "trigger active", "in vehicle"))
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (can not fight elites currently).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (can not fight elites currently).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
         if (!AttackersValue::IsValid(unit, bot, nullptr, false, false))
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (is pet or evading/unkillable).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (is pet or evading/unkillable).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
         if (!PossibleAttackTargetsValue::IsPossibleTarget(unit, bot, sPlayerbotAIConfig.sightDistance, false))
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (tapped, cced or out of range).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (tapped, cced or out of range).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
         if (creature && creature->IsCritter() && urand(0, 10))
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (ignore critters).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (ignore critters).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
             continue;
         }
 
@@ -236,7 +268,7 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
             if (urand(0, 100) < 99 && travelTargetWorking && !isGrindTravelDest)
             {
                 if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                    ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (not needed for active quest).");
+                    ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (not needed for active quest).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
 
                 continue;
             }
@@ -244,7 +276,7 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
             {
                 if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
                     if ((AI_VALUE(bool, "travel target traveling") && typeid(AI_VALUE(TravelTarget*, "travel target")->GetDestination()) != typeid(GrindTravelDestination)))
-                        ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " ignored (not xp and not needed for quest).");
+                        ai->TellPlayer(GetMaster(), BOT_TEXT2("%object ignored (not xp and not needed for quest).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
 
                 continue;
             }
@@ -252,7 +284,7 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
             {
                 if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
                     if (AI_VALUE(bool, "travel target traveling") && typeid(AI_VALUE(TravelTarget*, "travel target")->GetDestination()) != typeid(GrindTravelDestination))
-                        ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " increased distance (not needed for quest).");
+                        ai->TellPlayer(GetMaster(), BOT_TEXT2("%object increased distance (not needed for quest).", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(unit)} })));
 
                 newdistance += 20;
             }
@@ -261,7 +293,7 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
         if (!bot->InBattleGround() && GetTargetingPlayerCount(unit) > assistCount)
         {
             if (ai->HasStrategy("debug grind", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayer(GetMaster(), chat->formatWorldobject(unit) + " increased distance (" + std::to_string(GetTargetingPlayerCount(unit)) + " bots already targeting).");
+                ai->TellPlayer(GetMaster(), BOT_TEXT2("%object increased distance (%count bots already targeting).", (std::map<std::string, std::string>{ {"%count", std::to_string(GetTargetingPlayerCount(unit))}, {"%object", chat->formatWorldobject(unit)} })));
 
             newdistance =+ GetTargetingPlayerCount(unit) * 5;
         }
@@ -297,11 +329,11 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
     {
         if(result)
         {
-            ai->TellPlayer(GetMaster(), chat->formatWorldobject(result) + " selected.");
+            ai->TellPlayer(GetMaster(), BOT_TEXT2("%object selected.", (std::map<std::string, std::string>{ {"%object", chat->formatWorldobject(result)} })));
         }
         else
         {
-            ai->TellPlayer(GetMaster(), "No grind target found.");
+            ai->TellPlayer(GetMaster(), BOT_TEXT("No grind target found."));
         }
     }
 

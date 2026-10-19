@@ -106,7 +106,10 @@ AiPlayerbot.RandomBotArenaTeamCount = 20
 AiPlayerbot.DeleteRandomBotArenaTeams = 0
 
 # Maps to teleport random bots
-AiPlayerbot.RandomBotMaps = 0,1,530,571
+# [2026-10-16 站长口径] 随机机器人只在大世界 530（外域）活动；跨图传送会被拉回出生点（沙塔斯）。
+# 漫游按普通玩家处理：走到哪个网格就加载哪个，离开网格由核心卸载。
+# 原值 0,1,530,571 会让 bot 撒到 0/1 号地图的野外。
+AiPlayerbot.RandomBotMaps = 530
 
 # Min and max intervals for random teleports, in seconds (default: 2hrs and 48hrs)
 AiPlayerbot.RandomBotTeleportTeleportMinInterval = 7200
@@ -238,6 +241,16 @@ AiPlayerbot.RandomBotQuestIds = 7848,3802,5505,6502,7761,9378
 # AiPlayerbot.RandomBotGroupNearby = 1
 # AiPlayerbot.RandomBotRaidNearby = 1
 # AiPlayerbot.RandomBotGuildNearby = 1
+
+# [2026-10-16] 队伍里没有真人时的自动解散：0 = 关；1 = 只解散"曾经有真人、真人已离开"的队伍（默认）；
+# 2 = 任何纯机器人队伍（会把"附近机器人自动组队"一起解散，一般不需要）
+# AiPlayerbot.AutoDisbandBotOnlyGroups = 1
+
+# [2026-10-16] BOSS 战策略：战斗中按"队伍当前正在打的 BOSS entry"自动挂载 / 卸载自定义策略
+# custom::boss_<entry>。规则行写在角色库 tbccharacters.ai_playerbot_custom_strategy（owner = 0 = 全服共享），
+# 写法与已收录的 BOSS 见 dev/功能更新手册_卡布魔兽.md 的「副本/BOSS 战策略」一章。
+# 0 = 关；1 = 开（默认）。每约 5 秒检查一次，脱战 / 换目标自动摘掉。
+# AiPlayerbot.BossStrategies = 1
 
 # Randombots will form guilds by buying a charter, getting signatures and handing it in.
 # AiPlayerbot.RandomBotFormGuild = 1
@@ -785,6 +798,17 @@ AiPlayerbot.PremadeSpecLink.11.9.60 = 0143503002551351--5005021
 # Prefix for bot chat commands (e.g. follow, stay)
 #AiPlayerbot.CommandPrefix =
 
+# [.bot command gate 2026-10-17] Non-GM (gmlevel < 3) players' bot command blacklist / whitelist.
+#   Comma separated, case-insensitive. Blacklist is checked first (reject), then whitelist
+#   (a command not in the whitelist is rejected too). GMs and the console CLI are never limited.
+#   中文: 非GM玩家只能用白名单里的机器人命令；目标机器人必须在自己的队伍里（或同账号）。
+#   Blacklist default: add,self,always,delete,remove,kick,guild
+#   Whitelist default (built in, see PlayerbotAIConfig.cpp): follow/stay/attack/pull/rti/co/cast/
+#   revive/loot/roll/repair/trainer/talents/bank/stats/speak/invite/leave/give leader/summon ...
+#   An empty whitelist means "no whitelist filtering, blacklist only".
+#AiPlayerbot.PlayerCommandBlacklist = add,self,always,delete,remove,kick,guild
+#AiPlayerbot.PlayerCommandWhitelist =
+
 # Max AI iterations per tick
 #AiPlayerbot.IterationsPerTick = 10
 
@@ -1017,7 +1041,8 @@ AiPlayerbot.UseKnockback = 1
 # Self bot turns your current character into a bot with the command ".bot self"
 # !!DISCLAMER!! Selfbots will work and act like randombots based on their enabled strategies. Your epic mount will be sold to a vendor!
 # Self bot level. Values: 0 (disabled), 1 (Game masters only), 2 (Any player), 3 (Allow .bot always command for all players), 4 (Enabled on login), 4 (Enabled even when offline)
-# AiPlayerbot.SelfBotLevel = 1
+# 中文: 站长 2026-10-17 口径 —— 显式写死为 1（只有 GM 能用 .bot self / .bot always）。
+AiPlayerbot.SelfBotLevel = 1
 
 # Account/character names that are either, always online as bot (SelfBotLevel < 4) or prevented from being always online as bot (SelfBotLevel = 4) 
 # When AiPlayerbot.BotAutologin is set to 2 these characters only log in on player (on the same account) logs in.
@@ -4872,3 +4897,28 @@ AiPlayerbot.GearProgressionSystem.5.11.3.15 = 22988	# Main Hand
 AiPlayerbot.GearProgressionSystem.5.11.3.16 = 13385	# Off Hand
 AiPlayerbot.GearProgressionSystem.5.11.3.17 = 23198	# Ranged
 AiPlayerbot.GearProgressionSystem.5.11.3.18 = 5976	# Tabard
+
+#
+# [2026-10-18 站长口径] 副本推进（DungeonRoute）自动开怪：**默认关，需要手动打开**
+#   =1 打开；另外目标图必须 ai_playerbot_dungeon_route.verified=1 才真正生效
+#   运行时可用 GM 命令 `.bot route on|off|reset` 切换（不用重启；reset = 跟随本配置）
+AiPlayerbot.DungeonRoute = 0
+#
+# [2026-10-18 站长口径] 战斗目标筛选跳过 critter（小动物 / 无害 NPC）：1 = 跳过（默认），0 = 老行为
+AiPlayerbot.SkipCritters = 1
+# [自动进本 2026-10-18] 驱动坦克自动带队伍进副本打怪（运行时也可用 .bot route on 打开）
+#   目标副本 map id 列表，逗号分隔（例 543,542,547,556,558）；空 = 不自动进本
+AiPlayerbot.AutoDungeonRun = 0
+AiPlayerbot.AutoDungeonMaps = ""
+#
+# [仿真 2026-10-18] 可控场景注入（`.bot sim start <mapId> [groups] [partySize]` / `.bot sim stop`）：
+#   **只在本地 WSL 仿真开 1**；云端必须 0（云端即使开了也只允许 GM 手动执行）。
+#   开启后仿真逻辑只在世界线程跑，且不会新建角色（只复用库里已有的随机 bot 角色）。
+AiPlayerbot.SimMode = 0
+
+# [2026-10-19] 水里/游泳时也走 mmap 路径（上游默认不寻路，退化成直线游会卡池壁）。本地仿真可开 1；云端默认 0。
+AiPlayerbot.WaterPath = 0
+# [2026-10-19] 副本推进移动自救：卡住 2.5s 小跳一次（跳点表用）；只在 DungeonRoute 启用时生效
+AiPlayerbot.RouteJumpAssist = 1
+# [2026-10-19] 副本推进升降台/传送连接点：到点等 3 秒后传送到对岸（脚本化，只在 DungeonRoute 启用时生效）
+AiPlayerbot.RouteLiftAssist = 1

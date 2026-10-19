@@ -91,19 +91,19 @@ bool AddAllLootAction::AddLoot(Player* requester, ObjectGuid guid)
 
     if (loot.IsEmpty())
     {
-        ai->TellDebug(requester, "Loot object is empty.", "debug loot");
+        ai->TellDebug(requester,BOT_TEXT("Loot object is empty."), "debug loot");
         return false;
     }
 
     if (abs(wo->GetPositionZ() - bot->GetPositionZ()) > INTERACTION_DISTANCE)
     {
-        ai->TellDebug(requester, "Object too high or low.", "debug loot");
+        ai->TellDebug(requester,BOT_TEXT("Object too high or low."), "debug loot");
         return false;
     }
 
     if (!loot.IsLootPossible(bot))
     {
-        ai->TellDebug(requester, "Looting is not possible.", "debug loot");
+        ai->TellDebug(requester,BOT_TEXT("Looting is not possible."), "debug loot");
         return false;
     }
 
@@ -123,7 +123,7 @@ bool AddAllLootAction::AddLoot(Player* requester, ObjectGuid guid)
             && group->GetMasterLooterGuid()
             && group->GetMasterLooterGuid() != bot->GetObjectGuid())
         {
-            ai->TellDebug(requester, "Not master looter.", "debug loot");
+            ai->TellDebug(requester,BOT_TEXT("Not master looter."), "debug loot");
             return false;
         }
 
@@ -188,7 +188,7 @@ bool AddAllLootAction::AddLoot(Player* requester, ObjectGuid guid)
 
             if (usedBagSpacePercent > 99)
             {
-                ai->TellPlayer(requester, "Can not loot quest item, my bags are full", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester,BOT_TEXT("Can not loot quest item, my bags are full"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 return false;
             }
 
@@ -305,7 +305,7 @@ bool AddGatheringLootAction::AddLoot(Player* requester, ObjectGuid guid)
 
             if (usedBagSpacePercent > 99)
             {
-                ai->TellPlayer(requester, "Can not loot quest item, my bags are full", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester,BOT_TEXT("Can not loot quest item, my bags are full"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 return false;
             }
 

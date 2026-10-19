@@ -51,6 +51,6 @@ bool TeleportAction::Execute(Event& event)
         return true;
     }
 
-    ai->TellPlayerNoFacing(requester, "Cannot find any portal to teleport");
+    ai->TellPlayerNoFacing(requester,BOT_TEXT("Cannot find any portal to teleport"));
     return false;
 }

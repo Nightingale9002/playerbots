@@ -20,6 +20,7 @@
 #include "KarazhanDungeonTriggers.h"
 #include "NaxxramasDungeonTriggers.h"
 #include "MechanarDungeonTriggers.h"
+#include "DungeonRouteTriggers.h"
 #include "GlyphTriggers.h"
 #include "WorldBuffTravelTriggers.h"
 
@@ -47,6 +48,8 @@ namespace ai
             creators["very often"] = [](PlayerbotAI* ai) { return new TimeTrigger(ai, "very often", 5); };
 
             creators["target critical health"] = [](PlayerbotAI* ai) { return new TargetCriticalHealthTrigger(ai); };
+            // [BOSS 战策略触发器 2026-10-19] 通用目标血量档：`target health below::<n>[::<m>]`
+            creators["target health below"] = [](PlayerbotAI* ai) { return new TargetHealthBelowTrigger(ai); };
 
             creators["critical health"] = [](PlayerbotAI* ai) { return new CriticalHealthTrigger(ai); };
             creators["low health"] = [](PlayerbotAI* ai) { return new LowHealthTrigger(ai); };
@@ -82,6 +85,8 @@ namespace ai
             creators["not dps target active"] = [](PlayerbotAI* ai) { return new NotDpsTargetActiveTrigger(ai); };
             creators["not dps aoe target active"] = [](PlayerbotAI* ai) { return new NotDpsAoeTargetActiveTrigger(ai); };
             creators["has nearest adds"] = [](PlayerbotAI* ai) { return new HasNearestAddsTrigger(ai); };
+            creators["party position active"] = [](PlayerbotAI* ai) { return new PartyPositionTrigger(ai); };
+            creators["enemy has dispellable buff"] = [](PlayerbotAI* ai) { return new EnemyHasDispellableBuffTrigger(ai); };
             creators["enemy player near"] = [](PlayerbotAI* ai) { return new EnemyPlayerNear(ai); };
 
             creators["combat start"] = [](PlayerbotAI* ai) { return new CombatStartTrigger(ai); };
@@ -95,6 +100,16 @@ namespace ai
             creators["tank assist"] = [](PlayerbotAI* ai) { return new TankAssistTrigger(ai); };
             creators["lose aggro"] = [](PlayerbotAI* ai) { return new LoseAggroTrigger(ai); };
             creators["has aggro"] = [](PlayerbotAI* ai) { return new HasAggroTrigger(ai); };
+            // [threat margin 2026-10-19] 预测仇恨闸门（判据在值 will overaggro 里）
+            creators["will overaggro"] = [](PlayerbotAI* ai) { return new WillOveraggroTrigger(ai); };
+            // [pull-gate 2026-10-19] 附近敌对太多 ⇒ 不主动开怪
+            creators["too many hostiles"] = [](PlayerbotAI* ai) { return new TooManyHostilesTrigger(ai); };
+            // [defend-self 2026-10-19] 被近战贴脸且血量低 ⇒ 走位
+            creators["being meleed low health"] = [](PlayerbotAI* ai) { return new BeingMeleedLowHealthTrigger(ai); };
+            // [tank 2026-10-19] 有漏怪（正在打队友、坦克没仇恨）
+            creators["has loose mobs"] = [](PlayerbotAI* ai) { return new HasLooseMobsTrigger(ai); };
+            // [tank 2026-10-19 站长口径] 当前目标正在打治疗（坦克策略用）
+            creators["target attacking healer"] = [](PlayerbotAI* ai) { return new TargetAttackingHealerTrigger(ai); };
 
             creators["ranged light aoe"] = [](PlayerbotAI* ai) { return new RangedLightAoeTrigger(ai); };
             creators["ranged medium aoe"] = [](PlayerbotAI* ai) { return new RangedMediumAoeTrigger(ai); };
@@ -107,6 +122,26 @@ namespace ai
 
             creators["has area debuff"] = [](PlayerbotAI* ai) { return new HasAreaDebuffTrigger(ai); };
             creators["has aura"] = [](PlayerbotAI* ai) { return new HasAuraTrigger(ai); };
+
+            // -------------------------------------------------------------------
+            // [BOSS 战策略触发器 2026-10-19] BOSS 规则要用的四类新触发器。
+            //   实现见 GenericTriggers.h/.cpp、HealthTriggers.h/.cpp、CureTriggers.h/.cpp。
+            // -------------------------------------------------------------------
+            // 当前目标身上的光环（`has aura` 只能查自己）
+            creators["target has aura"] = [](PlayerbotAI* ai) { return new TargetHasAuraTrigger(ai); };
+            // 附近有敌人在读条（值 `enemy casting target` 做扫描/缓存；可选限定词 dist::/spellid::）
+            creators["enemy casting"] = [](PlayerbotAI* ai) { return new EnemyCastingTrigger(ai); };
+            creators["enemy casting interruptible"] = [](PlayerbotAI* ai) { return new EnemyCastingInterruptibleTrigger(ai); };
+            // [rules 2026-10-17] 敌方地面 AOE 正落在自己/队友脚下（"脚下有地板"）⇒ 配 `move away from hazard`。
+            //   与自带的 `avoid aoe` 分工：那个管"身上已经挂了 area debuff"，这个管"即将踩到"。
+            creators["hostile aoe incoming"] = [](PlayerbotAI* ai) { return new HostileAoeIncomingTrigger(ai); };
+            // [rules 2026-10-17] 当前目标正面朝着人群（"坦克把 BOSS 背对人群"，写在 _tank 集里）。
+            creators["target facing group"] = [](PlayerbotAI* ai) { return new TargetFacingGroupTrigger(ai); };
+            // 队友（不是当前目标）和自己太近 —— "分散/别扎堆"
+            creators["team member too close"] = [](PlayerbotAI* ai) { return new TeamMembersCloseTrigger(ai, "team member too close", 1, 8.0f); };
+            creators["team members close"] = [](PlayerbotAI* ai) { return new TeamMembersCloseTrigger(ai, "team members close", 2, 8.0f); };
+            // 队里有人中了可驱散的负面光环（配合动作 `cure team member`）
+            creators["team member needs cure"] = [](PlayerbotAI* ai) { return new TeamMemberNeedsCureTrigger(ai); };
 
             creators["potion cooldown"] = [](PlayerbotAI* ai) { return new PotionCooldownTrigger(ai); };
 
@@ -364,6 +399,10 @@ namespace ai
             creators["raging flames too close"] = [](PlayerbotAI* ai) { return new RagingFlamesTooCloseTrigger(ai); };
 
             creators["specific creature too close"] = [](PlayerbotAI* ai) { return new CloseToSpecificCreaturesTrigger(ai, "specific creature too close", true); };
+
+            // [副本推进 2026-10-18] 运行期按波推进（只对 verified=1 的图 + 驱动坦克生效）
+            creators["dungeon route move"] = [](PlayerbotAI* ai) { return new DungeonRouteMoveTrigger(ai); };
+            creators["dungeon route pull"] = [](PlayerbotAI* ai) { return new DungeonRoutePullTrigger(ai); };
 
             // Test framework triggers
 #ifdef GenerateBotTests

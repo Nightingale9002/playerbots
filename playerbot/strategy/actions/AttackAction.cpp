@@ -6,6 +6,7 @@
 #include "playerbot/LootObjectStack.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/generic/CombatStrategy.h"
+#include "playerbot/strategy/values/ThreatValues.h"
 
 using namespace ai;
 
@@ -83,7 +84,7 @@ bool AttackAction::Attack(Player* requester, Unit* target)
     {
         if (verbose)
         {
-            ai->TellPlayerNoFacing(requester, "I cannot attack in flight");
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("I cannot attack in flight"));
         }
 
         return false;
@@ -116,9 +117,33 @@ bool AttackAction::Attack(Player* requester, Unit* target)
         WaitForAttackStrategy* strategy = WaitForAttackStrategy::Get(ai);
         bool isWaitingForAttack = false;
         Pet* pet = bot->GetPet();
+
+        // [threat 2026-10-17 站长口径] 副本/团本专用门禁（野外恒为 false）：
+        //   非坦克 + 队里有活着的坦克 ⇒ 只打"坦克已经有仇恨的目标"或"正在攻击队友的目标"。
+        //   放在这里是为了盖住**所有** AttackAction 派生动作（melee / attack anything / dps assist /
+        //   attack least hp target / attack rti target ...）—— WaitForAttackMultiplier 的豁免名单
+        //   会放过它们（见 CombatStrategy.cpp → WaitForAttackMultiplier::GetValue()）。
+        //   这道门禁不依赖 AiPlayerbot.WaitForAttackTime / WaitForAttackThreatPercent 配置。
+        if (IsWaitingForTankThreat(target))
+            isWaitingForAttack = true;
+
+        // [感知层 2026-10-19] "看着近其实过不去"不再硬追：mmap 明确判死路（PATHFIND_NOPATH）⇒ 不接这次攻击。
+        //   值本身有三重限制（同图同实例 / 60 码内 / 约 2 秒缓存），超出范围一律返回可达，
+        //   所以这条门禁只在"近处的目标确实没有可行路径"时生效，不会影响远处的正常赶路。
+        //   放在这里（而不是 isUseful）是因为 current target 刚在几行前被设成本目标，值才对准它。
+        if (!AI_VALUE(bool, "target reachable"))
+        {
+            sLog.outDetail("[Playerbot][perception] %s 放弃攻击 %s (entry %u): mmap 无可行路径",
+                bot->GetName(), target->GetName(), target->GetEntry());
+            if (verbose)
+                ai->TellPlayerNoFacing(requester, BOT_TEXT("The target can't be reached"));
+
+            return false;
+        }
+
         if (strategy)
         {
-            isWaitingForAttack = strategy->ShouldWait(ai);
+            isWaitingForAttack = strategy->ShouldWait(ai) || isWaitingForAttack;
             if (pet)
             {
                 UnitAI* creatureAI = ((Creature*)pet)->AI();
@@ -160,7 +185,11 @@ bool AttackAction::Attack(Player* requester, Unit* target)
             }
         }
         else
-            PetAttack(requester, target);
+        {
+            // [threat 2026-10-17] 没有"等坦克"策略时也不能让宠物去开"坦克还没仇恨"的怪
+            if (!isWaitingForAttack)
+                PetAttack(requester, target);
+        }
 
         if (ai->CanMove() && !sServerFacade.IsInFront(bot, target, sPlayerbotAIConfig.sightDistance, CAST_ANGLE_IN_FRONT))
         {
@@ -214,6 +243,65 @@ bool AttackAction::Attack(Player* requester, Unit* target)
     return false;
 }
 
+// [threat 2026-10-17 站长口径] 副本/团本专用门禁："非坦克只打坦克已经有仇恨的目标"。
+//   规则（顺序即短路顺序）：
+//     1) 不是副本/团本（bot->GetMap()->IsDungeon() || IsRaid()）⇒ 不限制（野外照旧自由开打）；
+//     2) 自己就是坦克 ⇒ 不限制（坦克要能自己起手、自己接怪）；
+//     3) 队里没有**活着的**坦克 ⇒ 不限制（纯机器人小队、坦克阵亡/不在队里时不能集体发呆）；
+//     4) 目标上已经有某个坦克的仇恨（ThreatValue::GetTankThreat() > 0）⇒ 允许打；
+//     5) 目标正在攻击队伍成员（含自己）⇒ 允许打（队友被咬了要能还手，这不是"开新怪"）；
+//     6) 其余情况 ⇒ 返回 true = 现在先不出手（选目标/朝向可以做，"出手"这一步被拦下）。
+//   注意：门禁**不依赖** AiPlayerbot.WaitForAttackTime / WaitForAttackThreatPercent
+//   （那两个配置是全局的"等坦克"，关掉 0 时这道副本门禁依然生效）。
+bool AttackAction::IsWaitingForTankThreat(Unit* target)
+{
+    if (!target)
+        return false;
+
+    if (!bot->GetMap() || (!bot->GetMap()->IsDungeon() && !bot->GetMap()->IsRaid()))
+        return false;
+
+    if (ai->IsTank(bot))
+        return false;
+
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+
+    Player* tank = nullptr;
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->getSource();
+        if (member && member != bot && sServerFacade.IsAlive(member) && ai->IsTank(member))
+        {
+            tank = member;
+            break;
+        }
+    }
+
+    if (!tank)
+        return false;
+
+    if (ThreatValue::GetTankThreat(ai, target) > 0)
+        return false;
+
+    // 目标当前的受害者在队伍里（含自己）⇒ 它已经在打我们，允许还手
+    Unit* victim = target->GetVictim();
+    if (victim == bot)
+        return false;
+
+    if (Player* victimPlayer = dynamic_cast<Player*>(victim))
+    {
+        if (victimPlayer->GetGroup() == group)
+            return false;
+    }
+
+    sLog.outDetail("[threat] %s: hold fire on %s (instance gate: tank %s has no threat on it yet)",
+        bot->GetName(), target->GetName(), tank->GetName());
+
+    return true;
+}
+
 bool AttackAction::PetAttack(Player* requester, Unit* target)
 {
     // If we're done waiting to attack and there's mobs to cc, we can't use defensive/aggressive
@@ -257,7 +345,7 @@ bool AttackAction::IsTargetValid(Player* requester, Unit* target)
     {
         if (verbose) 
         {
-            ai->TellPlayerNoFacing(requester, "I have no target");
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("I have no target"));
         }
 
         return false;

@@ -297,6 +297,8 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
     combatEngine->addStrategy("avoid mobs");
     combatEngine->addStrategy("dungeon");
     combatEngine->addStrategy("avoid specific creatures");
+    // [2026-10-18 站长口径] 爆发的独立策略：所有职业都挂（触发器按职业注册；嗜血/英勇=团队爆发）
+    combatEngine->addStrategy("burst");
 
     if (!player->InBattleGround())
     {
@@ -353,7 +355,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         {
             if (tab == 2)
             {
-                combatEngine->addStrategies("protection", "tank assist", "pull", "pull back", "close", NULL);
+                combatEngine->addStrategies("protection", "tank assist", "pull", "close", NULL);
             }
             else if (player->GetLevel() < 30 || tab == 0)
             {
@@ -397,7 +399,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         {
             if (tab == 1)
             {
-                combatEngine->addStrategies("protection", "tank assist", "pull", "pull back", "close", NULL);
+                combatEngine->addStrategies("protection", "tank assist", "pull", "close", NULL);
 			}
             else if(tab == 0)
             {
@@ -422,7 +424,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
             {
                 if (player->HasSpell(16961) || player->HasSpell(16958))
                 {
-                    combatEngine->addStrategies("tank feral", "tank assist", "pull", "pull back", "close", NULL);
+                    combatEngine->addStrategies("tank feral", "tank assist", "pull", "close", NULL);
                 }
                 else
                 {
@@ -510,7 +512,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         {
             if (tab == 0)
             {
-                combatEngine->addStrategies("blood", "tank assist", "pull", "pull back", NULL);
+                combatEngine->addStrategies("blood", "tank assist", "pull", NULL);
             }
             else if (tab == 1)
             {
@@ -527,8 +529,31 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
 #endif
     }
 
+    // [threat 2026-10-16 站长口径] 非坦克默认挂"等坦克"策略：
+    //   WaitForAttackStrategy::ShouldWait() 第一行就要求 HasStrategy("wait for attack")，而全模块没人
+    //   给 bot 挂过这个策略 ⇒ 实测 DPS 一开怪就打：既不等坦克 pull back、也不看自己的仇恨。
+    //   坦克（warrior/paladin prot、feral tank、DK blood 都带 "pull back"）不挂：它们必须能立刻开怪，
+    //   ShouldWait() 里另有一道坦克豁免。
+    if (!combatEngine->HasStrategy("pull back"))
+        combatEngine->addStrategy("wait for attack");
+
+    // [pull-gate 2026-10-19 站长口径] "坦克乱开怪"：全员挂怪堆闸门（含坦克）。
+    //   还没进战斗、且附近敌对 ≥ AiPlayerbot.PullHostileLimit 时不主动开怪；
+    //   一旦进战斗触发器自动失效，不会打断已有战斗。配置为 0 即关闭。
+    combatEngine->addStrategy("pull gate");
+
+    // [defend-self 2026-10-19 站长口径] "一直挨打也不知道跑"：
+    //   给非坦克挂一条**专用**的 "defend self"（不是 kite —— kite 的判据是 has aggro，
+    //   那在单刷时几乎恒真，挂上去会让 bot 见到怪就跑；站长指出复用错策略，已改）。
+    if (!combatEngine->HasStrategy("pull back"))
+        combatEngine->addStrategy("defend self");
+    else
+        // [tank 2026-10-19 站长口径] 坦克救场：接"正在打队友、自己没仇恨"的漏怪。
+        //   嘲讽可用就嘲讽；嘲讽在 CD 就把目标换成它，让普通仇恨循环去打。
+        combatEngine->addStrategy("tank pick up");
+
     if (facade->IsRealPlayer() || sRandomPlayerbotMgr.IsFreeBot(player))
-	{
+    {
         combatEngine->addStrategy("roll");
 
         if (!player->GetGroup())
@@ -900,6 +925,8 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
     nonCombatEngine->addStrategies("wbuff", NULL);
     nonCombatEngine->addStrategy("avoid mobs");
     nonCombatEngine->addStrategy("dungeon");
+    // [副本推进 2026-10-18] 运行期按波推进（只对 route 表 verified=1 的图 + 驱动坦克生效，见 DungeonRoute.h）
+    nonCombatEngine->addStrategy("dungeon route");
 
     if(sPlayerbotAIConfig.llmEnabled == 2)
         nonCombatEngine->addStrategy("ai chat");

@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "PartyMemberToHeal.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/DecisionWeights.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/LootObjectStack.h"
 #include "playerbot/strategy/generic/KarazhanDungeonStrategies.h"
@@ -139,7 +140,26 @@ ObjectGuid PartyMemberToHeal::Calculate()
     }
 
     bool preHealing = ai->HasStrategy("preheal", BotState::BOT_STATE_COMBAT);
-    sort(needHeals.begin(), needHeals.end(), [preHealing](const Unit* u1, const Unit* u2) { return compareByMissingHealth(u1, u2, preHealing); });
+
+    // [决策参数化 2026-10-18] 治疗目标打分（权重表可离线调）
+    float const wMissing = dw::Get("heal.missing_health");
+    float const wTank = dw::Get("heal.tank_bonus");
+    float const wIncoming = dw::Get("heal.incoming_damage");
+    float const wDistance = dw::Get("heal.distance");
+    auto healScore = [&](Unit const* unit) -> float
+    {
+        if (!unit) return -1e18f;
+        uint32 maxHealth = unit->GetMaxHealth() ? unit->GetMaxHealth() : 1;
+        float missing = float(maxHealth - unit->GetHealth()) / float(maxHealth);
+        if (preHealing)
+            missing += wIncoming * float(getIncomingdamage(unit)) / float(maxHealth);
+        float score = wMissing * missing * 100.0f;
+        if (unit->GetTypeId() == TYPEID_PLAYER && ai->IsTank(const_cast<Player*>(static_cast<Player const*>(unit))))
+            score += wTank;
+        score += wDistance * bot->GetDistance(unit);
+        return score;
+    };
+    sort(needHeals.begin(), needHeals.end(), [&](const Unit* u1, const Unit* u2) { return healScore(u1) > healScore(u2); });
 
     int healerIndex = 0;
     if (!partyMembers.empty())

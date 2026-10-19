@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/strategy/generic/PullStrategy.h"
 #include "playerbot/strategy/values/AttackersValue.h"
+#include "playerbot/strategy/values/PossibleAttackTargetsValue.h"
 #include "PullActions.h"
 #include "playerbot/strategy/values/PositionValue.h"
 
@@ -20,7 +21,7 @@ bool PullRequestAction::Execute(Event& event)
     Unit* target = GetTarget(event);
     if (!target)
     {
-        ai->TellPlayerNoFacing(requester, "You have no target");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("You have no target"));
         return false;
     }
 
@@ -28,13 +29,22 @@ bool PullRequestAction::Execute(Event& event)
     const float distanceToPullTarget = target->GetDistance(ai->GetBot());
     if (distanceToPullTarget > maxPullDistance)
     {
-        ai->TellPlayerNoFacing(requester, "The target is too far away");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("The target is too far away"));
         return false;
     }
 
     if (!AttackersValue::IsValid(target, bot, nullptr, false))
     {
-        ai->TellPlayerNoFacing(requester, "The target can't be pulled");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("The target can't be pulled"));
+        return false;
+    }
+
+    // [pull 2026-10-18 站长口径] 目标不在同一层 / 走不到 ⇒ 不接这个拉怪请求（否则坦克会一路直线冲过去）。
+    if (!PossibleAttackTargetsValue::CanReachTarget(target, bot))
+    {
+        sLog.outDetail("[Playerbot][pull] %s 拒绝拉怪目标 %s (entry %u): 不同层或不可达",
+            bot->GetName(), target->GetName(), target->GetEntry());
+        ai->TellPlayerNoFacing(requester, BOT_TEXT("The target can't be pulled"));
         return false;
     }
 

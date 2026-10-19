@@ -44,7 +44,7 @@ bool PositionAction::Execute(Event& event)
     std::vector<std::string> params = split(param, ' ');
     if (params.size() != 2)
     {
-        ai->TellPlayer(requester, "Whisper position <name> ?/set/reset");
+        ai->TellPlayer(requester,BOT_TEXT("Whisper position <name> ?/set/reset"));
         return false;
     }
 

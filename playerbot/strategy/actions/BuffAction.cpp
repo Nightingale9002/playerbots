@@ -65,19 +65,19 @@ void BuffAction::TellHeader(uint32 subClass, Player* requester)
     switch (subClass)
     {
     case ITEM_SUBCLASS_ELIXIR:
-        ai->TellPlayer(requester, "--- Elixir ---");
+        ai->TellPlayer(requester,BOT_TEXT("--- Elixir ---"));
         return;
     case ITEM_SUBCLASS_FLASK:
-        ai->TellPlayer(requester, "--- Flask ---");
+        ai->TellPlayer(requester,BOT_TEXT("--- Flask ---"));
         return;
     case ITEM_SUBCLASS_SCROLL:
-        ai->TellPlayer(requester, "--- Scroll ---");
+        ai->TellPlayer(requester,BOT_TEXT("--- Scroll ---"));
         return;
     case ITEM_SUBCLASS_FOOD:
-        ai->TellPlayer(requester, "--- Food ---");
+        ai->TellPlayer(requester,BOT_TEXT("--- Food ---"));
         return;
     case ITEM_SUBCLASS_ITEM_ENHANCEMENT:
-        ai->TellPlayer(requester, "--- Enchant ---");
+        ai->TellPlayer(requester,BOT_TEXT("--- Enchant ---"));
         return;
     }
 }

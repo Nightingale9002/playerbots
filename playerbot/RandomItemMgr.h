@@ -168,16 +168,42 @@ class RandomItemMgr
 
         uint32 CalculateRandomEnchantId(uint8 playerclass, uint8 spec, ItemPrototype const* proto);
         uint32 CalculateBestRandomEnchantId(uint8 playerclass, uint8 spec, uint32 itemId);
-        uint32 CalculateEnchantWeight(uint8 playerclass, uint8 spec, uint32 enchantId);
+        // [cap 2026-10-16] 站长口径（方案B）：上限型属性"达标降权"。
+        // 传入 Player* 时，若该 (专精,属性) 有上限记录且角色当前已达标，就用记录里的"达标后权重"。
+        uint32 CalculateEnchantWeight(uint8 playerclass, uint8 spec, uint32 enchantId, Player* player = nullptr);
         uint32 CalculateRandomPropertyWeight(uint8 playerclass, uint8 spec, int32 randomPropertyId);
         uint32 CalculateGemWeight(uint8 playerclass, uint8 spec, uint32 gemId);
-        uint32 CalculateSocketWeight(uint8 playerclass, ItemQualifier& qualifier, uint8 spec);
+        uint32 CalculateSocketWeight(uint8 playerclass, ItemQualifier& qualifier, uint8 spec, Player* player = nullptr);
 
-        uint32 CalculateStatWeight(uint8 playerclass, uint8 spec, ItemPrototype const* proto, ItemSpecType &itSpec);
+        uint32 CalculateStatWeight(uint8 playerclass, uint8 spec, ItemPrototype const* proto, ItemSpecType &itSpec, Player* player = nullptr);
         uint32 ItemStatWeight(Player* player, ItemQualifier& qualifier);
         uint32 ItemStatWeight(Player* player, Item* item);
 
-        uint32 CalculateSingleStatWeight(uint8 playerclass, uint8 spec, std::string stat, uint32 value);
+        uint32 CalculateSingleStatWeight(uint8 playerclass, uint8 spec, std::string stat, uint32 value, Player* player = nullptr);
+        // [cap 2026-10-16] 上限表：specId + 属性名 -> (达标所需等级值, 达标后权重[, 备选属性][, 二级上限])
+        //   cap == 0 表示"该属性自己没有上限，由四维(avoid4)统一门控"（闪避/招架/格挡）
+        //   altField/altCap = 备选达标途径（如熊德"韧性 103"可替代"防御等级 156"免暴）
+        //   cap2/capped2    = 二级硬上限（如防战精准硬上限 56≈221 等级：消掉 BOSS 招架后再堆精准收益为 0）
+        //   field == "armor" 时比较的是角色护甲值（Unit::GetArmor()），不是战斗等级
+        struct WeightCap { uint32 cap; uint32 capped; std::string altField; uint32 altCap; uint32 cap2; uint32 capped2; };
+        std::map<std::pair<uint32, std::string>, WeightCap> m_weightCaps;
+        // [cap 2026-10-16] "达标降权"上下文：加权函数原本只有 (职业,专精)，判不了是否达标，
+        // 用一个作用域守卫把当前角色挂进来（模块这段逻辑只跑在世界线程，单线程使用）。
+        Player* m_weightPlayer = nullptr;
+        struct WeightPlayerScope
+        {
+            explicit WeightPlayerScope(Player* p) : m_prev(instance().m_weightPlayer) { instance().m_weightPlayer = p; }
+            ~WeightPlayerScope() { instance().m_weightPlayer = m_prev; }
+            WeightPlayerScope(WeightPlayerScope const&) = delete;
+            WeightPlayerScope& operator=(WeightPlayerScope const&) = delete;
+            Player* m_prev;
+        };
+        void LoadWeightCaps();
+        bool HasWeightCaps(uint32 spec);
+        uint32 ApplyWeightCap(Player* player, uint32 spec, std::string const& stat, uint32 precapWeight);
+        // [cap 2026-10-16] 四维（未命中+闪避+招架+格挡），单位：万分之一（10240 = 102.4%）
+        // spec 用于站长口径的差异：防骑未命中基准 365 且"开神盾后"格挡 +30%
+        uint32 GetAvoidanceBasisPoints(Player* player, uint32 spec = 0);
         bool CanEquipArmor(uint8 clazz, uint8 spec, uint32 level, ItemPrototype const* proto);
         bool ShouldEquipArmorForSpec(uint8 playerclass, uint8 spec, ItemPrototype const* proto);
         bool CanEquipWeapon(uint8 clazz, ItemPrototype const* proto);
@@ -188,6 +214,8 @@ class RandomItemMgr
         std::vector<uint32> GetQuestIdsForItem(uint32 itemId);
         std::string GetPlayerSpecName(Player* player);
         uint32 GetPlayerSpecId(Player* player);
+    // [gear 2026-10-16] 本职业第一个已定义专精 id（兜底，见 RandomItemMgr.cpp）
+    uint32 GetDefaultSpecIdForClass(uint8 cls);
         std::vector<uint32> GetGlyphs(uint8 playerClass) { return glyphCache.at(playerClass); }
     private:
         void BuildRandomItemCache();

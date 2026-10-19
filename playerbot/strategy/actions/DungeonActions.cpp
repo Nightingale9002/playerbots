@@ -33,58 +33,93 @@ bool MoveAwayFromHazard::Execute(Event& event)
         const float hazardRadius = closestHazard->second;
         if (closestHazardDistance <= hazardRadius)
         {
-            float angle = 0.0f;
+            // [BOT-METRICS 2026-10-17] 记一次"被地面技覆盖"（= 需要躲），用于量化躲地板能力。
+            sPlayerbotAIConfig.logEvent(ai, "bm_dodge", std::to_string((int)closestHazardDistance));
+
             const WorldPosition initialPosition(closestHazard->first);
             const float distance = frand(hazardRadius, hazardRadius * 1.5f);
 
-            Unit* currentTarget = ai->GetUnit(AI_VALUE(ObjectGuid, "current target"));
-            if (currentTarget)
-            {
-                const int8 startDir = urand(0, 1) * 2 - 1;
-                const WorldPosition targetPosition(currentTarget);
-                angle = targetPosition.getAngleTo(initialPosition) + (0.5 * M_PI_F * startDir);
-            }
-            else
-            {
-                angle = frand(0, M_PI_F * 2.0f);
-            }
+            // [感知层 2026-10-19] 落点要避开怪堆：躲地板躲进另一堆怪等于没躲。
+            //   做法：先把地板周围可能挡路的敌对单位收一次（一次格子遍历，不是每个落点扫一遍），
+            //   再对每个候选落点数一下 8 码内有几只怪。
+            //   两遍式：第一遍要求"落点附近 <= 1 只"，一个都找不到再走第二遍（放宽）。
+            //   宁可躲进怪堆，也不能站着让地板打死 —— 所以第二遍必须存在，而且是无条件放宽。
+            float const packScanRange = hazardRadius * 1.5f + 8.0f;
+            std::list<Unit*> packHostiles;
+            MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck packCheck(bot, packScanRange);
+            MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> packSearcher(packHostiles, packCheck);
+            Cell::VisitAllObjects(bot, packSearcher, packScanRange);
 
-            const uint8 attempts = 10;
-            float angleIncrement = (float)((2 * M_PI) / attempts);
-
-            for (uint8 i = 0; i < attempts; i++)
+            auto countHostilesAt = [&packHostiles](WorldPosition const& point) -> uint8
             {
-                WorldPosition point = initialPosition + WorldPosition(0, distance * cos(angle), distance * sin(angle), 1.0f);
-                point.setZ(point.getHeight());
-
-                // Check if the point is not near other hazards
-                if (!IsHazardNearby(point, hazards))
+                uint8 count = 0;
+                for (Unit* hostile : packHostiles)
                 {
-                    if (bot->IsWithinLOS(point.getX(), point.getY(), point.getZ() + bot->GetCollisionHeight()) && initialPosition.canPathTo(point, bot))
-                    {
-                        if (ai->HasStrategy("debug move", BotState::BOT_STATE_COMBAT))
-                        {
-                            bot->SummonCreature(15631, point.getX(), point.getY(), point.getZ(), 0.0f, TEMPSPAWN_TIMED_DESPAWN, 5000.0f);
-                        }
+                    if (hostile && hostile->GetDistance(point.getX(), point.getY(), point.getZ()) <= 8.0f)
+                        ++count;
+                }
 
-                        if (MoveTo(bot->GetMapId(), point.getX(), point.getY(), point.getZ(), false, IsReaction(), false, true))
+                return count;
+            };
+
+            for (uint8 pass = 0; pass < 2; ++pass)
+            {
+                const bool avoidPacks = (pass == 0);
+                float angle = 0.0f;
+
+                Unit* currentTarget = ai->GetUnit(AI_VALUE(ObjectGuid, "current target"));
+                if (currentTarget)
+                {
+                    const int8 startDir = urand(0, 1) * 2 - 1;
+                    const WorldPosition targetPosition(currentTarget);
+                    angle = targetPosition.getAngleTo(initialPosition) + (0.5 * M_PI_F * startDir);
+                }
+                else
+                {
+                    angle = frand(0, M_PI_F * 2.0f);
+                }
+
+                const uint8 attempts = 10;
+                float angleIncrement = (float)((2 * M_PI) / attempts);
+
+                for (uint8 i = 0; i < attempts; i++)
+                {
+                    WorldPosition point = initialPosition + WorldPosition(0, distance * cos(angle), distance * sin(angle), 1.0f);
+                    point.setZ(point.getHeight());
+
+                    // Check if the point is not near other hazards
+                    if (!IsHazardNearby(point, hazards))
+                    {
+                        if (avoidPacks && countHostilesAt(point) > 1)
                         {
-                            if (!IsReaction())
+                            // 这个方向落地就贴着一堆怪：先看下一个方向（第二遍会放宽）
+                        }
+                        else if (bot->IsWithinLOS(point.getX(), point.getY(), point.getZ() + bot->GetCollisionHeight()) && initialPosition.canPathTo(point, bot))
+                        {
+                            if (ai->HasStrategy("debug move", BotState::BOT_STATE_COMBAT))
                             {
-                                WaitForReach(point.distance(initialPosition));
+                                bot->SummonCreature(15631, point.getX(), point.getY(), point.getZ(), 0.0f, TEMPSPAWN_TIMED_DESPAWN, 5000.0f);
                             }
 
-                            return true;
+                            if (MoveTo(bot->GetMapId(), point.getX(), point.getY(), point.getZ(), false, IsReaction(), false, true))
+                            {
+                                if (!IsReaction())
+                                {
+                                    WaitForReach(point.distance(initialPosition));
+                                }
+
+                                return true;
+                            }
                         }
                     }
-                }
 
-                if (ai->HasStrategy("debug move", BotState::BOT_STATE_COMBAT))
-                {
-                    bot->SummonCreature(1, point.getX(), point.getY(), point.getZ(), 0.0f, TEMPSPAWN_TIMED_DESPAWN, 5000.0f);
-                }
+                    if (ai->HasStrategy("debug move", BotState::BOT_STATE_COMBAT))
+                    {
+                        bot->SummonCreature(1, point.getX(), point.getY(), point.getZ(), 0.0f, TEMPSPAWN_TIMED_DESPAWN, 5000.0f);
+                    }
 
-                angle += angleIncrement;
+                    angle += angleIncrement;
+                }
             }
         }
     }

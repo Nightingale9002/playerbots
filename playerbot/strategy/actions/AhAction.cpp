@@ -30,7 +30,7 @@ bool AhAction::Execute(Event& event)
         return doneAuction;
     }
 
-    ai->TellPlayerNoFacing(requester, "Cannot find auctioneer nearby");
+    ai->TellPlayerNoFacing(requester,BOT_TEXT("Cannot find auctioneer nearby"));
     return false;
 }
 

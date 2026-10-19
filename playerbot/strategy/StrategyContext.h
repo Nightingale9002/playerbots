@@ -16,6 +16,7 @@
 #include "generic/StayStrategy.h"
 #include "generic/UseFoodStrategy.h"
 #include "generic/ConserveManaStrategy.h"
+#include "generic/BurstStrategy.h"
 #include "generic/EmoteStrategy.h"
 #include "generic/TankAssistStrategy.h"
 #include "generic/DpsAssistStrategy.h"
@@ -57,6 +58,7 @@
 #include "generic/KarazhanDungeonStrategies.h"
 #include "generic/NaxxramasDungeonStrategies.h"
 #include "generic/MechanarDungeonStrategies.h"
+#include "generic/DungeonRouteStrategy.h"
 
 namespace ai
 {
@@ -73,6 +75,8 @@ namespace ai
             creators["emote"] = [](PlayerbotAI* ai) { return new EmoteStrategy(ai); };
             creators["passive"] = [](PlayerbotAI* ai) { return new PassiveStrategy(ai); };
             creators["conserve mana"] = [](PlayerbotAI* ai) { return new ConserveManaStrategy(ai); };
+            // [2026-10-18 站长口径] 爆发的独立策略（每个 DPS 职业都挂；嗜血/英勇算团队爆发）
+            creators["burst"] = [](PlayerbotAI* ai) { return new BurstStrategy(ai); };
             creators["food"] = [](PlayerbotAI* ai) { return new UseFoodStrategy(ai); };
             creators["consumables"] = [](PlayerbotAI* ai) { return new ConsumableStrategy(ai); };
             creators["chat"] = [](PlayerbotAI* ai) { return new ChatCommandHandlerStrategy(ai); };
@@ -114,7 +118,8 @@ namespace ai
             creators["map full"] = [](PlayerbotAI* ai) { return new MapFullStrategy(ai); };
             creators["sit"] = [](PlayerbotAI* ai) { return new SitStrategy(ai); };
             creators["mark rti"] = [](PlayerbotAI* ai) { return new MarkRtiStrategy(ai); };
-            creators["ads"] = [](PlayerbotAI* ai) { return new PossibleAdsStrategy(ai); };
+            // [dead-rule 2026-10-19] "ads"（PossibleAdsStrategy）已删除：它绑的触发器 "possible ads"
+            //   从未注册，规则永远不执行；等价功能在 "flee from adds"（"has nearest adds"）。
             creators["close"] = [](PlayerbotAI* ai) { return new MeleeCombatStrategy(ai); };
             creators["ranged"] = [](PlayerbotAI* ai) { return new RangedCombatStrategy(ai); };
             creators["behind"] = [](PlayerbotAI* ai) { return new SetBehindCombatStrategy(ai); };
@@ -155,6 +160,12 @@ namespace ai
             creators["avoid aoe"] = [](PlayerbotAI* ai) { return new AvoidAoeStrategy(ai); };
             creators["avoid specific creatures"] = [](PlayerbotAI* ai) { return new AvoidSpecificCreaturesStrategy(ai); };
             creators["wait for attack"] = [](PlayerbotAI* ai) { return new WaitForAttackStrategy(ai); };
+            // [pull-gate 2026-10-19] 怪堆闸门（附近敌对太多就不主动开怪）
+            creators["pull gate"] = [](PlayerbotAI* ai) { return new PullGateStrategy(ai); };
+            // [defend-self 2026-10-19] 残血被近战贴脸 ⇒ 脱离近战（专用策略，不复用 kite）
+            creators["defend self"] = [](PlayerbotAI* ai) { return new DefendSelfStrategy(ai); };
+            // [tank 2026-10-19] 坦克救场：接漏怪（选中 → 嘲讽 → CD 中交给普通仇恨循环）
+            creators["tank pick up"] = [](PlayerbotAI* ai) { return new TankPickUpStrategy(ai); };
             creators["pull back"] = [](PlayerbotAI* ai) { return new PullBackStrategy(ai); };
             creators["focus heal targets"] = [](PlayerbotAI* ai) { return new FocusHealTargetsStrategy(ai); };
             creators["focus rti targets"] = [](PlayerbotAI* ai) { return new FocusRtiTargetsStrategy(ai); };
@@ -169,6 +180,8 @@ namespace ai
 
             // Dungeon Strategies
             creators["dungeon"] = [](PlayerbotAI* ai) { return new DungeonStrategy(ai); };
+            // [副本推进 2026-10-18] 运行期按波推进（查 route 表，只对 verified=1 的图生效）
+            creators["dungeon route"] = [](PlayerbotAI* ai) { return new DungeonRouteStrategy(ai); };
             creators["onyxias lair"] = [](PlayerbotAI* ai) { return new OnyxiasLairDungeonStrategy(ai); };
             creators["molten core"] = [](PlayerbotAI* ai) { return new MoltenCoreDungeonStrategy(ai); };
             creators["blackwing lair"] = [](PlayerbotAI* ai) { return new BlackwingLairDungeonStrategy(ai); };

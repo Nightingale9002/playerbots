@@ -2,6 +2,8 @@
 #include "playerbot/playerbot.h"
 #include "GenericActions.h"
 #include "playerbot/PlayerbotFactory.h"
+// [tank 2026-10-19] PickUpLooseMobAction 需要 GetTankThreat 判断"坦克是否已经拉住"
+#include "playerbot/strategy/values/ThreatValues.h"
 
 using namespace ai;
 
@@ -418,12 +420,12 @@ bool SetPetAction::Execute(Event& event)
                 }
                 else
                 {
-                    ai->TellPlayer(requester, "I can't set to autocast that spell.");
+                    ai->TellPlayer(requester,BOT_TEXT("I can't set to autocast that spell."));
                 }
             }
             else
             {
-                ai->TellPlayer(requester, "Please specify a pet spell to set the autocast.");
+                ai->TellPlayer(requester,BOT_TEXT("Please specify a pet spell to set the autocast."));
             }
         }
         else if (command == "aggressive")
@@ -441,7 +443,7 @@ bool SetPetAction::Execute(Event& event)
             bot->GetSession()->HandlePetAction(packet);
             bot->PetSpellInitialize();
 
-            ai->TellPlayer(requester, "Setting pet to aggressive mode");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to aggressive mode"));
             return true;
         }
         else if (command == "defensive")
@@ -459,7 +461,7 @@ bool SetPetAction::Execute(Event& event)
             bot->GetSession()->HandlePetAction(packet);
             bot->PetSpellInitialize();
 
-            ai->TellPlayer(requester, "Setting pet to defensive mode");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to defensive mode"));
             return true;
         }
         else if (command == "passive")
@@ -477,7 +479,7 @@ bool SetPetAction::Execute(Event& event)
             bot->GetSession()->HandlePetAction(packet);
             bot->PetSpellInitialize();
 
-            ai->TellPlayer(requester, "Setting pet to passive mode");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to passive mode"));
             return true;
         }
         else if (command == "follow")
@@ -495,7 +497,7 @@ bool SetPetAction::Execute(Event& event)
             data << targetGuid;
             bot->GetSession()->HandlePetAction(data);
 
-            ai->TellPlayer(requester, "Setting pet to follow me");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to follow me"));
             return true;
         }
         else if (command == "stay")
@@ -513,7 +515,7 @@ bool SetPetAction::Execute(Event& event)
             data << targetGuid;
             bot->GetSession()->HandlePetAction(data);
 
-            ai->TellPlayer(requester, "Setting pet to stay in place");
+            ai->TellPlayer(requester,BOT_TEXT("Setting pet to stay in place"));
             return true;
         }
         else if (command == "attack")
@@ -526,7 +528,7 @@ bool SetPetAction::Execute(Event& event)
                     pet->AI() && pet->AI()->HasReactState(REACT_PASSIVE) &&
                     pet->GetEntry() == PET_IMP && pet->HasAura(PHASE_SHIFT))
                 {
-                    ai->TellPlayer(requester, "Pet has Phase Shift active, cannot attack");
+                    ai->TellPlayer(requester,BOT_TEXT("Pet has Phase Shift active, cannot attack"));
                     return false;
                 }
 
@@ -543,12 +545,12 @@ bool SetPetAction::Execute(Event& event)
                 data << targetGuid;
                 bot->GetSession()->HandlePetAction(data);
 
-                ai->TellPlayer(requester, "Sending pet to attack");
+                ai->TellPlayer(requester,BOT_TEXT("Sending pet to attack"));
                 return true;
             }
             else
             {
-                ai->TellPlayer(requester, "Please select a target to attack");
+                ai->TellPlayer(requester,BOT_TEXT("Please select a target to attack"));
             }
         }
         else if (command == "dismiss")
@@ -559,12 +561,12 @@ bool SetPetAction::Execute(Event& event)
                 {
                     ai->ChangeStrategy("-pet", BotState::BOT_STATE_COMBAT);
                     ai->ChangeStrategy("-pet", BotState::BOT_STATE_NON_COMBAT);
-                    ai->TellPlayer(requester, "Dismissing pet");
+                    ai->TellPlayer(requester,BOT_TEXT("Dismissing pet"));
                     return true;
                 }
                 else
                 {
-                    ai->TellPlayer(requester, "I can't dismiss my pet");
+                    ai->TellPlayer(requester,BOT_TEXT("I can't dismiss my pet"));
                 }
             }
             else
@@ -586,7 +588,7 @@ bool SetPetAction::Execute(Event& event)
                 ai->ChangeStrategy("+pet", BotState::BOT_STATE_NON_COMBAT);
                 ai->ChangeStrategy("-pet", BotState::BOT_STATE_COMBAT);
                 ai->ChangeStrategy("-pet", BotState::BOT_STATE_NON_COMBAT);
-                ai->TellPlayer(requester, "Dismissing pet");
+                ai->TellPlayer(requester,BOT_TEXT("Dismissing pet"));
 
                 return true;
             }
@@ -611,12 +613,12 @@ bool SetPetAction::Execute(Event& event)
             }
             else
             {
-                ai->TellPlayer(requester, "Please specify a pet command (Like autocast).");
+                ai->TellPlayer(requester,BOT_TEXT("Please specify a pet command (Like autocast)."));
             }
         }
         else
         {
-            ai->TellPlayer(requester, "Please specify a pet command (Like autocast).");
+            ai->TellPlayer(requester,BOT_TEXT("Please specify a pet command (Like autocast)."));
         }
     }
     else if (command == "call")
@@ -625,18 +627,77 @@ bool SetPetAction::Execute(Event& event)
         {
             ai->ChangeStrategy("+pet", BotState::BOT_STATE_COMBAT);
             ai->ChangeStrategy("+pet", BotState::BOT_STATE_NON_COMBAT);
-            ai->TellPlayer(requester, "Calling my pet");
+            ai->TellPlayer(requester,BOT_TEXT("Calling my pet"));
             return true;
         }
         else
         {
-            ai->TellPlayer(requester, "I can't call any pets");
+            ai->TellPlayer(requester,BOT_TEXT("I can't call any pets"));
         }
     }
     else
     {
-        ai->TellPlayer(requester, "I don't have any pets");
+        ai->TellPlayer(requester,BOT_TEXT("I don't have any pets"));
     }
 
+    return false;
+}
+// [tank 2026-10-19 站长口径] 坦克救场：选中漏怪 → 嘲讽；嘲讽在 CD 就交给普通仇恨循环。
+bool PickUpLooseMobAction::isUseful()
+{
+    return !AI_VALUE(std::list<ObjectGuid>, "loose mobs").empty();
+}
+
+bool PickUpLooseMobAction::Execute(Event& event)
+{
+    std::list<ObjectGuid> const loose = AI_VALUE(std::list<ObjectGuid>, "loose mobs");
+    if (loose.empty())
+        return false;
+
+    // ① 选一只：`loose mobs` 已按"受害者血量升序"排好（快死的队友优先救）
+    Unit* target = nullptr;
+    for (ObjectGuid const& guid : loose)
+    {
+        Unit* unit = ai->GetUnit(guid);
+        if (unit && unit->IsInWorld() && unit->IsAlive())
+        {
+            target = unit;
+            break;
+        }
+    }
+
+    if (!target)
+        return false;
+
+    // ② 换成它 —— 坦克主动接怪（否则嘲讽会打到原来的目标上）
+    SET_AI_VALUE(ObjectGuid, "current target", target->GetObjectGuid());
+
+    // [tank 2026-10-19 站长口径] 坦克已经拉住的目标别再浪费嘲讽：
+    //   治疗被追时如果这只怪仇恨本来就在我身上，该做的是继续建立仇恨（交给普通循环），
+    //   而不是把嘲讽交出去。
+    if (ThreatValue::GetTankThreat(ai, target) > 0.0f)
+        return false;
+
+    // ③ 逐个尝试本职业的嘲讽技：能放就放
+    static char const* kTaunts[] = {
+        "taunt",                // 战士
+        "growl",                // 德鲁伊（熊）
+        "hand of reckoning",    // 圣骑士（TBC 实际是正义防御，表里两条都放）
+        "righteous defense",
+        "dark command",         // 死亡骑士
+        "distracting shot",     // 猎人（非坦克职业也有，留作兜底）
+    };
+
+    for (char const* taunt : kTaunts)
+    {
+        if (!ai->HasSpell(taunt))
+            continue;
+
+        if (ai->CastSpell(taunt, target))
+            return true;
+    }
+
+    // ④ 嘲讽全在 CD / 没有嘲讽技 ⇒ 不做动作，返回 false 让普通仇恨循环（破甲、盾牌猛击、撕裂…）
+    //    去打这个新目标。站长口径："如果嘲讽 cd 也可以做其他高仇恨技能"。
     return false;
 }

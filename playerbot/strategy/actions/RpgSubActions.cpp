@@ -723,9 +723,9 @@ bool RpgTradeUsefulAction::Execute(Event& event)
         if (IsTradingItem(item->GetEntry())) //Did we manage to add the item to the trade?
         {
             if (bot->GetGroup() && bot->GetGroup()->IsMember(guidP))
-                ai->TellPlayerNoFacing(GetMaster(), "You can use this " + chat->formatItem(item) + " better than me, " + player->GetName() + ".", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT2("You can use this %item better than me, %player.", (std::map<std::string, std::string>{ {"%item", chat->formatItem(item)}, {"%player", player->GetName()} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             else
-                bot->Say("You can use this " + chat->formatItem(item) + " better than me, " + player->GetName() + ".", (bot->GetTeam() == ALLIANCE ? LANG_COMMON : LANG_ORCISH));
+                bot->Say(BOT_TEXT2("You can use this %item better than me, %player.", (std::map<std::string, std::string>{ {"%item", chat->formatItem(item)}, {"%player", player->GetName()} })), (bot->GetTeam() == ALLIANCE ? LANG_COMMON : LANG_ORCISH));
 
             if (!urand(0, 4) || items.size() < 2) //Complete the trade if we have no more items to trade.
             {
@@ -790,7 +790,7 @@ bool RpgEnchantAction::Execute(Event& event)
 
         if (player->isRealPlayer() && !player->GetTradeData()) //Start the trade from the other side to open the window
         {
-            ai->TellDebug(ai->GetMaster(), "open trade window", "debug rpg");
+            ai->TellDebug(ai->GetMaster(), BOT_TEXT("open trade window"), "debug rpg");
             WorldPacket packet(CMSG_INITIATE_TRADE);
             packet << player->GetObjectGuid();
             bot->GetSession()->HandleInitiateTradeOpcode(packet);
@@ -798,7 +798,7 @@ bool RpgEnchantAction::Execute(Event& event)
 
         if (!player->GetTradeData() || !player->GetTradeData()->HasItem(item->GetObjectGuid()))
         {
-            ai->TellDebug(ai->GetMaster(), "starting trade", "debug rpg");
+            ai->TellDebug(ai->GetMaster(), BOT_TEXT("starting trade"), "debug rpg");
             player->GetPlayerbotAI()->DoSpecificAction("trade", Event("rpg action", param.str().c_str()), true);
         }
 
@@ -811,16 +811,16 @@ bool RpgEnchantAction::Execute(Event& event)
                 uint32 duration;
                 Unit* target = nullptr;
 
-                ai->TellDebug(ai->GetMaster(), "set enchant spell", "debug rpg");
+                ai->TellDebug(ai->GetMaster(), BOT_TEXT("set enchant spell"), "debug rpg");
                 bool didCast = ai->CastSpell(spellId, target, item, true, &duration);
 
                 if (didCast)
                 {
-                    ai->TellDebug(ai->GetMaster(), "accept trade", "debug rpg");
+                    ai->TellDebug(ai->GetMaster(), BOT_TEXT("accept trade"), "debug rpg");
                     if (bot->GetGroup() && bot->GetGroup()->IsMember(guidP))
-                        ai->TellPlayerNoFacing(GetMaster(), "Let me enchant this " + chat->formatItem(item) + " with " + chat->formatSpell(spellId) + " for you " + player->GetName() + ".", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                        ai->TellPlayerNoFacing(GetMaster(), BOT_TEXT2("Let me enchant this %item with %spell for you %player.", (std::map<std::string, std::string>{ {"%spell", chat->formatSpell(spellId)}, {"%item", chat->formatItem(item)}, {"%player", player->GetName()} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                     else
-                        bot->Say("Let me enchant this " + chat->formatItem(item) + " with " + chat->formatSpell(spellId) + " for you " + player->GetName() + ".", (bot->GetTeam() == ALLIANCE ? LANG_COMMON : LANG_ORCISH));
+                        bot->Say(BOT_TEXT2("Let me enchant this %item with %spell for you %player.", (std::map<std::string, std::string>{ {"%spell", chat->formatSpell(spellId)}, {"%item", chat->formatItem(item)}, {"%player", player->GetName()} })), (bot->GetTeam() == ALLIANCE ? LANG_COMMON : LANG_ORCISH));
 
                     WorldPacket p;
                     uint32 status = TRADE_STATUS_TRADE_ACCEPT;

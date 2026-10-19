@@ -10,15 +10,52 @@
 #include "playerbot/strategy/actions/CheatAction.h"
 
 #include "playerbot/TravelMgr.h"
+#include "playerbot/strategy/values/SharedValueContext.h"
+#include "playerbot/strategy/values/TravelValues.h"
 
 #include <iostream>
 #include <numeric>
 #include <iomanip>
+#include <algorithm>
+#include <cctype>
 #include <boost/algorithm/string.hpp>
 #include <regex>
 #include <fstream>
 #include <sstream>
 #include "PlayerbotLoginMgr.h"
+
+#if PLATFORM == PLATFORM_WINDOWS
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <cstdio>
+#include <unistd.h>
+#endif
+
+// [诊断 2026-10-15] 启动/登录期内存打点：只在 PB_RSS_LOG=1 时输出，不开就是空操作。
+// 用途：把"每阶段吃多少 RSS"量化出来，避免凭猜测改代码。上云前本机验证。
+void PlayerbotLogRss(const char* tag)
+{
+    static bool enabled = (std::getenv("PB_RSS_LOG") != nullptr);
+    if (!enabled)
+        return;
+
+    uint32 rssMb = 0;
+#if PLATFORM == PLATFORM_WINDOWS
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        rssMb = (uint32)(pmc.WorkingSetSize / (1024 * 1024));
+#else
+    if (FILE* f = fopen("/proc/self/statm", "r"))
+    {
+        unsigned long total = 0, resident = 0;
+        if (fscanf(f, "%lu %lu", &total, &resident) == 2)
+            rssMb = (uint32)((resident * (unsigned long)sysconf(_SC_PAGESIZE)) / (1024 * 1024));
+        fclose(f);
+    }
+#endif
+    sLog.outString("[RSS] %-34s %6u MB", tag, rssMb);
+}
 
 std::vector<std::string> ConfigAccess::GetValues(const std::string& name) const
 {
@@ -27,17 +64,13 @@ std::vector<std::string> ConfigAccess::GetValues(const std::string& name) const
     for (auto entry : m_entries)
         if (entry.first.find(nameLower) != std::string::npos)
             values.push_back(entry.first);
-
     return values;
 };
-
 INSTANTIATE_SINGLETON_1(PlayerbotAIConfig);
-
 PlayerbotAIConfig::PlayerbotAIConfig()
 : enabled(false)
 {
 }
-
 template <class T>
 void LoadList(std::string value, T &list)
 {
@@ -88,6 +121,7 @@ inline ParsedUrl parseUrl(const std::string& url) {
 bool PlayerbotAIConfig::Initialize()
 {
     sLog.outString("Initializing AI Playerbot by ike3, based on the original Playerbot by blueboy");
+    PlayerbotLogRss("core: world loaded (bot init start)");
 
     if (!config.SetSource(_D_AIPLAYERBOT_CONFIG, "PlayerBots_"))
     {
@@ -168,6 +202,8 @@ bool PlayerbotAIConfig::Initialize()
     randomGearLoweringChance = config.GetFloatDefault("AiPlayerbot.RandomGearLoweringChance", 0.15f);
     randomBotMaxLevelChance = config.GetFloatDefault("AiPlayerbot.RandomBotMaxLevelChance", 0.15f);
     rollBadItemsWithPlayer = config.GetBoolDefault("AiPlayerbot.RollBadItemsWithPlayer", false);
+    // [不抢装备 2026-10-14] 默认开启：组里有真人玩家时不参与装备竞拍
+    passRollsWithRealPlayer = config.GetBoolDefault("AiPlayerbot.PassRollsWithRealPlayer", true);
     randomBotRpgChance = config.GetFloatDefault("AiPlayerbot.RandomBotRpgChance", 0.35f);
     usePotionChance = config.GetFloatDefault("AiPlayerbot.UsePotionChance", 1.0f);
     attackEmoteChance = config.GetFloatDefault("AiPlayerbot.AttackEmoteChance", 0.0f);
@@ -228,6 +264,17 @@ bool PlayerbotAIConfig::Initialize()
     enableMinimalMove = config.GetBoolDefault("AiPlayerbot.EnableMinimalMove", true);
     
     randomBotTeleportDistance = config.GetIntDefault("AiPlayerbot.RandomBotTeleportDistance", 1000);
+    // [spawn 2026-10-16] 站长口径：bot 固定出生点（沙塔斯 A'dal：530 / -1863.7 / 5430.0 / -9.7）
+    fixedSpawnEnabled = config.GetBoolDefault("AiPlayerbot.FixedSpawn.Enable", false);
+    fixedSpawnMapId = (uint32)config.GetIntDefault("AiPlayerbot.FixedSpawn.MapId", 530);
+    fixedSpawnX = config.GetFloatDefault("AiPlayerbot.FixedSpawn.X", -1863.7f);
+    fixedSpawnY = config.GetFloatDefault("AiPlayerbot.FixedSpawn.Y", 5430.0f);
+    fixedSpawnZ = config.GetFloatDefault("AiPlayerbot.FixedSpawn.Z", -9.7f);
+    fixedSpawnO = config.GetFloatDefault("AiPlayerbot.FixedSpawn.O", 3.72f);
+    fixedSpawnRadius = config.GetFloatDefault("AiPlayerbot.FixedSpawn.Radius", 25.0f);
+    if (fixedSpawnEnabled)
+        sLog.outString("[SPAWN] fixed bot spawn: map %u (%.1f, %.1f, %.1f) r=%.0f",
+            fixedSpawnMapId, fixedSpawnX, fixedSpawnY, fixedSpawnZ, fixedSpawnRadius);
     transportTeleportType = config.GetIntDefault("AiPlayerbot.TransportTeleportType", 2);
     randomBotTeleportNearPlayer = config.GetBoolDefault("AiPlayerbot.RandomBotTeleportNearPlayer", false);
     randomBotTeleportNearPlayerMaxAmount = config.GetIntDefault("AiPlayerbot.RandomBotTeleportNearPlayerMaxAmount", 0);
@@ -275,6 +322,45 @@ bool PlayerbotAIConfig::Initialize()
 
     commandPrefix = config.GetStringDefault("AiPlayerbot.CommandPrefix", "");
     commandSeparator = config.GetStringDefault("AiPlayerbot.CommandSeparator", "\\\\");
+
+    // [.bot 命令闸门 2026-10-17 站长口径] 非 GM 玩家的 bot 命令黑/白名单（见 PlayerbotAIConfig.h 注释）。
+    //   黑名单默认：加/删机器人、self（把自己变 bot）、always（常驻）、踢人、公会级操作。
+    //   白名单默认：站长口径那一批 —— 跟随/站位/攻击/拉怪/标记/策略(co)/施法/复活/拾取/掷点/修理/
+    //   训练/天赋/银行/读状态/说话/入队离队移交队长/summon，外加 .bot 里只影响自己机器人外观与补给的
+    //   子命令（list/help/gear/prepare/train/food/pet…）。**未列出的已注册命令一律拒绝**。
+    LoadListString<std::vector<std::string>>(config.GetStringDefault("AiPlayerbot.PlayerCommandBlacklist",
+        "add,self,always,delete,remove,kick,guild"), playerCommandBlacklist);
+    LoadListString<std::vector<std::string>>(config.GetStringDefault("AiPlayerbot.PlayerCommandWhitelist",
+        "follow,stay,guard,free,wander,flee,runaway,grind,position,formation,stance,move style,"
+        "follow target,boost target,max dps,tank attack,"
+        "attack,attack rti,attack rti target,attack my target,pull,pull rti,rti,"
+        "possible attack targets,attackers,avoid creature,chat,save mana,wait for attack time,"
+        "cast,cast custom nc spell,spell,spells,buff,buff target,focus heal,glyph,pet,"
+        "release,revive,revive target,self res,spirit healer,repop,"
+        "loot,add all loot,roll,keep,use,item count,items,inv,equip,equip upgrades,unequip,"
+        "trade,sell,buy,buy back,reward,repair,trainer,talents,bank,"
+        "stats,range,quests,reputation,los,help,who,where,log,speak,emote,wts,rep,"
+        "invite,join,leave,lfg,give leader,accept,ready,talk,summon,"
+        "go,jump,skill,faction,home,taxi,teleport,doquest,query quest,query item usage,quest reward,share,drop,"
+        "clean quest log,outfit,warning,"
+        "list,gear,prepare,prep,init,train,learn,food,drink,potions,pots,consumes,consumables,consums,"
+        "regs,reg,reagents,enchants,ammo"), playerCommandWhitelist);
+
+    // 统一转小写（大小写不敏感）；只去掉首尾空白，**不能**去掉词中间的空格
+    // （白名单里有 "move style"/"give leader"/"clean quest log" 这类多词命令）
+    auto toLowerList = [](std::vector<std::string>& list)
+    {
+        for (auto& s : list)
+        {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+            size_t b = s.find_first_not_of(" \t\r\n");
+            size_t e = s.find_last_not_of(" \t\r\n");
+            s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+        }
+    };
+    toLowerList(playerCommandBlacklist);
+    toLowerList(playerCommandWhitelist);
 
     commandServerPort = config.GetIntDefault("AiPlayerbot.CommandServerPort", 0);
     perfMonEnabled = config.GetBoolDefault("AiPlayerbot.PerfMonEnabled", false);
@@ -457,6 +543,33 @@ bool PlayerbotAIConfig::Initialize()
         }
     }
 
+    // [roster 2026-10-16] 站长口径：AiPlayerbot.PremadeSpecPick.<cls>.<race> = <specNo>
+    for (uint32 cls = 0; cls < MAX_CLASSES; ++cls)
+        for (uint32 race = 0; race < MAX_RACES; ++race)
+            specPick[cls][race] = -1;
+    for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
+    {
+        for (uint32 race = 1; race < MAX_RACES; ++race)
+        {
+            std::string key = "AiPlayerbot.PremadeSpecPick." + std::to_string(cls) + "." + std::to_string(race);
+            int32 pick = config.GetIntDefault(key.c_str(), -1);
+            if (pick >= 0)
+            {
+                specPick[cls][race] = pick;
+                sLog.outString("[ROSTER] class %u race %u -> premade spec %d", cls, race, pick);
+            }
+        }
+    }
+
+    // [gems 2026-10-16] 站长口径：AiPlayerbot.Gems.<职业id> = 宝石物品id,...
+    for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
+    {
+        std::string key = "AiPlayerbot.Gems." + std::to_string(cls);
+        std::string val = config.GetStringDefault(key.c_str(), "");
+        if (!val.empty())
+            LoadList<std::vector<uint32>>(val, gemIds[cls]);
+    }
+
     botCheatMask = uint32(CheatAction::GetCheatMask(config.GetStringDefault("AiPlayerbot.BotCheats", "taxi,item,breath")));
 
     rndBotCheatMask = uint32(CheatAction::GetCheatMask(config.GetStringDefault("AiPlayerbot.RndBotCheats", "taxi,item,breath")));    
@@ -537,6 +650,55 @@ bool PlayerbotAIConfig::Initialize()
     randomBotSayWithoutMaster = config.GetBoolDefault("AiPlayerbot.RandomBotSayWithoutMaster", false);
     randomBotInvitePlayer = config.GetBoolDefault("AiPlayerbot.RandomBotInvitePlayer", true);
     randomBotGroupNearby = config.GetBoolDefault("AiPlayerbot.RandomBotGroupNearby", true);
+    // [group 2026-10-16] 队伍里没有真人时的自动解散（0 关 / 1 真人离开后解散 / 2 任何纯机器人队伍）
+    autoDisbandBotOnlyGroups = (uint8)config.GetIntDefault("AiPlayerbot.AutoDisbandBotOnlyGroups", 1);
+    // [threat 2026-10-16 站长口径] 自己仇恨 ≥ 坦克仇恨的这个百分比就压着不出手（0 = 关）
+    waitForAttackThreatPercent = (uint8)config.GetIntDefault("AiPlayerbot.WaitForAttackThreatPercent", 90);
+    // [threat 2026-10-16 站长口径] 开场"等坦克 pull back"的秒数上限（默认 5；游戏内可单 bot 覆盖）
+    waitForAttackTime = (uint8)config.GetIntDefault("AiPlayerbot.WaitForAttackTime", 5);
+    // [threat 2026-10-16 站长口径] 坦克离我 ≤ 这个距离且对该目标有仇恨 ⇒ 视为"已拉回来"，立刻开打
+    waitForAttackTankBackDistance = config.GetFloatDefault("AiPlayerbot.WaitForAttackTankBackDistance", 12.0f);
+    // [threat 2026-10-16 站长口径] 等坦克时保持的安全距离（站长口径：一般 15 码合适）
+    waitForAttackSafeDistance = config.GetFloatDefault("AiPlayerbot.WaitForAttackSafeDistance", 15.0f);
+    // [pull-gate 2026-10-19 站长口径] "坦克乱开怪"：未进战斗时附近敌对达到这个数量就不主动开怪（0 = 关）
+    pullHostileLimit = (uint8)config.GetIntDefault("AiPlayerbot.PullHostileLimit", 3);
+    pullHostileRadius = config.GetFloatDefault("AiPlayerbot.PullHostileRadius", 15.0f);
+    // [defend-self 2026-10-19] 非坦克被贴脸且血量低于此百分比时走位（0 = 关）
+    selfDefendHealth = (uint8)config.GetIntDefault("AiPlayerbot.SelfDefendHealth", 45);
+    // [critter 2026-10-18 站长口径] t 的战斗行为跳过小动物等无害目标（1 = 跳过，默认）
+    skipCritters = config.GetBoolDefault("AiPlayerbot.SkipCritters", true);
+    // [tank-wait 2026-10-18 站长口径] "如果有人掉队 T 不应该继续往前走"：坦克等掉队队友的总开关
+    tankWaitForGroupEnabled = config.GetBoolDefault("AiPlayerbot.TankWaitForGroup", true);
+    // [tank-wait 2026-10-18 站长口径] 掉队判定距离阈值（码，默认 30）
+    tankWaitForGroupDistance = config.GetFloatDefault("AiPlayerbot.TankWaitForGroupDistance", 30.0f);
+    // [tank-wait 2026-10-18 站长口径] 坦克等待上限（秒，默认 20）；超时后恢复前进并进入等长冷却
+    tankWaitForGroupTimeout = (uint32)config.GetIntDefault("AiPlayerbot.TankWaitForGroupTimeout", 20);
+    // [safe-move 2026-10-18 站长口径] 战斗内移动选点的"别引到旁边怪"安全检查总开关
+    combatMoveSafetyEnabled = config.GetBoolDefault("AiPlayerbot.CombatMoveSafety", true);
+    // [safe-move 2026-10-18 站长口径] 仇恨半径之外再留的余量（码，默认 5）
+    combatMoveSafetyMargin = config.GetFloatDefault("AiPlayerbot.CombatMoveSafetyMargin", 5.0f);
+    // [pull 2026-10-18 站长口径] 坦克开怪目标的"同层"判据：|Δz| 上限（默认 6 码；0 = 关）
+    pullSameLevelZDistance = config.GetFloatDefault("AiPlayerbot.PullSameLevelZDistance", 6.0f);
+    // [pull 2026-10-18 站长口径] 2D 距离超过这个值才做 navmesh 路径校验（默认 20 码）
+    pullPathCheckDistance = config.GetFloatDefault("AiPlayerbot.PullPathCheckDistance", 20.0f);
+    // [BOSS 战策略 2026-10-16] 战斗中按队伍目标 BOSS entry 自动挂载 custom::boss_<entry>（数据 owner=0）
+    bossStrategies = config.GetBoolDefault("AiPlayerbot.BossStrategies", true);
+    // [副本推进 2026-10-18] 运行期按波推进总开关（只对 route 表 verified=1 的图生效）
+    // [2026-10-18 站长口径] "bot 自动开怪应该做成开关，需要手动打开" ⇒ 默认 **false**。
+    //   运行时用 GM 命令 `.bot route on` 打开（不需要重启；reset = 回到跟配置）。
+    //   另外还有第二道闸：目标图的 `ai_playerbot_dungeon_route.verified=1`（实测通过才放行）。
+    dungeonRoute = config.GetBoolDefault("AiPlayerbot.DungeonRoute", false);
+    // [自动进本 2026-10-18] 目标副本列表（例 "543,542,547"）；空 = 不自动进本
+    autoDungeonRun = config.GetBoolDefault("AiPlayerbot.AutoDungeonRun", false);
+    autoDungeonMaps = config.GetStringDefault("AiPlayerbot.AutoDungeonMaps", "");
+    // [仿真 2026-10-18] 可控场景注入：本地 WSL 仿真开 1，云端必须 0（默认 0）
+    simMode = config.GetBoolDefault("AiPlayerbot.SimMode", false);
+    if (simMode)
+        sLog.outString("[SIM] AiPlayerbot.SimMode = 1 —— 仿真模式开启（.bot sim start/stop/status；仅本地使用）");
+    // [2026-10-19] 水里也走 mmap 路径 / 移动自救（跳跃、升降台传送），默认关，本地仿真打开
+    waterPath = config.GetBoolDefault("AiPlayerbot.WaterPath", false);
+    routeJumpAssist = config.GetBoolDefault("AiPlayerbot.RouteJumpAssist", true);
+    routeLiftAssist = config.GetBoolDefault("AiPlayerbot.RouteLiftAssist", true);
     randomBotRaidNearby = config.GetBoolDefault("AiPlayerbot.RandomBotRaidNearby", true);
     randomBotGuildNearby = config.GetBoolDefault("AiPlayerbot.RandomBotGuildNearby", true);
     inviteChat = config.GetBoolDefault("AiPlayerbot.InviteChat", true);
@@ -639,6 +801,8 @@ bool PlayerbotAIConfig::Initialize()
     autoLearnQuestSpells = config.GetBoolDefault("AiPlayerbot.AutoLearnQuestSpells", false);
     autoLearnDroppedSpells = config.GetBoolDefault("AiPlayerbot.AutoLearnDroppedSpells", false);
     autoDoQuests = config.GetBoolDefault("AiPlayerbot.AutoDoQuests", true);
+    // [必要功能裁剪 2026-10-15] 鱼点：我们只保留必要功能，默认关闭（详见 TravelMgr::LoadFishLocations）
+    enableFishLocations = config.GetBoolDefault("AiPlayerbot.EnableFishLocations", false);
     syncLevelWithPlayers = config.GetBoolDefault("AiPlayerbot.SyncLevelWithPlayers", false);
     syncLevelMaxAbove = config.GetIntDefault("AiPlayerbot.SyncLevelMaxAbove", 5);
     syncLevelNoPlayer = config.GetIntDefault("AiPlayerbot.SyncLevelNoPlayer", randombotStartingLevel);
@@ -777,6 +941,51 @@ bool PlayerbotAIConfig::Initialize()
         }
     }
 
+    // [按副本换阶段 2026-10-14] AiPlayerbot.GearProgressionSystem.InstancePhases = "mapId:phase,mapId:phase,..."
+    // 站长口径：五人本+卡拉赞/格鲁尔/玛瑟里顿 = 0(团本前毕业)；毒蛇/风暴+祖阿曼 = 1(P1毕业)；
+    // 海山/黑庙 = 2(P2毕业)；太阳井 = 3(P4毕业)。留空则沿用原行为（按队长装备等级判断阶段）。
+    {
+        std::string instancePhases = config.GetStringDefault("AiPlayerbot.GearProgressionSystem.InstancePhases", "");
+        std::stringstream ss(instancePhases);
+        std::string pair;
+        while (std::getline(ss, pair, ','))
+        {
+            std::string::size_type colon = pair.find(':');
+            if (colon == std::string::npos)
+                continue;
+
+            uint32 mapId = (uint32)atoi(pair.substr(0, colon).c_str());
+            uint8 phase = (uint8)atoi(pair.substr(colon + 1).c_str());
+            if (mapId && phase < MAX_GEAR_PROGRESSION_LEVEL)
+                gearProgressionInstancePhases[mapId] = phase;
+        }
+
+        if (!gearProgressionInstancePhases.empty())
+            sLog.outString("GearProgression: %u instance->phase mappings loaded", (uint32)gearProgressionInstancePhases.size());
+    }
+
+    // [性能 2026-10-14] AiPlayerbot.GearProgressionSystem.CacheLevels = "70" 或 "60,70"（空=全部等级）
+    // 固定等级的服务器只建用得到的等级 ⇒ 装备缓存构建的外层组合数从 287,280 降到 4,104（70 倍）
+    {
+        std::string cacheLevels = config.GetStringDefault("AiPlayerbot.GearProgressionSystem.CacheLevels", "");
+        std::stringstream ss(cacheLevels);
+        std::string token;
+        while (std::getline(ss, token, ','))
+        {
+            uint32 lvl = (uint32)atoi(token.c_str());
+            if (lvl >= 1 && lvl <= DEFAULT_MAX_LEVEL)
+                gearProgressionCacheLevels.push_back(lvl);
+        }
+
+        if (!gearProgressionCacheLevels.empty())
+            sLog.outString("GearProgression: equipment cache will be built for %u level(s) only (CacheLevels)", (uint32)gearProgressionCacheLevels.size());
+    }
+
+    // [按阶段生成 2026-10-15] 随机生成装备时使用的默认阶段（0 = 团本前；站长口径 ilvl 100-115）⇒ 见 RandomItemMgr::Query
+    gearProgressionDefaultPhase = (uint8)config.GetIntDefault("AiPlayerbot.GearProgressionSystem.DefaultPhase", 0);
+    if (gearProgressionDefaultPhase >= MAX_GEAR_PROGRESSION_LEVEL)
+        gearProgressionDefaultPhase = 0;
+
     sLog.outString("Loading free bots.");
     selfBotLevel = BotSelfBotLevel(config.GetIntDefault("AiPlayerbot.SelfBotLevel", uint32(BotSelfBotLevel::GM_ONLY)));
     LoadListString<std::list<std::string>>(config.GetStringDefault("AiPlayerbot.ToggleAlwaysOnlineAccounts", ""), toggleAlwaysOnlineAccounts);
@@ -804,25 +1013,70 @@ bool PlayerbotAIConfig::Initialize()
     ItemUsageValue::PopulateReagentItemIdsForCraftableItemIds();
 
     RandomPlayerbotFactory::CreateRandomBots();
+    PlayerbotLogRss("after CreateRandomBots");
     PlayerbotFactory::Init();
+    PlayerbotLogRss("after PlayerbotFactory::Init");
     sRandomItemMgr.Init();
+    PlayerbotLogRss("after RandomItemMgr::Init");
     sPlayerbotTextMgr.LoadBotTexts();
     sPlayerbotTextMgr.LoadBotTextChance();
     sPlayerbotHelpMgr.LoadBotHelpTexts();
+    PlayerbotLogRss("after texts/help");
 
     LoadTalentSpecs();
+    PlayerbotLogRss("after LoadTalentSpecs");
+
+    // [BOT-METRICS 2026-10-17] 数据采集出口：`BOT_METRICS=1` 时强制打开 bot_events.csv。
+    //   logEvent() 本身被 hasLog("bot_events.csv") 门控，而该文件名默认不在启用列表里
+    //   ⇒ 过去 bot_events.csv 根本不会生成（本地实测不存在/0 字节）。
+    //   openLog(file, mode, haslog=true) 会绕过 hasLog 检查（见 openLog 实现）。
+    //   不设 BOT_METRICS 时这一段完全跳过 ⇒ 线上零成本、零行为变化。
+    if (std::getenv("BOT_METRICS"))
+    {
+        openLog("bot_events.csv", "a", true);
+        sLog.outString("[BM] metrics enabled -> bot_events.csv (LogsDir=%s)", sConfig.GetStringDefault("LogsDir").c_str());
+    }
+
 
     if (sPlayerbotAIConfig.autoDoQuests)
     {
         sLog.outString("Loading Quest Detail Data...");
         sTravelMgr.LoadQuestTravelTable();
+        PlayerbotLogRss("after LoadQuestTravelTable");
+
+        // [诊断 2026-10-15] 清空前先量一下这个共享值有多大（实测清掉后 RSS 掉 ~590MB，要钉死是谁）
+        // [crash-fix 2026-10-16] 原来这里用 guidpsValue->GetRef() 取引用。GetRef() 已删除（它交出的
+        // 引用会随宿主被 ClearValue() 释放而悬垂）。这里只需"看一眼规模"，改成 GetRef() 的等价安全写法：
+        // 拿指针 → 确认还登记着 → 用一次 Get() 的返回值（拷贝）统计。统计块本来就是诊断用途，
+        // 顺手用 PB_RSS_LOG 门控，默认不开时连这次拷贝都不做（EntryGuidps 可能有几十 MB）。
+        static bool const dumpGuidpsSize = (std::getenv("PB_RSS_LOG") != nullptr);
+        // [收敛 2026-10-16] AiSharedValueAlive 现在在全局命名空间（见 SharedValueContext.h），用 :: 限定。
+        if (dumpGuidpsSize && ::AiSharedValueAlive("entry guidps"))
+        {
+            if (auto* guidpsValue = sSharedObjectContext.GetValue<EntryGuidps>("entry guidps"))
+            {
+                EntryGuidps const guidps = guidpsValue->Get();
+                size_t points = 0;
+                for (auto& entryPair : guidps)
+                    points += entryPair.second.size();
+                sLog.outString("[SZ] before clear: entry guidps = %zu entries / %zu positions",
+                    guidps.size(), points);
+            }
+        }
+        PlayerbotLogRss("before clear entry guidps");
+
+        // [降峰 2026-10-15] 旅行图建完后立刻释放共享值 "entry guidps"（EntryGuidps，实测约 500MB 永久缓存）
+        sSharedObjectContext.ClearValue("entry guidps");
+        PlayerbotLogRss("after clear entry guidps");
     }
 
     sLog.outString("Loading named locations...");
     sRandomPlayerbotMgr.LoadNamedLocations();
+    PlayerbotLogRss("after LoadNamedLocations");
 
     if (sPlayerbotAIConfig.randomBotJoinBG)
         sRandomPlayerbotMgr.LoadBattleMastersCache();
+    PlayerbotLogRss("bot init done");
 
     sLog.outString("---------------------------------------");
     sLog.outString("        AI Playerbot initialized       ");
@@ -894,6 +1148,8 @@ std::string PlayerbotAIConfig::GetValue(std::string name)
 
     return out.str();
 }
+
+
 
 void PlayerbotAIConfig::SetValue(std::string name, std::string value)
 {
@@ -1066,7 +1322,11 @@ void PlayerbotAIConfig::log(std::string fileName, const char* str, ...)
 
 void PlayerbotAIConfig::logEvent(PlayerbotAI* ai, std::string eventName, std::string info1, std::string info2)
 {
-    if (hasLog("bot_events.csv"))
+    // [BOT-ML 2026-10-17] BOT_METRICS=1 时强制启用 bot_events.csv：
+    //   openLog(..., haslog=true) 只把文件打开，并不会让 hasLog() 变 true，
+    //   所以这里必须显式放行，否则 44 处 logEvent() 仍然全部静默（实测 0 字节）。
+    char const* bmMetricsEnv = std::getenv("BOT_METRICS");
+    if (hasLog("bot_events.csv") || (bmMetricsEnv && bmMetricsEnv[0] != '\0'))
     {
         Player* bot = ai->GetBot();
 
@@ -1084,7 +1344,13 @@ void PlayerbotAIConfig::logEvent(PlayerbotAI* ai, std::string eventName, std::st
         out << subLevel << ",";
 
         out << "\"" << info1 << "\",";
-        out << "\"" << info2 << "\"";
+        out << "\"" << info2 << "\",";
+
+        // [rewards 2026-10-19] 角色列（追加在最后，保持前面列的位置不变）：
+        //   "按职责分别算奖励"必须有它；取值 tank / heal / dps。
+        //   判据复用 PlayerbotAI::IsTank/IsHeal（读的是 bot 身上的策略类型，不是名字）。
+        char const* role = PlayerbotAI::IsTank(bot) ? "tank" : (PlayerbotAI::IsHeal(bot) ? "heal" : "dps");
+        out << role;
 
         log("bot_events.csv", out.str().c_str());
     }
@@ -1131,6 +1397,7 @@ void PlayerbotAIConfig::LoadTalentSpecs()
     sLog.outString("Loading TalentSpecs");
 
     uint32 maxSpecLevel = 0;
+    uint32 talentSpecsBuilt = 0;   // [A/B 诊断] 统计实际构建的 TalentSpec 数量
 
     for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
     {
@@ -1144,6 +1411,17 @@ void PlayerbotAIConfig::LoadTalentSpecs()
                 std::ostringstream os; os << "AiPlayerbot.PremadeSpecProb." << cls << "." << spec;
                 int probability = config.GetIntDefault(os.str().c_str(), 100);
 
+                // [roster 2026-10-16] 入队自我介绍的中文台词
+                {
+                    // [fix 2026-10-16] spec 循环上限是 MAX_LEVEL(100)，而 specSayCn 只有 10 列 ⇒ 必须夹住索引，
+                    // 否则越界写坏堆：表现为启动期 std::string::_M_assign 段错误（gdb 栈 #1 = LoadTalentSpecs）。
+                    if (spec < 10)
+                    {
+                        std::ostringstream osk; osk << "AiPlayerbot.PremadeSpecSayCn." << cls << "." << spec;
+                        specSayCn[cls][spec] = config.GetStringDefault(osk.str().c_str(), "");
+                    }
+                }
+
                 TalentPath talentPath(spec, specName, probability);
 
                 for (uint32 level = 10; level <= 100; level++)
@@ -1155,6 +1433,15 @@ void PlayerbotAIConfig::LoadTalentSpecs()
 
                     if (!specLink.empty())
                     {
+                        // [降峰 2026-10-15] 只为本服实际用到的等级区间建 TalentSpec。
+                        // 原实现为每个职业×专精×等级(10..100) 都建一个完整 TalentSpec（约 2500 个），
+                        // 本机剖析实测该步骤 +243MB；本站 bot 全部固定 70 级
+                        // （RandomBotMinLevel=RandomBotMaxLevel=70）⇒ 其余等级纯属浪费。
+                        // [A/B 诊断 2026-10-15] PB_NO_TALENT_FILTER=1 时不做等级过滤，用于量化该过滤的内存收益
+                        static bool const noTalentFilter = std::getenv("PB_NO_TALENT_FILTER") != nullptr;
+                        if (!noTalentFilter && (level < sPlayerbotAIConfig.randomBotMinLevel || level > sPlayerbotAIConfig.randomBotMaxLevel))
+                            continue;
+
                         if (maxSpecLevel < level)
                             maxSpecLevel = level;
 
@@ -1169,6 +1456,7 @@ void PlayerbotAIConfig::LoadTalentSpecs()
                         }
 
                         TalentSpec linkSpec(&classSpecs[cls].baseSpec, specLink);
+                        ++talentSpecsBuilt;
 
                         if (!linkSpec.CheckTalents(TalentSpec::LeveltoPoints(level), &out))
                         {
@@ -1246,6 +1534,8 @@ void PlayerbotAIConfig::LoadTalentSpecs()
             sLog.outErrorDb("!!!!!!!!!!! randomBotMaxLevel and the talentspec levels are below this expansions max level. Please check if you have the correct config file!!!!!!");
 
     }
+    sLog.outString("[TALENT] TalentSpecs built: %u (%s)", talentSpecsBuilt,
+        std::getenv("PB_NO_TALENT_FILTER") ? "level filter OFF" : "level filter ON");
 }
 
 void PlayerbotAIConfig::LoadLLMDefaultPrompts(const std::string& fileName)

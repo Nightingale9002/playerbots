@@ -563,7 +563,7 @@ bool CastRandomSpellAction::castSpell(uint32 spellId, WorldObject* wo, Player* r
     {
         if (ai->CastSpell(spellId, bot, spellItem, false, &spellDuration))
         {
-            ai->TellPlayer(requester, "Casting " + ChatHelper::formatSpell(pSpellInfo) + " on " + ChatHelper::formatItem(spellItem), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayer(requester, BOT_TEXT2("Casting %spell on %item", (std::map<std::string, std::string>{ {"%spell", ChatHelper::formatSpell(pSpellInfo)}, {"%item", ChatHelper::formatItem(spellItem)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             executed = true;
         }
     }
@@ -574,7 +574,7 @@ bool CastRandomSpellAction::castSpell(uint32 spellId, WorldObject* wo, Player* r
         {
             if (ai->CastSpell(spellId, wo->GetPositionX(), wo->GetPositionY(), wo->GetPositionZ(), nullptr, false, &spellDuration))
             {
-                ai->TellPlayer(requester, "Casting " + ChatHelper::formatSpell(pSpellInfo) + " near " + ChatHelper::formatWorldobject(wo), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester, BOT_TEXT2("Casting %spell near %object", (std::map<std::string, std::string>{ {"%spell", ChatHelper::formatSpell(pSpellInfo)}, {"%object", ChatHelper::formatWorldobject(wo)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 executed = true;
             }
         }
@@ -583,9 +583,9 @@ bool CastRandomSpellAction::castSpell(uint32 spellId, WorldObject* wo, Player* r
             if (ai->CastSpell(spellId, (Unit*)wo, nullptr, false, &spellDuration))
             {
                 if(wo != bot)
-                    ai->TellPlayer(requester, "Casting " + ChatHelper::formatSpell(pSpellInfo) + " on " + ChatHelper::formatWorldobject(wo), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                    ai->TellPlayer(requester, BOT_TEXT2("Casting %spell on %object", (std::map<std::string, std::string>{ {"%spell", ChatHelper::formatSpell(pSpellInfo)}, {"%object", ChatHelper::formatWorldobject(wo)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 else
-                    ai->TellPlayer(requester, "Casting " + ChatHelper::formatSpell(pSpellInfo), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                    ai->TellPlayer(requester, BOT_TEXT2("Casting %spell", (std::map<std::string, std::string>{ {"%spell", ChatHelper::formatSpell(pSpellInfo)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 executed = true;
             }
         }
@@ -593,7 +593,7 @@ bool CastRandomSpellAction::castSpell(uint32 spellId, WorldObject* wo, Player* r
         {
             if (ai->CastSpell(spellId, (GameObject*)wo, nullptr, false, &spellDuration))
             {
-                ai->TellPlayer(requester, "Casting " + ChatHelper::formatSpell(pSpellInfo) + " on " + ChatHelper::formatWorldobject(wo), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester, BOT_TEXT2("Casting %spell on %object", (std::map<std::string, std::string>{ {"%spell", ChatHelper::formatSpell(pSpellInfo)}, {"%object", ChatHelper::formatWorldobject(wo)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 executed = true;
             }
         }
@@ -601,7 +601,7 @@ bool CastRandomSpellAction::castSpell(uint32 spellId, WorldObject* wo, Player* r
         {
             if (ai->CastSpell(spellId, wo->GetPositionX(), wo->GetPositionY(), wo->GetPositionZ(), nullptr, false, &spellDuration))
             {
-                ai->TellPlayer(requester, "Casting " + ChatHelper::formatSpell(pSpellInfo) + " near " + ChatHelper::formatWorldobject(wo), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                ai->TellPlayer(requester, BOT_TEXT2("Casting %spell near %object", (std::map<std::string, std::string>{ {"%spell", ChatHelper::formatSpell(pSpellInfo)}, {"%object", ChatHelper::formatWorldobject(wo)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
                 executed = true;
             }
         }
@@ -611,7 +611,7 @@ bool CastRandomSpellAction::castSpell(uint32 spellId, WorldObject* wo, Player* r
     {
         if (ai->CastSpell(spellId, bot, nullptr, false, &spellDuration))
         {
-            ai->TellPlayer(requester, "Casting " + ChatHelper::formatSpell(pSpellInfo), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayer(requester, BOT_TEXT2("Casting %spell", (std::map<std::string, std::string>{ {"%spell", ChatHelper::formatSpell(pSpellInfo)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
             executed = true;
         }
     }
@@ -756,7 +756,7 @@ bool DisenchantRandomItemAction::Execute(Event& event)
 
         if(didCast)
         {
-            ai->TellPlayer(requester, "Disenchanting " + chat->formatItem(itemQualifier), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            ai->TellPlayer(requester, BOT_TEXT2("Disenchanting %item", (std::map<std::string, std::string>{ {"%item", chat->formatItem(itemQualifier)} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         }
 
         return didCast;

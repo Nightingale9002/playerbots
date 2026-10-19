@@ -580,4 +580,66 @@ void TestRegistry::RegisterInstanceTests()
     GenerateBossWalkTest();
     GenerateBossEncounterTest();
     GenerateBossReachTest();
+
+    // =====================================================================================
+    // [BOT-ML 2026-10-17 站长口径] 两个"战斗场景"测试：单目标 / 五目标，各跑 6 分钟。
+    //   目标物 = 训练假人 190013（CommandSetup 的 pull <entry> 会在找不到时随时 SummonCreature
+    //   就地刷一个，见 CommandSetup.cpp 里 "pull: creature not found ... spawning it"），
+    //   engage spawn <entry> 让 bot 交战。
+    //   细粒度指标（躲地板 bm_dodge / 打断 bm_interrupt / GCD 挂起 bm_gcd_wait，以及
+    //   Engine 写入的动作名 = 治疗/输出代理）都落在 bot_events.csv：启动服务时设 BOT_METRICS=1 即可。
+    //   开跑方式（三选一，2026-10-17 查证）：
+    //     · GM 命令：`.playerbots test combat_single_target`（DebugAction.cpp 的 test 分支）
+    //     · 或给 bot 挂策略：`test::combat_single_target`（TestStrategy 用 test::<名字> 做限定词）
+    // =====================================================================================
+    RegisterTest("combat_single_target", {
+        "monitor time > 375 => pass \"single-target scenario ran 6 minutes\"",
+        "monitor time > 420 => fail \"Timeout: single-target scenario did not finish\"",
+        // 先造一队 bot 并拉到同一处（木桩是友善目标，随机 bot 不会主动打它，必须显式 engage）
+        // 每职业一个（专精由 AiPlayerbot.PremadeSpec* 表自动分配）：坦克 / 治疗 / 法系 / 混合
+        "spawn level=70 class=warrior temporary=1 login=1",
+        "spawn level=70 class=paladin temporary=1 login=1",
+        "spawn level=70 class=priest temporary=1 login=1",
+        "spawn level=70 class=mage temporary=1 login=1",
+        "spawn level=70 class=druid temporary=1 login=1",
+        "form",
+        "wait 8",
+        "pull 190013",
+        "wait 2",
+        "engage spawn 190013",
+        "observe"
+    });
+
+    RegisterTest("combat_five_targets", {
+        "monitor time > 375 => pass \"five-target scenario ran 6 minutes\"",
+        "monitor time > 420 => fail \"Timeout: five-target scenario did not finish\"",
+        // 每职业一个（专精由 AiPlayerbot.PremadeSpec* 表自动分配）
+        "spawn level=70 class=warrior temporary=1 login=1",
+        "spawn level=70 class=paladin temporary=1 login=1",
+        "spawn level=70 class=priest temporary=1 login=1",
+        "spawn level=70 class=mage temporary=1 login=1",
+        "spawn level=70 class=druid temporary=1 login=1",
+        "form",
+        "wait 8",
+        "pull 190013",                                    // 唯一的"有技能"目标（7 个机制法术都在 190013 上）
+        "pull 190014", "pull 190014", "pull 190015", "pull 190015",   // 4 个无技能目标
+        "wait 2",
+        "engage spawn 190013",
+        "engage spawn 190014",
+        "engage spawn 190015",
+        "observe"
+    });
+
+    // [bottest 2026-10-19] 最小可测场景：**不需要组队**（不依赖在线机器人数量 / 账号槽位），
+    //   只用主机 bot 自己打 190013，用来验证"度量链路"本身是否通：
+    //   pull 会在找不到目标时自己召唤，所以只要数据库里有 190013 的 creature_template 就能打。
+    //   期望产出：bm_dmg / bm_heal / bm_kills / bm_deaths / bm_rule + role 列。
+    RegisterTest("combat_smoke", {
+        "pull 190013",
+        "wait 2",
+        "engage spawn 190013",
+        "observe",
+        "monitor time > 150 => pass \"smoke: combat metrics produced\"",
+        "monitor time > 210 => fail \"Timeout: smoke scenario did not produce combat\""
+    });
 }

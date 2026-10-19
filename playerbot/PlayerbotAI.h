@@ -511,7 +511,12 @@ public:
     bool TellError(Player* player, std::string text, PlayerbotSecurityLevel securityLevel = PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, bool ignoreSilent = false);
     void SpellInterrupted(uint32 spellid);
     int32 CalculateGlobalCooldown(uint32 spellid);
-    void InterruptSpell(bool withMeleeAndAuto = true);
+    // keepUsefulHeals：为 true 时，"目标依然缺血"的治疗不被打断。
+    //   只给**非策略性**的中断用（状态切换 / 反应引擎）。预读打断走策略
+    //   （HealInterruptStrategy + HealTargetFullHealthTrigger），判据在那边，不经过这个开关。
+    void InterruptSpell(bool withMeleeAndAuto = true, bool keepUsefulHeals = false);
+    // 当前正在读的治疗是否仍然有用（目标未满血且这一发不会完全溢出）
+    bool IsCurrentHealUseful();
     bool RemoveAura(const std::string& name);
     void RemoveShapeshift();
     void WaitForSpellCast(Spell *spell);
@@ -757,6 +762,11 @@ public:
 private:
     bool UpdateAIReaction(uint32 elapsed, bool minimal, bool isStunned);
     void UpdateFaceTarget(uint32 elapsed, bool minimal);
+    // [进本跟随 2026-10-17 站长口径] bot 在副本门口(<=10码)时跟着真人 master 一起进本；状态驱动+限流。
+    void CheckInstanceFollow();
+    // [tank-wait 2026-10-18 站长口径] "如果有人掉队 T 不应该继续往前走"：
+    //   队伍里有人掉队时坦克停下原地等（判定/超时/提示见实现）。
+    bool ShouldTankWaitForGroup();
 
 protected:
 	Player* bot;
@@ -801,6 +811,10 @@ protected:
     bool m_recordIncommingMessages = false;
     std::vector<std::string> m_recordedMessages;
     Event lastEvent;
+    time_t lastInstanceFollow = 0;      // [进本跟随 2026-10-17] 限流时间戳（约 2 秒一次）
+    uint32 instanceFollowTrigger = 0;   // [进本跟随 2026-10-17] 已锁定的副本门 AreaTrigger id
+    time_t tankWaitForGroupStart = 0;   // [tank-wait 2026-10-18] 当前"等掉队队友"周期的起点（0 = 没在等）
+    time_t tankWaitForGroupResumeAt = 0;// [tank-wait 2026-10-18] 超时后恢复前进的冷却截止时刻
 
 public:
     void RecordMessages(bool record, bool incomming = false) { m_recordMessages = record; m_recordIncommingMessages = incomming; if (!record) m_recordedMessages.clear(); }

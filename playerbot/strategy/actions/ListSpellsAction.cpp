@@ -268,7 +268,7 @@ bool ListSpellsAction::Execute(Event& event)
 
     std::list<std::pair<uint32, std::string> > spells = GetSpellList(filter);
 
-    ai->TellPlayer(requester, "=== Spells ===");
+    ai->TellPlayer(requester,BOT_TEXT("=== Spells ==="));
     spells.sort(CompareSpells);
 
     int count = 0;

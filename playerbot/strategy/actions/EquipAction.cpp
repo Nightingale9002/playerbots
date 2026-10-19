@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "EquipAction.h"
 
+#include "playerbot/PlayerbotFactory.h"
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/strategy/values/ItemCountValue.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
@@ -80,7 +81,7 @@ bool EquipAction::Execute(Event& event)
 
 void EquipAction::ListItems(Player* requester)
 {
-    ai->TellPlayer(requester, "=== Equip ===");
+    ai->TellPlayer(requester,BOT_TEXT("=== Equip ==="));
 
     std::map<uint32, int> items;
     std::map<uint32, bool> soulbound;
@@ -233,7 +234,7 @@ void EquipAction::EquipItemToSlot(Player* requester, Item* item, uint8 targetSlo
     uint8 destSlot = dest & 0xFF;
     if (destSlot != targetSlot)
     {
-        ai->TellPlayer(requester, "Cannot equip this item to the specified slot.");
+        ai->TellPlayer(requester,BOT_TEXT("Cannot equip this item to the specified slot."));
         return;
     }
 
@@ -259,6 +260,11 @@ void EquipAction::EquipItemToSlot(Player* requester, Item* item, uint8 targetSlo
     std::map<std::string, std::string> args;
     args["%item"] = chat->formatItem(item);
     ai->TellPlayer(requester, BOT_TEXT2("equip_command", args), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+
+    // [gems 2026-10-17 站长口径] 换装后补插空槽宝石（只补空槽 ⇒ 幂等，不拆已有宝石）
+    uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
+    if (filledGems)
+        sLog.outString("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
 }
 
 void EquipAction::EquipItem(PlayerbotAI* ai, Player* requester, Item* item, bool silent)
@@ -334,11 +340,25 @@ void EquipAction::EquipItem(PlayerbotAI* ai, Player* requester, Item* item, bool
         args["%item"] = ChatHelper::formatItem(item);
         ai->TellPlayer(requester, BOT_TEXT2("equip_command", args), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
     }
+
+    // [gems 2026-10-17 站长口径] 换装后补插空槽宝石。放在这个"单件装备"的公共函数里 ⇒ 覆盖所有入口：
+    // 自动拾取升级（EquipUpgradesAction → EquipItem）、对话命令 .bot equip（EquipItems → EquipItem）、
+    // 钓鱼竿互换（FishAction → EquipItem）。只补空槽（onlyEmpty=true）⇒ 幂等，不拆已有宝石。
+    uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
+    if (filledGems)
+        sLog.outString("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
 }
 
 bool EquipUpgradesAction::Execute(Event& event)
 {
-    if (!sPlayerbotAIConfig.autoEquipUpgradeLoot && !sRandomPlayerbotMgr.IsRandomBot(bot))
+    // [gear 2026-10-18 站长口径] "bot 会自动装备新拾取的、但是不如自己装备好的物品" —— 两个原因：
+    //   ① 以前这里对**随机 bot 无视开关**（`|| sRandomPlayerbotMgr.IsRandomBot(bot)`），
+    //      配置 `AiPlayerbot.AutoEquipUpgradeLoot=0` 也关不掉；
+    //   ② 下面原来先把已装备的主手/副手**脱掉**再重新扫描背包，槽位一空，
+    //      `ITEM_USAGE_BAD_EQUIP`（"垃圾但空槽也穿"）就成立 ⇒ 捡到的差装备也会被穿上，
+    //      甚至把原来更好的装备换下来（排序里 mainhand 优先还会抢在更好的双手/法杖前面）。
+    //   现在：开关对**所有** bot 生效；不再脱装；只穿 `ITEM_USAGE_EQUIP`（严格优于当前装备）。
+    if (!sPlayerbotAIConfig.autoEquipUpgradeLoot)
         return false;
 
     if (event.getSource() == "trade status")
@@ -401,21 +421,13 @@ bool EquipUpgradesAction::Execute(Event& event)
         }
     }
 
-    Item* oldMainhand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
-    Item* oldOffhand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
-        
-    if (oldMainhand)
-        UnequipAction::UnequipItem(ai, bot, oldMainhand, true);
-    if (oldOffhand)
-        UnequipAction::UnequipItem(ai, bot, oldOffhand, true);
-
+    // [gear 2026-10-18] 不再"先脱后穿"：item usage 是**对当前已装备**算出来的，
+    //   脱掉会让比较失去基准；直接从背包里挑"严格更好"的，换下来时 EquipItem 自己会把旧件放回背包。
     context->ClearExpiredValues("item usage", 10); //Clear old item usage.
 
     std::list<Item*> items;
 
     FindItemUsageVisitor visitor(bot, ItemUsage::ITEM_USAGE_EQUIP);
-    ai->InventoryIterateItems(&visitor, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
-    visitor.SetUsage(ItemUsage::ITEM_USAGE_BAD_EQUIP);
     ai->InventoryIterateItems(&visitor, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
     items = visitor.GetResult();
 
@@ -438,12 +450,14 @@ bool EquipUpgradesAction::Execute(Event& event)
 #endif
 
         ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", ItemQualifier(item).GetQualifier());
-        if (usage == ItemUsage::ITEM_USAGE_EQUIP || usage == ItemUsage::ITEM_USAGE_BAD_EQUIP)
+        // [gear 2026-10-18] 只穿"严格优于当前装备"的（ITEM_USAGE_EQUIP）；BAD_EQUIP 是
+        //   "垃圾但空槽也穿"，在这个"拾取升级"动作里一律不穿。
+        if (usage == ItemUsage::ITEM_USAGE_EQUIP)
         {
-            sLog.outDetail("Bot #%d <%s> auto equips item %d (%s)", bot->GetGUIDLow(), bot->GetName(), item->GetProto()->ItemId, usage == ItemUsage::ITEM_USAGE_EQUIP ? "better than current" : usage == ItemUsage::ITEM_USAGE_BAD_EQUIP ? "wrong item but empty slot" : "");
+            sLog.outDetail("Bot #%d <%s> auto equips item %d (better than current)", bot->GetGUIDLow(), bot->GetName(), item->GetProto()->ItemId);
             ai->TellDebug(ai->GetMaster(), "Equipping: " + chat->formatItem(item) + " - " + ItemUsageValue::ReasonForNeed(usage, item, 1, bot), "debug equip");
 
-            EquipItem(ai, GetMaster(), item, item == oldMainhand || item == oldOffhand);  
+            EquipItem(ai, GetMaster(), item, false);
             didEquip = true;
 
             // auto enchant if cheat is turned on
@@ -478,6 +492,8 @@ bool EquipUpgradesAction::Execute(Event& event)
         }
     }
 
+    // [gems 2026-10-17 站长口径] MH/OH 互换只是把已插好的装备挪位置（宝石跟着物品走），无需再补；
+    // 循环里每件装备在 EquipAction::EquipItem() 里已经补过了。
     return didEquip;
 }
 

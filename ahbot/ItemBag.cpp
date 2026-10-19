@@ -85,8 +85,11 @@ ItemBag::ItemBag()
     }
 }
 
+void AhBotLogRss(char const* tag);
+
 void ItemBag::Init(bool silent)
 {
+    AhBotLogRss("ItemBag::Init enter");
     // test skip ahbot loading at start
     // return;
 
@@ -100,14 +103,22 @@ void ItemBag::Init(bool silent)
 
     Load();
 	uint32 ahcounter = 0;
+    AhBotLogRss("ItemBag::Init: Load() returned");
     for (int i = 0; i < CategoryList::instance.size(); i++)
     {
         Category* category = CategoryList::instance[i];
+        if ((i % 10) == 0)
+        {
+            char t[160]; snprintf(t, sizeof(t), "Init loop %d/%d cat=%s n=%zu", i, (int)CategoryList::instance.size(), category->GetDisplayName().c_str(), content[category].size());
+            AhBotLogRss(t);
+        }
         Shuffle(content[category]);
         sLog.outDetail("loaded %zu %s items", content[category].size(), category->GetDisplayName().c_str());
 		ahcounter += content[category].size();
     }
+	AhBotLogRss("ItemBag::Init: shuffle loop done");
 	sLog.outString("Loaded %u items", ahcounter);
+	AhBotLogRss("ItemBag::Init done");
 }
 
 int32 ItemBag::GetCount(Category* category, uint32 item)
@@ -182,6 +193,11 @@ void AvailableItemsBag::Load()
       BarGoLink bar(sItemStorage.GetMaxEntry());
       for (uint32 itemId = 0; itemId < sItemStorage.GetMaxEntry(); ++itemId)
       {
+          if ((itemId % 2000) == 0)
+          {
+              char t[128]; snprintf(t, sizeof(t), "Load: item %u/%u", itemId, (uint32)sItemStorage.GetMaxEntry());
+              AhBotLogRss(t);
+          }
           if (vendorItems.find(itemId) == vendorItems.end() || sAhBotConfig.ignoreVendorItemIds.find(itemId) != sAhBotConfig.ignoreVendorItemIds.end())
               Add(sObjectMgr.GetItemPrototype(itemId));
 

@@ -24,7 +24,7 @@ bool CustomStrategyEditAction::Execute(Event& event)
 
 bool CustomStrategyEditAction::PrintHelp(Player* requester)
 {
-    ai->TellPlayer(requester, "=== Custom strategies ===");
+    ai->TellPlayer(requester,BOT_TEXT("=== Custom strategies ==="));
     uint32 owner = (uint32)ai->GetBot()->GetGUIDLow();
     auto results = CharacterDatabase.PQuery("SELECT distinct name FROM ai_playerbot_custom_strategy WHERE owner = '%u'", owner);
     if (results)
@@ -38,7 +38,7 @@ bool CustomStrategyEditAction::PrintHelp(Player* requester)
         while (results->NextRow());
     }
 
-    ai->TellPlayer(requester, "Usage: cs <name> <idx> <command>");
+    ai->TellPlayer(requester,BOT_TEXT("Usage: cs <name> <idx> <command>"));
     return false;
 }
 

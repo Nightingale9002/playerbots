@@ -1,5 +1,12 @@
+#include <regex>
+// [跑位 2026-10-18] 队伍整体跑位决策层（LOS 优先）：先 include 进编译单元，接线下一步做
+#include "playerbot/PartyPositionCoordinator.h"
+#include <algorithm>
+#include <cctype>
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
+// [2026-10-18] `.bot route` 要切 DungeonRoute 的运行时开关
+#include "playerbot/DungeonRoute.h"
 #include "PlayerbotDbStore.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "playerbot/RandomPlayerbotFactory.h"
@@ -13,6 +20,8 @@
 #include "strategy/actions/ChangeTalentsAction.h"
 #include "strategy/actions/InviteToGroupAction.h"
 #include "AiFactory.h"
+// [仿真 2026-10-18] `.bot sim ...`（本地可控场景注入；见 playerbot/SimScenario.h）
+#include "playerbot/SimScenario.h"
 #include "Guilds/GuildMgr.h"
 
 #ifdef GenerateBotTests
@@ -29,6 +38,8 @@ PlayerbotHolder::PlayerbotHolder() : PlayerbotAIBase()
     m_holderHandlers["help"] = &PlayerbotHolder::HandleHelp;
     m_holderHandlers["reload"] = &PlayerbotHolder::HandleReload;
     m_holderHandlers["tweak"] = &PlayerbotHolder::HandleTweak;
+    m_holderHandlers["route"] = &PlayerbotHolder::HandleRoute;
+    m_holderHandlers["sim"] = &PlayerbotHolder::HandleSim;
     m_holderHandlers["self"] = &PlayerbotHolder::HandleSelf;
     m_holderHandlers["spoof"] = &PlayerbotHolder::HandleSpoof;
     m_holderHandlers["p"] = &PlayerbotHolder::HandleParty;
@@ -579,7 +590,7 @@ bool PlayerbotMgr::HandlePlayerbotMgrCommand(ChatHandler* handler, char const* a
 {
 	if (!sPlayerbotAIConfig.enabled)
 	{
-		handler->PSendSysMessage("|cffff0000Playerbot system is currently disabled!");
+		handler->PSendSysMessage(BOT_TEXT("|cffff0000Playerbot system is currently disabled!").c_str());
         return false;
 	}
 
@@ -587,7 +598,7 @@ bool PlayerbotMgr::HandlePlayerbotMgrCommand(ChatHandler* handler, char const* a
 
     if (!m_session)
     {
-        handler->PSendSysMessage("You may only add bots from an active session");
+        handler->PSendSysMessage(BOT_TEXT("You may only add bots from an active session").c_str());
         return false;
     }
 
@@ -595,7 +606,7 @@ bool PlayerbotMgr::HandlePlayerbotMgrCommand(ChatHandler* handler, char const* a
     PlayerbotMgr* mgr = player->GetPlayerbotMgr();
     if (!mgr)
     {
-        handler->PSendSysMessage("you cannot control bots yet");
+        handler->PSendSysMessage(BOT_TEXT("you cannot control bots yet").c_str());
         return false;
     }
 
@@ -645,6 +656,12 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
     std::string command = params[0];
     std::string param, charname;
 
+    // [.bot 命令闸门 2026-10-17] 命令子类型写法 "cmd=sub"（见 ProcessBotCommand 里的 eqPos）按主命令判
+    std::string gatedCommand = command;
+    size_t gateEqPos = gatedCommand.find('=');
+    if (gateEqPos != std::string::npos)
+        gatedCommand = gatedCommand.substr(0, gateEqPos);
+
     if (params.size() > 1)
     {
         param = args.substr(params[0].size() + 1);
@@ -655,6 +672,10 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
     {
         if (command != prefix)
             continue;
+
+        // [.bot 命令闸门 2026-10-17] holder 级子命令（list/help/p/g/r/self/spoof/create/group/…）也过闸门
+        if (!CheckPlayerBotCommand(master, useSecurity, gatedCommand, "", ObjectGuid()))
+            return messages;
 
         messages = (this->*handler)(master, param, useSecurity);
         return messages;
@@ -777,12 +798,20 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
             param = "";
     }
 
+    bool gatedByPlayerGate = false;
     for (auto bot :  bots)
     {
         std::ostringstream out;
         out << command << ": " << bot << " - ";
 
         ObjectGuid member = sObjectMgr.GetPlayerGuidByName(bot);
+        // [.bot 命令闸门 2026-10-17] 逐个目标过闸门（黑/白名单 + 目标必须在发令者队伍里/同账号）
+        if (!CheckPlayerBotCommand(master, useSecurity, gatedCommand, bot, member))
+        {
+            gatedByPlayerGate = true;
+            continue;
+        }
+
         if (!member)
         {
             out << "character not found";
@@ -799,11 +828,112 @@ std::list<std::string> PlayerbotHolder::HandlePlayerbotCommand(const std::string
         messages.push_back(out.str());
     }
 
-    if (messages.empty())
+    if (messages.empty() && !gatedByPlayerGate)
         messages.push_back("Unknown command. Use 'help' for more information.");
 
     return messages;
 }
+
+// [.bot 命令闸门 2026-10-17 站长口径] ------------------------------------------------------------------
+// 背景：`.bot` 在 Chat.cpp 里注册成 SEC_PLAYER ⇒ gmlevel 0 的玩家能对自己账号的机器人用全部子命令；
+//       原先只有 HandleSelf(`self`) / HandleBotAlways(`always`) 两处看 AiPlayerbot.SelfBotLevel。
+// 口径：非 GM（< SEC_GAMEMASTER）只放行"白名单"里的命令，黑名单里的命令一律拒绝；
+//       目标 bot 必须属于发令者（同一队伍，或同一账号的 alt bot —— 与 PlayerbotSecurity::LevelFor 同口径）。
+//       被拒时给发令者一句中文提示（BOT_TEXT: no_permission_for_bot_command），并写 [BOTCMD] 审计日志。
+// 覆盖入口：
+//       ① `.bot <子命令> ...`  → PlayerbotHolder::HandlePlayerbotCommand  （本文件）
+//       ② 对 bot 说话的聊天命令 → PlayerbotAI::HandleCommand              （那边调同一个 CheckPlayerBotCommand）
+//       `.rndbot`（控制台 CLI，master == nullptr）与 GM 不受影响。
+bool PlayerbotHolder::IsBotCommandBlacklisted(const std::string& command)
+{
+    if (command.empty())
+        return false;
+
+    std::string needle = command;
+    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+    for (const auto& blocked : sPlayerbotAIConfig.playerCommandBlacklist)
+        if (!blocked.empty() && blocked == needle)
+            return true;
+
+    return false;
+}
+
+bool PlayerbotHolder::IsBotCommandWhitelisted(const std::string& command)
+{
+    // 白名单留空 = 不做白名单过滤（只按黑名单判），避免"配置写空 ⇒ 所有命令都被拒"
+    if (sPlayerbotAIConfig.playerCommandWhitelist.empty())
+        return true;
+
+    if (command.empty())
+        return false;
+
+    std::string needle = command;
+    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+    for (const auto& allowed : sPlayerbotAIConfig.playerCommandWhitelist)
+        if (!allowed.empty() && allowed == needle)
+            return true;
+
+    return false;
+}
+
+bool PlayerbotHolder::CheckPlayerBotCommand(Player* from, AccountTypes security, const std::string& command,
+                                            const std::string& targetName, ObjectGuid targetGuid)
+{
+    // 控制台 / CLI（没有发令玩家）、GM 及以上、以及"发令者是机器人"（bot 之间互相说话）都不受玩家闸门限制
+    if (!from || !from->GetSession() || security >= SEC_GAMEMASTER)
+        return true;
+
+    if (from->GetPlayerbotAI() && !from->GetPlayerbotAI()->IsRealPlayer())
+        return true;
+
+    std::string reason;
+
+    if (IsBotCommandBlacklisted(command))
+    {
+        reason = "blacklist";
+    }
+    else if (!IsBotCommandWhitelisted(command))
+    {
+        reason = "not whitelisted";
+    }
+    else if (targetGuid && !targetGuid.IsEmpty())
+    {
+        // 目标必须属于发令者：同一账号的 alt bot（与 PlayerbotSecurity::LevelFor 一致），或与发令者同队伍
+        bool owned = false;
+        uint32 botAccount = sObjectMgr.GetPlayerAccountIdByGUID(targetGuid);
+        if (botAccount && botAccount == from->GetSession()->GetAccountId())
+            owned = true;
+
+        if (!owned)
+        {
+            Player* bot = sObjectMgr.GetPlayer(targetGuid);
+            Group* fromGroup = from->GetGroup();
+            if (bot && fromGroup && bot->GetGroup() == fromGroup)
+                owned = true;
+        }
+
+        if (!owned)
+            reason = "target not in group";
+    }
+
+    if (reason.empty())
+        return true;
+
+    std::string targetForLog = targetName.empty() ? std::string("-") : targetName;
+
+    sLog.outString("[BOTCMD] 玩家=%s gm=%u 命令=%s 目标=%s 原因=%s",
+        from->GetName(), uint32(security), command.c_str(), targetForLog.c_str(), reason.c_str());
+
+    std::string text = BOT_TEXT("no_permission_for_bot_command");
+    if (text.empty())
+        text = "你没有权限使用这个机器人命令。";
+
+    ChatHandler(from->GetSession()).PSendSysMessage("%s", text.c_str());
+    return false;
+}
+// ----------------------------------------------------------------------------------------------------
 
 uint32 PlayerbotHolder::GetAccountId(std::string name)
 {
@@ -1232,6 +1362,55 @@ std::list<std::string> PlayerbotHolder::HandleTweak(Player* master, const std::s
         sPlayerbotAIConfig.tweakValue = 0;
     messages.push_back("Set tweakvalue to " + std::to_string(sPlayerbotAIConfig.tweakValue));
     return messages;
+}
+
+std::list<std::string> PlayerbotHolder::HandleRoute(Player* master, const std::string param, AccountTypes security)
+{
+    // [2026-10-18 站长口径] "bot 自动开怪应该做成开关。需要手动打开"
+    //   `.bot route on`   强制开（本进程内生效，不用重启）
+    //   `.bot route off`  强制关
+    //   `.bot route reset`回到跟随配置项 AiPlayerbot.DungeonRoute（默认 false = 关）
+    //   `.bot route`      只查询当前状态
+    std::list<std::string> messages;
+    if (security < SEC_GAMEMASTER)
+    {
+        messages.push_back("You do not have permission to use this command.");
+        return messages;
+    }
+
+    std::string arg = param;
+    std::transform(arg.begin(), arg.end(), arg.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+
+    int& sw = dungeonroute::RouteRuntimeSwitch();
+
+    if (arg == "on" || arg == "1" || arg == "enable")
+        sw = 1;
+    else if (arg == "off" || arg == "0" || arg == "disable")
+        sw = 0;
+    else if (arg == "reset" || arg == "auto")
+        sw = -1;
+    else if (!arg.empty())
+    {
+        messages.push_back("用法: .bot route on|off|reset （不带参数 = 查询当前状态）");
+        return messages;
+    }
+
+    char const* state = (sw < 0)
+        ? (sPlayerbotAIConfig.dungeonRoute ? "跟随配置（当前=开）" : "跟随配置（当前=关）")
+        : (sw ? "强制开" : "强制关");
+
+    messages.push_back(std::string("DungeonRoute 自动开怪: ") + state);
+    sLog.outString("[DUNGEONROUTE] .bot route %s by %s => %s",
+        arg.empty() ? "(query)" : arg.c_str(), master ? master->GetName() : "console", state);
+    return messages;
+}
+
+// [仿真 2026-10-18] `.bot sim start <mapId> [groups] [partySize]` / `.bot sim stop [runId|all]` / `.bot sim status`
+//   全部逻辑在 playerbot/SimScenario.cpp（状态机走世界线程：RandomPlayerbotMgr::UpdateAIInternal 开头 Update()）。
+//   控制台等价命令：`.rndbot sim ...`（CliHandler 只放行 rndbot，`.bot` 的 console 标志是 false）。
+std::list<std::string> PlayerbotHolder::HandleSim(Player* master, const std::string param, AccountTypes security)
+{
+    return simscenario::HandleCommand(master, param, security);
 }
 
 std::string PlayerbotHolder::HandleBotAlways(Player* bot, Player* master, const std::string param)

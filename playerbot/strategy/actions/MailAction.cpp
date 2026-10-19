@@ -14,7 +14,7 @@ class TellMailProcessor : public MailProcessor
 public:
     bool Before(Player* requester, PlayerbotAI* ai) override
     {
-        ai->TellPlayer(requester, "=== Mailbox ===", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayer(requester,BOT_TEXT("=== Mailbox ==="), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         tells.clear();
         return true;
     }
@@ -285,7 +285,7 @@ bool MailAction::Execute(Event& event)
     std::string text = event.getParam();
     if (text.empty())
     {
-        ai->TellPlayer(requester, "whisper 'mail ?' to query mailbox, 'mail take/delete/read filter' to take/delete/read mails by filter");
+        ai->TellPlayer(requester,BOT_TEXT("whisper 'mail ?' to query mailbox, 'mail take/delete/read filter' to take/delete/read mails by filter"));
         return false;
     }
 

@@ -21,5 +21,10 @@ namespace ai
     private:
         void InitCombatTriggers(std::list<TriggerNode*>& triggers) override;
         void InitNonCombatTriggers(std::list<TriggerNode*>& triggers) override;
+
+        // [dodge 2026-10-17 方案A] 通用「躲技能」反应。
+        //   放在 reaction 引擎：`AiFactory` 已给 reactionEngine 挂上 "dungeon"，且 reaction 引擎
+        //   本身就是"每 tick 一个紧急动作"的语义（`avoid aoe` 也挂在这里）⇒ 躲地板技属于它。
+        void InitReactionTriggers(std::list<TriggerNode*>& triggers) override;
     };
 }

@@ -39,6 +39,20 @@ namespace ai
             if (!bot->GetGroup() || !bot->GetGroup()->IsMember(inviter->GetObjectGuid()))
                 return false;
 
+            // [roster 2026-10-16] 站长口径：组 bot 时用中文报出自己的职业+专精（私聊给邀请者）
+            {
+                uint8 cls = bot->getClass();
+                uint32 stored = sRandomPlayerbotMgr.GetValue(bot->GetGUIDLow(), "specNo");
+                uint32 specNo = stored > 0 ? stored - 1 : 0;
+                std::string line;
+                if (cls < MAX_CLASSES && specNo < 10 && !sPlayerbotAIConfig.specSayCn[cls][specNo].empty())
+                    line = sPlayerbotAIConfig.specSayCn[cls][specNo];
+                else if (ChrClassesEntry const* ce = sChrClassesStore.LookupEntry(cls))
+                    line = std::string("我是") + ce->name[sWorld.GetDefaultDbcLocale()];
+                if (!line.empty())
+                    bot->Whisper(line, LANG_UNIVERSAL, inviter->GetObjectGuid());
+            }
+
             if (sRandomPlayerbotMgr.IsFreeBot(bot))
             {
                 ai->SetMaster(inviter);

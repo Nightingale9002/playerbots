@@ -5,6 +5,8 @@
 #include <set>
 #include <list>
 #include <map>
+#include <type_traits>
+#include "AiObject.h"
 
 namespace ai
 {
@@ -191,19 +193,70 @@ namespace ai
     };
 
 
+    // [crash-fix 2026-10-16] 只有 AiNamedObject 那一族（Action/Trigger/UntypedValue）有
+    // SetOwner/Register/Unregister；Strategy 继承的是 PlayerbotAIAware，没有这些。
+    // 用 SFINAE 分流，避免给 Strategy 也强加这套接口。
+    template<class T>
+    inline void NamedObjectAttach(T* object, void* owner, std::true_type)
+    {
+        object->SetOwner(owner);
+        object->Register();
+    }
+
+    template<class T>
+    inline void NamedObjectAttach(T*, void*, std::false_type) {}
+
+    template<class T>
+    inline void NamedObjectDetach(T* object, std::true_type)
+    {
+        object->Unregister();
+    }
+
+    template<class T>
+    inline void NamedObjectDetach(T*, std::false_type) {}
+
+    template<class T>
+    inline bool NamedObjectOwnedBy(T* object, void* owner, std::true_type)
+    {
+        return object->IsOwnedBy(owner);
+    }
+
+    template<class T>
+    inline bool NamedObjectOwnedBy(T*, void*, std::false_type)
+    {
+        // 没有归属概念的 context（Strategy）：保持旧行为（Clear/Erase 时删掉它自己 new 的对象）。
+        return true;
+    }
+
     template <class T>
     class NamedObjectContext : public NamedObjectFactory<T>
     {
     public:
+        using IsNamedObject = std::is_base_of<AiNamedObject, T>;
+
         NamedObjectContext(bool shared = false, bool supportsSiblings = false) :
             NamedObjectFactory<T>(), shared(shared), supportsSiblings(supportsSiblings) {}
 
         T* Create(std::string name, PlayerbotAI* ai)
         {
-            if (created.find(name) == created.end())
-                return created[name] = NamedObjectFactory<T>::Create(name, ai);
+            // [crash-fix 2026-10-16] 原来这里是 created[name] = ...：等号左边的下标的求值先于右边，
+            // 而 operator[] 会把 key 插进 map。若工厂返回 nullptr（未注册的名字），map 里就留下一个
+            // 空指针条目 ⇒ 之后每次 look_up 都命中 nullptr，调用方拿到 nullptr 直接解引用（崩在 0）。
+            // 改成"先创建、成功才登记"，并且不覆盖已有条目（覆盖会把旧对象泄漏/悬垂）。
+            typename std::map<std::string, T*>::iterator i = created.find(name);
+            if (i != created.end())
+                return i->second;
 
-            return created[name];
+            T* object = NamedObjectFactory<T>::Create(name, ai);
+            if (object == nullptr)
+                return nullptr;
+
+            created[name] = object;
+
+            // [crash-fix 2026-10-16] 登记归属 + 存活标记（WeakRef，见 Value.h）。
+            NamedObjectAttach(object, (void*)this, IsNamedObject());
+
+            return object;
         }
 
         virtual ~NamedObjectContext()
@@ -216,7 +269,10 @@ namespace ai
             for (typename std::map<std::string, T*>::iterator i = created.begin(); i != created.end(); i++)
             {
                 if (i->second)
+                {
+                    NamedObjectDetach(i->second, IsNamedObject());
                     delete i->second;
+                }
             }
 
             created.clear();
@@ -224,11 +280,26 @@ namespace ai
 
         void Erase(const std::string& name)
         {
-            if (created.find(name) != created.end())
-            {
-                delete created[name];
-                created.erase(name);
-            }
+            typename std::map<std::string, T*>::iterator i = created.find(name);
+            if (i == created.end())
+                return;
+
+            T* object = i->second;
+            created.erase(i);
+
+            if (object == nullptr)
+                return;
+
+            NamedObjectDetach(object, IsNamedObject());
+
+            // [crash-fix 2026-10-16] 只删"本 context 真正 new 出来的"对象。
+            // SharedValueContext 是共享的：本地 AiObjectContext 的 ClearValues("...") 会走到这里，
+            // 以前会把共享对象 delete 掉，而 SharedValueContext::created 里还留着它的指针
+            // ⇒ 双重释放 / 悬垂引用（正是线上 AI 取值链崩溃那一族）。共享对象只从自己的 map 上摘掉。
+            if (!NamedObjectOwnedBy(object, (void*)this, IsNamedObject()))
+                return;
+
+            delete object;
         }
 
         void Update()

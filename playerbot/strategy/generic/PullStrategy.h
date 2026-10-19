@@ -60,15 +60,11 @@ namespace ai
         float GetValue(Action* action) override;
     };
 
-    class PossibleAdsStrategy : public Strategy
-    {
-    public:
-        PossibleAdsStrategy(PlayerbotAI* ai) : Strategy(ai) {}
-        std::string getName() override { return "ads"; }
-
-    private:
-        void InitCombatTriggers(std::list<TriggerNode*> &triggers) override;
-    };
+    // [dead-rule 2026-10-19] PossibleAdsStrategy（注册名 "ads"）已删除：
+    //   它绑的触发器 "possible ads" 在全模块**从未注册**（只有这一处引用），
+    //   所以这条 flee with pet 永远不执行；而 "flee from adds" 策略已经用
+    //   现成的 "has nearest adds" 做同样的事。留着只会误导调参。
+    //   —— 由 _agent_tmp/extract_strategy_inventory.ps1 自动发现。
 
     class PullBackStrategy : public Strategy
     {

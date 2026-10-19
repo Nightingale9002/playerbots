@@ -932,12 +932,12 @@ void WorldPosition::loadMapAndVMaps(const WorldPosition& secondPos, uint32 insta
     }
 }
 
+// [bot-grid 2026-10-16 站长口径] 卸载由**核心**负责：某个网格引用计数归零时，
+// TerrainInfo 的清理循环会调 VMapManager2::unloadMap(mapId,x,y) 与
+// MMapManager::unloadMap(mapId,x,y)（见 src/game/Maps/GridMap.cpp 的 m_GridRef==0 分支）。
+// 模块自己不再另外卸载：模块按点加载的瓦片就落在同一个网格坐标上，网格卸载时会一并被清掉。
 void WorldPosition::unloadMapAndVMaps(uint32 mapId)
 {
-#ifndef MANGOSBOT_TWO
-    //TerrainInfoAccess* terrain = reinterpret_cast<TerrainInfoAccess*>(const_cast<TerrainInfo*>(sTerrainMgr.LoadTerrain(mapId)));
-    //terrain->UnLoadUnused();
-#endif
 }
 
 bool WorldPosition::loadVMap(uint32 mapId, int x, int y)
@@ -945,7 +945,18 @@ bool WorldPosition::loadVMap(uint32 mapId, int x, int y)
     if (isVmapLoaded(mapId, x, y))
         return true;
 
-    return VMAP::VMapFactory::createOrGetVMapManager()->loadMap(sWorld.GetDataPath().c_str(), mapId, x, y);
+    // [VMAP-PATH-BOT 2026-10-15] 这里原来传的是 sWorld.GetDataPath().c_str()，**少了 "vmaps/" 这一层**：
+    //   base = "./"（DataDir） ⇒ VMapManager2::_loadMap() 里 basePath + "530.vmtree" = "./530.vmtree"
+    //   ⇒ fopen 失败 ⇒ InitMap 返回 false ⇒ VMapManager2::iNoVmapDataMaps.insert(mapId)
+    //   ⇒ **整张图在这一进程内被永久拉黑**（此后任何 loadMap 都直接 return false），
+    //     核心侧 TerrainInfo::LoadMapAndVMap() 传的虽然是对的路径也救不回来。
+    // 表现：`.los` 永远 tree=NO；vmap 高度/水位查询落回 .map（副本没有 .map ⇒ -95）
+    //      ⇒ 水/陆判据全乱 ⇒ "陆地上游泳"。
+    // 为什么"关 bot 就正常"：只有 bot 会频繁走 WorldPosition::getAreaFlag()（WorldPosition.h:299
+    // 第一步就是 loadVMap()），于是只有 bot 在跑时才会用这个错路径去 loadMap、才会把图拉黑。
+    // 核心侧 GridMap.cpp 一直是 GetDataPath() + "vmaps"，这里对齐即可（末尾补 '/' 防止拼接粘连）。
+    static std::string const vmapBasePath = sWorld.GetDataPath() + "vmaps/";
+    return VMAP::VMapFactory::createOrGetVMapManager()->loadMap(vmapBasePath.c_str(), mapId, x, y);
 }
 
 std::vector<WorldPosition> WorldPosition::fromPointsArray(const std::vector<G3D::Vector3>& path) const
@@ -977,9 +988,14 @@ std::vector<WorldPosition> WorldPosition::getPathStepFrom(const WorldPosition& s
         instanceId = isSharedNavmeshMap(startPos.getMapId()) ? 0 : hasher(std::this_thread::get_id());
     else
         instanceId = bot->GetInstanceId();
-    //Load mmaps and vmaps between the two points.
-
-    loadMapAndVMaps(startPos, instanceId);
+    // [bot-grid 2026-10-16 站长口径] bot 与正常玩家一致：
+    //   * **不**做"起点到终点沿途全量加载"；走到哪个网格由**核心**按网格加载 vmap/mmap，
+    //     离开网格时核心自己卸载（GridMap.cpp 里 m_GridRef==0 的分支会调
+    //     VMapManager2::unloadMap(mapId,x,y) + MMapManager::unloadMap(mapId,x,y)）。
+    //   * 只有"没有 bot 上下文"的旅行图预计算（bot == nullptr）才需要模块自己预载，
+    //     否则跨图寻路在核心还没载格时算不出来。真 bot 跨图也交给核心。
+    if (!bot)
+        loadMapAndVMaps(startPos, instanceId);
 
     PointsArray points;
     PathType type;

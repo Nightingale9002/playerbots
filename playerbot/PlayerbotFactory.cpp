@@ -25,10 +25,26 @@
 #include "strategy/ItemVisitors.h"
 
 #include <unordered_set>
+#include <cstdlib>
 
 using namespace ai;
 
 #define PLAYER_SKILL_INDEX(x)       (PLAYER_SKILL_INFO_1_1 + ((x)*3))
+
+// [set 2026-10-16] 站长口径：优先凑套装。
+// 返回候选物品的加权百分比（0 = 不是套装物品）：
+//   已穿同套 0 件 => +8%（略微鼓励起套）、1 件 => +24%、2 件 => +40%、3 件及以上 => +56%
+// 说明：只看"已经穿在身上"的同套件数，不含本插槽（本插槽的旧件会被替换掉）。
+static uint32 SetBonusPercent(std::map<uint32, uint32> const& equippedSetPieces, ItemPrototype const* proto)
+{
+    if (!proto || !proto->ItemSet)
+        return 0;
+
+    std::map<uint32, uint32>::const_iterator itr = equippedSetPieces.find(proto->ItemSet);
+    uint32 const pieces = (itr == equippedSetPieces.end()) ? 0 : itr->second;
+
+    return 8 + 16 * std::min(pieces, 3u);
+}
 
 uint32 PlayerbotFactory::tradeSkills[] =
 {
@@ -84,11 +100,26 @@ void PlayerbotFactory::Init()
     overworldTaxiNodeLevelsH.clear();
     overworldTaxiNodeLevelsA.clear();
 
+    // [降内存 2026-10-16] 只为 **bot 地图**（AiPlayerbot.RandomBotMaps）算 taxi 节点区等级：
+    // taxiPosition.getAreaLevel() 会为该点载入 terrain + vmap，而全世界 taxi 节点遍布 0/1/530 …
+    // ⇒ 本机实测这一段 = 启动 +177MB（第二大项）。模块其它地方（旅行点/探索点/鱼点/entry guidps）
+    // 早已只收 randomBotMaps，所以其它地图的节点等级没有任何使用者。
+    // randomBotMaps 为空时保持原行为（不限制）。
+    bool const restrictToBotMaps = !sPlayerbotAIConfig.randomBotMaps.empty();
+    auto isBotMap = [](uint32 mapId)
+    {
+        return std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), mapId)
+            != sPlayerbotAIConfig.randomBotMaps.end();
+    };
+
     for (uint32 i = 1; i < sTaxiNodesStore.GetNumRows(); ++i)
     {
         TaxiNodesEntry const* taxiNode = sTaxiNodesStore.LookupEntry(i);
 
         if (!taxiNode)
+            continue;
+
+        if (restrictToBotMaps && !isBotMap(taxiNode->map_id))
             continue;
 
         WorldPosition taxiPosition(taxiNode);
@@ -2546,12 +2577,23 @@ void PlayerbotFactory::InitTalentsTree(bool incremental)
 	}
     else
     {
-        uint32 point = urand(0, 100);
         uint8 cls = bot->getClass();
-        uint32 p1 = sPlayerbotAIConfig.specProbability[cls][0];
-        uint32 p2 = p1 + sPlayerbotAIConfig.specProbability[cls][1];
+        uint8 race = bot->getRace();
+        // [roster 2026-10-16] 站长口径：按「职业+种族」点名专精；未点名才回落到原逻辑
+        // （注意：specProbability 全模块无人赋值 ⇒ 回落路径实际恒为 specNo=2）
+        int32 picked = (cls < MAX_CLASSES && race < MAX_RACES) ? sPlayerbotAIConfig.specPick[cls][race] : -1;
+        if (picked >= 0)
+        {
+            specNo = uint32(picked);
+        }
+        else
+        {
+            uint32 point = urand(0, 100);
+            uint32 p1 = sPlayerbotAIConfig.specProbability[cls][0];
+            uint32 p2 = p1 + sPlayerbotAIConfig.specProbability[cls][1];
 
-        specNo = (point < p1 ? 0 : (point < p2 ? 1 : 2));
+            specNo = (point < p1 ? 0 : (point < p2 ? 1 : 2));
+        }
         sRandomPlayerbotMgr.SetValue(bot, "specNo", specNo + 1);
     }
 
@@ -3019,7 +3061,24 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
 
     uint32 specId = sRandomItemMgr.GetPlayerSpecId(bot);
     if (specId == 0)
-        return;
+    {
+        // [gear 2026-10-16] 原来这里直接 return ⇒ 装备插槽全空（specId 由已学天赋点推断，
+        // 天赋未落/名字匹配不上即为 0）。改为回落到本职业第一个已定义专精，至少把装备穿上。
+        specId = sRandomItemMgr.GetDefaultSpecIdForClass(bot->getClass());
+        if (specId == 0)
+            return;   // 本职业连一条权重表都没有：保持原行为
+        sLog.outString("[GEAR] %s specId==0 -> fallback specId %u", bot->GetName(), specId);
+    }
+
+    // [gear 2026-10-16] 站长口径：野外只穿"前团本"（默认阶段的 ilvl 上限）。
+    // 高于这个上限的旧装备（上次进本穿的 T5/T6）在野外必须被换掉，不能因为"旧件更强"而保留。
+    uint32 openWorldMaxIlvl = 9999999;
+    {
+        uint8 const defaultPhase = sPlayerbotAIConfig.gearProgressionDefaultPhase;
+        if (defaultPhase < MAX_GEAR_PROGRESSION_LEVEL)
+            openWorldMaxIlvl = sPlayerbotAIConfig.gearProgressionSystemItemLevels[defaultPhase][1];
+    }
+    bool const inInstance = bot->GetMap() && (bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid());
 
     // choose type of weapon
     uint32 weaponType = 0;
@@ -3233,6 +3292,21 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
             quality = itemQuality;
         }
 
+        // [set 2026-10-16] 优先凑套装：先统计"当前已穿（不含本插槽）"的套装件数，
+        // 供排序与取舍判定共用（每件候选+8%，同套每多一件再+16%，上限约+56%）。
+        std::map<uint32, uint32> equippedSetPieces;
+        for (uint8 wornSlot = EQUIPMENT_SLOT_START; wornSlot < EQUIPMENT_SLOT_END; ++wornSlot)
+        {
+            if (wornSlot == slot)
+                continue;
+
+            Item* wornItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, wornSlot);
+            if (!wornItem || !wornItem->GetProto() || !wornItem->GetProto()->ItemSet)
+                continue;
+
+            equippedSetPieces[wornItem->GetProto()->ItemSet]++;
+        }
+
         bool found = false;
         uint32 attempts = 0;
         do
@@ -3363,7 +3437,9 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                 if (incremental || !progressiveGear)
                 {
                     // sort items based on stat value, ilvl or quality
-                    std::sort(ids.begin(), ids.end(), [specId](int a, int b)
+                    // [set 2026-10-16] 站长口径：优先凑套装 —— 与已穿部位同套（itemset）的候选加权，
+                    // 口径与下面的取舍判定完全一致（同一个 SetBonusPercent），避免"排序选中、判定又否掉"。
+                    std::sort(ids.begin(), ids.end(), [specId, &equippedSetPieces](int a, int b)
                         {
                             uint32 baseCompareA = (sRandomItemMgr.GetStatWeight(a, specId) + sRandomItemMgr.GetBestRandomEnchantStatWeight(a, specId)) * 1000;
                             uint32 baseCompareB = (sRandomItemMgr.GetStatWeight(b, specId) + sRandomItemMgr.GetBestRandomEnchantStatWeight(b, specId)) * 1000;
@@ -3375,6 +3451,9 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
 
                             baseCompareA += proto1->Quality * proto1->ItemLevel;
                             baseCompareB += proto2->Quality * proto2->ItemLevel;
+
+                            baseCompareA += baseCompareA * SetBonusPercent(equippedSetPieces, proto1) / 100;
+                            baseCompareB += baseCompareB * SetBonusPercent(equippedSetPieces, proto2) / 100;
 
                             return baseCompareA < baseCompareB;
                         });
@@ -3480,6 +3559,9 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     ItemPrototype const* oldProto = oldItem ? oldItem->GetProto() : nullptr;
                     //uint32 oldStatValue = oldItem ? sRandomItemMgr.GetStatWeight(oldProto->ItemId, specId) : 0;
                     uint32 oldStatValue = oldItem ? sRandomItemMgr.GetLiveStatWeight(bot, oldProto->ItemId, specId) : 0;
+                    // [set 2026-10-16] 旧装备也按"套装加成"折算，否则换掉一件套装会显得毫无损失
+                    if (oldStatValue && oldProto)
+                        oldStatValue += oldStatValue * SetBonusPercent(equippedSetPieces, oldProto) / 100;
 
                     if (oldItem && oldProto->ItemId == newItemId)
                         continue;
@@ -3495,6 +3577,9 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     uint32 newStatValue = sRandomItemMgr.GetLiveStatWeight(bot, newItemId, specId);
                     if (newStatValue <= 0)
                         continue;
+
+                    // [set 2026-10-16] 与已穿部位同套 ⇒ 加权（优先把套装凑齐）
+                    newStatValue += newStatValue * SetBonusPercent(equippedSetPieces, proto) / 100;
 
                     // check if already have reward
                     if (sRandomItemMgr.HasSameQuestRewards(bot, newItemId))
@@ -3563,7 +3648,11 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                                 continue;
                         }
 
-                    if (incremental && oldItem && oldStatValue >= newStatValue && oldStatValue > 1)
+                    // [gear 2026-10-16] 野外降级：旧件超过默认阶段上限、新件在前团本以内 ⇒ 无条件替换
+                    bool const openWorldDowngrade = oldItem && oldProto && !inInstance &&
+                        oldProto->ItemLevel > openWorldMaxIlvl && proto->ItemLevel <= openWorldMaxIlvl;
+
+                    if (!openWorldDowngrade && incremental && oldItem && oldStatValue >= newStatValue && oldStatValue > 1)
                         continue;
 
                     // replace grey items right away
@@ -5575,160 +5664,274 @@ void PlayerbotFactory::LoadEnchantContainer()
     }
 #endif
 }*/
-void PlayerbotFactory::InitGems() //WIP
+
+// [gems 2026-10-17 站长口径] InitGems() 的"给 bot 身上装备补插宝石"抽成可复用的静态函数：
+//   老 bot 一次性补插（RandomPlayerbotMgr::ProcessBot 空闲分支）+ 每次换装后补插（UpdateGearAction /
+//   EquipAction / PlayerbotFactory 的换装包装）都调它；装备创建期的 InitGems() 变成 FillGems(bot,false) 的薄壳。
+//   onlyEmpty=true 时天然幂等：整件已插满 → 跳过；单个槽已有宝石 → 跳过；只有"空槽"才会写。
+uint32 PlayerbotFactory::FillGems(Player* bot, bool onlyEmpty)
 {
-#ifndef MANGOSBOT_ZERO
-    std::vector<uint32> gems = sRandomItemMgr.GetGemsList();
-    for (int slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; slot++)
+    // [gems 2026-10-16] 站长口径：**按插槽颜色 + 职业/专精属性**选宝石（黄=命中/暴击/急速+法伤，
+    // 蓝=耐力+法伤，物理=耐力+AP/敏捷，坦克优先耐力，治疗优先治疗量）；
+    // 只有"该颜色里挑不出有收益的宝石"时才放宽颜色（保证插槽插满 + 颜色对了能吃插槽奖励）。
+    // 直接写 SOCK_ENCHANTMENT_SLOT（不走 CMSG_SOCKET_GEMS）⇒ 不需要背包里有宝石；
+    // 但必须自己调 ApplyEnchantment，否则只改了物品数据、玩家属性不生效（HandleSocketOpcode 就是这么做的）。
+    if (!bot)
+        return 0;
+
+    static bool const gemLog = (std::getenv("PB_GEM_LOG") != nullptr);
+
+    uint8 const cls = bot->getClass();
+    if (cls >= MAX_CLASSES)
+        return 0;
+
+    // ── 第一遍：只挑"有插槽且需要补"的装备（不建宝石表、不算专精权重 ⇒ 幂等空跑/满身插满时极便宜）──
+    std::vector<uint8> slotsToFill;
+    uint32 scannedItems = 0;                                // 有插槽、被检查过的装备件数
+    uint32 alreadyFullItems = 0;                            // onlyEmpty 下被幂等跳过的"已插满"件数
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
     {
-        if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!item)
+            continue;
+
+        ItemPrototype const* proto = item->GetProto();
+        if (!proto)
+            continue;
+
+        // 这件装备有没有插槽 / 还有没有空槽：全满 ⇒ 整件跳过；没插槽 ⇒ 直接忽略，不算"已插满"
+        uint32 socketCount = 0;
+        bool hasEmptySocket = false;
+        for (uint32 i = 0; i < MAX_GEM_SOCKETS; ++i)
         {
-            if (ItemPrototype const* proto = item->GetProto())
+            if (!proto->Socket[i].Color)
+                continue;
+
+            socketCount++;
+            if (!item->GetEnchantmentId(EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + i)))
+                hasEmptySocket = true;
+        }
+
+        if (!socketCount)
+            continue;
+
+        scannedItems++;
+
+        if (onlyEmpty && !hasEmptySocket)
+        {
+            alreadyFullItems++;
+            if (gemLog)
+                sLog.outString("[GEM] %s slot %u 的 %u 个插槽已插满，跳过（onlyEmpty 幂等）", bot->GetName(), slot, socketCount);
+            continue;
+        }
+
+        slotsToFill.push_back(slot);
+    }
+
+    if (slotsToFill.empty())
+        return 0;                                           // 幂等快路径：身上没有空槽 ⇒ 连宝石表和权重都不碰
+
+    uint32 specId = sRandomItemMgr.GetPlayerSpecId(bot);
+    if (!specId)
+        specId = sRandomItemMgr.GetDefaultSpecIdForClass(cls);
+    if (!specId)
+        return 0;
+
+    // 宝石候选表（物品id / 附魔id / 颜色掩码 / 物品等级），只建一次
+    struct GemCandidate { uint32 itemId; uint32 enchantId; uint32 color; uint32 itemLevel; };
+    static std::vector<GemCandidate> gemCandidates;
+    if (gemCandidates.empty())
+    {
+        for (uint32 itemId = 0; itemId < sItemStorage.GetMaxEntry(); ++itemId)
+        {
+            ItemPrototype const* proto = ObjectMgr::GetItemPrototype(itemId);
+            if (!proto || proto->Class != ITEM_CLASS_GEM || proto->SubClass == ITEM_SUBCLASS_GEM_SIMPLE)
+                continue;
+
+            GemPropertiesEntry const* gemProp = sGemPropertiesStore.LookupEntry(proto->GemProperties);
+            if (!gemProp || !gemProp->spellitemenchantement || !gemProp->color)
+                continue;
+
+            if (!sSpellItemEnchantmentStore.LookupEntry(gemProp->spellitemenchantement))
+                continue;
+
+            GemCandidate candidate = { itemId, gemProp->spellitemenchantement, gemProp->color, proto->ItemLevel };
+            gemCandidates.push_back(candidate);
+        }
+        sLog.outString("[GEMS] 宝石候选表：%u 个", uint32(gemCandidates.size()));
+    }
+
+    if (gemCandidates.empty())
+        return 0;
+
+    // 同一 (职业,专精) 的宝石权重只算一次（CalculateEnchantWeight 内部要查 DBC/法术表）。
+    // [cap 2026-10-16] 有上限表(方案B)的专精，权重与"该角色是否已达标"有关 ⇒ 不能跨角色缓存。
+    static std::map<uint32, std::vector<uint32> > weightCache;
+    std::vector<uint32> localWeights;
+    bool const capAware = sRandomItemMgr.HasWeightCaps(specId);
+    std::vector<uint32>& weights = capAware ? localWeights : weightCache[specId];
+    if (weights.empty())
+    {
+        RandomItemMgr::WeightPlayerScope const weightScope(bot);   // 达标降权上下文
+        weights.reserve(gemCandidates.size());
+        for (GemCandidate const& gem : gemCandidates)
+            weights.push_back(sRandomItemMgr.CalculateEnchantWeight(cls, uint8(specId), gem.enchantId, bot));
+
+        uint32 usable = 0;
+        for (uint32 w : weights)
+            if (w)
+                usable++;
+        // [gems 2026-10-17] 这条汇总日志按专精去重：FillGems 现在会被换装/补插反复调用，
+        // 达标降权专精（capAware）每次都要重算权重，不去重会刷屏。
+        static std::set<uint32> loggedWeightSpecs;
+        if (loggedWeightSpecs.insert(specId).second)
+            sLog.outString("[GEMS] 职业 %u 专精 %u：%u/%u 个宝石有属性收益%s", cls, specId, usable, uint32(weights.size()),
+                capAware ? "（含达标降权）" : "");
+    }
+
+    // 阶段性：默认阶段（野外 = 前团本）区间内的宝石优先
+    uint32 phaseMinIlvl = 0;
+    uint32 phaseMaxIlvl = 9999999;
+    uint8 const phase = sPlayerbotAIConfig.gearProgressionDefaultPhase;
+    if (phase < MAX_GEAR_PROGRESSION_LEVEL)
+    {
+        phaseMinIlvl = sPlayerbotAIConfig.gearProgressionSystemItemLevels[phase][0];
+        phaseMaxIlvl = sPlayerbotAIConfig.gearProgressionSystemItemLevels[phase][1];
+    }
+
+    // 配置里点名要用的宝石（AiPlayerbot.Gems.<职业>）优先；配置为空的职业直接用全表
+    std::vector<uint32> preferred;
+    for (uint32 gemId : sPlayerbotAIConfig.gemIds[cls])
+    {
+        for (size_t i = 0; i < gemCandidates.size(); ++i)
+        {
+            if (gemCandidates[i].itemId == gemId)
             {
-               /*bool hasSockets = false;
-
-                for (int i = 0; i < MAX_GEM_SOCKETS; ++i)               // check for hack maybe
-                {
-                    // tried to put gem in socket where no socket exists
-                    if (!proto->Socket[i].Color)
-                        continue;
-
-                    if (proto->Socket[i].Color)
-                        hasSockets = true;
-                }
-                if (!hasSockets)
-                    continue;*/
-
-
-                WorldPacket data(CMSG_SOCKET_GEMS);
-
-                data << item->GetObjectGuid();
-                uint32 gem_placed[MAX_GEM_SOCKETS];
-
-                for (int i = 0; i < MAX_GEM_SOCKETS; i++) gem_placed[i] = 0;
-                for (uint32 enchant_slot = SOCK_ENCHANTMENT_SLOT; enchant_slot < SOCK_ENCHANTMENT_SLOT + MAX_GEM_SOCKETS; ++enchant_slot)
-                {
-                    ObjectGuid gem_GUID;
-                    //uint64 gem_GUID = 0;
-                    uint32 socketSlot = enchant_slot - SOCK_ENCHANTMENT_SLOT;
-                    uint32 SocketColor = proto->Socket[socketSlot].Color;
-#ifdef MANGOSBOT_TWO
-                    if (!SocketColor)
-                    {
-                        // item has prismatic socket?
-                        if (item->GetEnchantmentId(PRISMATIC_ENCHANTMENT_SLOT))
-                        {
-                            // first not-colored socket OR normally used socket
-                            if (socketSlot == 0 || proto->Socket[socketSlot - 1].Color || (socketSlot + 1 < MAX_GEM_SOCKETS && !proto->Socket[socketSlot + 1].Color))
-                            {
-                                SocketColor = SOCKET_COLOR_RED | SOCKET_COLOR_YELLOW | SOCKET_COLOR_BLUE;
-                            }
-                        }
-                    }
-#endif
-                    //uint32 SocketContent = proto->Socket[socketSlot].Content;
-                    uint32 gem_id = 0;
-                    switch (SocketColor) {
-                    case SOCKET_COLOR_META:
-                        gem_id = 25890;
-                        break;
-                    default:
-                    {
-                        for (std::vector<uint32>::const_iterator itr = gems.begin(); itr != gems.end(); itr++)
-                        {
-                            if (ItemPrototype const* gemProto = sObjectMgr.GetItemPrototype(*itr))
-                            {
-                                // We don't want the same gem twice on the same piece 
-                                bool already_placed = false;
-                                for (int i = 0; i < MAX_GEM_SOCKETS; i++)
-                                    if (gem_placed[i] == gemProto->ItemId)
-                                    {
-                                        already_placed = true;
-                                    }
-                                if (already_placed) continue;
-
-                                if (GemPropertiesEntry const* gemProperty = sGemPropertiesStore.LookupEntry(gemProto->GemProperties))
-                                {
-                                    if (SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(gemProperty->spellitemenchantement))
-                                    {
-                                        uint32 GemColor = gemProperty->color;
-
-                                      // check unique-equipped on item
-                                        if (gemProto->Flags & ITEM_FLAG_UNIQUE_EQUIPPABLE)
-                                        {
-                                            // there is an equip limit on this item and also we dont want to have more than 1 anywhere
-                                            if ((bot->HasItemOrGemWithIdEquipped(gemProto->ItemId, 1)) || (bot->HasItemCount(gemProto->ItemId, 1)))
-                                                continue;
-                                        }
-
-                                        if (gemProto->RequiredSkillRank > bot->GetSkillValue(SKILL_JEWELCRAFTING))
-                                            continue;
-
-                                        // no need epic gems to low gear and never need crap gem to epic gear
-                                        if (((proto->ItemLevel) < 100) && ((gemProto->Quality) > 3) || ((proto->ItemLevel) > 100) && ((gemProto->Quality) < 3))
-                                            continue;
-
-                                        uint8 sp = 0, ap = 0, tank = 0;
-                                        if (GemColor & SocketColor && GemColor == SocketColor)
-                                        {
-                                            for (int i = 0; i < 3; ++i)
-                                            {
-                                                if (pEnchant->type[i] != ITEM_ENCHANTMENT_TYPE_STAT && pEnchant->type[i] != ITEM_ENCHANTMENT_TYPE_EQUIP_SPELL)
-                                                    continue;
-                                                switch (pEnchant->type[i]) 
-                                                {
-                                                case ITEM_ENCHANTMENT_TYPE_STAT:                                                    
-                                                        AddItemStats(pEnchant->spellid[i], sp, ap, tank);
-                                                break;                                                    
-                                                case ITEM_ENCHANTMENT_TYPE_EQUIP_SPELL:                                                   
-                                                        const SpellEntry* const spellInfo = sServerFacade.LookupSpellInfo(pEnchant->spellid[i]);
-                                                        if (!spellInfo)
-                                                            continue;
-
-                                                        for (int j = 0; j < MAX_EFFECT_INDEX; j++)
-                                                        {
-                                                            if (spellInfo->Effect[j] != SPELL_EFFECT_APPLY_AURA)
-                                                                continue;
-
-                                                            AddItemSpellStats(spellInfo->EffectApplyAuraName[j], sp, ap, tank);
-                                                        }  
-                                                break;
-                                                }
-                                            }
-                                        }
-                                        if (!CheckItemStats(sp, ap, tank))
-                                            continue;
-                                        gem_id = gemProto->ItemId;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    break;
-                    }
-                    if (gem_id > 0)
-                    {
-                        gem_placed[socketSlot] = gem_id;
-                        ItemPosCountVec dest;
-                        InventoryResult res = bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, gem_id, 1);
-                        if (res == EQUIP_ERR_OK)
-                        {
-                            if (Item* gem = bot->StoreNewItem(dest, gem_id, true))
-                            {
-                                bot->SendNewItem(gem, 1, false, true, false);
-                                gem_GUID = gem->GetObjectGuid();
-
-                            }
-                        }
-                    }
-                    data << gem_GUID;
-                }
-                bot->GetSession()->HandleSocketOpcode(data);
+                preferred.push_back(gemId);
+                break;
             }
         }
     }
-#endif
+
+    uint32 insertedGems = 0;                                // 本次真正写入的宝石颗数
+
+    // ── 第二遍：只对第一遍挑出来的"有空槽"装备挑宝石并写入 ──
+    for (size_t s = 0; s < slotsToFill.size(); ++s)
+    {
+        uint8 const slot = slotsToFill[s];
+        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!item)
+            continue;
+
+        ItemPrototype const* proto = item->GetProto();
+        if (!proto)
+            continue;
+
+        // 插槽奖励的状态要在改动前先记下来（core 里的 HandleSocketOpcode 就是这么比的），
+        // 只有真正发生变化时才写 BONUS_ENCHANTMENT_SLOT 并(去)应用，避免重复叠加属性。
+        bool const socketBonusBefore = item->GemsFitSockets();
+
+        bool changed = false;
+        for (uint32 i = 0; i < MAX_GEM_SOCKETS; ++i)
+        {
+            uint32 const socketColor = proto->Socket[i].Color;
+            if (!socketColor)
+                continue;                                   // 该物品没这个插槽
+
+            EnchantmentSlot const enchantSlot = EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + i);
+
+            // [gems 2026-10-17] 幂等：这个槽已经有宝石 ⇒ "只补空槽"模式跳过（绝不拆掉站长/系统已插好的宝石）
+            if (onlyEmpty && item->GetEnchantmentId(enchantSlot))
+                continue;
+
+            // 挑宝石：第 0 轮 = 配置点名 且 颜色匹配；第 1 轮 = 颜色匹配 + 阶段区间内；
+            // 第 2 轮 = 颜色匹配（不限阶段）；第 3 轮 = 放宽颜色
+            uint32 bestEnchant = 0;
+            uint32 bestItemId = 0;
+            uint32 bestWeight = 0;
+            uint32 bestItemLevel = 0;
+            for (int pass = 0; pass < 4 && !bestEnchant; ++pass)
+            {
+                for (size_t g = 0; g < gemCandidates.size(); ++g)
+                {
+                    GemCandidate const& gem = gemCandidates[g];
+
+                    if (pass <= 2 && !(gem.color & socketColor))
+                        continue;
+
+                    if (pass == 0 &&
+                        std::find(preferred.begin(), preferred.end(), gem.itemId) == preferred.end())
+                        continue;
+
+                    if (pass == 1 && (gem.itemLevel < phaseMinIlvl || gem.itemLevel > phaseMaxIlvl))
+                        continue;
+
+                    uint32 const weight = weights[g];
+                    if (!weight)
+                        continue;
+
+                    if (weight > bestWeight || (weight == bestWeight && gem.itemLevel > bestItemLevel))
+                    {
+                        bestEnchant = gem.enchantId;
+                        bestItemId = gem.itemId;
+                        bestWeight = weight;
+                        bestItemLevel = gem.itemLevel;
+                    }
+                }
+            }
+
+            if (!bestEnchant)
+                continue;
+
+            // [GEM 2026-10-16] 诊断：PB_GEM_LOG=1 时打印"插槽颜色 -> 选中的宝石（含宝石颜色）"
+            if (gemLog)
+            {
+                GemPropertiesEntry const* chosenProp = nullptr;
+                if (ItemPrototype const* chosenProto = ObjectMgr::GetItemPrototype(bestItemId))
+                    chosenProp = sGemPropertiesStore.LookupEntry(chosenProto->GemProperties);
+                sLog.outString("[GEM] %s cls %u spec %u slot %u socket %u -> gem %u (gemColor %u) weight %u",
+                    bot->GetName(), cls, specId, slot, socketColor, bestItemId,
+                    chosenProp ? chosenProp->color : 0, bestWeight);
+            }
+
+            if (item->GetEnchantmentId(enchantSlot) == bestEnchant)
+                continue;                                   // 已经插对，不重复写库
+
+            changed = true;
+            insertedGems++;
+            bot->ApplyEnchantment(item, enchantSlot, false);
+            item->SetEnchantment(enchantSlot, bestEnchant, 0, 0, bot->GetObjectGuid());
+            bot->ApplyEnchantment(item, enchantSlot, true);
+        }
+
+        if (!changed)
+            continue;
+
+        item->SetState(ITEM_CHANGED, bot);
+
+        // 插槽奖励：颜色是否凑齐发生变化 ⇒ 写 BONUS_ENCHANTMENT_SLOT 并(去)应用（等于 core 的 socket 处理）
+        bool const socketBonusAfter = item->GemsFitSockets();
+        if (socketBonusBefore != socketBonusAfter)
+        {
+            bot->ApplyEnchantment(item, BONUS_ENCHANTMENT_SLOT, false);
+            item->SetEnchantment(BONUS_ENCHANTMENT_SLOT, socketBonusAfter ? proto->socketBonus : 0, 0, 0, bot->GetObjectGuid());
+            bot->ApplyEnchantment(item, BONUS_ENCHANTMENT_SLOT, true);
+        }
+    }
+
+    // [GEMS] 汇总：只在本轮真的插了东西时输出（站长在 Server.log 里按 [GEMS] 验收）
+    if (insertedGems)
+        sLog.outString("[GEMS] %s 插槽补插 %u 颗（扫描 %u 件带插槽装备，跳过已插满 %u 件，onlyEmpty=%u）",
+            bot->GetName(), insertedGems, scannedItems, alreadyFullItems, onlyEmpty ? 1 : 0);
+
+    return insertedGems;
+}
+
+// 装备创建链（PlayerbotFactory::EquipGear → InitEquipment(false,false) → InitGems）用的入口：
+// 保持原行为（按专精权重重选、纠正插错的槽），只补插逻辑挪进了 FillGems()。
+void PlayerbotFactory::InitGems()
+{
+    FillGems(bot, false);
 }
 
 void PlayerbotFactory::InitTaxiNodes()

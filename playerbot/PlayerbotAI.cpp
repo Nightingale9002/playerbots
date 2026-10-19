@@ -4,6 +4,8 @@
 #include <iomanip>
 
 #include "playerbot/AiFactory.h"
+// [BOT-ML 2026-10-17] 无玩家开跑：BOT_SCENARIO=<测试名> 时由第一个 bot 自动 StartTest
+#include "playerbot/strategy/tests/TestRegistry.h"
 
 #include "MotionGenerators/MovementGenerator.h"
 #include "Grids/GridNotifiers.h"
@@ -16,6 +18,7 @@
 #include "strategy/values/LastSpellCastValue.h"
 #include "LootObjectStack.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/BossStrategyHook.h"   // [BOSS 战策略 2026-10-16] 按 BOSS 自动挂载自定义策略
 #include "PlayerbotAI.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "PlayerbotSecurity.h"
@@ -263,6 +266,8 @@ PlayerbotAI::PlayerbotAI(Player* bot) :
 
 PlayerbotAI::~PlayerbotAI()
 {
+    bossstrategy::Forget(this);   // [BOSS 战策略 2026-10-16] 清掉本 bot 的挂载记录（见 BossStrategyHook.h）
+
     for (uint8 i = 0 ; i < (uint8)BotState::BOT_STATE_ALL; i++)
     {
         if (engines[i])
@@ -275,6 +280,81 @@ PlayerbotAI::~PlayerbotAI()
 
 void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 {
+    // [BOT-ML 2026-10-17] 站长口径"加启动自动开跑"：没有玩家/GM 也能起场景。
+    //   设 env BOT_SCENARIO=combat_single_target（或 combat_five_targets）⇒ 第一个跑起来的 bot
+    //   自动 TestRegistry::StartTest()，脚本自己 spawn 队伍、pull 假人、engage 并 observe 6 分钟。
+    //   不设该 env 时这段完全跳过（线上零影响）。只跑一次（static 标志）。
+    static bool botScenarioStarted = false;
+    if (!botScenarioStarted)
+    {
+        if (char const* scenario = std::getenv("BOT_SCENARIO"))
+        {
+            if (scenario[0] != '\0')
+            {
+                // [bottest 2026-10-19] 场景要"借用在线机器人"组队，所以要等世界稳定（其它 bot 陆续上线）。
+                //   实测启动期在线数量抖动很大（有时 95 秒就有 20 个、有时 150 秒只有 2 个），
+                //   按数量判断不可靠 ⇒ 改成**固定延迟**：世界跑起来满 90 秒后才开场景。
+                static time_t firstFrame = 0;
+                if (!firstFrame)
+                    firstFrame = time(0);
+
+                uint32 onlineBots = 0;
+                for (auto const& itr : sObjectAccessor.GetPlayers())
+                {
+                    Player* candidate = itr.second;
+                    if (candidate && candidate->IsInWorld() && candidate->GetPlayerbotAI())
+                        ++onlineBots;
+                }
+
+                if (time(0) - firstFrame >= 90)
+                {
+                    botScenarioStarted = true;
+                    sLog.outString("[BM] auto-start scenario '%s' on host bot %s (online bots=%u)",
+                                   scenario, bot->GetName(), onlineBots);
+                    ai::TestRegistry::StartTest(this, std::string(scenario));
+                }
+                // 时间没到就什么都不做：**只跳过"开场景"**，绝不能 return —— 那样会冻住整个 AI
+                // （实测：所有 bot 都不动、bm_rule/csv 一行都没有）。下一帧再判断即可。
+            }
+        }
+    }
+
+    // [BOT-ML 2026-10-17] 站长口径"用核心数据"：每 5 秒把核心累计的伤害/治疗【增量】写进 bot_events.csv。
+    //   数据源是 Unit::DealDamage / Unit::DealHeal 里对 bot 的累加（isRealPlayer() 判据）；
+    //   这里只算增量，所以同一 bot 每次得到的是"这 5 秒的输出/治疗"。
+    if (std::getenv("BOT_METRICS"))
+    {
+        static std::map<ObjectGuid, std::pair<uint64, uint64>> lastFlush;
+        static std::map<ObjectGuid, std::pair<uint32, uint32>> lastFlushKd;
+        static uint32 lastFlushMs = 0;
+        uint32 nowMs = sWorld.GetCurrentMSTime();
+        if (lastFlushMs == 0)
+            lastFlushMs = nowMs;
+        if (nowMs - lastFlushMs >= 5000)
+        {
+            lastFlushMs = nowMs;
+            uint64 const dmg = bot->botDamageDealt;
+            uint64 const heal = bot->botHealingDone;
+            auto& prev = lastFlush[bot->GetObjectGuid()];
+            if (dmg > prev.first)
+                sPlayerbotAIConfig.logEvent(this, "bm_dmg", std::to_string(dmg - prev.first));
+            if (heal > prev.second)
+                sPlayerbotAIConfig.logEvent(this, "bm_heal", std::to_string(heal - prev.second));
+            prev = std::make_pair(dmg, heal);
+
+            // [rewards 2026-10-19] 击杀 / 死亡增量：奖励函数的"推进进度"与"自己死了"两项原始数据。
+            //   灭团不单独记，离线用"同一副本内 30 秒内 >=3 次 bm_deaths"判定（见 kpi_score.ps1）。
+            uint32 const kills = bot->botKills;
+            uint32 const deaths = bot->botDeaths;
+            auto& prevKd = lastFlushKd[bot->GetObjectGuid()];
+            if (kills > prevKd.first)
+                sPlayerbotAIConfig.logEvent(this, "bm_kills", std::to_string(kills - prevKd.first));
+            if (deaths > prevKd.second)
+                sPlayerbotAIConfig.logEvent(this, "bm_deaths", std::to_string(deaths - prevKd.second));
+            prevKd = std::make_pair(kills, deaths);
+        }
+    }
+
     AiObjectContext* context = aiObjectContext;
     std::string mapString = WorldPosition(bot).isInstance() ? "I" : std::to_string(bot->GetMapId());
     auto pmo = sPerformanceMonitor.start(PERF_MON_TOTAL, "PlayerbotAI::UpdateAI " + mapString, nullptr, bot->GetMapId(), bot->GetInstanceId());
@@ -586,7 +666,7 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     {
         if (HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
         {
-            TellPlayer(GetMaster(), "Jumping off " + std::string(bot->GetTransport()->GetName()));
+            TellPlayer(GetMaster(), BOT_TEXT2("Jumping off %transport", (std::map<std::string, std::string>{ {"%transport", std::string(bot->GetTransport()->GetName())} })));
         }
 
         WorldPosition botPos(bot);
@@ -653,7 +733,8 @@ bool PlayerbotAI::UpdateAIReaction(uint32 elapsed, bool minimal, bool isStunned)
         {
             if(reaction->ShouldInterruptCast())
             {
-                InterruptSpell();
+                // [heal 2026-10-19] 同 ReInitCurrentEngine：反应触发也不该掐掉"目标依然缺血"的治疗
+                InterruptSpell(true, /*keepUsefulHeals*/ true);
             }
 
             if (reaction->ShouldInterruptMovement())
@@ -1381,10 +1462,115 @@ void PlayerbotAI::LogKillEvents()
     logIfDead(target);
 }
 
+// [进本跟随 2026-10-17 站长口径] bot 在副本门口(<=10 码)时，跟着真人 master 一起进本。
+//   为什么不用原来的"包驱动"路（PlayerbotAI 的 CMSG_AREATRIGGER handler → "area trigger"）：
+//   那条路只在 master 用门的那一刻把包转给 bot，且要求 bot 已经在触发器区域内 ⇒ bot 站在门口时会静默失败。
+//   这里改成**状态驱动**：每约 2 秒自己看一次"master 进本了、bot 还在外面、门就在脚边"。
+//   战斗中**不**强行（跟真人一样，等脱战）；被传送中不动。
+//   找门的方式：遍历 AreaTrigger.dbc（入口坐标 + 所在 mapid），配 sObjectMgr.GetAreaTrigger(entry).target_mapId
+//   （来自 areatrigger_teleport 表）挑出 target_mapId == master 所在 map 的那一个，取离 bot 最近的。
+void PlayerbotAI::CheckInstanceFollow()
+{
+    const time_t now = time(0);
+    if (lastInstanceFollow && now < lastInstanceFollow + 2)
+        return;
+
+    lastInstanceFollow = now;
+
+    if (IsRealPlayer() || !bot || !bot->IsAlive() || bot->IsInCombat() || bot->IsBeingTeleported() || !bot->IsInWorld())
+    {
+        instanceFollowTrigger = 0;
+        return;
+    }
+
+    // 1) 必须有真人 master（且在同一队伍里）
+    if (!HasRealPlayerMaster() || !master->isRealPlayer() || !master->IsInWorld())
+    {
+        instanceFollowTrigger = 0;
+        return;
+    }
+
+    if (!bot->GetGroup() || bot->GetGroup() != master->GetGroup())
+    {
+        instanceFollowTrigger = 0;
+        return;
+    }
+
+    // 2) master 在副本/团本里，而 bot 还在外面的另一个 map
+    Map* masterMap = master->GetMap();
+    if (!masterMap || !(masterMap->IsDungeon() || masterMap->IsRaid()))
+    {
+        instanceFollowTrigger = 0;
+        return;
+    }
+
+    if (bot->GetMapId() == master->GetMapId())
+    {
+        instanceFollowTrigger = 0;
+        return;
+    }
+
+    // 3) 找"通往 master 所在 map"的副本门，且它离 bot <= 10 码
+    uint32 triggerId = 0;
+    AreaTriggerEntry const* atEntry = nullptr;
+    float bestDist = 0.0f;
+    for (uint32 i = 0; i < sAreaTriggerStore.GetNumRows(); ++i)
+    {
+        AreaTriggerEntry const* entry = sAreaTriggerStore.LookupEntry(i);
+        if (!entry || entry->mapid != bot->GetMapId())
+            continue;
+
+        AreaTrigger const* at = sObjectMgr.GetAreaTrigger(i);
+        if (!at || at->target_mapId != master->GetMapId())
+            continue;
+
+        float dist = bot->GetDistance(entry->x, entry->y, entry->z);
+        if (!triggerId || dist < bestDist)
+        {
+            triggerId = i;
+            atEntry = entry;
+            bestDist = dist;
+        }
+    }
+
+    if (!triggerId || !atEntry || bestDist > 10.0f)
+    {
+        instanceFollowTrigger = 0;
+        return;
+    }
+
+    WorldPacket packet(CMSG_AREATRIGGER);
+    packet << triggerId;
+    packet.rpos(0);
+
+    // 4) 走到门 -> 用门（用服务器自己的区域判定：delta 5.0 与服务端 HandleAreaTriggerOpcode 一致）
+    if (!IsPointInAreaTriggerZone(atEntry, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), 5.0f))
+    {
+        // 只有"没在走"时才重新下移动指令，避免每 2 秒把寻路打断一次
+        if (!sServerFacade.isMoving(bot))
+        {
+            instanceFollowTrigger = triggerId;
+            DoSpecificAction("reach area trigger", Event("instance follow", packet, bot), true);
+        }
+        return;
+    }
+
+    instanceFollowTrigger = triggerId;
+    DoSpecificAction("reach area trigger", Event("instance follow", packet, bot), true);
+    if (DoSpecificAction("area trigger", Event("instance follow", packet, bot), true))
+    {
+        instanceFollowTrigger = 0;
+        sLog.outString("[进本跟随] bot=%s 跟着 master=%s 从 map %u 用门 %u 进入 map %u",
+            bot->GetName(), master->GetName(), bot->GetMapId(), triggerId, master->GetMapId());
+    }
+}
+
 void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
 {
     if (bot->IsBeingTeleported() || !bot->IsInWorld())
         return;
+
+    CheckInstanceFollow();
 
     aiTick++;
 
@@ -1644,6 +1830,76 @@ bool PlayerbotAI::IsAllowedCommand(std::string text)
     return false;
 }
 
+// [.bot 命令闸门 2026-10-17 站长口径] 玩家对 bot 说话的"聊天命令"词表。
+//   = ChatCommandHandlerStrategy::supported（注册成 action 的那批）
+//   ∪ InitReactionTriggers 里的 trigger 词（follow/stay/attack/pull/… 这些在策略里是 trigger 名）
+//   ∪ PlayerbotAI::HandleCommand 里内联处理的那几个。
+//   只有"以这些词开头"的消息才算 bot 命令，才会过白/黑名单；普通闲聊不受影响。
+//   注意：1-2 个字母的短别名（b/s/u/c/e/t/r/q/m/nt/bb/ue/ra/ah/co/nc/de/cs/ll/ss/gb）**不参与闸门**
+//   （见 ResolveBotChatCommand 的首词长度判断）—— 它们在普通聊天里太容易误伤，代价是这批别名不受白名单限制。
+static const std::set<std::string>& GetKnownBotChatCommands()
+{
+    static const std::set<std::string> commands = {
+        // ChatCommandHandlerStrategy::supported
+        "quests", "quest reward", "stats", "leave", "reputation", "log", "los", "drop", "roll", "share",
+        "avoid creature", "release", "teleport", "taxi", "repair", "talents", "spells", "react",
+        "all", "trainer", "chat", "home", "destroy", "load ai", "list ai", "save ai", "reset ai", "reset strats",
+        "reset values", "emote", "buff", "help", "bank", "invite", "join", "lfg", "spell", "rti", "position",
+        "summon", "who", "where", "save mana", "formation", "stance", "sendmail", "mail", "outfit", "go", "debug",
+        "cdebug", "wts", "hire", "craft", "flag", "range", "give leader", "cheat", "guild invite",
+        "guild join", "guild promote", "guild demote", "guild remove", "guild leave", "guild leader", "rtsc",
+        "ah bid", "keep", "bg free", "cast", "move style", "jump", "doquest", "skill", "faction", "set value",
+        "glyph", "speak",
+        // ChatCommandHandlerStrategy::InitReactionTriggers 里的命令词
+        "rep", "add all loot", "loot", "items", "inv", "equip", "attack", "attack rti", "pull", "pull rti",
+        "accept", "follow", "wander", "stay", "guard", "free", "wait for attack time", "pet", "focus heal",
+        "follow target", "boost target", "revive target", "buff target", "self res", "flee", "tank attack",
+        "grind", "talk", "revive", "runaway", "warning", "max dps", "possible attack targets", "attackers", "ready",
+        "clean quest log", "query quest", "query item usage", "trade", "sell", "buy", "buy back", "reward",
+        // HandleCommand 内联处理
+        "reset", "logout", "logout cancel"
+    };
+    return commands;
+}
+
+// 取消息开头的"最长命令词"（按词边界），空串 = 不是 bot 命令（放行）。
+// 首词必须 >= 3 个字符：b/s/u/c/e/t/r/q/m/bb/ah/co/nc/… 这些短别名在普通聊天里太容易误伤，不做闸门。
+static std::string ResolveBotChatCommand(const std::string& text)
+{
+    std::vector<std::string> words;
+    std::istringstream ss(text);
+    std::string word;
+    while (ss >> word)
+        words.push_back(word);
+
+    if (words.empty() || words[0].size() < 3)
+        return "";
+
+    const std::set<std::string>& known = GetKnownBotChatCommands();
+
+    for (size_t len = words.size(); len >= 1; --len)
+    {
+        std::string candidate;
+        for (size_t i = 0; i < len; ++i)
+        {
+            if (i)
+                candidate += " ";
+            candidate += words[i];
+        }
+
+        std::string lower = candidate;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+        if (known.find(lower) != known.end())
+            return lower;
+
+        if (len == 1)
+            break;
+    }
+
+    return "";
+}
+
 void PlayerbotAI::HandleCommand(uint32 type, const std::string& text, Player& fromPlayer, const uint32 lang)
 {
     std::string filtered = text;
@@ -1716,6 +1972,27 @@ void PlayerbotAI::HandleCommand(uint32 type, const std::string& text, Player& fr
 
     if (!IsAllowedCommand(filtered) && !GetSecurity()->CheckLevelFor(PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, type != CHAT_MSG_WHISPER, &fromPlayer))
         return;
+
+    // [.bot 命令闸门 2026-10-17 站长口径] 玩家侧的 bot 命令闸门（黑名单 / 白名单 / 目标必须在发令者队伍里）。
+    //   `.bot <子命令>` 那条路走 PlayerbotHolder::HandlePlayerbotCommand 里的同一个 CheckPlayerBotCommand。
+    //   只有"以已知命令词开头"的消息才过闸门；普通闲聊原样放行。
+    //   "do <action>" / "d <action>" 是通用逃生口 ⇒ 按后面的 action 名判。
+    {
+        std::string gateText = filtered;
+        if ((gateText.size() > 2 && gateText.substr(0, 2) == "d ") || (gateText.size() > 3 && gateText.substr(0, 3) == "do "))
+        {
+            size_t space = gateText.find(' ');
+            gateText = gateText.substr(space + 1);
+        }
+
+        std::string gateCommand = ResolveBotChatCommand(gateText);
+        if (!gateCommand.empty() && (!fromPlayer.GetPlayerbotAI() || fromPlayer.GetPlayerbotAI()->IsRealPlayer()) &&
+            !PlayerbotHolder::CheckPlayerBotCommand(&fromPlayer, fromPlayer.GetSession()->GetSecurity(), gateCommand,
+                bot->GetName(), bot->GetObjectGuid()))
+        {
+            return;
+        }
+    }
 
     if (type == CHAT_MSG_RAID_WARNING && filtered.find(bot->GetName()) != std::string::npos && filtered.find("award") == std::string::npos)
     {
@@ -1791,13 +2068,13 @@ void PlayerbotAI::HandleCommand(uint32 type, const std::string& text, Player& fr
         uint32 delay = atof(remaining.c_str()) * static_cast<uint32>(IN_MILLISECONDS);
         if (delay > 20000)
         {
-            TellPlayer(&fromPlayer, "Max wait time is 20 seconds!");
+            TellPlayer(&fromPlayer, BOT_TEXT("Max wait time is 20 seconds!"));
             return;
         }
 
         IncreaseAIInternalUpdateDelay(delay);
         isWaiting = true;
-        TellPlayer(&fromPlayer, "Waiting for " + remaining + " seconds!");
+        TellPlayer(&fromPlayer, BOT_TEXT2("Waiting for %seconds seconds!", (std::map<std::string, std::string>{ {"%seconds", remaining} })));
         return;
     }
     else
@@ -2243,12 +2520,13 @@ void PlayerbotAI::SpellInterrupted(uint32 spellid)
     if (now <= lastSpell.time)
         return;
 
-    uint32 castTimeSpent = 1000 * (now - lastSpell.time);
-    uint32 globalCooldown = CalculateGlobalCooldown(lastSpell.id);
-    if (castTimeSpent < globalCooldown)
-        SetAIInternalUpdateDelay(globalCooldown - castTimeSpent);
-    else
-        SetAIInternalUpdateDelay(sPlayerbotAIConfig.reactDelay);
+    // [2026-10-17 站长口径：让 bot 自己做] 施法被中断后不要挂起整个 AI（原来按 StartRecoveryTime
+    // 等 1.5 秒，期间连走位/躲地板/换目标都停了，观感就是"放完技能发呆"）。现在只等一个 reactDelay，
+    // 让 bot 自己的移动/躲避策略继续跑；重复施法由核心的 GCD 拒绝，不会刷屏。
+    SetAIInternalUpdateDelay(sPlayerbotAIConfig.reactDelay);
+
+    // [BOT-METRICS 2026-10-17] 记录被中断法术的 GCD 长度（ms），用于量化 GCD 挂起对生存的影响。
+    sPlayerbotAIConfig.logEvent(this, "bm_gcd_wait", std::to_string(CalculateGlobalCooldown(lastSpell.id)));
 
     lastSpell.id = 0;
 }
@@ -2555,11 +2833,19 @@ void PlayerbotAI::DoNextAction(bool min)
     {
         return;
     }
+
+    // [BOSS 战策略 2026-10-16] 按队伍正在打的 BOSS 自动挂载 / 卸载 custom::boss_*（见 BossStrategyHook.h）
+    bossstrategy::Update(this);
 }
 
 void PlayerbotAI::ReInitCurrentEngine()
 {
-    InterruptSpell();
+    // [heal 2026-10-19 站长口径] 状态切换（combat↔noncombat↔dead↔reaction）会走到这里。
+    //   原来是**无条件** InterruptSpell() ⇒ 一条还在读、而且目标依然缺血的治疗会被无缘无故掐掉
+    //   （观感就是"治疗自己打断自己、加不上血"）。
+    //   注意：这**不影响**预读打断 —— 那是由策略 HealInterruptStrategy + HealTargetFullHealthTrigger
+    //   主动判定的（目标已满 / 这一发只会溢出），优先级和判据都不动。
+    InterruptSpell(true, /*keepUsefulHeals*/ true);
     currentEngine->Init();
 }
 
@@ -5765,8 +6051,48 @@ void PlayerbotAI::WaitForSpellCast(Spell *spell)
     SetAIInternalUpdateDelay(GetSpellCastDuration(spell));
 }
 
-void PlayerbotAI::InterruptSpell(bool withMeleeAndAuto)
+bool PlayerbotAI::IsCurrentHealUseful()
 {
+    // [precast 2026-10-19 站长口径] 判据覆盖**所有**治疗技能：普通读条 + 引导，且用统一的 IsHealSpell。
+    //   与 HealTargetFullHealthTrigger（预读打断）同一口径：目标已满 / 这一发过半溢出 ⇒ "不需要读完"。
+    static CurrentSpellTypes const kCastSlots[] = { CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL };
+
+    for (CurrentSpellTypes slot : kCastSlots)
+    {
+        Spell* currentSpell = bot->GetCurrentSpell(slot);
+        if (!currentSpell || currentSpell->getState() != SPELL_STATE_CASTING)
+            continue;
+
+        if (!PlayerbotAI::IsHealSpell(currentSpell->m_spellInfo))
+            continue;
+
+        Unit* target = currentSpell->m_targets.getUnitTarget();
+        if (!target || !target->IsInWorld())
+            continue;
+
+        uint32 const needHeal = target->GetMaxHealth() - target->GetHealth();
+        if (!needHeal)
+            continue;   // 目标已满 ⇒ 该掐（与预读打断同一口径）
+
+        // 这一发几乎全是溢出（能溢出掉一半以上）⇒ 也算"不需要读完"
+        uint32 const healValue = currentSpell->GetDamage();
+        if (healValue > needHeal && float(needHeal * 100.0f) / healValue < 50.0f)
+            continue;
+
+        return true;
+    }
+
+    return false;
+}
+
+void PlayerbotAI::InterruptSpell(bool withMeleeAndAuto, bool keepUsefulHeals)
+{
+    // [heal 2026-10-19] 只拦"目标依然缺血"的治疗，其它施法一律照旧打断。
+    //   预读打断（HealInterruptStrategy）走的是"interrupt current spell"动作，
+    //   最终调用的是 InterruptSpell(false)（keepUsefulHeals 默认 false），因此不受影响。
+    if (keepUsefulHeals && IsCurrentHealUseful())
+        return;
+
     for (int type = CURRENT_MELEE_SPELL; type < CURRENT_CHANNELED_SPELL; type++)
     {
         if (!withMeleeAndAuto)
@@ -5881,7 +6207,10 @@ bool PlayerbotAI::canDispel(const SpellEntry* entry, uint32 dispelType)
 
 bool PlayerbotAI::IsHealSpell(const SpellEntry* spell)
 {
-    // Holy Light/Flash of Light
+    if (!spell)
+        return false;
+
+    // Holy Light/Flash of Light（圣骑士这两个技能在 TBC 的效果类型不是统一的 HEAL，靠图标兜底）
     if (spell->SpellFamilyName == SPELLFAMILY_PALADIN)
     {
         if (spell->SpellIconID == 70 ||
@@ -5895,6 +6224,10 @@ bool PlayerbotAI::IsHealSpell(const SpellEntry* spell)
         {
             case SPELL_EFFECT_HEAL:
             case SPELL_EFFECT_HEAL_MAX_HEALTH:
+            // [precast 2026-10-19 站长口径] "预读打断应该对所有治疗技能都起效"：
+            //   机械治疗 / 百分比治疗此前漏判（TBC 枚举里没有 RAID 区域光环，团队治疗走 PARTY/FRIEND）
+            case SPELL_EFFECT_HEAL_MECHANICAL:
+            case SPELL_EFFECT_HEAL_PCT:
                 return true;
             case SPELL_EFFECT_APPLY_AURA:
             case SPELL_EFFECT_APPLY_AREA_AURA_FRIEND:
@@ -6834,7 +7167,7 @@ void PlayerbotAI::EnsureDefaultMovementStrategy(Player* requester)
     {
         TellPlayerNoFacing(
             requester,
-            "Welcome back!",
+            BOT_TEXT("Welcome back!"),
             PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL,
             false
         );
@@ -7698,45 +8031,45 @@ void PlayerbotAI::InventoryTellItems(Player* player, std::map<uint32, int> itemM
             switch (proto->Class)
             {
             case ITEM_CLASS_CONSUMABLE:
-                TellPlayer(player, "--- consumable ---");
+                TellPlayer(player, BOT_TEXT("--- consumable ---"));
                 break;
             case ITEM_CLASS_CONTAINER:
-                TellPlayer(player, "--- container ---");
+                TellPlayer(player, BOT_TEXT("--- container ---"));
                 break;
             case ITEM_CLASS_WEAPON:
-                TellPlayer(player, "--- weapon ---");
+                TellPlayer(player, BOT_TEXT("--- weapon ---"));
                 break;
 #ifndef MANGOSBOT_ZERO
             case ITEM_CLASS_GEM:
-                TellPlayer(player, "--- gems ---");
+                TellPlayer(player, BOT_TEXT("--- gems ---"));
                 break;
 #endif
             case ITEM_CLASS_ARMOR:
-                TellPlayer(player, "--- armor ---");
+                TellPlayer(player, BOT_TEXT("--- armor ---"));
                 break;
             case ITEM_CLASS_REAGENT:
-                TellPlayer(player, "--- reagent ---");
+                TellPlayer(player, BOT_TEXT("--- reagent ---"));
                 break;
             case ITEM_CLASS_PROJECTILE:
-                TellPlayer(player, "--- projectile ---");
+                TellPlayer(player, BOT_TEXT("--- projectile ---"));
                 break;
             case ITEM_CLASS_TRADE_GOODS:
-                TellPlayer(player, "--- trade goods ---");
+                TellPlayer(player, BOT_TEXT("--- trade goods ---"));
                 break;
             case ITEM_CLASS_RECIPE:
-                TellPlayer(player, "--- recipe ---");
+                TellPlayer(player, BOT_TEXT("--- recipe ---"));
                 break;
             case ITEM_CLASS_QUIVER:
-                TellPlayer(player, "--- quiver ---");
+                TellPlayer(player, BOT_TEXT("--- quiver ---"));
                 break;
             case ITEM_CLASS_QUEST:
-                TellPlayer(player, "--- quest items ---");
+                TellPlayer(player, BOT_TEXT("--- quest items ---"));
                 break;
             case ITEM_CLASS_KEY:
-                TellPlayer(player, "--- keys ---");
+                TellPlayer(player, BOT_TEXT("--- keys ---"));
                 break;
             case ITEM_CLASS_MISC:
-                TellPlayer(player, "--- other ---");
+                TellPlayer(player, BOT_TEXT("--- other ---"));
                 break;
             }
         }
@@ -8684,6 +9017,134 @@ uint32 PlayerbotAI::GetBuffedCount(Player* player, std::string spellname)
     return bcount;
 }
 
+// [tank-wait 2026-10-18 站长口径] "如果有人掉队 T 不应该继续往前走"
+//   坦克在"队伍里有人掉队"时停下原地等：
+//     * 判定：自己是坦克、在队伍里(>=2 人)、自己不在战斗；
+//             至少一名队友同 map + 同 instance、活着、没在传送，
+//             离"队伍参考点"(队长/master；坦克自己在带队时参考点就是自己) > AiPlayerbot.TankWaitForGroupDistance，
+//             且离坦克自己 > 同一阈值（"跑到我前面去"不算掉队，必须掉在队伍后面）；
+//             掉线的队友(GroupReference::getSource() == nullptr)、死亡、在别的图/副本的一律不计（否则会永远等）。
+//     * 行为：CanMove() 返回 false ⇒
+//             (a) UpdateAI 里既有的 "force stop if moving but should not" 分支会 StopMoving() —— 原地等；
+//             (b) MovementAction::isPossible() / FollowAction / MoveToTravelTargetAction 等都不会再往前走；
+//             同一等待周期里给队伍发一句提示（BOT_TEXT("tank_wait_for_group")；台词表没有这个 key 就不发）。
+//     * 超时：最多等 AiPlayerbot.TankWaitForGroupTimeout 秒，然后恢复前进，
+//             并给一个等长的冷却期(tankWaitForGroupResumeAt)，避免"走两步停一步"的抖动和永久僵住。
+bool PlayerbotAI::ShouldTankWaitForGroup()
+{
+    if (!sPlayerbotAIConfig.tankWaitForGroupEnabled)
+        return false;
+
+    // 战场/竞技场不适用（大团里总有人离得远，会变成集体发呆）
+    if (bot->InBattleGround())
+    {
+        tankWaitForGroupStart = 0;
+        tankWaitForGroupResumeAt = 0;
+        return false;
+    }
+
+    if (sServerFacade.IsInCombat(bot))
+        return false;
+
+    Group* group = bot->GetGroup();
+    if (!group || group->GetMembersCount() < 2)
+    {
+        tankWaitForGroupStart = 0;
+        return false;
+    }
+
+    if (!IsTank(bot))
+        return false;
+
+    const time_t now = time(0);
+
+    // 队伍参考点：队长(或 master)。坦克自己在带队时参考点就是坦克自己。
+    Player* groupMaster = GetGroupMaster();
+    Player* reference = (groupMaster && groupMaster != bot) ? groupMaster : (GetMaster() && GetMaster() != bot ? GetMaster() : bot);
+
+    if (reference != bot && (reference->GetMapId() != bot->GetMapId() || reference->GetInstanceId() != bot->GetInstanceId()))
+        reference = bot;
+
+    const float threshold = sPlayerbotAIConfig.tankWaitForGroupDistance;
+    Player* laggingMember = nullptr;
+    float laggingDistance = 0.0f;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->getSource();
+
+        // 掉线/还没加载的队友(getSource() == nullptr)不算掉队
+        if (!member || member == bot || member == reference || member == GetMaster() || member == groupMaster)
+            continue;
+
+        if (!sServerFacade.IsAlive(member) || member->IsBeingTeleported())
+            continue;
+
+        // 不在同一张地图/同一个副本实例 ⇒ 不算掉队
+        if (member->GetMapId() != bot->GetMapId() || member->GetInstanceId() != bot->GetInstanceId())
+            continue;
+
+        const float distanceToBot = sServerFacade.GetDistance2d(bot, member);
+        if (distanceToBot <= threshold)
+            continue;
+
+        // 只是跑到坦克前面去了（没掉在队伍参考点后面）⇒ 不算掉队
+        if (reference != bot && sServerFacade.GetDistance2d(reference, member) <= threshold)
+            continue;
+
+        if (!laggingMember || distanceToBot > laggingDistance)
+        {
+            laggingMember = member;
+            laggingDistance = distanceToBot;
+        }
+    }
+
+    if (!laggingMember)
+    {
+        // 人都跟上了：清掉等待/冷却状态，下次有人掉队立刻重新开始等
+        tankWaitForGroupStart = 0;
+        tankWaitForGroupResumeAt = 0;
+        return false;
+    }
+
+    // 超时后的冷却期：这段时间里不再等（给坦克追上队伍的机会，也避免队伍被一直拖住）
+    if (tankWaitForGroupResumeAt)
+    {
+        if (now < tankWaitForGroupResumeAt)
+            return false;
+
+        tankWaitForGroupResumeAt = 0;
+    }
+
+    if (!tankWaitForGroupStart)
+    {
+        tankWaitForGroupStart = now;
+
+        // 只给"正在往前走"的坦克发提示（站着不动时不用喊）
+        if (!bot->IsStopped())
+        {
+            std::string text = BOT_TEXT("tank_wait_for_group");
+            if (!text.empty())
+            {
+                Player* requester = GetMaster() ? GetMaster() : bot;
+                TellPlayerNoFacing(requester, text, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+            }
+        }
+
+        return true;
+    }
+
+    if (now - tankWaitForGroupStart >= (time_t)sPlayerbotAIConfig.tankWaitForGroupTimeout)
+    {
+        // 等够了：恢复前进，并给一个等长冷却期，避免"走两步又停"的抖动
+        tankWaitForGroupStart = 0;
+        tankWaitForGroupResumeAt = now + (time_t)sPlayerbotAIConfig.tankWaitForGroupTimeout;
+        return false;
+    }
+
+    return true;
+}
+
 bool PlayerbotAI::CanMove()
 {
     // do not allow if not vehicle driver
@@ -8779,6 +9240,12 @@ bool PlayerbotAI::CanMove()
         return false;
     }
 #endif
+
+    // [tank-wait 2026-10-18 站长口径] "如果有人掉队 T 不应该继续往前走"：
+    //   坦克在队伍里有人掉队时停下等（见 ShouldTankWaitForGroup()）。放在最后，硬性不能动的判定优先。
+    if (!sServerFacade.IsInCombat(bot) && bot->GetGroup() && bot->GetGroup()->GetMembersCount() > 1 && ShouldTankWaitForGroup())
+        return false;
+
     return true;
 }
 

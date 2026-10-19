@@ -80,6 +80,9 @@
 #include "KarazhanDungeonActions.h"
 #include "NaxxramasDungeonActions.h"
 #include "MechanarDungeonActions.h"
+#include "DungeonRouteActions.h"
+#include "PartyPositionActions.h"
+#include "OffensiveDispelActions.h"
 
 #ifdef GenerateBotTests
 #include "../tests/TestAction.h"
@@ -178,6 +181,9 @@ namespace ai
             creators["check values"] = [](PlayerbotAI* ai) { return new CheckValuesAction(ai); };
             creators["set avoid area"] = [](PlayerbotAI* ai) { return new SetAvoidAreaAction(ai); };
             creators["ra"] = [](PlayerbotAI* ai) { return new RemoveAuraAction(ai); };
+            // [BOSS 战策略动作 2026-10-19] 通用"对队友驱散/净化"：
+            //   `cure team member::<法术名>::<类型 token 表>`，例 `cure team member::cleanse::magic`
+            creators["cure team member"] = [](PlayerbotAI* ai) { return new CureTeamMemberAction(ai); };
             creators["remove blessing of salvation"] = [](PlayerbotAI* ai) { return new RemoveBlessingOfSalvationAction(ai); };
             creators["remove greater blessing of salvation"] = [](PlayerbotAI* ai) { return new RemoveGreaterBlessingOfSalvationAction(ai); };
             creators["apply stone"] = [](PlayerbotAI* ai) { return new ImbueWithStoneAction(ai); };
@@ -237,6 +243,8 @@ namespace ai
             creators["reset"] = [](PlayerbotAI* ai) { return new ResetAction(ai); };
             creators["interrupt current spell"] = [](PlayerbotAI* ai) { return new InterruptCurrentSpellAction(ai); };
             creators["initialize pet"] = [](PlayerbotAI* ai) { return new InitializePetAction(ai); };
+            // [tank 2026-10-19] 坦克救场：选中漏怪 → 嘲讽（CD 中则交给普通仇恨循环）
+            creators["pick up loose mob"] = [](PlayerbotAI* ai) { return new PickUpLooseMobAction(ai); };
 
             // item helpers
             creators["goblin sapper"] = [](PlayerbotAI* ai) { return new UseGoblinSapperChargeAction(ai); };
@@ -387,6 +395,13 @@ namespace ai
             creators["move away from magmadar"] = [](PlayerbotAI* ai) { return new MagmadarMoveAwayAction(ai); };
 
             creators["move away from hazard"] = [](PlayerbotAI* ai) { return new MoveAwayFromHazard(ai); };
+            // [跑位 2026-10-18] 走"队伍统一决策层"下发的占位槽（卡视野优先）
+            creators["move to party slot"] = [](PlayerbotAI* ai) { return new MoveToPartySlotAction(ai); };
+            // [BOSS 战策略 2026-10-18] 进攻驱散：按职业自动选 dispel magic / purge / spellsteal / tranquilizing shot
+            creators["dispel enemy"] = [](PlayerbotAI* ai) { return new DispelEnemyAction(ai); };
+            // [副本推进 2026-10-18] 运行期按波推进（只对 verified=1 的图 + 驱动坦克生效）
+            creators["dungeon route move"] = [](PlayerbotAI* ai) { return new DungeonRouteMoveAction(ai); };
+            creators["dungeon route pull"] = [](PlayerbotAI* ai) { return new DungeonRoutePullAction(ai); };
             creators["move to mc rune"] = [](PlayerbotAI* ai) { return new MoveToMCRuneAction(ai); };
             creators["douse mc rune aqual"] = [](PlayerbotAI* ai) { return new DouseMCRuneActionAqual(ai); };
             creators["douse mc rune eternal"] = [](PlayerbotAI* ai) { return new DouseMCRuneActionEternal(ai); };

@@ -358,7 +358,7 @@ bool UseAction::Execute(Event& event)
         }
     }
 
-    ai->TellPlayerNoFacing(requester, "No items or game objects available");
+    ai->TellPlayerNoFacing(requester, BOT_TEXT("No items or game objects available"));
     return false;
 }
 
@@ -779,7 +779,7 @@ bool UseAction::UseGameObject(Player* requester, Event& event, GameObject* gameO
 {
     if (gameObject == nullptr)
     {
-        ai->TellPlayerNoFacing(requester, "Invalid game object", PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayerNoFacing(requester, BOT_TEXT("Invalid game object"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         return false;
     }
 
@@ -1347,7 +1347,7 @@ bool UseRandomRecipeAction::Execute(Event& event)
     bool didUse = UseAction::Execute(rEvent);
 
     if (didUse && bot->GetCurrentSpell(CURRENT_GENERIC_SPELL))
-        ai->TellPlayerNoFacing(requester, "Learning " + recipeName, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayerNoFacing(requester, BOT_TEXT2("Learning %recipe", (std::map<std::string, std::string>{ {"%recipe", recipeName} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 
     return didUse;
 }
@@ -1385,7 +1385,7 @@ bool OpenRandomItemAction::Execute(Event& event)
     bool didUse = UseAction::Execute(rEvent);
 
     if (didUse)
-        ai->TellPlayerNoFacing(requester, "Opening " + itemName, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        ai->TellPlayerNoFacing(requester, BOT_TEXT2("Opening %item", (std::map<std::string, std::string>{ {"%item", itemName} })), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
 
     return didUse;
 }

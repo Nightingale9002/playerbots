@@ -2,11 +2,17 @@
 #include "playerbot/playerbot.h"
 #include "TargetValue.h"
 
+#include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/ServerFacade.h"
 #include "RtiTargetValue.h"
+#include "PossibleAttackTargetsValue.h"
 #include "Entities/Unit.h"
 #include "LastMovementValue.h"
 #include "playerbot/strategy/values/Formations.h"
+
+#include "Grids/GridNotifiers.h"
+#include "Grids/GridNotifiersImpl.h"
+#include "Grids/CellImpl.h"
 
 using namespace ai;
 
@@ -269,4 +275,144 @@ GuidPosition ClosestEntryValue::Calculate()
     }
 
     return GuidPosition();
+}
+
+// ===========================================================================
+// [BOSS 战策略值 2026-10-19] `enemy casting target` / `enemy casting interruptible target`
+//   （见 TargetValue.h 顶部同一段注释）
+// ===========================================================================
+
+namespace
+{
+    // 一个候选是否算"在读条的敌人"：敌对 + 活着 + 正在施放**非近战**法术（+ 可选可打断 + 可选法术过滤）
+    static bool IsEnemyCastingCandidate(PlayerbotAI* ai, Player* bot, Unit* unit, bool interruptibleOnly, uint32 spellFilter)
+    {
+        if (!unit || unit == bot || !unit->IsInWorld() || !unit->IsAlive())
+            return false;
+
+        if (unit->GetMapId() != bot->GetMapId())
+            return false;
+
+        if (ai->IsSafe(unit) || !sServerFacade.IsHostileTo(unit, bot))
+            return false;
+
+        // IsNonMeleeSpellCasted = 正在施放/引导非近战法术（近战平砍/自动射击不算）
+        if (!unit->IsNonMeleeSpellCasted(true))
+            return false;
+
+        if (interruptibleOnly && !unit->IsInterruptible())
+            return false;
+
+        if (spellFilter)
+        {
+            Spell* spell = unit->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            if (!spell)
+                spell = unit->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+
+            if (!spell || !spell->m_spellInfo || spell->m_spellInfo->Id != spellFilter)
+                return false;
+        }
+
+        return true;
+    }
+
+    // [2026-10-18 站长口径] 观测"怪在读治疗/控制条"（dev/193）：
+    //   打断扫描覆盖所有视野内的敌对施法者，比只靠 ThreatTier 被调到的时机更全，
+    //   观测计数才攒得起来（ ThreatTier 里也会观测，两处去重由 ObservePriorityCast 保证）。
+    static void ObservePriorityCastOf(Unit* unit)
+    {
+        if (!unit || !unit->IsNonMeleeSpellCasted(true))
+            return;
+
+        if (Spell* spell = unit->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+            if (spell->m_spellInfo)
+                PossibleAttackTargetsValue::ObservePriorityCast(unit, spell->m_spellInfo->Id);
+
+        if (Spell* spell = unit->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+            if (spell->m_spellInfo)
+                PossibleAttackTargetsValue::ObservePriorityCast(unit, spell->m_spellInfo->Id);
+    }
+}
+
+ObjectGuid EnemyCastingTargetValue::Calculate()
+{
+    Player* bot = ai->GetBot();
+    if (!bot)
+        return ObjectGuid();
+
+    float range = 30.0f;
+    uint32 spellFilter = 0;
+
+    // 限定词解析：空限定词 ⇒ 全部走默认；非法 token 直接忽略（不崩、不误解）
+    if (!getQualifier().empty())
+    {
+        std::vector<std::string> tokens = Qualified::getMultiQualifiers(getQualifier(), ",");
+        for (std::vector<std::string>::const_iterator i = tokens.begin(); i != tokens.end(); ++i)
+        {
+            if (i->empty())
+                continue;
+
+            // 裸数字 = 半径（写起来最短：`enemy casting target::25`）
+            if (Qualified::isValidNumberString(*i))
+            {
+                range = (float)atof(i->c_str());
+                continue;
+            }
+
+            std::vector<std::string> parts = Qualified::getMultiQualifiers(*i, "::");
+            if (parts.size() != 2 || !Qualified::isValidNumberString(parts[1]))
+                continue;
+
+            if (parts[0] == "dist" || parts[0] == "distance")
+                range = (float)atof(parts[1].c_str());
+            else if (parts[0] == "spellid")
+                spellFilter = (uint32)atoi(parts[1].c_str());
+        }
+    }
+
+    if (range <= 0.0f || range > sPlayerbotAIConfig.sightDistance)
+        return ObjectGuid();
+
+    // 1) current target 优先（最热路径；命中就不进范围扫描）
+    Unit* currentTarget = nullptr;
+    if (Value<ObjectGuid>* currentTargetValue = ai->GetAiObjectContext()->GetValue<ObjectGuid>("current target"))
+        currentTarget = ai->GetUnit(currentTargetValue->Get());
+
+    if (IsEnemyCastingCandidate(ai, bot, currentTarget, interruptibleOnly, spellFilter) &&
+        sServerFacade.GetDistance2d(bot, currentTarget) <= range)
+    {
+        ObservePriorityCastOf(currentTarget);
+        return currentTarget->GetObjectGuid();
+    }
+
+    // 2) 范围扫描：AnyUnfriendlyUnitInObjectRangeCheck 自带"敌对 + 射程内 + 有 LOS + 忽略图腾"，
+    //    Cell::VisitAllObjects 只访问与 range 相交的格子（不是全图扫描）。
+    std::list<Unit*> units;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(bot, range);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(units, check);
+    // 注意 `Cell` 是**全局**命名空间里的 struct（Grids/Cell.h），不在 MaNGOS 里
+    Cell::VisitAllObjects((const WorldObject*)bot, searcher, range);
+
+    Unit* best = nullptr;
+    float bestDistance = 0.0f;
+    for (std::list<Unit*>::iterator i = units.begin(); i != units.end(); ++i)
+    {
+        Unit* unit = *i;
+        if (!IsEnemyCastingCandidate(ai, bot, unit, interruptibleOnly, spellFilter))
+            continue;
+
+        ObservePriorityCastOf(unit);
+
+        float distance = sServerFacade.GetDistance2d(bot, unit);
+        if (distance > range)
+            continue;
+
+        if (!best || distance < bestDistance)
+        {
+            best = unit;
+            bestDistance = distance;
+        }
+    }
+
+    return best ? best->GetObjectGuid() : ObjectGuid();
 }

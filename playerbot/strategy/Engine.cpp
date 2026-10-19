@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include <stdarg.h>
 #include <iomanip>
+#include <map>
 
 #include "Engine.h"
 #include "playerbot/PlayerbotAIConfig.h"
@@ -782,6 +783,29 @@ bool Engine::ListenAndExecute(Action* action, Event& event)
         {
             ai->SetActionDuration(action);
             lastExecutedAction = action;
+        }
+    }
+
+    // [rule-hit 2026-10-19] 规则命中遥测（只在 BOT_METRICS=1 且**动作真的换了**时记一行）：
+    //   用途：① 找出"从不触发"的死规则（调参之前必须先知道哪些规则是死的）；
+    //        ② 找出"每 tick 抖动"的规则（同一动作被反复选中/取消）；
+    //        ③ 用相邻两行的时间差算每个动作的实际持续时长（= 行为序列）。
+    //   刻意只记"换动作"的时刻，避免每 tick 写一行把 CSV 撑爆。
+    if (actionExecuted && std::getenv("BOT_METRICS"))
+    {
+        static std::map<ObjectGuid, std::string> lastRuleAction;
+        Player* hitBot = ai->GetBot();
+        if (hitBot)
+        {
+            std::string const actionName = action->getName();
+            std::string& last = lastRuleAction[hitBot->GetObjectGuid()];
+            if (last != actionName)
+            {
+                last = actionName;
+                std::ostringstream info;
+                info << "r=" << std::fixed << std::setprecision(2) << action->getRelevance();
+                sPlayerbotAIConfig.logEvent(ai, "bm_rule", actionName, info.str());
+            }
         }
     }
 

@@ -32,7 +32,7 @@ namespace ai
             p << uint32(PARTY_OP_LEAVE) << member << uint32(0);
             bot->GetSession()->HandleGroupDisbandOpcode(p);
             if (ai->HasRealPlayerMaster() && ai->GetMaster()->GetObjectGuid() != player->GetObjectGuid())
-                bot->Whisper("I left my group", LANG_UNIVERSAL, player->GetObjectGuid());
+                bot->Whisper(BOT_TEXT("I left my group"), LANG_UNIVERSAL, player->GetObjectGuid());
         }
 
         if (freeBot)

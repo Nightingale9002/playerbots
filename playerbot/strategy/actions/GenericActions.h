@@ -155,4 +155,17 @@ namespace ai
         SetPetAction(PlayerbotAI* ai) : Action(ai, "pet") {}
         bool Execute(Event& event) override;
     };
+
+    // [tank 2026-10-19 站长口径] 坦克救场：把"正在打队友、但坦克没有仇恨"的怪接过来。
+    //   站长原话："缺的是「选中它并嘲讽」，如果嘲讽 cd 也可以做其他高仇恨技能"。
+    //   实现：① 从 `loose mobs`（已按受害者血量升序）里挑一只 → 设成 current target；
+    //        ② 逐个尝试本职业嘲讽技，能放就放；
+    //        ③ 嘲讽都在 CD ⇒ 返回 false，让普通仇恨循环去打这个新目标（不再硬等嘲讽）。
+    class PickUpLooseMobAction : public Action
+    {
+    public:
+        PickUpLooseMobAction(PlayerbotAI* ai) : Action(ai, "pick up loose mob") {}
+        bool Execute(Event& event) override;
+        bool isUseful() override;
+    };
 }

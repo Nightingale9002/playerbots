@@ -840,13 +840,16 @@ AiPlayerbot.AllowGuildBots = 1
 AiPlayerbot.AllowMultiAccountAltBots = 1
 
 # Delay between two short-time spells cast (Default 500)
-AiPlayerbot.GlobalCooldown = 1500
+# [pacing 2026-10-17 站长口径] 原来 1500 —— 这是 bot"反应慢"的真正瓶颈：每次施法成功都会
+# SetAIInternalUpdateDelay(GlobalCooldown)，把 AI 思考间隔顶到 1.5 秒，改 ReactDelay 也救不回来。
+AiPlayerbot.GlobalCooldown = 500
 
 # Max wait time when moving
 #AiPlayerbot.MaxWaitForMove = 5000
 
 # Delay between two bot actions (default 100)
-AiPlayerbot.ReactDelay = 500
+# [pacing 2026-10-17 站长口径] 300（原 500）。上游默认 100，但云端 2vCPU/1.87GB 取保守值。
+AiPlayerbot.ReactDelay = 300
 
 # Inactivity delay
 AiPlayerbot.PassiveDelay = 10000
@@ -878,6 +881,16 @@ AiPlayerbot.ShootDistance = 26.0
 #AiPlayerbot.GroupMemberGatheringDistance = 10.0
 #gathering distance when bot is a group member (not leader) and has active player master (if player is group leader)
 #AiPlayerbot.GroupMemberGatheringDistanceWithActiveMaster = 5.0
+#tank-wait: if a group member falls behind (same map/instance, alive, further than this from the tank), the tank stops and waits
+# [pacing 2026-10-17 站长口径] 打开：坦克不能把人甩在后面自己往前走
+AiPlayerbot.TankWaitForGroup = 1
+AiPlayerbot.TankWaitForGroupDistance = 30.0
+#max seconds the tank waits before moving on again (then an equal cooldown, so it cannot get stuck)
+#AiPlayerbot.TankWaitForGroupTimeout = 20
+#combat-move safety: in combat, only reposition/flee to a spot that is outside the aggro radius of every other hostile (avoids pulling nearby packs)
+#AiPlayerbot.CombatMoveSafety = 1
+#extra margin (yards) kept beyond that aggro radius
+#AiPlayerbot.CombatMoveSafetyMargin = 5.0
 #AiPlayerbot.FleeDistance = 15.0
 #AiPlayerbot.TooCloseDistance = 5.0
 #AiPlayerbot.MeleeDistance = 1.5

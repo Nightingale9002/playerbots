@@ -8,7 +8,8 @@ using namespace ai;
 
 bool WaitForAttackKeepSafeDistanceAction::Execute(Event& event)
 {  
-    Unit* target = ai->GetUnit(AI_VALUE(ObjectGuid, "current target"));
+    Unit* primaryTarget = ai->GetUnit(AI_VALUE(ObjectGuid, "current target"));
+    Unit* target = primaryTarget;
     if (target)
     {
         WorldPosition basePos = WorldPosition(target);
@@ -43,8 +44,11 @@ bool WaitForAttackKeepSafeDistanceAction::Execute(Event& event)
             // only reposition if it makes sense, ie. we are actually too close to danger
             if (WorldPosition(bot).fDist(basePos) <= safeDistance)
             {
+                // [safe-move 2026-10-18 站长口径] 附近敌对单位只扫一次（1 秒缓存），候选点用它做纯内存检查
+                const std::vector<CombatHostileUnit> hostiles = GetNearbyCombatHostiles(ai);
+
                 // Find the best point around the target.
-                const WorldPosition bestPoint = GetBestPoint(basePos, (safeDistance - safeDistanceThreshold), safeDistance);
+                const WorldPosition bestPoint = GetBestPoint(basePos, (safeDistance - safeDistanceThreshold), safeDistance, hostiles, primaryTarget);
                 if (bestPoint)
                 {
                     // Move to the best point
@@ -61,7 +65,8 @@ bool WaitForAttackKeepSafeDistanceAction::Execute(Event& event)
     return false;
 }
 
-const ai::WorldPosition WaitForAttackKeepSafeDistanceAction::GetBestPoint(const WorldPosition& pos, float minDistance, float maxDistance) const
+const ai::WorldPosition WaitForAttackKeepSafeDistanceAction::GetBestPoint(const WorldPosition& pos, float minDistance, float maxDistance,
+    const std::vector<CombatHostileUnit>& hostiles, Unit* ignoreUnit) const
 {
     const WorldPosition botPosition(bot);
     const WorldPosition targetPosition = pos;
@@ -103,7 +108,15 @@ const ai::WorldPosition WaitForAttackKeepSafeDistanceAction::GetBestPoint(const 
                 continue;
 
             // Check if the point is not surrounded by other enemies
-            if (IsEnemyClose(point, enemies))
+            // [safe-move 2026-10-18 站长口径] 统一安全检查：对"附近所有敌对单位"成立，而不再只看
+            //   "possible targets no los"（那是按 free move center 的 attack 范围过滤过的列表，
+            //   恰恰会漏掉远处/旁边的怪堆 ⇒ 远程 DPS 跑过去把它们引来了）。
+            if (sPlayerbotAIConfig.combatMoveSafetyEnabled)
+            {
+                if (!IsCombatMovePointSafe(ai, hostiles, point, sPlayerbotAIConfig.combatMoveSafetyMargin, ignoreUnit))
+                    continue;
+            }
+            else if (IsEnemyClose(point, enemies))
                 continue;
 
             // Check if the bot can move to this point.

@@ -57,6 +57,15 @@ public:
 #endif
 
     std::list<std::string> HandleGroup(Player* master, const std::string param, AccountTypes security);
+
+    // [.bot 命令闸门 2026-10-17 站长口径] 非 GM 玩家的 bot 命令统一闸门（黑名单 / 白名单 / 目标归属 / 审计日志）。
+    //   from == nullptr（控制台 CLI）或 security >= SEC_GAMEMASTER ⇒ 直接放行。
+    //   否则：黑名单命中、或不在白名单、或目标 bot 不属于发令者（同队伍或同账号）⇒ 拒绝：
+    //   给发令者一句中文 BOT_TEXT 提示，并写审计日志 sLog.outString("[BOTCMD] ...")。
+    static bool IsBotCommandBlacklisted(const std::string& command);
+    static bool IsBotCommandWhitelisted(const std::string& command);
+    static bool CheckPlayerBotCommand(Player* from, AccountTypes security, const std::string& command,
+                                      const std::string& targetName, ObjectGuid targetGuid);
 protected:
     virtual void OnBotLoginInternal(Player * const bot) = 0;
     virtual void OnBotDeleted(uint32 botGuid, uint32 accountId);
@@ -75,6 +84,10 @@ private:
     std::list<std::string> HandleHelp(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleReload(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleTweak(Player* master, const std::string param, AccountTypes security);
+    // [2026-10-18 站长口径] `.bot route on|off|reset` —— 副本自动开怪（DungeonRoute）运行时开关
+    std::list<std::string> HandleRoute(Player* master, const std::string param, AccountTypes security);
+    // [仿真 2026-10-18] `.bot sim start/stop/status` —— 本地可控场景注入（见 playerbot/SimScenario.h）
+    std::list<std::string> HandleSim(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleSelf(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleSpoof(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleParty(Player* master, const std::string param, AccountTypes security);

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <shared_mutex>
 #include "WorldPosition.h"
@@ -63,8 +63,24 @@ namespace ai
         };
 
         //Getters
-        bool getComplete() { return complete || pathType != TravelNodePathType::walk; }
-        std::vector<WorldPosition> getPath() { return path; }
+        // [懒加载 2026-10-15] 启动时不再全量加载 ai_playerbot_travelnode_path 的坐标点
+        // （外域就有 18.6 万点常驻内存）。改为某条路径**第一次被真正用到**时才查库加载；
+        // 于是内存只与"实际走过的路径"成正比，与 bot 分布在几个地图无关。
+        bool getComplete()
+        {
+            if (!complete && pathType == TravelNodePathType::walk && fromNodeId)
+                loadPathPoints();
+            return complete || pathType != TravelNodePathType::walk;
+        }
+        std::vector<WorldPosition> getPath()
+        {
+            if (!complete && pathType == TravelNodePathType::walk && fromNodeId)
+                loadPathPoints();
+            return path;
+        }
+
+        void setNodeIds(uint32 from, uint32 to) { fromNodeId = from; toNodeId = to; }
+        void loadPathPoints();
 
         TravelNodePathType getPathType() { return pathType; }
         uint64 getPathObject() { return pathObject; }
@@ -115,6 +131,10 @@ namespace ai
 
         TravelNodePathType pathType = TravelNodePathType::walk;
         uint64 pathObject = 0;
+
+        // [懒加载 2026-10-15] 路径两端节点 id，用于按需从 ai_playerbot_travelnode_path 取坐标点
+        uint32 fromNodeId = 0;
+        uint32 toNodeId = 0;
 
         /*
         //Is the path a portal/teleport to the destination?

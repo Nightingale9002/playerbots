@@ -3,51 +3,36 @@
 #include "Action.h"
 #include "AiObjectContext.h"
 #include "NamedObjectContext.h"
-#include "StrategyContext.h"
-#include "triggers/TriggerContext.h"
-#include "actions/ActionContext.h"
-#include "triggers/ChatTriggerContext.h"
-#include "actions/ChatActionContext.h"
-#include "triggers/WorldPacketTriggerContext.h"
-#include "actions/WorldPacketActionContext.h"
-#include "values/ValueContext.h"
-#include "values/SharedValueContext.h"
 
 
 using namespace ai;
 
 AiObjectContext::AiObjectContext(PlayerbotAI* ai) : PlayerbotAIAware(ai)
 {
-    strategyContexts.Add(new StrategyContext());
-    strategyContexts.Add(new MovementStrategyContext());
-    strategyContexts.Add(new AssistStrategyContext());
-    strategyContexts.Add(new QuestStrategyContext());
-    strategyContexts.Add(new FishStrategyContext());
-
-    actionContexts.Add(new ActionContext());
-    actionContexts.Add(new ChatActionContext());
-    actionContexts.Add(new WorldPacketActionContext());
-
-    triggerContexts.Add(new TriggerContext());
-    triggerContexts.Add(new ChatTriggerContext());
-    triggerContexts.Add(new WorldPacketTriggerContext());
-
-    valueContexts.Add(new ValueContext());
-
-    //valueContexts.Add(&sSharedValueContext);
+    // [降峰值 2026-10-15] Context 的实例化被拆到 6 个独立 TU（见 AiObjectContext*.cpp），
+    // 避免单个 TU 实例化全部注册表导致 gcc 峰值 >1.5GB 而被 OOM-killer 杀掉。
+    BuildStrategyContextsA();
+    BuildStrategyContextsB();
+    BuildActionContextsA();
+    BuildActionContextsB();
+    BuildTriggerContexts();
+    BuildValueContexts();
 }
 
 void AiObjectContext::ClearValues(std::string findName)
 {
+    // [crash-fix 2026-10-16] 名字要先快照（erase 会改 map），并且删之前把值对象标记成"已失效"
+    // （UntypedValue::Unregister）。如果别处还攥着这个值的裸指针，至少可以通过
+    // AiObjectContext::IsValueAlive() 判断出来，而不是继续解引用一块已被 std::string 复用的内存。
     std::set<std::string> names = valueContexts.GetCreated();
     for (std::set<std::string>::iterator i = names.begin(); i != names.end(); ++i)
     {
-        UntypedValue* value = GetUntypedValue(*i);
-        if (!value)
-            continue;
-
         if (!findName.empty() && i->find(findName) != 0)
             continue;
+
+        UntypedValue* value = GetUntypedValue(*i);
+        if (value)
+            value->Unregister();
 
         valueContexts.Erase(*i);
     }
@@ -75,6 +60,10 @@ void AiObjectContext::ClearExpiredValues(std::string findName, uint32 interval)
 
     for (const auto& name : namesToErase)
     {
+        UntypedValue* value = GetUntypedValue(name);
+        if (value)
+            value->Unregister();
+
         valueContexts.Erase(name);
     }
 }

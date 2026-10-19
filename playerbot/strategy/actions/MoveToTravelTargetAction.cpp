@@ -17,7 +17,7 @@ bool MoveToTravelTargetAction::Execute(Event& event)
 
     if (target->GetStatus() == TravelStatus::TRAVEL_STATUS_READY)
     {
-        ai->TellDebug(ai->GetMaster(), "The target is ready to travel start now.", "debug travel");
+        ai->TellDebug(ai->GetMaster(),BOT_TEXT("The target is ready to travel start now."), "debug travel");
         target->SetStatus(TravelStatus::TRAVEL_STATUS_TRAVEL);
     }
 
@@ -152,7 +152,7 @@ bool MoveToTravelTargetAction::Execute(Event& event)
 
         if (target->IsMaxRetry(true))
         {
-            ai->TellDebug(ai->GetMaster(), "The target is cooling down because we failed to move to it a few times in a row.", "debug travel");
+            ai->TellDebug(ai->GetMaster(),BOT_TEXT("The target is cooling down because we failed to move to it a few times in a row."), "debug travel");
             target->SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);      
             target->SetForced(false);
         }

@@ -123,6 +123,17 @@ if (BUILD_PLAYERBOTS)
   add_definitions(-DENABLE_PLAYERBOTS)
 endif()
 
+# [2026-10-19] 玩家机器人测试框架（TestRegistry / TestAction / TestStrategy / 场景脚本）
+#   —— 之前**没有任何地方定义 GenerateBotTests**，于是所有 #ifdef GenerateBotTests 的代码
+#   全部被编译掉：`TestRegistry::StartTest()` 仍然会打印 "[BM] auto-start scenario"，
+#   但它加的 "test::<场景名>" 策略根本没注册 ⇒ 场景永远不执行，测不出任何战斗数据。
+#   ⚠️ 定义已上移到**顶层 CMakeLists（全局）**：`PlayerbotMgr.h` 的 PlayerbotHolder 在
+#   `#ifdef GenerateBotTests` 下有 0x58 字节成员（testResultsMutex/pendingTests/testResults）。
+#   若只在模块里定义，core TU 与模块 TU 的 sizeof(RandomPlayerbotMgr) 不一致（0x610 vs 0x668），
+#   `instance()` 的静态对象按小尺寸分配、构造函数按大尺寸写 ⇒ 越界踩坏
+#   `WorldSocket::m_packetCooldowns`（云端表现为 socket 线程 `segfault at 807`）。
+#   这里**绝对不要**再单独 add_definitions(-DGenerateBotTests)。
+
 # Define Core
 if ( ${CMAKE_PROJECT_NAME} MATCHES "CMaNGOS")
   add_definitions(-DCMANGOS)
@@ -158,6 +169,9 @@ if(PCH)
 endif()
 
 add_library(${LIBRARY_NAME} STATIC ${LIBRARY_SRCS})
+
+# [2026-10-15] 模块的 -O0 降级已移除（它是为 2GB 云主机降**编译**内存而加，
+# 但会让**运行时**内存更大；编译改在 WSL/本地大内存机器进行）
 
 target_link_libraries(${LIBRARY_NAME}
   PRIVATE shared

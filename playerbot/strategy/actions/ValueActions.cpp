@@ -97,7 +97,7 @@ bool SetFocusHealTargetsAction::Execute(Event& event)
                 focusHealTargets.clear();
                 SET_AI_VALUE(std::list<ObjectGuid>, "focus heal targets", focusHealTargets);
                 ai->ChangeStrategy("-focus heal targets", BotState::BOT_STATE_COMBAT);
-                ai->TellPlayerNoFacing(requester, "Removed focus heal targets");
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("Removed focus heal targets"));
                 return true;
             }
             else
@@ -159,7 +159,7 @@ bool SetFocusHealTargetsAction::Execute(Event& event)
                             }
                             else
                             {
-                                ai->TellPlayerNoFacing(requester, "Please specify a + for add or - to remove a target");
+                                ai->TellPlayerNoFacing(requester,BOT_TEXT("Please specify a + for add or - to remove a target"));
                             }
                         }
 
@@ -178,23 +178,23 @@ bool SetFocusHealTargetsAction::Execute(Event& event)
                     }
                     else
                     {
-                        ai->TellPlayerNoFacing(requester, "I'm not in a group");
+                        ai->TellPlayerNoFacing(requester,BOT_TEXT("I'm not in a group"));
                     }
                 }
                 else
                 {
-                    ai->TellPlayerNoFacing(requester, "Please provide one or more player names");
+                    ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide one or more player names"));
                 }
             }
         }
         else
         {
-            ai->TellPlayerNoFacing(requester, "Please provide one or more player names");
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide one or more player names"));
         }
     }
     else
     {
-        ai->TellPlayerNoFacing(requester, "I'm not a healer or offhealer (please change my strats to heal or offheal)");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("I'm not a healer or offhealer (please change my strats to heal or offheal)"));
     }
 
     return false;
@@ -219,17 +219,17 @@ bool SetWaitForAttackTimeAction::Execute(Event& event)
             }
             else
             {
-                ai->TellPlayerNoFacing(requester, "Please provide valid time to set (in seconds) between 1 and 99");
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide valid time to set (in seconds) between 1 and 99"));
             }
         }
         else
         {
-            ai->TellPlayerNoFacing(requester, "Please provide valid time to set (in seconds) between 1 and 99");
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide valid time to set (in seconds) between 1 and 99"));
         }
     }
     else
     {
-        ai->TellPlayerNoFacing(requester, "Please provide a time to set (in seconds)");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide a time to set (in seconds)"));
     }
 
     return false;
@@ -245,7 +245,7 @@ bool SetFollowTargetAction::Execute(Event& event)
         if (removeTarget)
         {
             SET_AI_VALUE(GuidPosition, "manual follow target", GuidPosition());
-            ai->TellPlayerNoFacing(requester, "Removed follow target");
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("Removed follow target"));
             return true;
         }
         else
@@ -264,7 +264,7 @@ bool SetFollowTargetAction::Execute(Event& event)
                     }
                     else
                     {
-                        ai->TellPlayerNoFacing(requester, "I can't follow myself!");
+                        ai->TellPlayerNoFacing(requester,BOT_TEXT("I can't follow myself!"));
                     }
                 }
                 else
@@ -275,13 +275,13 @@ bool SetFollowTargetAction::Execute(Event& event)
             }
             else
             {
-                ai->TellPlayerNoFacing(requester, "I'm not in a group");
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("I'm not in a group"));
             }
         }
     }
     else
     {
-        ai->TellPlayerNoFacing(requester, "Please provide one or more player names");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide one or more player names"));
     }
 
     return false;
@@ -393,7 +393,7 @@ bool SetSpellTargetAction::Execute(Event& event)
                         }
                         else
                         {
-                            ai->TellPlayerNoFacing(requester, "Please specify a + for add or - to remove a target");
+                            ai->TellPlayerNoFacing(requester,BOT_TEXT("Please specify a + for add or - to remove a target"));
                         }
                     }
 
@@ -403,18 +403,18 @@ bool SetSpellTargetAction::Execute(Event& event)
                 }
                 else
                 {
-                    ai->TellPlayerNoFacing(requester, "I'm not in a group");
+                    ai->TellPlayerNoFacing(requester,BOT_TEXT("I'm not in a group"));
                 }
             }
             else
             {
-                ai->TellPlayerNoFacing(requester, "Please provide one or more player names");
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide one or more player names"));
             }
         }
     }
     else
     {
-        ai->TellPlayerNoFacing(requester, "Please provide one or more player names");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("Please provide one or more player names"));
     }
 
     return false;

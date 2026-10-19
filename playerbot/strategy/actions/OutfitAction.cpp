@@ -14,9 +14,9 @@ bool OutfitAction::Execute(Event& event)
     if (param == "?")
     {
         List(requester);
-        ai->TellPlayer(requester, "outfit <name> +[item] to add items");
-        ai->TellPlayer(requester, "outfit <name> -[item] to remove items");
-        ai->TellPlayer(requester, "outfit <name> equip/replace to equip items");
+        ai->TellPlayer(requester,BOT_TEXT("outfit <name> +[item] to add items"));
+        ai->TellPlayer(requester,BOT_TEXT("outfit <name> -[item] to remove items"));
+        ai->TellPlayer(requester,BOT_TEXT("outfit <name> equip/replace to equip items"));
     }
     else
     {

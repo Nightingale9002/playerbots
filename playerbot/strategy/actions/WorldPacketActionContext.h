@@ -1,5 +1,7 @@
 #pragma once
 
+#include "BattleGroundTactics.h"   // ArenaTactics 定义在此，本头文件用到它（原依赖调用方的传递包含）
+
 #include "AcceptInvitationAction.h"
 #include "PassLeadershipToMasterAction.h"
 #include "TellMasterAction.h"
@@ -82,6 +84,10 @@ namespace ai
             creators["accept duel"] = [](PlayerbotAI* ai) { return new AcceptDuelAction(ai); };
             creators["ready check"] = [](PlayerbotAI* ai) { return new ReadyCheckAction(ai); };
             creators["ready check finished"] = [](PlayerbotAI* ai) { return new FinishReadyCheckAction(ai); };
+            // [dead-rule 2026-10-19] 动作自己的名字是 "finish ready check"（见 FinishReadyCheckAction 构造函数），
+            //   而 WorldPacketHandlerStrategy 里规则写的就是这个名字 ⇒ 原来按 "ready check finished"
+            //   注册导致动作查不到、规则永远不执行。两个 key 都留，避免旧引用失效。
+            creators["finish ready check"] = [](PlayerbotAI* ai) { return new FinishReadyCheckAction(ai); };
             creators["uninvite"] = [](PlayerbotAI* ai) { return new UninviteAction(ai); };
             creators["security check"] = [](PlayerbotAI* ai) { return new SecurityCheckAction(ai); };
             creators["guild accept"] = [](PlayerbotAI* ai) { return new GuildAcceptAction(ai); };

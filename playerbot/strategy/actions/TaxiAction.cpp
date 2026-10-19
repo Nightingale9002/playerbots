@@ -19,7 +19,7 @@ bool TaxiAction::Execute(Event& event)
     {
         movement.taxiNodes.clear();
         movement.Set(NULL);
-        ai->TellPlayer(requester, "I am ready for the next flight");
+        ai->TellPlayer(requester,BOT_TEXT("I am ready for the next flight"));
         return true;
     }
 
@@ -45,7 +45,7 @@ bool TaxiAction::Execute(Event& event)
 
         if (param == "?")
         {
-            ai->TellPlayerNoFacing(requester, "=== Taxi ===");
+            ai->TellPlayerNoFacing(requester,BOT_TEXT("=== Taxi ==="));
             int index = 1;
             for (std::vector<uint32>::iterator i = nodes.begin(); i != nodes.end(); ++i)
             {
@@ -85,7 +85,7 @@ bool TaxiAction::Execute(Event& event)
             movement.taxiNodes.clear();
             movement.Set(NULL);
             if (!ai->GetMaster() || sServerFacade.GetDistance2d(bot, ai->GetMaster()) < sPlayerbotAIConfig.reactDistance || ai->HasStrategy("debug", BotState::BOT_STATE_NON_COMBAT))
-                ai->TellPlayerNoFacing(requester, "I can't fly with you");
+                ai->TellPlayerNoFacing(requester,BOT_TEXT("I can't fly with you"));
             return false;
         }
 
@@ -97,7 +97,7 @@ bool TaxiAction::Execute(Event& event)
     }
 
     if(!ai->GetMaster() || sServerFacade.GetDistance2d(bot, ai->GetMaster()) < sPlayerbotAIConfig.reactDistance || ai->HasStrategy("debug", BotState::BOT_STATE_NON_COMBAT))
-        ai->TellPlayerNoFacing(requester, "Cannot find any flightmaster to talk");
+        ai->TellPlayerNoFacing(requester,BOT_TEXT("Cannot find any flightmaster to talk"));
 
     return false;
 }

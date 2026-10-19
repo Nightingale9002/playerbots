@@ -1,6 +1,8 @@
 #include "Config/Config.h"
 
 #include "playerbot/playerbot.h"
+#include <cstdlib>
+#include "strategy/actions/ChangeTalentsAction.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "strategy/values/LastMovementValue.h"
@@ -8,6 +10,10 @@
 #include "Globals/ObjectMgr.h"
 #include "Database/DatabaseEnv.h"
 #include "PlayerbotAI.h"
+// [自动进本 2026-10-18] 副本推进期间不要解散纯机器人队伍
+#include "playerbot/DungeonRoute.h"
+// [仿真 2026-10-18] 可控场景注入状态机：只在世界线程推进（本函数由 World::Update 调）
+#include "playerbot/SimScenario.h"
 #include "Entities/Player.h"
 #include "playerbot/AiFactory.h"
 #include "PlayerbotCommandServer.h"
@@ -299,6 +305,7 @@ RandomPlayerbotMgr::RandomPlayerbotMgr()
         PlayersCheckTimer = 0;
         EventTimeSyncTimer = 0;
         OfflineGroupBotsTimer = 0;
+        BotOnlyGroupCheckTimer = 0;
         guildsDeleted = false;
         arenaTeamsDeleted = false;
 
@@ -660,13 +667,42 @@ void RandomPlayerbotMgr::LogPlayerLocation()
 
 void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
 {
+    // [仿真 2026-10-18] 可控场景注入：放在 autologin/enabled 闸门**之前**，这样即使轮换关着也能跑仿真。
+    //   空转时只有一次 vector::empty() 判断，线上零开销。
+    simscenario::Update();
+
 #ifdef MEMORY_MONITOR
     sMemoryMonitor.LogCount(sConfig.GetStringDefault("LogsDir") + "/" + "memory.csv");
     sMemoryMonitor.SampleDiagnostics();
 #endif
 
+    // [LOGIN 诊断 2026-10-17] 剖析台里"[LOGIN] 一行都没有"，要先分清是"函数没被调用"还是"提前 return"。
+    //   probeDiag 每个分支各打一次（只在本诊断开关下，正常情况下零开销、零输出）。
+    static bool const probeDiag = (std::getenv("PB_LOGIN_DIAG") != nullptr);
+    static bool probeDiagEntered = false;
+    if (probeDiag && !probeDiagEntered)
+    {
+        probeDiagEntered = true;
+        sLog.outError("[LOGIN] UpdateAIInternal() REACHED (elapsed=%u minimal=%u)", elapsed, (uint32)minimal);
+    }
+
     if (!sPlayerbotAIConfig.randomBotAutologin || !sPlayerbotAIConfig.enabled)
+    {
+        if (probeDiag)
+        {
+            static bool warned = false;
+            if (!warned)
+            {
+                warned = true;
+                sLog.outError("[LOGIN] RETURN at autologin/enabled guard: randomBotAutologin=%u enabled=%u",
+                    (uint32)sPlayerbotAIConfig.randomBotAutologin, (uint32)sPlayerbotAIConfig.enabled);
+            }
+        }
         return;
+    }
+
+    // [LOGIN 2026-10-16] 诊断开关：PB_LOGIN_DIAG=1
+    static bool const loginDiag = (std::getenv("PB_LOGIN_DIAG") != nullptr);
 
 #ifdef GenerateBotTests
     if (sPlayerbotAIConfig.startupRunTestsPending)
@@ -677,7 +713,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
         {
             std::list<std::string> messages = HandlePlayerbotCommand("runtest " + runTestParam, nullptr, SEC_PLAYER);
             for (const std::string& message : messages)
-                sLog.outString("[Config RunTest] %s", message.c_str());
+                sLog.outError("[Config RunTest] %s", message.c_str());
         }
     }
 #endif
@@ -721,6 +757,12 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
             logInAllowed = !players.empty();
         }
 
+        // [LOGIN 2026-10-16] 诊断：PB_LOGIN_DIAG=1 时打印"本轮是否放行 AddRandomBots"
+        if (loginDiag)
+            sLog.outError("[LOGIN] tick availableBots=%u maxAllowed=%u sessions=%u realPlayers=%u loginWithPlayer=%u allowed=%u currentBots=%u",
+                availableBotCount, maxAllowedBotCount, sWorld.GetActiveSessionCount(), (uint32)players.size(),
+                (uint32)sPlayerbotAIConfig.randomBotLoginWithPlayer, (uint32)logInAllowed, (uint32)currentBots.size());
+
         if (logInAllowed)
         {
             AddRandomBots();
@@ -748,6 +790,10 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
     if (time(nullptr) > (OfflineGroupBotsTimer + 5) && players.size())
         AddOfflineGroupBots();
 
+    // [group 2026-10-16] 队伍里没有真人时的自动解散（每 15 秒扫一次）
+    if (sPlayerbotAIConfig.autoDisbandBotOnlyGroups && time(nullptr) > (BotOnlyGroupCheckTimer + 15))
+        DisbandBotOnlyGroups();
+
     uint32 updateBots = sPlayerbotAIConfig.randomBotsPerInterval == 0 ? UINT32_MAX : sPlayerbotAIConfig.randomBotsPerInterval;
 
     //Update bots
@@ -765,32 +811,119 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
 
     uint32 maxLogins = sPlayerbotAIConfig.randomBotsMaxLoginsPerInterval;
 
+    // [always 2026-10-17 站长口径 · 修正] "always 名单优先占位：轮换 bot 数 = MaxRandomBots - always 数"。
+    //
+    // 第一版实现是"把随机 bot 的上限扣掉缺席的 always 数"，**在云端会把在线数打成 0**：
+    //   云端 `AiPlayerbot.RandomBotAccountList` 没配 ⇒ `freeAltBots` 为空 ⇒ `LoginFreeBots()` 直接返回，
+    //   always 角色**没有专线登录路径**；而 12 个 always 角色恰好都离线 ⇒ 上限 = 12 - 12 = 0。
+    // 正解：always 角色本来就在 `availableBots` 里（它们属于随机 bot 账号，只是打了 always=1 标记），
+    //   所以**不需要**从额度里扣，只要**在登录循环里让它们优先抢名额**即可 —— 既保证它们能先上线，
+    //   又不会把总额度打没（没有 always 名单时行为与改动前完全一致）。
+    std::list<uint32> logonOrder = availableBots;
+    uint32 priorityCount = 0;
+    {
+        std::list<uint32> priorityBots;
+        for (uint32 bot : logonOrder)
+        {
+            if (GetPlayerBot(bot))
+                continue;   // 已在世界里的不用管
+
+            if (sRandomPlayerbotMgr.GetValue(bot, "always") != (uint32)BotAlwaysOnline::ACTIVE)
+                continue;
+
+            // 关键：陈旧的 "login" 事件会让下面的循环把这只 bot **只计数、不登录**
+            //   （`if (GetEventValue(bot, "login")) onlineBotCount++;` 那条分支）。
+            //   always 名单是"必须在线"的口径，所以这里清掉它的 login 记号，确保它真的被 ProcessBot 拉起。
+            if (GetEventValue(bot, "login"))
+                SetEventValue(bot, "login", 0, 0);
+
+            priorityBots.push_back(bot);
+        }
+
+        priorityCount = (uint32)priorityBots.size();
+        if (!priorityBots.empty())
+        {
+            for (uint32 bot : priorityBots)
+                logonOrder.remove(bot);
+
+            logonOrder.splice(logonOrder.begin(), priorityBots);
+        }
+    }
+
+    if (loginDiag)
+        sLog.outError("[LOGIN] login loop gate: availableBots=%u onlineBots=%u maxLogins=%u dbDelay=%u async=%u "
+                       "alwaysPriorityBots=%u",
+            (uint32)availableBots.size(), onlineBotCount, maxLogins,
+            sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase"), (uint32)sPlayerbotAIConfig.asyncBotLogin,
+            priorityCount);
+
     //Log in bots
     if (sRandomPlayerbotMgr.GetDatabaseDelay("CharacterDatabase") < 10 * IN_MILLISECONDS && !sPlayerbotAIConfig.asyncBotLogin && onlineBotCount < maxAllowedBotCount && maxLogins > 0)
     {
-        for (auto bot : availableBots)
+        // [always 2026-10-17 站长口径 · 两遍式] **先只读 always 名单、再读随机**（站长给的简化）：
+        //   第一遍把这批"必须在线"的角色登进去、把位子占掉；第二遍才轮到其它 bot 填剩下的位子。
+        //   这样不需要任何"预留额度算术"，顺序天然保证 always 先占位。
+        //
+        // 为什么之前只排序不够：启动时很多 bot 带**陈旧的 login 事件**，循环碰到这类 bot 会
+        //   `onlineBotCount++` 却不真的把它登进世界（旧逻辑如此）⇒ 排序时它们排在前面就把额度吃光了，
+        //   always 角色反而挤不进来（实测只到 6~7/12）。两遍式把"必须在线"的那批隔离出来，不受此影响。
+        //
+        // [login 2026-10-16] 站长口径：在线数必须 ≤ bot_count（conf Min=Max=12 ⇒ 12）。
+        //   原实现只在"遇到已经有 login 事件的 bot"时 +1，而且那一步是 continue 出去的，
+        //   本 tick 刚登进去的 bot 完全不计入 ⇒ 一个 tick 能连登 maxLogins(10) 个，
+        //   实测从 10 一路冲到 20 在线。所以每次登录成功立刻计入。
+        auto loginOne = [&](uint32 bot) -> bool
         {
-            if (GetPlayerBot(bot))
-                continue;   
+            if (onlineBotCount >= maxAllowedBotCount || maxLogins == 0)
+                return false;
 
+            if (GetPlayerBot(bot))
+                return false;
+
+            // 带陈旧 login 记号的 bot：只计数、不登录（保持既有语义）
             if (!eventCache[bot].empty() && GetEventValue(bot, "login"))
             {
                 onlineBotCount++;
-                continue;
+                return false;
             }
 
             if (GetEventValue(bot, "login"))
                 onlineBotCount++;
 
             if (onlineBotCount >= maxAllowedBotCount)
-                break;
+                return false;
 
-            if (ProcessBot(bot)) {
+            if (ProcessBot(bot))
+            {
                 --maxLogins;
+                onlineBotCount++;
+                return true;
             }
 
-            if (maxLogins == 0)
+            return false;
+        };
+
+        // 第一遍：always 名单（priority bots 已排在 logonOrder 最前面）
+        uint32 loggedAlways = 0;
+        for (auto it = logonOrder.begin(); it != logonOrder.end() && loggedAlways < priorityCount; ++it)
+        {
+            if (loginDiag)
+                sLog.outError("[LOGIN] pass1(always) bot=%u online=%u", *it, onlineBotCount);
+
+            if (loginOne(*it))
+                ++loggedAlways;
+        }
+
+        // 第二遍：其余 bot 填满剩下的位子
+        for (auto bot : logonOrder)
+        {
+            if (loginDiag)
+                sLog.outError("[LOGIN] pass2(rest) bot=%u online=%u maxLogins=%u", bot, onlineBotCount, maxLogins);
+
+            if (onlineBotCount >= maxAllowedBotCount || maxLogins == 0)
                 break;
+
+            loginOne(bot);
         }
     }
 
@@ -910,8 +1043,7 @@ bool RandomPlayerbotMgr::BumpDeferredJoinTries(uint32 botGuid)
 void RandomPlayerbotMgr::LoginFreeBots()
 {
     if (!sPlayerbotAIConfig.freeAltBots.empty() && sPlayerbotAIConfig.botAutologin != BotAutoLogin::LOGIN_ONLY_ALWAYS_ACTIVE)
-    {
-        std::vector<std::pair<uint32, uint32>> botsToRemove;
+    {        std::vector<std::pair<uint32, uint32>> botsToRemove;
 
         for (auto [accountId, botGuid] : sPlayerbotAIConfig.freeAltBots)
         {
@@ -2223,6 +2355,46 @@ bool RandomPlayerbotMgr::AddRandomBot(uint32 bot)
     return true;
 }
 
+// [always 2026-10-17 站长口径] 数"本站点名常在线"的角色（event='always' 且 value=ACTIVE），
+//   onlyOffline=true 时只数当前没在线的。
+//
+// 为什么需要它（云端实锤）：`MinRandomBots = MaxRandomBots = 12` 时，12 个名额会被**先登录的轮换 bot
+//   先占满**；always 名单里的角色只要掉线一次，名额就被别人占死、再也挤不回来（云端日志一路
+//   `11/12 Bot ... logged in`，always 的 12 只里只有 7 只在，缺的正是猎人/盗贼/牧师/萨满/德鲁伊）。
+//   ⇒ 登录侧必须给它们**预留席位**：轮换 bot 的上限 = maxAllowedBotCount - 缺席的常在线数。
+uint32 RandomPlayerbotMgr::CountAlwaysOnlineChars(bool onlyOffline)
+{
+    uint32 count = 0;
+
+    auto results = CharacterDatabase.PQuery(
+        "SELECT r.bot FROM ai_playerbot_random_bots r "
+        "JOIN characters c ON c.guid = r.bot "
+        "WHERE r.event = 'always' AND r.value = %u",
+        (uint32)BotAlwaysOnline::ACTIVE);
+
+    if (!results)
+        return 0;
+
+    do
+    {
+        Field* fields = results->Fetch();
+        uint32 guid = fields[0].GetUInt32();
+        if (!guid)
+            continue;
+
+        if (onlyOffline)
+        {
+            ObjectGuid botGuid(HIGHGUID_PLAYER, guid);
+            if (sObjectMgr.GetPlayer(botGuid, false))
+                continue;   // 已在世界里，不占"缺席"名额
+        }
+
+        ++count;
+    } while (results->NextRow());
+
+    return count;
+}
+
 void RandomPlayerbotMgr::MovePlayerBot(uint32 guid, PlayerbotHolder* newHolder)
 {
     if (!sPlayerbotAIConfig.enabled)
@@ -2269,10 +2441,24 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     bool botsAllowedInWorld = !sPlayerbotAIConfig.randomBotLoginWithPlayer || (!players.empty() && sWorld.GetActiveSessionCount() > 0);
 
     bool isValid = true;
-   
-    if (sPlayerbotAIConfig.randomBotTimedLogout && !GetEventValue(bot, "add") && !sPlayerbotAIConfig.asyncBotLogin) // RandomBotInWorldTime is expired.
+
+    // [always 2026-10-17 站长口径 · 方案A] `always=ACTIVE`（点名常在线）的角色**不参与轮换登出**。
+    //
+    // 为什么必须在这里拦：`add` 事件是"轮换开关"，且 `SetEventValue(bot,"add",0,0)` 会把该行**整行删掉**
+    //   （见 SetEventValue：value==0 时只 DELETE 不 INSERT），而 `GetBots()` 的候选池口径正是
+    //   `event='add'` ⇒ 一旦被登出流程删掉 `add`，这只 bot 就**永久退出候选池**、再也不会被登录。
+    // 触发链条（实测 205 Lorineri 就是这么掉的）：
+    //   ① `add` 的 validIn（min/maxRandomBotInWorldTime）到期
+    //   ② `GetEventValue(bot,"add")` 因 3812 行的过期判定返回 0（该处豁免了 `always` 却**没有**豁免 always 角色的 `add`）
+    //   ③ 下面 2437 行 `!GetEventValue(bot,"add")` ⇒ `isValid=false`
+    //   ④ 走登出分支 ⇒ `currentBots.remove(bot)` + `SetEventValue(bot,"add",0,0)` ⇒ `add` 行被删除
+    //   ⑤ `GetBots()` 再也看不到它（日志里连一次登录尝试都没有）
+    // 站长口径：常在线角色就该常在线 ⇒ 在 ③ 和 ④ 两处都把 always 角色放行。
+    bool isAlwaysActive = (GetEventValue(bot, "always") == (uint32)BotAlwaysOnline::ACTIVE);
+
+    if (sPlayerbotAIConfig.randomBotTimedLogout && !GetEventValue(bot, "add") && !sPlayerbotAIConfig.asyncBotLogin && !isAlwaysActive) // RandomBotInWorldTime is expired.
         isValid = false;
-    else if(!botsAllowedInWorld)                                               // Logout if all players logged out
+    else if(!botsAllowedInWorld && !isAlwaysActive)                            // Logout if all players logged out
         isValid = false;
 
     //Log out bot
@@ -2289,8 +2475,13 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         else
             sLog.outDetail("Bot #%d %s:%d <%s>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H", player->GetLevel(), player->GetName());
 
-        currentBots.remove(bot);
-        SetEventValue(bot, "add", 0, 0);
+        // [always 2026-10-17 方案A] 常在线角色即便走到这里（例如队伍相关的其它无效条件），
+        //   也**不能**删它的 `add` 事件 —— 删了就等于把它永久踢出 GetBots() 候选池，再也登不回来。
+        if (!isAlwaysActive)
+        {
+            currentBots.remove(bot);
+            SetEventValue(bot, "add", 0, 0);
+        }
 
         if (!player)
         {
@@ -2373,6 +2564,39 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     return false;
 }
 
+// [roster 2026-10-16 站长口径] 点名的 12 个专精"至少必须有"：
+//   同一个 职业/种族 组合只让**一只在线 bot** 占点名专精（取 guid 最小的那只 ⇒ 确定性、无额外状态）；
+//   同组合多出来的 bot 走随机专精（站长："如果再多可以用随机的补"）。
+bool RandomPlayerbotMgr::IsRosterSpecHolder(Player* bot)
+{
+    if (!bot)
+        return false;
+
+    uint8 const cls = bot->getClass();
+    uint8 const race = bot->getRace();
+    if (cls >= MAX_CLASSES || race >= MAX_RACES || sPlayerbotAIConfig.specPick[cls][race] < 0)
+        return false;
+
+    uint32 const myGuid = bot->GetGUIDLow();
+    uint32 holder = myGuid;
+
+    for (uint32 guid : GetBots())
+    {
+        if (guid == myGuid)
+            continue;
+
+        Player* other = sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, guid));
+        if (!other || other->isRealPlayer() || !other->IsInWorld() ||
+            other->getClass() != cls || other->getRace() != race)
+            continue;
+
+        if (guid < holder)
+            holder = guid;
+    }
+
+    return holder == myGuid;
+}
+
 bool RandomPlayerbotMgr::ProcessBot(Player* player)
 {
     if (!player || !player->IsInWorld() || player->IsBeingTeleported() || player->GetSession()->isLogingOut())
@@ -2396,6 +2620,49 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
     }
     else
         idleBot = true;
+
+    // [roster 2026-10-16 站长口径] conf 点名的专精对**已存在的 bot 也要生效**。
+    // 只靠"随机化/升级"触发太慢（满级 bot 可能几天才随机化一次），这里在空闲 tick 里发现
+    // 专精与点名不符就直接重建天赋（重建后会写回 specNo，所以每只 bot 只做一次）。
+    if (player->GetLevel() >= 10)
+    {
+        uint8 const cls = player->getClass();
+        // [roster 2026-10-16 站长口径] 只有"本组合的点名持有者"才对齐点名专精；多出来的走随机
+        int32 const picked = IsRosterSpecHolder(player)
+            ? sPlayerbotAIConfig.specPick[cls][player->getRace()] : -1;
+        if (picked >= 0 && GetEventValue(bot, "specNo") != uint32(picked + 1))
+        {
+            std::ostringstream rosterOut;
+            if (ChangeTalentsAction::AutoSelectTalents(player, &rosterOut))
+            {
+                sLog.outString("[ROSTER] %s(%u/%u) 天赋对齐 -> %d（%s）",
+                    player->GetName(), cls, player->getRace(), picked, rosterOut.str().c_str());
+                return true;
+            }
+        }
+    }
+
+    // [gems 2026-10-17 站长口径] 老 bot 一次性补插宝石。老号不会再走 PlayerbotFactory 的建造链
+    // （InitGems() 只在建号/换装时跑），所以身上插槽一直空着。放在与上面 [ROSTER] 天赋对齐同一区域：
+    //   · 只做一次：事件值 gemsFilled 记位（参考 specNo 的用法）；即使身上没有插槽也要置 1，避免每 tick 重扫；
+    //   · 只补空槽：FillGems(player, true) 幂等 ⇒ 已插满的物品整件跳过，绝不拆掉已有宝石；
+    //   · 换装后的补插由 UpdateGearAction/EquipAction/Factory 换装包装负责，这里只清"历史遗留的空槽"。
+    // 限流：两次补插之间至少间隔 500ms（≈ 每秒最多 2 只），避免大量物品写库造成卡顿。
+    if (idleBot && player->GetLevel() >= 10 && !player->IsInCombat() && !player->IsBeingTeleported() &&
+        !GetEventValue(bot, "gemsFilled"))
+    {
+        static uint32 lastGemsFillMs = 0;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (!lastGemsFillMs || WorldTimer::getMSTimeDiff(lastGemsFillMs, nowMs) >= 500)
+        {
+            lastGemsFillMs = nowMs;
+
+            uint32 const filledGems = PlayerbotFactory::FillGems(player, true);
+            SetEventValue(bot, "gemsFilled", 1, 0xFFFFFFFF);   // validIn 必须极大，否则会被 GetEventValue() 判成过期
+            if (filledGems)
+                sLog.outString("[GEMS] %s 补插 %u 颗（历史 bot 一次性）", player->GetName(), filledGems);
+        }
+    }
 
     if (idleBot)
     {
@@ -2495,6 +2762,9 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
     if (bot->IsTaxiFlying() && bot->GetPlayerbotAI()->HasPlayerNearby())
         return;
 
+    // [spawn 2026-10-16 站长口径] 不做任何"固定出生点兜底"：bot 保持原有的大世界漫游/任务行为，
+    //   想去哪张图就自己走旅行系统（传送门 staticPortal/areaTrigger + 船/飞艇 transport），
+    //   跨图也不再被拉回或传送。固定出生点只用于**出生时**（InstaRandomize）。
     if (locs.empty())
     {
         sLog.outError("Cannot teleport bot %s - no locations available", bot->GetName());
@@ -2760,9 +3030,11 @@ std::vector<std::pair<uint32, uint32>> RandomPlayerbotMgr::RpgLocationsNear(Worl
 
 void RandomPlayerbotMgr::PrepareTeleportCache()
 {
+    PlayerbotLogRss("  tele: enter PrepareTeleportCache");
     uint32 maxLevel = sPlayerbotAIConfig.randomBotMaxLevel;
     if (maxLevel > sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
         maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
+
 
     auto results = CharacterDatabase.PQuery("SELECT `map_id`, `x`, `y`, `z`, `level` FROM `ai_playerbot_tele_cache`");
     if (results)
@@ -2814,6 +3086,38 @@ void RandomPlayerbotMgr::PrepareTeleportCache()
                 CharacterDatabase.CommitTransaction();
             }
             bar.step();
+        }
+    }
+
+    // [启动降峰 2026-10-15] RPG 传送缓存持久化：有表就直接读，并**跳过整个 enhancement**
+    // （原逻辑在启动时现场算：逐 level×race×point 调 getAreaName(true,true) + getGameObjectsNear(0,0)
+    //   全地图扫描 ⇒ 峰值 RSS 1.28GB，2 核 1.87GB 的云端会被 OOM-killer 连坐杀掉 sshd/crond）。
+    PlayerbotLogRss("  tele: level cache (tele_cache) done");
+    CharacterDatabase.PExecute(
+        "CREATE TABLE IF NOT EXISTS `ai_playerbot_rpg_tele_cache` ("
+        "`race` TINYINT UNSIGNED NOT NULL, `level` TINYINT UNSIGNED NOT NULL, `map_id` SMALLINT UNSIGNED NOT NULL, "
+        "`x` FLOAT NOT NULL, `y` FLOAT NOT NULL, `z` FLOAT NOT NULL, "
+        "PRIMARY KEY (`race`,`level`,`map_id`,`x`,`y`)) DEFAULT CHARSET=utf8mb4");
+
+    if (auto rpgCache = CharacterDatabase.PQuery("SELECT race, level, map_id, x, y, z FROM ai_playerbot_rpg_tele_cache"))
+    {
+        uint32 loaded = 0;
+        do
+        {
+            Field* fields = rpgCache->Fetch();
+            uint8 race = (uint8)fields[0].GetUInt32();
+            uint8 level = (uint8)fields[1].GetUInt32();
+            uint16 mapId = fields[2].GetUInt16();
+            WorldLocation loc(mapId, fields[3].GetFloat(), fields[4].GetFloat(), fields[5].GetFloat(), 0);
+            rpgLocsCacheLevel[race][level].push_back(loc);
+            ++loaded;
+        } while (rpgCache->NextRow());
+
+        if (loaded > 0)
+        {
+            sLog.outString("RPG teleport cache loaded from %u records (enhancement skipped)", loaded);
+            PlayerbotLogRss("  tele: rpg cache done");
+            return;
         }
     }
 
@@ -2950,6 +3254,20 @@ void RandomPlayerbotMgr::PrepareTeleportCache()
     
     for (auto innPoint : innPoints)
         innCacheLevel[innPoint.first.first][innPoint.first.second].push_back(std::make_pair(innPoint.second, innPoint.second));
+
+    // [启动降峰 2026-10-15] 把算好的 RPG 传送缓存写回 DB，供下次启动直接读取（跳过这段重活）
+    CharacterDatabase.BeginTransaction();
+    uint32 saved = 0;
+    for (auto& rl : rpgLocsCacheLevel)
+        for (auto& ll : rl.second)
+            for (auto& loc : ll.second)
+            {
+                CharacterDatabase.PExecute("INSERT IGNORE INTO `ai_playerbot_rpg_tele_cache` (`race`, `level`, `map_id`, `x`, `y`, `z`) "
+                    "VALUES (%u, %u, %u, %f, %f, %f)", (uint32)rl.first, (uint32)ll.first, (uint32)loc.mapid, loc.coord_x, loc.coord_y, loc.coord_z);
+                ++saved;
+            }
+    CharacterDatabase.CommitTransaction();
+    sLog.outString("RPG teleport cache saved to DB: %u records", saved);
 }
 
 void RandomPlayerbotMgr::PrintTeleportCache()
@@ -3019,10 +3337,192 @@ void RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly)
     }
 }
 
+// [spawn 2026-10-16 站长口径] 只要"真人在队里"（或真人是它的 master），
+// 任何"固定出生点 / 只 530"的兜底都必须让路：bot 要能跟着真人去 0/1 号地图、副本等任何地方，
+// 不能因为兜底而到不了真人身边。
+static bool BotFollowsRealPlayer(Player* bot)
+{
+    if (!bot)
+        return false;
+
+    if (PlayerbotAI* ai = bot->GetPlayerbotAI())
+        if (ai->HasRealPlayerMaster())
+            return true;
+
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->getSource();
+        if (member && member->isRealPlayer())
+            return true;
+    }
+
+    return false;
+}
+
+// [spawn 2026-10-16] 固定出生点模式的唯一出口：grind / rpg / level / 随机传送四条路径都走这里，
+// 否则 bot 仍会被 "RandomTeleportForLevel/ForRpg" 撒回 0/1 号地图的野外。
+// 已经在出生点附近时直接返回 true（不重复传送，避免客户端看到无意义的闪现）。
+// 真人带队的 bot 直接返回 false（不兜底，交给"跟随真人"的逻辑）。
+bool RandomPlayerbotMgr::TeleportToFixedSpawn(Player* bot)
+{
+    if (!bot || !sPlayerbotAIConfig.fixedSpawnEnabled)
+        return false;
+
+    if (BotFollowsRealPlayer(bot))
+        return false;
+
+    float const r = sPlayerbotAIConfig.fixedSpawnRadius;
+    if (bot->GetMapId() == sPlayerbotAIConfig.fixedSpawnMapId)
+    {
+        float const dx = bot->GetPositionX() - sPlayerbotAIConfig.fixedSpawnX;
+        float const dy = bot->GetPositionY() - sPlayerbotAIConfig.fixedSpawnY;
+        if (dx * dx + dy * dy <= r * r)
+            return true;
+    }
+
+    bot->TeleportTo(sPlayerbotAIConfig.fixedSpawnMapId,
+        sPlayerbotAIConfig.fixedSpawnX + frand(-r, r),
+        sPlayerbotAIConfig.fixedSpawnY + frand(-r, r),
+        sPlayerbotAIConfig.fixedSpawnZ,
+        sPlayerbotAIConfig.fixedSpawnO);
+    return true;
+}
+
+// [group 2026-10-16] 站长口径：队伍里没有真人时自动解散。
+//   AiPlayerbot.AutoDisbandBotOnlyGroups = 0 关 / 1 只解散"曾经有真人、真人已离开"的队伍（默认）/ 2 任何纯机器人队伍
+// 只对"全是机器人"的队伍生效；带真人的队伍一律不动。
+void RandomPlayerbotMgr::DisbandBotOnlyGroups()
+{
+    BotOnlyGroupCheckTimer = time(nullptr);
+
+    uint8 const mode = sPlayerbotAIConfig.autoDisbandBotOnlyGroups;
+    if (!mode)
+        return;
+
+    std::map<uint32, Group*> groups;
+    for (auto& i : players)
+    {
+        Player* bot = i.second;
+        if (!bot || !bot->IsInWorld())
+            continue;
+
+        Group* group = bot->GetGroup();
+        if (!group)
+            continue;
+
+        groups[group->GetId()] = group;
+    }
+
+    time_t const now = time(nullptr);
+    std::map<uint32, time_t> realPlayerSeen = botOnlyGroupRealPlayerSeen;
+    std::map<uint32, time_t> noPlayerSince = botOnlyGroupNoPlayerSince;
+    botOnlyGroupRealPlayerSeen.clear();
+    botOnlyGroupNoPlayerSince.clear();
+
+    uint32 disbanded = 0;
+    for (auto& itr : groups)
+    {
+        uint32 const groupId = itr.first;
+        Group* group = itr.second;
+        if (!group)
+            continue;
+
+        bool hasRealPlayer = false;
+        std::vector<ObjectGuid> botMembers;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (!member)
+                continue;
+
+            if (member->isRealPlayer())
+            {
+                hasRealPlayer = true;
+                break;
+            }
+
+            if (IsFreeBot(member))
+                botMembers.push_back(member->GetObjectGuid());
+        }
+
+        if (hasRealPlayer)
+        {
+            realPlayerSeen[groupId] = now;
+            noPlayerSince.erase(groupId);
+            botOnlyGroupRealPlayerSeen[groupId] = now;
+            continue;
+        }
+
+        // [自动进本 2026-10-18 站长口径] 副本推进期间不解散：
+        //   ① 路线开关打开（.bot route on / 配置）⇒ 这队伍正在被驱动打本；
+        //   ② 队伍里已经有人在本里 ⇒ 中途解散会让 bot 卡在副本里。
+        if (dungeonroute::RouteEnabled())
+            continue;
+
+        bool inInstance = false;
+        for (ObjectGuid const& guid : botMembers)
+        {
+            Player* member = sObjectMgr.GetPlayer(guid);
+            if (member && member->GetMap() && (member->GetMap()->IsDungeon() || member->GetMap()->IsRaid()))
+            {
+                inInstance = true;
+                break;
+            }
+        }
+        if (inInstance)
+            continue;
+
+        if (mode == 1 && realPlayerSeen.find(groupId) == realPlayerSeen.end())
+            continue;                       // 一直是纯机器人队伍（附近组队）⇒ 不动，交回模块自己的组队逻辑
+
+        auto since = noPlayerSince.find(groupId);
+        if (since == noPlayerSince.end())
+        {
+            noPlayerSince[groupId] = now;   // 刚开始没有真人，先等一会儿（默认 60 秒）
+            if (realPlayerSeen.find(groupId) != realPlayerSeen.end())
+                botOnlyGroupRealPlayerSeen[groupId] = realPlayerSeen[groupId];
+            continue;
+        }
+
+        if (now - since->second < 60)
+        {
+            if (realPlayerSeen.find(groupId) != realPlayerSeen.end())
+                botOnlyGroupRealPlayerSeen[groupId] = realPlayerSeen[groupId];
+            noPlayerSince[groupId] = since->second;
+            continue;
+        }
+
+        for (ObjectGuid const& guid : botMembers)
+        {
+            Player* bot = sObjectMgr.GetPlayer(guid);
+            if (!bot)
+                continue;
+
+            bot->RemoveFromGroup();
+            if (bot->GetPlayerbotAI())
+                bot->GetPlayerbotAI()->Reset();
+
+            disbanded++;
+        }
+
+        sLog.outString("[GROUP] 队伍 %u 里已无真人，解散（移出 %u 个机器人）", groupId, uint32(botMembers.size()));
+    }
+
+    if (disbanded)
+        sLog.outString("[GROUP] 本轮共移出 %u 个机器人", disbanded);
+}
+
 void RandomPlayerbotMgr::RandomTeleport(Player* bot)
 {
     if (bot->InBattleGround())
         return;
+
+    // [spawn 2026-10-16 站长口径] 不做兜底：随机传送保持原有行为（漫游用旅行系统/传送门/船）。
+    // 固定出生点只在"出生"那一步（InstaRandomize）生效。
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT, "RandomTeleport");
     std::vector<WorldLocation> locs;
@@ -3061,6 +3561,18 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot)
 void RandomPlayerbotMgr::InstaRandomize(Player* bot)
 {
     sRandomPlayerbotMgr.Randomize(bot);
+
+    // [spawn 2026-10-16] 站长口径：固定出生点（沙塔斯）——不再随机撒到全世界
+    if (sPlayerbotAIConfig.fixedSpawnEnabled)
+    {
+        float const r = sPlayerbotAIConfig.fixedSpawnRadius;
+        bot->TeleportTo(sPlayerbotAIConfig.fixedSpawnMapId,
+            sPlayerbotAIConfig.fixedSpawnX + frand(-r, r),
+            sPlayerbotAIConfig.fixedSpawnY + frand(-r, r),
+            sPlayerbotAIConfig.fixedSpawnZ,
+            sPlayerbotAIConfig.fixedSpawnO);
+        return;
+    }
 
     if(bot->GetLevel() > sWorld.getConfig(CONFIG_UINT32_START_PLAYER_LEVEL))
         sRandomPlayerbotMgr.RandomTeleportForLevel(bot, false);
@@ -3343,6 +3855,20 @@ uint32 RandomPlayerbotMgr::GetEventValue(uint32 bot, std::string event)
     }
     CachedEvent e = eventCache[bot][event];
 
+    // [always 2026-10-17 站长口径 · 方案A] `add` 事件对"点名常在线"的角色**不过期**。
+    //
+    // 为什么：`add` 是轮换开关（有 `add` 才在 `GetBots()` 候选池里）。它到期后这里会把它算成 0，
+    //   而 `ProcessBot()` 的登出分支会 `SetEventValue(bot,"add",0,0)` —— 由于 SetEventValue 在
+    //   value==0 时**只 DELETE 不 INSERT**，`add` 行被整行删掉 ⇒ 该 bot **永久退出候选池**
+    //   （日志里连登录尝试都没有，实测 205 Lorineri 就是这么掉的）。
+    //   旁边的豁免名单已经为 `always` 事件本身做了同样的事（常在线不该过期），这里把
+    //   **always 角色身上的 `add`** 一并豁免，杜绝"轮换时长到了就掉人"。
+    if (event == "add" && ((time(0) - e.lastChangeTime) >= e.validIn))
+    {
+        if (GetEventValue(bot, "always") == (uint32)BotAlwaysOnline::ACTIVE)
+            return e.value;
+    }
+
     if ((time(0) - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink" && event != "init" && event != "current_time" && event != "always" && event != "selfbot")
         e.value = 0;
 
@@ -3442,7 +3968,7 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
     {
         sLog.outError("Usage: rndbot help/stats/update/reset/init/refresh/add/remove/more..");
         if (isRA)
-            handler->SendSysMessage("Usage: rndbot help/stats/update/reset/init/refresh/add/remove/more..");
+            handler->SendSysMessage(BOT_TEXT("Usage: rndbot help/stats/update/reset/init/refresh/add/remove/more..").c_str());
 
         std::list<std::string> messages = sRandomPlayerbotMgr.HandleHelp("");
 
@@ -3571,7 +4097,7 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
         return true;
 
     if (isRA)
-        handler->SendSysMessage("usage: help/list/reload/more.. or add/init/remove/more.. PLAYERNAME");
+        handler->SendSysMessage(BOT_TEXT("usage: help/list/reload/more.. or add/init/remove/more.. PLAYERNAME").c_str());
 
     return true;
 }
@@ -3649,6 +4175,13 @@ void RandomPlayerbotMgr::OnPlayerLogout(Player* player)
 void RandomPlayerbotMgr::OnBotLoginInternal(Player * const bot)
 {
     sLog.outDetail("%u/%d Bot %s logged in", GetPlayerbotsAmount(), sRandomPlayerbotMgr.GetMaxAllowedBotCount(), bot->GetName());
+
+    // [诊断 2026-10-15] 每个 bot 登录后的 RSS：量化"每 bot 内存"
+    {
+        static uint32 rssCount = 0;
+        if ((++rssCount % 5) == 0 || rssCount <= 3)
+            PlayerbotLogRss(("  bot login #" + std::to_string(rssCount)).c_str());
+    }
 
     ApplyActionHistorySize(bot);
 	//if (loginProgressBar && playerBots.size() < sRandomPlayerbotMgr.GetMaxAllowedBotCount()) { loginProgressBar->step(); }
@@ -5264,6 +5797,27 @@ uint32 RandomPlayerbotMgr::GetOrCreateAccount(Player* master, std::string& error
                 {
                     sPlayerbotAIConfig.randomBotAccounts.push_back(accountId);
                     return accountId;
+                }
+            }
+
+            // [bottest 2026-10-19] 账号**已经存在于数据库**、但 sAccountMgr 缓存里查不到时
+            //   （本地测试服典型情形：账号是外部脚本导入的），CreateAccount 会返回"名字已存在"，
+            //   这里直接按名字回查数据库拿 id，而不是让整条 bot 创建链断掉
+            //   （实测症状：测试场景第一句 spawn 就 IMPOSSIBLE | reason: Failed to create account）。
+            //   注意：本分支的 PQuery 返回 unique_ptr（本仓库重载），不要再手动 delete。
+            if (auto existing = LoginDatabase.PQuery("SELECT id FROM account WHERE username = '%s'", accountName.c_str()))
+            {
+                Field* fields = existing->Fetch();
+                uint32 existingId = fields[0].GetUInt32();
+
+                if (existingId)
+                {
+                    sLog.outError("[BOTTEST] account '%s' already exists in DB (id=%u) but was unknown to AccountMgr; using it",
+                                  accountName.c_str(), existingId);
+                    if (!sPlayerbotAIConfig.IsInRandomAccountList(existingId))
+                        sPlayerbotAIConfig.randomBotAccounts.push_back(existingId);
+
+                    return existingId;
                 }
             }
 
