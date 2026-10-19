@@ -1323,18 +1323,42 @@ namespace simscenario
                             }
                             else if (now - run.noVictimSince >= 15000 && !run.combatSkipDone && tank->GetPlayerbotAI())
                             {
-                                dungeonroute::Target t;
-                                uint16 const ord = (dungeonroute::FindTargetNearest(tank, *route, t) && t.ord)
-                                    ? t.ord : dungeonroute::CurrentOrd(tank, *route);
-                                if (ord)
+                                // [2026-10-19 543 实测] 先看是不是“引到了路线外/跳过批次的怪”：
+                                //   这类怪不在 route->guidOrd 里 ⇒ 目标过滤会把它剔掉 ⇒ 表现为"战斗中无目标"。
+                                //   修法：只要坦克身上还有活着的攻击者，先强迫 attack anything 清掉，不跳波。
+                                bool hasLiveAttacker = false;
+                                for (Unit* attacker : tank->getAttackers())
                                 {
-                                    dungeonroute::MarkSkipped(tank, ord, "no victim 15s");
-                                    run.combatSkipDone = true;
-                                    ForceDisengage(run);
-                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 坦克战斗中 15s 无目标 ⇒ 跳过波 ord=%u，强制脱战继续下一波",
-                                        run.runId, run.index, run.attempt, (uint32)ord);
+                                    if (attacker && attacker->IsAlive())
+                                    {
+                                        hasLiveAttacker = true;
+                                        break;
+                                    }
                                 }
-                                run.noVictimSince = now;
+                                if (hasLiveAttacker)
+                                {
+                                    tank->GetPlayerbotAI()->DoSpecificAction("attack anything", Event(), true);
+                                    run.noVictimSince = now;
+                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 坦克战斗中无目标、但有攻击者 ⇒ 先清引到的怪，不跳波",
+                                        run.runId, run.index, run.attempt);
+                                    run.lastVictim = ObjectGuid();
+                                    run.lastVictimAt = 0;
+                                }
+                                else
+                                {
+                                    dungeonroute::Target t;
+                                    uint16 const ord = (dungeonroute::FindTargetNearest(tank, *route, t) && t.ord)
+                                        ? t.ord : dungeonroute::CurrentOrd(tank, *route);
+                                    if (ord)
+                                    {
+                                        dungeonroute::MarkSkipped(tank, ord, "no victim 15s");
+                                        run.combatSkipDone = true;
+                                        ForceDisengage(run);
+                                        sLog.outString("[SIM] run=%u g=%u attempt=%u 坦克战斗中 15s 无目标 ⇒ 跳过波 ord=%u，强制脱战继续下一波",
+                                            run.runId, run.index, run.attempt, (uint32)ord);
+                                    }
+                                    run.noVictimSince = now;
+                                }
                             }
                             run.lastVictim = ObjectGuid();
                             run.lastVictimAt = 0;

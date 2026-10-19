@@ -623,6 +623,26 @@ namespace dungeonroute
     //   记录本体已移到核心 pullrec::Update()）
     inline void PullEnd(Player* bot, const char* result);
 
+    // [2026-10-19 543 实测] PULL 记录报 cleared 时，路线状态要同步推进
+    inline void MarkCleared(Player* bot, uint16 ord, const char* why)
+    {
+        if (!bot || !ord)
+            return;
+        BotState& st = StateOf(bot);
+        if (st.cleared.insert(ord).second)
+        {
+            sLog.outString("[DUNGEONROUTE] %s 波已清 ord=%u（%s）",
+                bot->GetName(), uint32(ord), why ? why : "");
+        }
+        st.seenAlive.erase(ord);
+        if (st.lockOrd == ord)
+        {
+            st.lockOrd = 0;
+            st.lockUntil = 0;
+        }
+        st.calcedAt = 0;
+    }
+
     inline void MarkSkipped(Player* bot, uint16 ord, const char* why)
     {
         BotState& st = StateOf(bot);
@@ -1052,7 +1072,8 @@ namespace dungeonroute
     // ---- [模式A 2026-10-18] 最近目标 + 30 码视线内即停 ---------------------------------
     // 取代"必须踩 route 表精确锚点"的老逻辑：只要 30 码内有可攻击且视线内的怪就停下开拉；
     // 否则朝最近目标/刷点走过去。这样即使 route 表的 ord/锚点不准，队伍也能一路推进。
-    inline bool FindTargetNearest(Player* bot, MapRoute const& route, Target& out)
+    inline bool FindTargetNearest(Player* bot, MapRoute const& route, Target& out,
+                                  bool onlyCurrentWave = false)
     {
         Map* map = bot->GetMap();
         if (!map || !bot)
@@ -1060,6 +1081,10 @@ namespace dungeonroute
 
         BotState& st = StateOf(bot);
         RefreshWaveKnowledge(map, route, st);
+
+        // [2026-10-19 543 实测] 拉怪/移动只瞄 CurrentOrd（当前波）；否则会按“全图最近”
+        //   跨波乱拉，和攻击目标过滤（唯一当前波）打架，出现“15s 无目标 → 跳波”。
+        uint16 const curOrd = onlyCurrentWave ? CurrentOrd(bot, route) : 0;
 
         const float STOP_DIST = 30.0f;       // 见敌即停
         const float APPROACH_DIST = 22.0f;   // 走到离怪多近（沿用旧的 22 码）
@@ -1091,6 +1116,8 @@ namespace dungeonroute
                 if (st.skip.count(waveOrd) || st.cleared.count(waveOrd))
                     continue;
                 if (lockedOnly && waveOrd != st.lockOrd)
+                    continue;
+                if (onlyCurrentWave && curOrd && waveOrd != curOrd)
                     continue;
 
                 for (auto& m : kv.second.members)
@@ -1181,6 +1208,8 @@ namespace dungeonroute
                 continue;
             if (st.skip.count(waveOrd) || st.cleared.count(waveOrd))
                 continue;
+            if (onlyCurrentWave && curOrd && waveOrd != curOrd)
+                continue;
             if (!kv.second.hasCenter)
                 continue;
 
@@ -1207,6 +1236,10 @@ namespace dungeonroute
             out.hasPullPoint = true;
             return true;
         }
+
+        // [2026-10-19] 只瞄当前波时，绝不提前进 boss 阶段
+        if (onlyCurrentWave && curOrd)
+            return false;
 
         // ③ boss 阶段：最近的 boss（活着/没加载都先过去）
         float best = 1e18f;
@@ -1282,14 +1315,34 @@ namespace dungeonroute
         {
             if (v == bot)
                 return true;
-            if (v->GetTypeId() == TYPEID_PLAYER)
+
+            Unit* vMaster = v->GetMaster();
+            Player* vPlayer = vMaster && vMaster->GetTypeId() == TYPEID_PLAYER
+                ? (Player*)vMaster
+                : (v->GetTypeId() == TYPEID_PLAYER ? (Player*)v : nullptr);
+            if (vPlayer)
             {
                 Group* g = bot->GetGroup();
-                if (g && g->IsMember(v->GetObjectGuid()))
+                if (g && g->IsMember(vPlayer->GetObjectGuid()))
                     return true;
             }
         }
-        return unit->getThreatManager().getThreat(bot) > 0.0f;
+        if (unit->getThreatManager().getThreat(bot) > 0.0f)
+            return true;
+
+        // [2026-10-19 543 实测] 引到队友/队友宠物的怪也算“在打我们”：
+        //   云端标记的路线跳过了一部分怪，坦克拉路线怪时会把它们引到；
+        //   只要它们已经在打队伍里任何一人，就必须允许还手，否则会“战斗中无合法目标”。
+        if (Group* g = bot->GetGroup())
+        {
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->getSource();
+                if (member && member->IsInWorld() && unit->getThreatManager().getThreat(member) > 0.0f)
+                    return true;
+            }
+        }
+        return false;
     }
 
     inline bool AllowAttack(Player* bot, Unit* unit)

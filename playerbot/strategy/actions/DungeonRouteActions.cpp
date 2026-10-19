@@ -35,7 +35,7 @@ bool DungeonRouteMoveAction::Execute(Event& event)
     }
 
     dungeonroute::Target target;
-    if (!dungeonroute::FindTargetNearest(bot, *route, target) || !target.hasPullPoint)
+    if (!dungeonroute::FindTargetNearest(bot, *route, target, true) || !target.hasPullPoint)
         return false;
 
     if (bot->GetDistance(target.px, target.py, target.pz) <= dungeonroute::AT_PULL_POINT_DIST)
@@ -166,7 +166,7 @@ bool DungeonRoutePullAction::Execute(Event& event)
     // [2026-10-18 站长口径] 拉怪记录由核心统一采集（见 DungeonRoute.h §拉怪记录）
 
     dungeonroute::Target target;
-    if (!dungeonroute::FindTargetNearest(bot, *route, target) || !target.hasPullPoint)
+    if (!dungeonroute::FindTargetNearest(bot, *route, target, true) || !target.hasPullPoint)
         return false;
 
     if (bot->GetDistance(target.px, target.py, target.pz) > dungeonroute::AT_PULL_POINT_DIST)
@@ -175,6 +175,19 @@ bool DungeonRoutePullAction::Execute(Event& event)
     Creature* creature = map->GetCreature(target.guid);
     if (!creature || !creature->IsAlive() || !creature->IsInWorld())
     {
+        // [2026-10-19 543 实测] PULL 这一组打完了：整波没有活怪 ⇒ 立刻标记本波已清，
+        //   不要等 seenAlive 的下一次刷新（否则会先被 15s 无目标守卫跳掉）。
+        if (!target.boss && target.ord)
+        {
+            auto wit = route->waves.find(target.ord);
+            if (wit != route->waves.end() && !dungeonroute::WaveHasAlive(map, wit->second))
+            {
+                dungeonroute::BotState& st = dungeonroute::StateOf(bot);
+                if (st.seenAlive.count(target.ord) || st.lockOrd == target.ord)
+                    dungeonroute::MarkCleared(bot, target.ord, "pull cleared");
+            }
+        }
+
         // [2026-10-18 站长口径] "打完最近一波不推进"：目标是**还没加载**的怪/boss
         //   （FindTarget 会先给波中心/走位点）⇒ 站在波中心等网格加载；等 WAVE_NOT_LOADED_MS 还没有就放弃这波。
         if (dungeonroute::WaveStuckMs(bot) > dungeonroute::WAVE_NOT_LOADED_MS)
