@@ -7,7 +7,7 @@
 
 // ---------------------------------------------------------------------------
 // [决策参数化 2026-10-18 站长口径] 把"策略里写死的权重"挪到数据表，方便离线调参/后续 RL：
-//   表：tbccharacters.ai_playerbot_decision_weight(`key`,`weight`,`note`)
+//   表：tbcmangos.ai_playerbot_decision_weight(`key`,`weight`,`note`)
 //   读路径：thread_local 缓存 + 300s 重读（改数据不用重启）
 //   缺表 / 查询失败 ⇒ 用代码里的默认值（绝不因为缺数据影响出怪）
 //
@@ -90,13 +90,13 @@ namespace dw
         tried = true;
         loadedAt = now;
 
-        std::unique_ptr<QueryResult> table = CharacterDatabase.Query(
+        std::unique_ptr<QueryResult> table = WorldDatabase.Query(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
             "AND table_name = 'ai_playerbot_decision_weight'");
         if (!table)
             return;
 
-        std::unique_ptr<QueryResult> res = CharacterDatabase.Query(
+        std::unique_ptr<QueryResult> res = WorldDatabase.Query(
             "SELECT `key`,`weight` FROM `ai_playerbot_decision_weight`");
         if (!res)
             return;

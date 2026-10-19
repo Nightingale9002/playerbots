@@ -9,13 +9,13 @@
 // 这样被覆盖后重打成本最低。
 //
 // 数据口径（详见 dev/功能更新手册_卡布魔兽.md 的「副本/BOSS 战策略」一章）：
-//   tbccharacters.ai_playerbot_custom_strategy(owner=0)：
+//   tbcmangos.ai_playerbot_custom_strategy(owner=0)：
 //     通用集 boss_common*          打"登记过的 BOSS"时挂（只写一份，所有 BOSS 复用）
 //     专属集 boss_<entry>          该 BOSS 特有的
 //     **角色后缀**（2026-10-16 追加）：集名后可跟 _dps/_tank/_healer/_melee/_ranged，
 //       多个=与关系（例 boss_18371_dps_melee）；**只有匹配角色的 bot 才挂那个集**。
 //       换句话说："转火"这类规则写在 _dps 集里，就天然对坦克/治疗不生效。
-//   tbccharacters.ai_playerbot_boss_strategy(entry, note)：登记表（只有通用行为的 BOSS 用）。
+//   tbcmangos.ai_playerbot_boss_strategy(entry, note)：登记表（只有通用行为的 BOSS 用）。
 //   开关：AiPlayerbot.BossStrategies（默认 1）。日志：[BOSSSTRAT]（sLog.outString → Server.log）。
 //   限流：每个 bot 每 5 秒看一次；名单每 5 分钟重扫（改数据不用重启）。
 //   线程：MapUpdate.Threads 是多线程，所以共享表加锁；状态键用 PlayerbotAI*，析构里清。
@@ -100,7 +100,7 @@ namespace bossstrategy
         listCheckedAt = WorldTimer::getMSTime();
 
         // owner=0 = 全服共享；owner 非 0 的是单 bot 自己写的，不参与 BOSS 策略
-        auto results = CharacterDatabase.Query("SELECT DISTINCT name FROM ai_playerbot_custom_strategy WHERE owner = 0");
+        auto results = WorldDatabase.Query("SELECT DISTINCT name FROM ai_playerbot_custom_strategy WHERE owner = 0");
         if (results)
         {
             do
@@ -125,7 +125,7 @@ namespace bossstrategy
         }
 
         // 登记表：只吃通用集、没有专属规则的 BOSS 也登记
-        auto listed = CharacterDatabase.Query("SELECT entry FROM ai_playerbot_boss_strategy");
+        auto listed = WorldDatabase.Query("SELECT entry FROM ai_playerbot_boss_strategy");
         if (listed)
         {
             do

@@ -775,7 +775,7 @@ namespace partypos
         loadedAt = now;
 
         std::set<uint32> set;
-        std::unique_ptr<QueryResult> res = CharacterDatabase.Query("SELECT entry FROM ai_playerbot_boss_strategy");
+        std::unique_ptr<QueryResult> res = WorldDatabase.Query("SELECT entry FROM ai_playerbot_boss_strategy");
         if (res)
         {
             do

@@ -32,7 +32,7 @@ using namespace MaNGOS;
 // ===========================================================================
 // [aggro 2026-10-17 站长口径] **攻略点名的重点小怪**表（数据优先于一切启发式）。
 //
-// 表：`tbccharacters.ai_playerbot_priority_target`（现 dev/182_机器人相关_整合.sql）
+// 表：`tbcmangos.ai_playerbot_priority_target`（现 dev/182_机器人相关_整合.sql）
 //   entry / priority / source / reason
 //   [2026-10-19 口径·定稿] 数字越大越优先，含义分档（站长原文）：
 //     priority 5 = 任何情况必须**立刻转火击杀**（压过一切；吃控制也不降级）
@@ -372,7 +372,7 @@ namespace
         priorityLoadTried = true;
 
         // 表是可选增强：先探测存在性，避免每次刷出 SQL 报错刷日志
-        auto exists = CharacterDatabase.Query(
+        auto exists = WorldDatabase.Query(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
             "AND table_name = 'ai_playerbot_priority_target'");
         if (!exists)
@@ -390,7 +390,7 @@ namespace
             return;
         }
 
-        auto results = CharacterDatabase.Query(
+        auto results = WorldDatabase.Query(
             "SELECT entry, priority FROM ai_playerbot_priority_target WHERE priority > 0");
         if (!results)
             return;
