@@ -48,11 +48,13 @@ void DungeonStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)
         "hostile aoe incoming",
         NextAction::array(0, new NextAction("move away from hazard", ACTION_EMERGENCY + 5), NULL)));
 
-    // [跑位 2026-10-18 站长口径] 队伍统一决策层下发的占位槽（卡视野优先）：
-    //   比紧急躲圈低一档（躲圈最高），比默认追击高一档。
+    // [跑位 2026-10-19 站长口径] **跑位是 BOSS 战第一优先级**：
+    //   "进入 boss 战后首先应该移动到安全位置（不会引新的怪的位置），按照策略站好队形，然后才是其他的"。
+    //   ⇒ 比紧急躲圈（ACTION_EMERGENCY+5）和所有自定义策略权重（最高 99）都高；
+    //     到槽位（1.5 码内）后动作返回 false，自动恢复其它动作（加血/驱散/输出）。
     triggers.push_back(new TriggerNode(
         "party position active",
-        NextAction::array(0, new NextAction("move to party slot", ACTION_EMERGENCY - 5), NULL)));
+        NextAction::array(0, new NextAction("move to party slot", ACTION_PASSTROUGH + 20), NULL)));
 
     // [BOSS 战策略 2026-10-18 站长口径] 进攻驱散：敌人身上的魔法增益（护盾/增益/回血）优先驱掉
     triggers.push_back(new TriggerNode(
