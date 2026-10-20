@@ -86,6 +86,8 @@ private:
     std::list<std::string> HandleTweak(Player* master, const std::string param, AccountTypes security);
     // [2026-10-18 站长口径] `.bot route on|off|reset` —— 副本自动开怪（DungeonRoute）运行时开关
     std::list<std::string> HandleRoute(Player* master, const std::string param, AccountTypes security);
+    // [2026-10-20 站长口径] `.bot prio <0-5>` —— 手动指定"当前选中目标"的优先级（实时生效、落库）
+    std::list<std::string> HandlePrio(Player* master, const std::string param, AccountTypes security);
     // [仿真 2026-10-18] `.bot sim start/stop/status` —— 本地可控场景注入（见 playerbot/SimScenario.h）
     std::list<std::string> HandleSim(Player* master, const std::string param, AccountTypes security);
     std::list<std::string> HandleSelf(Player* master, const std::string param, AccountTypes security);

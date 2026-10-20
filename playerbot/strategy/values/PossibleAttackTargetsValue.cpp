@@ -15,6 +15,7 @@
 #include "ThreatValues.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -66,6 +67,11 @@ namespace
     std::map<uint32, uint8> priorityByEntry;   // entry -> 表里的 priority（1 最高）
     time_t priorityLoadedAt = 0;
     bool priorityLoadTried = false;
+
+    // [2026-10-20 站长口径] `.bot prio` 要"实时生效"：每次手动改优先级就 ++ 这个 epoch，
+    //   PriorityTargetRank() 的 thread_local 读缓存里带着 epoch，对不上就当场重算
+    //   （否则改完要等 kPriorityRefreshSeconds 才生效）。
+    std::atomic<uint32> priorityEpoch{0};
 
     // ===========================================================================
     // 观测层：**引擎真的看见它读过的条**（治疗 / 控制）→ 计数 → 生效 → 落库。
@@ -445,12 +451,15 @@ namespace
         // 读路径缓存：怪 entry 的判定结果不随 tick 变化（thread_local ⇒ 不加锁）。
         // [2026-10-18] 加**过期时间**：以前缓存永不过期 ⇒ 改完表要重启进程才生效；
         //   现在每个 entry 的缓存最多活 kPriorityRefreshSeconds 秒，到期重查 ⇒ 改表 5 分钟内生效。
-        struct CacheEntry { uint8 rank; time_t expire; };
+        // [2026-10-20] 加 **epoch**：`.bot prio` 手动改档要求"实时生效" ⇒ 手动改档会推进
+        //   priorityEpoch，缓存里的 epoch 对不上就当场重算（不必等 5 分钟）。
+        struct CacheEntry { uint8 rank; time_t expire; uint32 epoch; };
         thread_local std::unordered_map<uint32, CacheEntry> cache;
         const time_t now = time(nullptr);
+        const uint32 epoch = priorityEpoch.load(std::memory_order_relaxed);
 
         auto hit = cache.find(entry);
-        if (hit != cache.end() && hit->second.expire > now)
+        if (hit != cache.end() && hit->second.expire > now && hit->second.epoch == epoch)
             return hit->second.rank;
 
         if (!priorityLoadTried || (now - priorityLoadedAt) >= kPriorityRefreshSeconds)
@@ -467,9 +476,73 @@ namespace
         if (cache.size() > 8192)
             cache.clear();
 
-        cache[entry] = CacheEntry{ rank, now + kPriorityRefreshSeconds };
+        cache[entry] = CacheEntry{ rank, now + kPriorityRefreshSeconds, epoch };
         return rank;
     }
+}
+
+// [2026-10-20 站长口径] ".bot prio <数字1-5> 指定当前目标的优先级，并且实时生效"
+//   ① 先落库（幂等 upsert；表不存在 ⇒ 只在内存生效，不影响出怪）；
+//   ② 再改内存表 + 推进 epoch ⇒ 各线程的读缓存全部失效，全服 bot 下一 tick 就按新档位行动。
+//   0 = 清除（回落启发式 / 观测表）。
+bool PossibleAttackTargetsValue::SetPriorityRank(uint32 entry, uint8 priority, char const* source)
+{
+    if (!entry || priority > 5)
+        return false;
+
+    char const* src = (source && *source) ? source : "gm";
+
+    // 表是可选增强：探一次存在性（与 LoadPriorityTargets 同口径），缺表就只改内存
+    static bool checkedTable = false;
+    static bool tableExists = false;
+    if (!checkedTable)
+    {
+        checkedTable = true;
+        std::unique_ptr<QueryResult> exists = WorldDatabase.Query(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
+            "AND table_name = 'ai_playerbot_priority_target'");
+        tableExists = exists != nullptr;
+    }
+
+    bool persisted = false;
+    if (tableExists)
+    {
+        if (priority == 0)
+            persisted = WorldDatabase.PExecute("DELETE FROM `ai_playerbot_priority_target` WHERE `entry` = %u", entry);
+        else
+            persisted = WorldDatabase.PExecute(
+                "INSERT INTO `ai_playerbot_priority_target` (`entry`,`priority`,`source`,`reason`) "
+                "VALUES (%u, %u, '%s', 'GM .bot prio 手动指定') "
+                "ON DUPLICATE KEY UPDATE `priority` = VALUES(`priority`), `source` = VALUES(`source`)",
+                entry, uint32(priority), src);
+    }
+
+    uint8 oldPriority = 0;
+    {
+        std::scoped_lock lock(priorityMutex);
+
+        auto found = priorityByEntry.find(entry);
+        if (found != priorityByEntry.end())
+            oldPriority = found->second;
+
+        if (priority)
+            priorityByEntry[entry] = priority;
+        else
+            priorityByEntry.erase(entry);
+
+        // 别让下一次自动重载把这次手动改动当"旧数据"覆盖掉：
+        //   已落库 ⇒ 重载读到的就是新值；没落库 ⇒ 推迟重载，内存值继续生效。
+        priorityLoadedAt = time(nullptr);
+        priorityLoadTried = true;
+    }
+
+    priorityEpoch.fetch_add(1, std::memory_order_relaxed);
+
+    sLog.outString("[PRIO-CHANGE] entry=%u name=%s old=%u -> new=%u source=%s%s",
+        entry, PriorityObsCreatureName(entry).c_str(), uint32(oldPriority), uint32(priority), src,
+        persisted ? "" : " (memory only)");
+
+    return true;
 }
 
 std::list<ObjectGuid> PossibleAttackTargetsValue::Calculate()
@@ -1200,6 +1273,11 @@ int PossibleAttackTargetsValue::ThreatTier(Unit* target, Player* bot)
         return false;
     };
 
+    // [2026-10-20 站长口径] "骷髅头标记也要随时生效"：骷髅是**人工即时指令**，
+    //   必须压过表里的优先级（以前这段在表判定之后 ⇒ 表里已有档位的怪被标成骷髅也不生效）。
+    if (IsSkullMarked(target, bot))
+        return 5;
+
     // 优先级来源（高 → 低）：人工表 ai_playerbot_priority_target > 观测表 ai_playerbot_priority_obs
     //   > 启发式；观测只补"人工表里没有这只怪"的 entry。
     uint8 priority = PriorityTargetRank(target);
@@ -1246,9 +1324,6 @@ int PossibleAttackTargetsValue::ThreatTier(Unit* target, Player* bot)
                 return 4;
         }
     }
-
-    if (IsSkullMarked(target, bot))
-        return 5;
 
     if (HasHighThreatAbility(target))
         return 4;

@@ -40,6 +40,17 @@ namespace dw
         if (key == "cc.priority_rank")        return 15.0f;
         if (key == "cc.distance")             return -1.0f;
 
+        // [2026-10-20 站长口径] "（变羊/放逐这类控制的优先级）应该能根据战斗情况动态调整"
+        //   人工标记（`.bot rti` 的 cc 标记 / 星星标记）**不参与**动态 ⇒ 保持策略里的原优先级；
+        //   其余自动挑的目标按"场面压力"给**绝对优先级**（见 strategy/generic/ClassStrategy.cpp）：
+        //     base + per_enemy*(同时交战怪数-1) + hurt_ally*(队内血量低于 hurt_health% 的成员数)
+        //   再夹到 [1, max]。单怪/安全 ⇒ 压到普通输出位（控得少）；多怪/有人快死 ⇒ 抬到打断~治疗之间。
+        if (key == "cc.dyn.base")             return 10.0f;
+        if (key == "cc.dyn.per_enemy")        return 12.0f;
+        if (key == "cc.dyn.hurt_ally")        return 10.0f;
+        if (key == "cc.dyn.hurt_health")      return 60.0f;   // 血线（%）
+        if (key == "cc.dyn.max")              return 80.0f;   // 上限（低于治疗 80/90 档）
+
         // 治疗目标排序
         if (key == "heal.missing_health")     return 100.0f;
         if (key == "heal.tank_bonus")         return 30.0f;

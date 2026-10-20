@@ -19,6 +19,8 @@
 #include "Accounts/AccountMgr.h"
 #include "strategy/actions/ChangeTalentsAction.h"
 #include "strategy/actions/InviteToGroupAction.h"
+// [2026-10-20] `.bot prio` 要直改威胁优先级（内存 + 表）
+#include "strategy/values/PossibleAttackTargetsValue.h"
 #include "AiFactory.h"
 // [仿真 2026-10-18] `.bot sim ...`（本地可控场景注入；见 playerbot/SimScenario.h）
 #include "playerbot/SimScenario.h"
@@ -39,6 +41,8 @@ PlayerbotHolder::PlayerbotHolder() : PlayerbotAIBase()
     m_holderHandlers["reload"] = &PlayerbotHolder::HandleReload;
     m_holderHandlers["tweak"] = &PlayerbotHolder::HandleTweak;
     m_holderHandlers["route"] = &PlayerbotHolder::HandleRoute;
+    // [2026-10-20 站长口径] `.bot prio <1-5>` —— 手动指定"当前选中目标"的优先级，实时生效
+    m_holderHandlers["prio"] = &PlayerbotHolder::HandlePrio;
     m_holderHandlers["sim"] = &PlayerbotHolder::HandleSim;
     m_holderHandlers["self"] = &PlayerbotHolder::HandleSelf;
     m_holderHandlers["spoof"] = &PlayerbotHolder::HandleSpoof;
@@ -1402,6 +1406,82 @@ std::list<std::string> PlayerbotHolder::HandleRoute(Player* master, const std::s
     messages.push_back(std::string("DungeonRoute 自动开怪: ") + state);
     sLog.outString("[DUNGEONROUTE] .bot route %s by %s => %s",
         arg.empty() ? "(query)" : arg.c_str(), master ? master->GetName() : "console", state);
+    return messages;
+}
+
+// [2026-10-20 站长口径] ".bot prio <数字1-5> 指定当前目标的优先级，并且实时生效"。
+//   `.bot prio`        只查询：选中目标的表档位 + 算出来的威胁等级
+//   `.bot prio <0-5>`  改档：0 = 清除（回落启发式/观测表）
+//     1 = 只打断   2 = 没有对应驱散才优先   3 = 优先击杀   4 = 优先控制、最后击杀   5 = 立刻转火击杀
+//   生效范围：**按 entry 全服生效**（所有 bot 共享一张表），写内存 + 落库
+//   （world 库 `ai_playerbot_priority_target`；表不存在则只在内存生效）。
+//   [2026-10-20 站长口径] GM 和非 GM 都能用（团长/队员现场标优先级），但**每次都写日志**留痕：
+//     `[BOTCMD] .bot prio entry=... old -> new by <玩家名>`。
+//   为什么是 holder 级命令：选中怪直接 `.bot prio 4`，不用写 bot 名字。
+std::list<std::string> PlayerbotHolder::HandlePrio(Player* master, const std::string param, AccountTypes security)
+{
+    std::list<std::string> messages;
+
+    if (!master)
+    {
+        messages.push_back("prio: 只能在游戏内使用（需要选中一个目标）");
+        return messages;
+    }
+
+    Creature* creature = dynamic_cast<Creature*>(master->GetTarget());
+    if (!creature || !creature->GetCreatureInfo())
+    {
+        messages.push_back("prio: 先选中一只怪物，再用 .bot prio <0-5>");
+        return messages;
+    }
+
+    uint32 const entry = creature->GetEntry();
+    uint8 const oldRank = PossibleAttackTargetsValue::PriorityRankOf(creature);
+    int const threatTier = PossibleAttackTargetsValue::ThreatTier(creature, master);
+
+    std::string arg = param;
+    std::transform(arg.begin(), arg.end(), arg.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+
+    if (arg.empty())
+    {
+        messages.push_back("prio: " + std::string(creature->GetName()) + " (entry " + std::to_string(entry) + ")"
+                           " 表档位=" + std::to_string(uint32(oldRank)) + " 威胁等级=" + std::to_string(threatTier));
+        messages.push_back("用法: .bot prio <0-5>   0=清除 1=只打断 2=没驱散才优先 3=优先击杀 4=优先控制 5=立刻击杀");
+        return messages;
+    }
+
+    // 严格解析（避免 ".bot prio 4abc" 这类输入被 atoi 吞掉尾巴）
+    size_t consumed = 0;
+    long value = 0;
+    try
+    {
+        value = std::stol(arg, &consumed);
+    }
+    catch (...)
+    {
+        messages.push_back("prio: 参数必须是 0-5 的整数");
+        return messages;
+    }
+
+    if (consumed != arg.size() || value < 0 || value > 5)
+    {
+        messages.push_back("prio: 参数必须是 0-5 的整数");
+        return messages;
+    }
+
+    if (!PossibleAttackTargetsValue::SetPriorityRank(entry, uint8(value), "gm"))
+    {
+        messages.push_back("prio: 设置失败");
+        return messages;
+    }
+
+    messages.push_back("prio: " + std::string(creature->GetName()) + " (entry " + std::to_string(entry) + ")  "
+                       + std::to_string(uint32(oldRank)) + " -> " + std::to_string(uint32(value))
+                       + (value ? "（全服 bot 下一 tick 生效）" : "（已清除，回落启发式/观测表）"));
+
+    sLog.outError("[BOTCMD] .bot prio entry=%u name=%s %u -> %u by %s (gmlevel=%u)",
+        entry, creature->GetName(), uint32(oldRank), uint32(value), master->GetName(), uint32(security));
+
     return messages;
 }
 
@@ -2937,6 +3017,7 @@ std::unordered_map<std::string, std::string> PlayerbotHolder::GetCommandTexts()
         {"help", "Show help for commands.\nUsage: .(rnd)bot help <command>"},
         {"reload", "Reload the playerbot config (GM only).\nUsage: .(rnd)bot reload"},
         {"tweak", "Adjust the tweak value for testing (GM only).\nUsage: .(rnd)bot tweak"},
+        {"prio", "Set target priority (0-5) for all bots, effective immediately (logged).\nUsage: .bot prio <0-5>  (0=clear, 1=interrupt only, 2=kill if no dispel, 3=kill first, 4=control first, 5=kill now)\nWithout argument = show the selected target's current rank"},
         {"self", "Enable self-bot mode for a player.\nUsage: .(rnd)bot self <playername>"},
         {"group", "Create 4 bots with complementary classes at master's level.\nUsage: .(rnd)bot group"},
         {"create", "Create a new bot character.\nUsage: .(rnd)bot create level=<n> class=<class> race=<race>"},

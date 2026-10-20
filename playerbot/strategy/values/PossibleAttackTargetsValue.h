@@ -59,6 +59,12 @@ namespace ai
         // [2026-10-18 站长口径] 表 `ai_playerbot_priority_target` 里的优先级原值（0 = 不在表里）。
         //   语义：5=任何情况立刻转火杀、4=**需要优先控制**、3=优先击杀、2=无对应驱散才优先、1=只打断。
         static uint8 PriorityRankOf(Unit* target);
+        // [2026-10-20 站长口径] `.bot prio <1-5>`（0 = 清除）：把一只怪（按 entry）的优先级
+        //   **立刻**写进内存并落库（world 库 `ai_playerbot_priority_target`）。
+        //   内存直改 + 推进 epoch 让各线程的读缓存失效 ⇒ 全服 bot 下一 tick 就按新的优先级
+        //   选目标/控场，不用重启、也不用等 5 分钟自动重载。
+        //   表不存在 / 写库失败 ⇒ 只在内存生效（可选增强，不能影响出怪），返回值仍是 true。
+        static bool SetPriorityRank(uint32 entry, uint8 priority, char const* source = "gm");
 
         // -------------------------------------------------------------------
         // [2026-10-18 站长口径] **读条观测**层（dev/193_优先级观测表.sql）

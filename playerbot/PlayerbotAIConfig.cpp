@@ -343,6 +343,8 @@ bool PlayerbotAIConfig::Initialize()
         "invite,join,leave,lfg,give leader,accept,ready,talk,summon,"
         "go,jump,skill,faction,home,taxi,teleport,doquest,query quest,query item usage,quest reward,share,drop,"
         "clean quest log,outfit,warning,"
+        // [2026-10-20 站长口径] `.bot prio <0-5>`：GM 和非 GM 都能用（每次调用写 [BOTCMD] 日志留痕）
+        "prio,"
         "list,gear,prepare,prep,init,train,learn,food,drink,potions,pots,consumes,consumables,consums,"
         "regs,reg,reagents,enchants,ammo"), playerCommandWhitelist);
 

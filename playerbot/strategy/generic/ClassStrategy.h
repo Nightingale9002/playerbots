@@ -116,6 +116,9 @@ namespace ai
     protected:
         virtual void InitCombatTriggers(std::list<TriggerNode*>& triggers) override;
         virtual void InitNonCombatTriggers(std::list<TriggerNode*>& triggers) override;
+        // [2026-10-20 站长口径] "（变羊/放逐这类控制的优先级）应该能根据战斗情况动态调整"
+        //   所有职业的 cc 策略都继承本类 ⇒ 这里注册一次就覆盖全职业（见 ClassStrategy.cpp）。
+        virtual void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
     };
 
     class CcPvpStrategy

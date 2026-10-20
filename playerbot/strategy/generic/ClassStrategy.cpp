@@ -1,8 +1,157 @@
 
 #include "playerbot/playerbot.h"
 #include "ClassStrategy.h"
+#include "playerbot/DecisionWeights.h"
+
+#include <algorithm>
+#include <set>
+#include <string>
 
 using namespace ai;
+
+// ===========================================================================
+// [2026-10-20 站长口径] 控制技能的优先级**按战斗情况动态调整**。
+//   站长原话："（变羊/放逐这类控制的优先级）应该能根据战斗情况动态调整"。
+//
+// 为什么用 multiplier 而不是改各职业策略里的固定 relevance：
+//   ① 固定值只能一刀切；同一个 bot 在"单怪"和"5 只怪围上来"时该不该控完全不同；
+//   ② multiplier 每 tick 参与 action 选优 ⇒ 改 `ai_playerbot_decision_weight` 表即可生效，
+//      不用重编译/重启（符合 2026-10-18 "决策参数化" 的口径）。
+//      表缺行 ⇒ 用 DecisionWeights.h 里的默认值。
+//
+// 判据：
+//   先看**人工标记**：`.bot rti` 的 cc 目标、星星标记（index 0 = 控制标记）⇒ **不降级**，
+//     保持策略里写的原优先级（人工指令随时生效，压过自动判断）；
+//   否则按场面压力给**绝对优先级**：
+//     base + per_enemy * (同时交战的怪数 - 1) + hurt_ally * (队内血量 < hurt_health% 的成员数)
+//   再夹到 [1, max] ⇒ 单怪/队伍安全时排在普通输出后面（基本不控）；
+//     多怪同时打、队里有人快死时抬到打断/驱散附近（积极控场）。
+//
+// 返回值是**倍率**：Engine.cpp 里是 `relevance *= multiplier->GetValue(action)`，
+//   所以返回 target/current 把 relevance 精确设成 target。多次注册也幂等
+//   （第二次调用时 current == target ⇒ 返回 1.0）。
+// ===========================================================================
+namespace
+{
+    // 参与动态调整的控制动作（= 各职业 cc 策略里的 NextAction 名）。
+    //   注意：hunter 的冰冻陷阱**不在**名单里 —— HunterStrategy 的注释明确要求陷阱必须
+    //   >= ACTION_INTERRUPT（陷阱有前后置移动/连招），降级会破坏它的动作链。
+    bool IsDynamicCcAction(std::string const& name)
+    {
+        static std::set<std::string> const names =
+        {
+            "polymorph",
+            "banish on cc",
+            "fear on cc",
+            "hibernate on cc",
+            "entangling roots",
+            "sap",
+            "turn undead",
+            "scare beast on cc"
+        };
+        return names.find(name) != names.end();
+    }
+
+    // 人工控制标记：rti 的 cc 目标 / 星星标记（index 0）
+    bool HasManualCcMark(PlayerbotAI* ai, Player* bot)
+    {
+        if (Value<ObjectGuid>* ccMark = ai->GetAiObjectContext()->GetValue<ObjectGuid>("rti cc target"))
+        {
+            if (!ccMark->Get().IsEmpty())
+                return true;
+        }
+
+        if (bot)
+        {
+            if (Group* group = bot->GetGroup())
+            {
+                if (!group->GetTargetIcon(0).IsEmpty())
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    uint32 CountHurtMembers(Player* bot, float healthPct)
+    {
+        if (!bot)
+            return 0;
+
+        uint32 count = 0;
+        if (bot->IsAlive() && bot->GetHealthPercent() < healthPct)
+            ++count;
+
+        Group* group = bot->GetGroup();
+        if (!group)
+            return count;
+
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (!member || member == bot || !member->IsInWorld() || !member->IsAlive())
+                continue;
+
+            if (member->GetHealthPercent() < healthPct)
+                ++count;
+        }
+
+        return count;
+    }
+
+    uint32 CountEngagedEnemies(PlayerbotAI* ai)
+    {
+        if (Value<uint8>* count = ai->GetAiObjectContext()->GetValue<uint8>("possible attack targets count"))
+            return count->Get();
+
+        return 0;
+    }
+}
+
+class CcRelevanceMultiplier : public Multiplier
+{
+public:
+    CcRelevanceMultiplier(PlayerbotAI* ai) : Multiplier(ai, "cc relevance") {}
+
+    float GetValue(Action* action) override
+    {
+        if (!action || !IsDynamicCcAction(action->getName()))
+            return 1.0f;
+
+        float const current = action->getRelevance();
+        if (current <= 0.01f)
+            return 1.0f;
+
+        Player* bot = ai->GetBot();
+        if (!bot)
+            return 1.0f;
+
+        // 人工标记 ⇒ 保持原优先级（"随时生效"）
+        if (HasManualCcMark(ai, bot))
+            return 1.0f;
+
+        uint32 const enemies = CountEngagedEnemies(ai);
+        uint32 const hurt = CountHurtMembers(bot, dw::Get("cc.dyn.hurt_health"));
+
+        float target = dw::Get("cc.dyn.base")
+                     + dw::Get("cc.dyn.per_enemy") * float(enemies > 0 ? enemies - 1 : 0)
+                     + dw::Get("cc.dyn.hurt_ally") * float(hurt);
+
+        float const cap = dw::Get("cc.dyn.max");
+        if (cap > 0.0f)
+            target = std::min(target, cap);
+
+        target = std::max(target, 1.0f);
+
+        return target / current;
+    }
+};
+
+void CcStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new CcRelevanceMultiplier(ai));
+}
+
 
 #ifdef MANGOSBOT_ZERO // Vanilla
 
