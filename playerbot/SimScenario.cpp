@@ -44,6 +44,7 @@ namespace simscenario
             uint8 cls = 0;
             uint8 level = 0;
             uint8 race = 0;
+            uint8 role = 0;   // [2026-10-21] 来自 ai_playerbot_bot_profile：1=tank 2=heal 3=dps（0=未知）
         };
 
         struct GroupRun
@@ -62,6 +63,8 @@ namespace simscenario
             uint32 enteredDungeonAt = 0;
             uint32 lastStatusAt = 0;
             uint32 leaderTryAt = 0;
+            uint32 memberIdx = 1;        // 逐个进本：下一个要传的成员下标
+            uint32 memberTryAt = 0;      // 该成员最近一次传送时间（0 = 还没传）
             uint32 tankGuid = 0;         // 真实专精挑出来的坦克（不再强挂策略）
             uint32 healGuid = 0;
             uint32 nextRoleFixAt = 0;    // 职能校验的节流
@@ -74,6 +77,7 @@ namespace simscenario
             uint32 attempt = 1;          // 第几次尝试（1-based）
             uint32 maxAttempts = 3;      // reset 模式最多几次
             uint32 stuckMs = 480000;     // 卡死阈值（可用 stuck=<秒> 覆盖，测试重置用）
+            uint32 maxRunMs = 1500000;   // 单轮硬性时间上限（可用 maxtime=<秒> 覆盖，默认 25 分钟）
             uint8 policy = 0;            // 0 = reset（灭团→重置重跑） / 1 = continue（死即复活续推）
             uint16 bestCleared = 0;      // 全部 attempt 里清掉的最大波次
             uint16 attemptBest = 0;      // 本 attempt 清掉的最大波次
@@ -88,7 +92,17 @@ namespace simscenario
             bool combatSkipDone = false; // 本次战斗已经跳过一波（战斗结束后复位）
             uint32 combatLastDmgMs = 0;  // 本次战斗里最近一次看到的伤害时间戳
             bool combatDamageSeen = false; // 本次战斗是否已经真打起来（有伤害）
+            uint32 combatCloseInSince = 0; // [2026-10-21] 本次目标开始"追过去打"的时间（0=未追）
+            uint32 chaseBestAt = 0;        // 追击中最近一次"距离明显缩短"的时间（判断是否真的走不过去）
+            float  chaseBestDist = 1e9f;   // 追击中见过的最小距离
+            uint32 chaseLogAt = 0;         // 追击日志节流
+            uint32 meleeSince = 0;         // 已进入近战距离但仍无伤害的起点
+            uint32 combatAssistAt = 0;     // [2026-10-21] 坦克"去帮队友打"的节流
+            bool outReported = false;      // [2026-10-21] 本次 run 是否已记录过"有人离开副本"
+            uint32 outFixAt = 0;           // [2026-10-21] 离本拉回节流
+            uint32 pickUpAt = 0;           // [2026-10-21] 强制"接漏怪"节流
             uint32 noVictimSince = 0;    // 坦克"在战斗但没目标"的起始时间（0=有目标/不在战斗）
+            uint32 soloReviveAt = 0;     // [2026-10-21] 单人阵亡就地复活的节流（0 = 没有待复活的）
             uint32 deaths = 0;           // 本 attempt 死亡次数累计（复活后不清零）
             uint32 lastDead = 0;         // 上一 tick 死亡人数（算增量）
             uint32 wipeSince = 0;        // 全员死亡开始时间（0 = 未灭团）
@@ -200,9 +214,186 @@ namespace simscenario
         //      会随机传送/随机换策略，仿真期间会捣乱；轮换关着（RandomBotAutologin=0）时
         //      这些 bot 完全没人管 ⇒ 可以放心用（本地多组并发就靠这批补人）。
         //   ③ 排除已在队伍里的；④ 排除正在被别的 run 用的。
+        // ---- bot 固定职责（DB 持久化） ---------------------------------------
+        // [2026-10-21 站长口径] bot 的天赋/专精/职责是固定的，必须落库复用，
+        //   不能在每次登录后"重新生成策略"再判断。表：character DB `ai_playerbot_bot_profile`。
+        std::map<uint32, uint8>& ProfileRoles()
+        {
+            static std::map<uint32, uint8> roles;
+            return roles;
+        }
+
+        bool& ProfileRolesLoaded()
+        {
+            static bool loaded = false;
+            return loaded;
+        }
+
+        void LoadProfileRoles()
+        {
+            if (ProfileRolesLoaded())
+                return;
+            ProfileRolesLoaded() = true;
+            std::unique_ptr<QueryResult> res(CharacterDatabase.Query(
+                "SELECT guid, role FROM ai_playerbot_bot_profile"));
+            if (!res)
+                return;
+            do
+            {
+                Field* f = res->Fetch();
+                ProfileRoles()[f[0].GetUInt32()] = f[1].GetUInt8();
+            } while (res->NextRow());
+        }
+
+        uint8 CachedRole(uint32 guid)
+        {
+            LoadProfileRoles();
+            auto it = ProfileRoles().find(guid);
+            return it == ProfileRoles().end() ? 0 : it->second;
+        }
+
+        // 从 character_spell（天赋=已学天赋法术）+ DBC 天赋表算出固定 spec_tab。
+        uint8 SpecTabFromSpells(uint8 cls, uint8 level, std::set<uint32> const& spells)
+        {
+            std::map<uint32, int32> tabs;
+            for (uint32 i = 0; i < 3; ++i)
+                tabs[i] = 0;
+
+            uint32 const classMask = 1u << (cls - 1);
+            for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+            {
+                TalentEntry const* talentInfo = sTalentStore.LookupEntry(i);
+                if (!talentInfo)
+                    continue;
+                TalentTabEntry const* tabInfo = sTalentTabStore.LookupEntry(talentInfo->TalentTab);
+                if (!tabInfo || (classMask & tabInfo->ClassMask) == 0)
+                    continue;
+                for (int rank = MAX_TALENT_RANK - 1; rank >= 0; --rank)
+                {
+                    uint32 spellid = talentInfo->RankID[rank];
+                    if (spellid && spells.count(spellid))
+                    {
+                        tabs[tabInfo->tabpage] += rank + 1;
+                        break;
+                    }
+                }
+            }
+
+            int32 const total = tabs[0] + tabs[1] + tabs[2];
+            if (level >= 10 && total > 0)
+            {
+                uint8 best = 0;
+                for (uint8 t = 1; t < 3; ++t)
+                    if (tabs[t] > tabs[best])
+                        best = t;
+                return best;
+            }
+
+            switch (cls)
+            {
+                case CLASS_MAGE:    return 1;
+                case CLASS_PALADIN: return 2;
+                case CLASS_PRIEST:  return 1;
+                case CLASS_WARRIOR: return 2;
+                default:            return 0;
+            }
+        }
+
+        // 一次性构建/刷新 bot 固定职责表（数据操作；之后仿真直接用 DB 里的角色）。
+        std::string BuildBotProfiles()
+        {
+            std::unique_ptr<QueryResult> bots(CharacterDatabase.Query(
+                "SELECT DISTINCT r.bot, c.class, c.level FROM ai_playerbot_random_bots r "
+                "JOIN characters c ON c.guid = r.bot WHERE r.owner = 0"));
+            if (!bots)
+                return "profile: 没有随机 bot 数据";
+
+            std::map<uint32, std::pair<uint8, uint8>> botInfo;   // guid -> (class, level)
+            do
+            {
+                Field* f = bots->Fetch();
+                botInfo[f[0].GetUInt32()] = std::make_pair(f[1].GetUInt8(), f[2].GetUInt8());
+            } while (bots->NextRow());
+
+            std::map<uint32, std::set<uint32>> botSpells;
+            std::vector<uint32> guids;
+            for (auto const& kv : botInfo)
+                guids.push_back(kv.first);
+
+            for (size_t base = 0; base < guids.size(); base += 400)
+            {
+                std::string in;
+                for (size_t i = base; i < guids.size() && i < base + 400; ++i)
+                {
+                    if (!in.empty())
+                        in += ",";
+                    in += std::to_string(guids[i]);
+                }
+                std::unique_ptr<QueryResult> res(CharacterDatabase.PQuery(
+                    "SELECT guid, spell FROM character_spell WHERE guid IN (%s)", in.c_str()));
+                if (!res)
+                    continue;
+                do
+                {
+                    Field* f = res->Fetch();
+                    botSpells[f[0].GetUInt32()].insert(f[1].GetUInt32());
+                } while (res->NextRow());
+            }
+
+            uint32 written = 0, tanks = 0, heals = 0;
+            std::string values;
+            auto flush = [&]()
+            {
+                if (values.empty())
+                    return;
+                CharacterDatabase.PExecute(
+                    "INSERT INTO ai_playerbot_bot_profile(guid, cls, spec_tab, role) VALUES %s "
+                    "ON DUPLICATE KEY UPDATE cls=VALUES(cls), spec_tab=VALUES(spec_tab), role=VALUES(role)",
+                    values.c_str());
+                values.clear();
+            };
+
+            for (auto const& kv : botInfo)
+            {
+                uint32 const guid = kv.first;
+                uint8 const cls = kv.second.first;
+                uint8 const level = kv.second.second;
+                auto spellIt = botSpells.find(guid);
+                std::set<uint32> empty;
+                std::set<uint32> const& spells = (spellIt == botSpells.end()) ? empty : spellIt->second;
+
+                uint8 const tab = SpecTabFromSpells(cls, level, spells);
+                BotRoles const roles = AiFactory::GetPlayerRoles(cls, tab);
+                uint8 role = 3;
+                if (roles & BOT_ROLE_TANK) role = 1;
+                else if (roles & BOT_ROLE_HEALER) role = 2;
+                if (role == 1) ++tanks;
+                if (role == 2) ++heals;
+
+                if (!values.empty())
+                    values += ",";
+                values += "(" + std::to_string(guid) + "," + std::to_string(cls) + "," +
+                    std::to_string(tab) + "," + std::to_string(role) + ")";
+                ++written;
+                if (values.size() > 30000)
+                    flush();
+            }
+            flush();
+
+            // 刷新内存缓存
+            ProfileRoles().clear();
+            ProfileRolesLoaded() = false;
+            LoadProfileRoles();
+
+            return "profile: 写入/刷新 " + std::to_string(written) + " 个 bot（tank=" +
+                   std::to_string(tanks) + " heal=" + std::to_string(heals) + " dps=" +
+                   std::to_string(written - tanks - heals) + "）";
+        }
+
         std::vector<Candidate> LoadCandidates(uint32 minLevel, std::vector<uint32> const& excluded)
         {
             std::vector<Candidate> out;
+            LoadProfileRoles();   // [2026-10-21] 候选带固定职责（DB）
 
             std::string sql =
                 "SELECT c.guid, c.class, c.level, c.race FROM characters c "
@@ -228,6 +419,7 @@ namespace simscenario
                 c.cls = fields[1].GetUInt8();
                 c.level = fields[2].GetUInt8();
                 c.race = fields[3].GetUInt8();
+                c.role = CachedRole(c.guid);
 
                 if (!c.guid || !c.level)
                     continue;
@@ -270,11 +462,22 @@ namespace simscenario
                 std::shuffle(free.begin(), free.end(), rng);
             }
 
-            // 队长（坦克候选）：优先坦克职业
+            // 队长（坦克候选）：优先 DB 固定职责=tank，其次坦克职业
             Candidate tank;
             bool foundTank = false;
             for (auto const& c : free)
             {
+                if (c.role == 1)
+                {
+                    tank = c;
+                    foundTank = true;
+                    break;
+                }
+            }
+            for (auto const& c : free)
+            {
+                if (foundTank)
+                    break;
                 if (IsTankClass(c.cls))
                 {
                     tank = c;
@@ -312,9 +515,32 @@ namespace simscenario
 
             // [2026-10-18] 真坦/真奶只能从"候选池"里挑 ⇒ 多抓几种坦职业/奶职业，
             //   否则 8 个候选里可能一个防护坦都没有（站长口径：不用 DPS 顶替坦克）。
+            // [2026-10-21] 固定职责来自 DB（ai_playerbot_bot_profile），不再靠登录后的临时策略判定。
+            auto takeFirstRole = [&](uint8 role) -> bool
+            {
+                if (picked.size() >= size)
+                    return true;
+                for (auto const& c : free)
+                {
+                    if (used.count(c.guid) || !sameTeam(c) || c.role != role)
+                        continue;
+                    picked.push_back(c);
+                    used.insert(c.guid);
+                    return true;
+                }
+                return false;
+            };
+            // [2026-10-21 修正] 只各取 1 个坦/1 个奶，其余**优先 DPS**，
+            //   否则候选池里坦多时会组出"2 个真坦 + 没有 DPS"的队伍（与驱动坦克口径冲突）。
+            takeFirstRole(1);
+            takeFirstRole(2);
+            while (picked.size() < size)
+            {
+                if (!takeFirstRole(3))
+                    break;
+            }
+            // 职责表缺失/不够时再退回职业启发式
             takeFirst(&IsTankClass);
-            takeFirst(&IsTankClass);
-            takeFirst(&IsHealClass);
             takeFirst(&IsHealClass);
             while (picked.size() < size)
             {
@@ -412,8 +638,15 @@ namespace simscenario
                     continue;
                 }
 
-                bool const isTank = PlayerbotAI::IsTank(p);
-                bool const isHeal = PlayerbotAI::IsHeal(p);
+                // [2026-10-21] 固定职责：优先用 DB（ai_playerbot_bot_profile）；缺失才退回运行时判定。
+                uint8 const dbRole = CachedRole(guid);
+                bool isTank = (dbRole == 1);
+                bool isHeal = (dbRole == 2);
+                if (dbRole == 0)
+                {
+                    isTank = PlayerbotAI::IsTank(p);
+                    isHeal = PlayerbotAI::IsHeal(p);
+                }
                 poolDesc += " " + std::string(p->GetName()) + "(" + ClassName(p->getClass())
                           + (isTank ? ",tank" : (isHeal ? ",heal" : ",dps")) + ")";
 
@@ -434,40 +667,44 @@ namespace simscenario
                 return false;
             }
 
-            // 队伍 = 1 真坦 + 1 真奶 + 其余**真 DPS**（同阵营已由 PickParty 保证）。
-            //   [2026-10-18] 不能让第二个真坦进队：DungeonRoute 的驱动坦克是"队里 guid 最小的坦"，
-            //   多坦会让实际驱动坦克 ≠ run.tankGuid（监控/治疗对象全错），所以 DPS 位优先挑非坦非奶。
+            // 队伍 = 1 真坦 + 1 真奶 + (partySize-2) 真 DPS；**绝不多带第二个坦/奶**（1+1+3）。
             std::vector<uint32> party;
             party.push_back(tank->GetGUIDLow());
             if (heal->GetGUIDLow() != tank->GetGUIDLow())
                 party.push_back(heal->GetGUIDLow());
 
-            // ① DPS 位：既不是真坦也不是真奶
-            for (uint32 guid : run.guids)
+            // ① DPS 位：优先 DB role=3；没有职责数据时，只接受"非坦非奶"的在线成员
+            for (int pass = 0; pass < 2 && party.size() < partySize; ++pass)
             {
-                if (party.size() >= partySize)
-                    break;
-                if (std::find(party.begin(), party.end(), guid) != party.end())
-                    continue;
+                for (uint32 guid : run.guids)
+                {
+                    if (party.size() >= partySize)
+                        break;
+                    if (std::find(party.begin(), party.end(), guid) != party.end())
+                        continue;
 
-                Player* p = FindPlayerInWorld(guid);
-                if (!p)
-                    continue;
-                if (PlayerbotAI::IsTank(p) || PlayerbotAI::IsHeal(p))
-                    continue;
+                    Player* p = FindPlayerInWorld(guid);
+                    if (!p)
+                        continue;
 
-                party.push_back(guid);
+                    uint8 const r = CachedRole(guid);
+                    bool const isT = (r == 1) || (r == 0 && PlayerbotAI::IsTank(p));
+                    bool const isH = (r == 2) || (r == 0 && PlayerbotAI::IsHeal(p));
+                    if (isT || isH)
+                        continue;
+                    if (pass == 0 && r != 3)
+                        continue;
+
+                    party.push_back(guid);
+                }
             }
 
-            // ② 不够再放开（极端情况：候选里全是坦/奶）
-            for (uint32 guid : run.guids)
+            // ② 不够就明确失败（换人重选），不用第二个坦/奶凑数
+            if (party.size() < partySize)
             {
-                if (party.size() >= partySize)
-                    break;
-                if (std::find(party.begin(), party.end(), guid) != party.end())
-                    continue;
-                if (FindPlayerInWorld(guid))
-                    party.push_back(guid);
+                error = "没有足够的真 DPS（需要 " + std::to_string(partySize - 2) +
+                        "，只有 " + std::to_string(party.size() - 2) + "）（候选：" + poolDesc + "）";
+                return false;
             }
 
             // 候选里没用上的：直接下线（不组队、不占世界）
@@ -712,6 +949,7 @@ namespace simscenario
 
                 PlayerbotFactory factory(bot, 70);
                 factory.Randomize(false, false);
+                bot->SaveToDB();   // [站长 2026-10-20] prepare 必须落库，否则 70 级只在内存
 
                 CharacterDatabase.PExecute(
                     "INSERT INTO ai_playerbot_random_bots (owner,bot,time,validIn,event,value) "
@@ -1020,17 +1258,11 @@ namespace simscenario
                     }
 
                     // ① 先队长进本：由他创建 instance 并把队伍绑定进去
+                    //   [2026-10-20 站长口径] 不能只看 GetMapId：角色可能是死在本里后被复活在
+                    //   墓地/入口旧坐标（实例里 0,0 附近），map 相同但离入口 2000 码。
+                    //   这里第一次一定先传送到 areatrigger 入口，落地后才算"已进本"。
                     if (!run.leaderTeleported)
                     {
-                        if (leader->GetMapId() == run.mapId && !leader->IsBeingTeleported())
-                        {
-                            run.leaderTeleported = true;
-                            run.phaseSince = now;
-                            sLog.outString("[SIM] run=%u g=%u leader %s 已进本 map=%u inst=%u",
-                                run.runId, run.index, leader->GetName(), run.mapId, leader->GetInstanceId());
-                            return true;
-                        }
-
                         if (now - run.phaseSince > 60000)
                         {
                             CloseRun(run, false, "队长进本超时");
@@ -1039,6 +1271,15 @@ namespace simscenario
 
                         if (leader->IsBeingTeleported())
                             return true;
+
+                        if (run.leaderTryAt && leader->GetMapId() == run.mapId)
+                        {
+                            run.leaderTeleported = true;
+                            run.phaseSince = now;
+                            sLog.outString("[SIM] run=%u g=%u leader %s 已进本 map=%u inst=%u",
+                                run.runId, run.index, leader->GetName(), run.mapId, leader->GetInstanceId());
+                            return true;
+                        }
 
                         if (now - run.leaderTryAt < 3000)
                             return true;
@@ -1053,32 +1294,39 @@ namespace simscenario
                     // ② 其余成员再进本（此时队伍已经绑定 instance）
                     //   [2026-10-19 修] 必须**逐个**传、等落地再传下一个：同一 tick 批量传会各自创建
                     //   一个 instance（实测 5 人分到 inst 11/12/13，导致只有 3 人一起打、清波统计为 0）。
+                    //   [2026-10-20 站长口径] 每个成员第一次也一定先传入口：不能因为"map 已经对"就跳过，
+                    //   否则会保留角色登录时的旧坐标（实例里 0,0 附近，离入口 2000 码）。
                     if (!run.membersTeleported)
                     {
-                        bool pending = false;
-                        for (size_t i = 1; i < run.guids.size(); ++i)
+                        for (; run.memberIdx < run.guids.size(); ++run.memberIdx)
                         {
-                            Player* p = FindPlayerInWorld(run.guids[i]);
+                            Player* p = FindPlayerInWorld(run.guids[run.memberIdx]);
                             if (!p)
                                 continue;
-                            if (p->GetMapId() == run.mapId && !p->IsBeingTeleported())
-                                continue;                       // 已落地
 
-                            pending = true;
-                            if (p->IsBeingTeleported())
-                                return true;                    // 等它落地
+                            if (run.memberTryAt)
+                            {
+                                if (p->IsBeingTeleported())
+                                    return true;                    // 等它落地
+                                if (p->GetMapId() == run.mapId)
+                                {
+                                    run.memberTryAt = 0;            // 已落地 → 传下一个
+                                    continue;
+                                }
+                                if (now - run.memberTryAt < 3000)
+                                    return true;
+                            }
 
+                            run.memberTryAt = now ? now : 1;
                             p->TeleportTo(run.mapId, run.ex, run.ey, run.ez, run.eo);
                             sLog.outString("[SIM] run=%u g=%u teleport member %s（逐个传送）",
                                 run.runId, run.index, p->GetName());
                             return true;
                         }
 
-                        if (pending)
-                            return true;
-
                         run.membersTeleported = true;
                         run.phase = PHASE_MOVEIN;
+
                         run.phaseSince = now;
                         return true;
                     }
@@ -1182,6 +1430,36 @@ namespace simscenario
                             ++inCombat;
                     }
 
+                    // [2026-10-21] 记录"谁离开了副本图"（546 出现过 cleared=14/14 但 inst=0：
+                    //   波次清完人却已经不在本里 ⇒ 需要知道是谁/哪个动作把队伍带出去的）。
+                    // [2026-10-21] 记录并**拉回**：随机传送/轮换可能把单个队员拽出副本，
+                    //   仿真期间直接把人传送回副本（队长位置，队长不在则入口）。
+                    if (!run.outFixAt || now - run.outFixAt > 5000)
+                    {
+                        Player* leader = FindPlayerInWorld(run.guids[0]);
+                        for (uint32 guid : run.guids)
+                        {
+                            Player* p = FindPlayerInWorld(guid);
+                            if (!p || p->GetMapId() == run.mapId)
+                                continue;
+
+                            float tx = run.ex, ty = run.ey, tz = run.ez;
+                            float to = run.eo;
+                            if (leader && leader->GetMapId() == run.mapId)
+                            {
+                                tx = leader->GetPositionX();
+                                ty = leader->GetPositionY();
+                                tz = leader->GetPositionZ();
+                                to = leader->GetOrientation();
+                            }
+                            sLog.outString("[SIM] run=%u g=%u 离本检测+拉回: %s map=%u → %u pos=(%.1f,%.1f,%.1f)",
+                                run.runId, run.index, p->GetName(), p->GetMapId(), run.mapId,
+                                p->GetPositionX(), p->GetPositionY(), p->GetPositionZ());
+                            p->TeleportTo(run.mapId, tx, ty, tz, to);
+                            run.outFixAt = now;
+                        }
+                    }
+
                     if (!online)
                     {
                         CloseRun(run, false, "全部掉线");
@@ -1249,6 +1527,8 @@ namespace simscenario
                                 ++cleared;
                         }
                         run.routeWaves = realWaves;
+                        // 只认尸体：每 tick 刷新 boss 死亡状态，网格卸载不算死
+                        dungeonroute::RefreshBossKnowledge(tmap, *route, *st);
 
                         // [2026-10-19] 卡死判定不能只看"清整波"：水里的 1 只可打、其余不可达的波永远清不掉，
                         //   但每杀一只就是推进 ⇒ 用小怪存活数下降作为推进信号。
@@ -1261,6 +1541,54 @@ namespace simscenario
                     if (dead > run.lastDead)
                         run.deaths += dead - run.lastDead;
                     run.lastDead = dead;
+
+                    // [2026-10-21 站长口径 · 仿真] 单人阵亡就地复活：
+                    //   副本里 bot 不再自己释放灵魂/跑尸（ReleaseSpiritAction / RepopAction 已挡），
+                    //   但躺尸的人不会自己起来 ⇒ 8 秒后由仿真直接复活并拉回队长身边，
+                    //   否则一支队伍会带着 1~2 个尸体跑完整张图，波次推进和"去帮队友"都被拖慢。
+                    if (dead > 0 && alive > 0)
+                    {
+                        if (!run.soloReviveAt)
+                            run.soloReviveAt = now;
+                        else if (now - run.soloReviveAt >= 8000)
+                        {
+                            Player* lead = FindPlayerInWorld(run.guids[0]);
+                            uint32 revived = 0;
+                            for (uint32 guid : run.guids)
+                            {
+                                Player* p = FindPlayerInWorld(guid);
+                                if (!p || p->IsAlive())
+                                    continue;
+
+                                p->ResurrectPlayer(1.0f);
+                                p->SpawnCorpseBones();
+                                p->SetHealthPercent(100.0f);
+                                if (p->GetMaxPower(POWER_MANA))
+                                    p->SetPower(POWER_MANA, p->GetMaxPower(POWER_MANA));
+                                p->CombatStopWithPets(true);
+
+                                if (PlayerbotAI* pAI = p->GetPlayerbotAI())
+                                    pAI->ResetStrategies();
+
+                                if (lead && lead->FindMap() && !p->IsBeingTeleported() &&
+                                    p->GetMapId() == lead->GetMapId())
+                                {
+                                    p->TeleportTo(p->GetMapId(), lead->GetPositionX(), lead->GetPositionY(),
+                                        lead->GetPositionZ(), lead->GetOrientation());
+                                }
+                                ++revived;
+                            }
+
+                            if (revived)
+                                sLog.outString("[SIM] run=%u g=%u 单人阵亡 %u 秒 → 就地复活 %u 人（deaths=%u）",
+                                    run.runId, run.index, (uint32)((now - run.soloReviveAt) / 1000), revived, run.deaths);
+                            run.soloReviveAt = 0;
+                        }
+                    }
+                    else
+                    {
+                        run.soloReviveAt = 0;
+                    }
 
                     // 只有"清掉一波"才算进展：单纯在战斗里磨不算（否则永远判不出卡死）。
                     if (cleared != run.lastCleared)
@@ -1280,7 +1608,9 @@ namespace simscenario
                     //   只认**坦克当前目标**：它 15 秒血量没变化（打不到 / 不可达 / 脱战残留）⇒ 跳过该目标所在的波；
                     //   一次战斗段最多跳一波（脱战后复位）。
                     //   不再用"整队零伤害"做判据 —— 接近/拉怪途中会误杀虫群（实测连锁跳过 17 波）。
-                    if (inCombat && tank && route && !run.combatSkipDone)
+                    // [2026-10-21 站长口径] 只要**队伍里有人在战斗**就进入这个守卫：
+                    //   坦克有目标 → 追/打；坦克没目标 → 去帮队友打（不跳波、不开下一波）。
+                    if (tank && inCombat && route && !run.combatSkipDone)
                     {
                         Unit* victim = tank->GetVictim();
                         if (victim && victim->GetTypeId() == TYPEID_UNIT && victim->GetMapId() == run.mapId)
@@ -1291,18 +1621,67 @@ namespace simscenario
                                 run.lastVictim = victim->GetObjectGuid();
                                 run.lastVictimHp = hp;
                                 run.lastVictimAt = now;
+                                run.combatCloseInSince = 0;
+                                run.chaseBestAt = 0;
+                                run.chaseBestDist = 1e9f;
+                                run.chaseLogAt = 0;
+                                run.meleeSince = 0;
                             }
                             else if (run.lastVictimAt && now - run.lastVictimAt >= 15000)
                             {
+                                // [2026-10-21 站长口径]
+                                //   ① 坦克开怪后**原地等怪走过来**，不冲上去；
+                                //   ② 只要还有怪在和队伍战斗，就**不跳波**（继续等/打）；
+                                //   只有"没有任何怪在和队伍战斗"时才允许放弃这个打不到的波。
+                                bool anyFighting = false;
+                                for (uint32 g : run.guids)
+                                {
+                                    Player* p = FindPlayerInWorld(g);
+                                    if (!p)
+                                        continue;
+                                    for (Unit* a : p->getAttackers())
+                                    {
+                                        if (a && a->IsAlive() && a->IsInCombat())
+                                        {
+                                            anyFighting = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!anyFighting && p->GetVictim() && p->GetVictim()->IsAlive())
+                                        anyFighting = true;
+                                    if (anyFighting)
+                                        break;
+                                }
+
+                                if (anyFighting)
+                                {
+                                    if (!run.chaseLogAt || now - run.chaseLogAt > 5000)
+                                    {
+                                        run.chaseLogAt = now;
+                                        sLog.outString("[SIM] run=%u g=%u attempt=%u 15s 无伤害（目标 %s，距离 %.1f）⇒ 原地等待怪过来、不跳波",
+                                            run.runId, run.index, run.attempt, victim->GetName(), tank->GetDistance(victim));
+                                    }
+                                    run.lastVictimAt = now;
+                                    run.lastVictim = ObjectGuid();
+                                    return true;
+                                }
+
                                 dungeonroute::Target t;
                                 uint16 const ord = (dungeonroute::FindTargetNearest(tank, *route, t) && t.ord)
                                     ? t.ord : dungeonroute::CurrentOrd(tank, *route);
                                 if (ord && tank->GetPlayerbotAI())
                                 {
-                                    dungeonroute::MarkSkipped(tank, ord, "no damage 15s");
+                                    Creature* vc = (victim->GetTypeId() == TYPEID_UNIT) ? (Creature*)victim : nullptr;
+                                    bool const evading = vc && vc->GetMotionMaster()
+                                        && vc->GetMotionMaster()->GetCurrentMovementGeneratorType() == HOME_MOTION_TYPE;
+                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 无伤害诊断: victim=%s entry=%u hp=%u inCombat=%d evade=%d dist=%.1f",
+                                        run.runId, run.index, run.attempt, victim->GetName(), victim->GetEntry(),
+                                        (uint32)victim->GetHealth(), victim->IsInCombat() ? 1 : 0,
+                                        evading ? 1 : 0, tank->GetDistance(victim));
+                                    dungeonroute::MarkSkipped(tank, ord, "no damage 15s no combat");
                                     run.combatSkipDone = true;
                                     ForceDisengage(run);
-                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 目标 %s 15s 无伤害 ⇒ 跳过波 ord=%u，强制脱战继续下一波",
+                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 目标 %s 15s 无伤害且已无战斗 ⇒ 跳过波 ord=%u",
                                         run.runId, run.index, run.attempt, victim->GetName(), (uint32)ord);
                                 }
                                 run.lastVictimAt = now;
@@ -1311,55 +1690,42 @@ namespace simscenario
                         }
                         else
                         {
-                            // [2026-10-18] "在战斗但坦克没有目标"：怪已 aggro 却打不到/在 evade
-                            //   （例如水里/另一层的 Bogstrok）⇒ 15 秒就跳过这波。
-                            //   但先给坦克 5 秒"自救"：主动 attack anything 重新锁定（很多是目标丢了没重选）。
+                            // [2026-10-21 站长口径] 队伍一部分在战斗时，其余人要去帮，**不要自己开下一波**；
+                            //   坦克没目标时：① 优先打队友正在打的目标；② 否则 attack anything 重新锁定。
+                            //   这里不再用"15s 无目标"跳波（跳波只保留"追不到 / 近战仍无伤害"两种真卡死）。
                             if (!run.noVictimSince)
                                 run.noVictimSince = now;
-                            else if (now - run.noVictimSince >= 5000 && now - run.noVictimSince < 15000
-                                     && tank->GetPlayerbotAI())
+
+                            if (!run.combatAssistAt || now - run.combatAssistAt > 2000)
                             {
-                                tank->GetPlayerbotAI()->DoSpecificAction("attack anything", Event(), true);
-                            }
-                            else if (now - run.noVictimSince >= 15000 && !run.combatSkipDone && tank->GetPlayerbotAI())
-                            {
-                                // [2026-10-19 543 实测] 先看是不是“引到了路线外/跳过批次的怪”：
-                                //   这类怪不在 route->guidOrd 里 ⇒ 目标过滤会把它剔掉 ⇒ 表现为"战斗中无目标"。
-                                //   修法：只要坦克身上还有活着的攻击者，先强迫 attack anything 清掉，不跳波。
-                                bool hasLiveAttacker = false;
-                                for (Unit* attacker : tank->getAttackers())
+                                run.combatAssistAt = now;
+
+                                Unit* assist = nullptr;
+                                for (uint32 g : run.guids)
                                 {
-                                    if (attacker && attacker->IsAlive())
+                                    Player* p = FindPlayerInWorld(g);
+                                    if (!p || p == tank || !p->GetVictim())
+                                        continue;
+                                    Unit* v = p->GetVictim();
+                                    if (v && v->IsAlive() && v->GetMapId() == run.mapId)
                                     {
-                                        hasLiveAttacker = true;
+                                        assist = v;
                                         break;
                                     }
                                 }
-                                if (hasLiveAttacker)
+
+                                if (assist)
+                                {
+                                    tank->Attack(assist, true);
+                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 坦克无目标 ⇒ 去帮队友打 %s(entry=%u)",
+                                        run.runId, run.index, run.attempt, assist->GetName(), assist->GetEntry());
+                                }
+                                else if (tank->GetPlayerbotAI())
                                 {
                                     tank->GetPlayerbotAI()->DoSpecificAction("attack anything", Event(), true);
-                                    run.noVictimSince = now;
-                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 坦克战斗中无目标、但有攻击者 ⇒ 先清引到的怪，不跳波",
-                                        run.runId, run.index, run.attempt);
-                                    run.lastVictim = ObjectGuid();
-                                    run.lastVictimAt = 0;
-                                }
-                                else
-                                {
-                                    dungeonroute::Target t;
-                                    uint16 const ord = (dungeonroute::FindTargetNearest(tank, *route, t) && t.ord)
-                                        ? t.ord : dungeonroute::CurrentOrd(tank, *route);
-                                    if (ord)
-                                    {
-                                        dungeonroute::MarkSkipped(tank, ord, "no victim 15s");
-                                        run.combatSkipDone = true;
-                                        ForceDisengage(run);
-                                        sLog.outString("[SIM] run=%u g=%u attempt=%u 坦克战斗中 15s 无目标 ⇒ 跳过波 ord=%u，强制脱战继续下一波",
-                                            run.runId, run.index, run.attempt, (uint32)ord);
-                                    }
-                                    run.noVictimSince = now;
                                 }
                             }
+
                             run.lastVictim = ObjectGuid();
                             run.lastVictimAt = 0;
                         }
@@ -1367,38 +1733,26 @@ namespace simscenario
                     else if (!inCombat)
                     {
                         run.combatSkipDone = false;
+                        run.combatCloseInSince = 0;
+                        run.chaseBestAt = 0;
+                        run.chaseBestDist = 1e9f;
+                        run.chaseLogAt = 0;
+                        run.meleeSince = 0;
+                        run.combatAssistAt = 0;
                         run.noVictimSince = 0;
                         run.lastVictim = ObjectGuid();
                         run.lastVictimAt = 0;
                     }
 
-                    // ① 通关：所有波都"已清/被跳过" + boss 要么死了要么确认见过
+                    // ① 通关：只认**所有 boss 确认死亡**，不要求所有波清完
                     bool clearedAll = false;
-                    if (route && st && tank && !route->waves.empty())
+                    if (route && st && tank && !route->bosses.empty())
                     {
-                        bool allWavesDone = true;
-                        for (auto const& kv : route->waves)
-                        {
-                            if (!st->cleared.count(kv.first) && !st->skip.count(kv.first))
-                            {
-                                allWavesDone = false;
-                                break;
-                            }
-                        }
-
-                        uint32 bossesAlive = 0;
-                        uint32 bossesResolved = 0;
+                        uint32 bossesCleared = 0;
                         for (auto const& b : route->bosses)
-                        {
-                            if (dungeonroute::MemberCreature(tank->GetMap(),
-                                dungeonroute::Member{ b.guid, b.entry }))
-                                ++bossesAlive;
-                            else if (st->bossCleared.count(b.guid) || st->bossSeen.count(b.guid))
-                                ++bossesResolved;
-                        }
-
-                        clearedAll = allWavesDone && bossesAlive == 0
-                                  && bossesResolved >= (uint32)route->bosses.size();
+                            if (st->bossCleared.count(b.guid))
+                                ++bossesCleared;
+                        clearedAll = (bossesCleared == (uint32)route->bosses.size());
                     }
                     if (clearedAll)
                     {
@@ -1447,7 +1801,18 @@ namespace simscenario
                     else
                         run.wipeSince = 0;
 
-                    // ③ 卡死 / attempt 超时
+                    // ③ 超时：本轮进本后跑满 maxRunMs（默认 25 分钟，可用 maxtime=<秒> 覆盖）就收尾。
+                    //    policy=continue 是"死即复活"，没有这一步的话「灭团→复活→再灭」会无限循环，
+                    //    整轮测试永远停不下来（2026-10-21 站长口径：必须有一个时间限制）。
+                    if (run.attemptStartedAt && now - run.attemptStartedAt > run.maxRunMs)
+                    {
+                        RecordAttempt(run, "timeout");
+                        CloseRun(run, true, "超时（跑满 " + std::to_string(run.maxRunMs / 1000) + " 秒，best="
+                            + std::to_string(run.bestCleared) + "/" + std::to_string(run.routeWaves) + "）");
+                        return false;
+                    }
+
+                    // ④ 卡死 / attempt 超时
                     bool const stuck = (now - run.lastProgressAt > run.stuckMs)
                         || (run.attemptStartedAt && now - run.attemptStartedAt > ATTEMPT_TIMEOUT_MS);
                     if (stuck)
@@ -1594,6 +1959,9 @@ namespace simscenario
                     run.nextLoginTryAt.assign(party.size(), 0);
                     run.leaderTeleported = false;
                     run.membersTeleported = false;
+                    run.memberIdx = 1;
+                    run.memberTryAt = 0;
+                    run.leaderTryAt = 0;
                     run.nextRepairAt = 0;
                     run.instanceId = 0;
                     run.lastCleared = 0;
@@ -1700,7 +2068,13 @@ namespace simscenario
                     + (r.error.empty() ? "" : (" error=" + r.error)));
 
             if (args.empty())
-                messages.push_back("用法: .bot sim start <mapId> [groups=1] [partySize=5] [policy=reset|continue] [attempts=3] [seed=N] | stop [runId|all] | status | prepare <n>");
+                messages.push_back("用法: .bot sim start <mapId> [groups=1] [partySize=5] [policy=reset|continue] [attempts=3] [seed=N] [stuck=<秒>] [maxtime=<秒>] [boss=0|1] | stop [runId|all] | status | prepare <n>");
+            return messages;
+        }
+
+        if (args[0] == "profile")
+        {
+            messages.push_back(BuildBotProfiles());
             return messages;
         }
 
@@ -1738,14 +2112,14 @@ namespace simscenario
         {
             uint32 count = args.size() > 1 ? uint32(atoi(args[1].c_str())) : 20;
             if (count < 1) count = 1;
-            if (count > 100) count = 100;
+            if (count > 1000) count = 1000;   // [站长 2026-10-20] 每批 1000 个空壳
             StartPrepare(count, messages);
             return messages;
         }
 
         if (args[0] != "start")
         {
-            messages.push_back("用法: .bot sim start <mapId> [groups=1] [partySize=5] [policy=reset|continue] [attempts=3] [seed=N] | stop [runId|all] | status | prepare <n>");
+            messages.push_back("用法: .bot sim start <mapId> [groups=1] [partySize=5] [policy=reset|continue] [attempts=3] [seed=N] [stuck=<秒>] [maxtime=<秒>] [boss=0|1] | stop [runId|all] | status | prepare <n>");
             return messages;
         }
 
@@ -1758,6 +2132,8 @@ namespace simscenario
         uint32 maxAttempts = 3;
         uint32 baseSeed = uint32(time(nullptr));
         uint32 stuckMs = STUCK_MS;        // 卡死阈值（测试时可 stuck=<秒> 覆盖）
+        uint32 maxRunMs = ATTEMPT_TIMEOUT_MS; // 单轮硬性时间上限（maxtime=<秒>，默认 45 分钟）
+        bool bossFirst = false;           // [2026-10-22] boss 优先模式（boss=1 打开）
         for (size_t i = 4; i < args.size(); ++i)
         {
             std::string const& a = args[i];
@@ -1772,14 +2148,20 @@ namespace simscenario
                 baseSeed = uint32(strtoul(a.substr(5).c_str(), nullptr, 10));
             else if (a.rfind("stuck=", 0) == 0)
                 stuckMs = uint32(atoi(a.substr(6).c_str())) * 1000;
+            else if (a.rfind("maxtime=", 0) == 0)
+                maxRunMs = uint32(atoi(a.substr(8).c_str())) * 1000;
+            else if (a.rfind("boss=", 0) == 0)
+                bossFirst = (atoi(a.substr(5).c_str()) != 0);
         }
+        // [2026-10-22] boss 优先默认关：只有显式 boss=1 才开（同一二进制做 A/B）
+        dungeonroute::BossFirstSwitch() = bossFirst;
         // attempts=0 ⇒ 一直跑（灭团/卡死就重置再开，直到手动 stop）
         if (maxAttempts > 20) maxAttempts = 20;
         if (!baseSeed) baseSeed = uint32(time(nullptr));
 
         if (!mapId)
         {
-            messages.push_back("用法: .bot sim start <mapId> [groups=1] [partySize=5] [policy=reset|continue] [attempts=3] [seed=N]");
+            messages.push_back("用法: .bot sim start <mapId> [groups=1] [partySize=5] [policy=reset|continue] [attempts=3] [seed=N] [stuck=<秒>] [maxtime=<秒>] [boss=0|1]");
             return messages;
         }
         if (groups < 1) groups = 1;
@@ -1841,6 +2223,7 @@ namespace simscenario
             run.attempt = 1;
             run.maxAttempts = maxAttempts;
             run.stuckMs = stuckMs;
+            run.maxRunMs = maxRunMs;
             run.policy = policy;
             run.ex = entrance.x;
             run.ey = entrance.y;

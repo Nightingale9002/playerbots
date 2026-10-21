@@ -15,7 +15,10 @@ static bool AutoSkipIfNoTarget(Player* bot, dungeonroute::MapRoute const& route,
         return false;
 
     uint16 const ord = dungeonroute::CurrentOrd(bot, route);
-    if (ord && dungeonroute::WaveStuckMs(bot) > dungeonroute::WAVE_NOT_LOADED_MS)
+    // [2026-10-22 站长口径] 有怪在打我们（含未登记进路线表的怪）就不许因为"没目标"跳过这一波
+    if (ord && dungeonroute::WaveStuckMs(bot) > dungeonroute::WAVE_NOT_LOADED_MS &&
+        !dungeonroute::WaveInFight(bot, route, ord) &&
+        !dungeonroute::UnknownFighterInCombat(bot, route))
         dungeonroute::MarkSkipped(bot, ord, "wave no valid target");
     return true;
 }

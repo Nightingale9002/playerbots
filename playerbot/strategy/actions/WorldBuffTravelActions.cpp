@@ -250,7 +250,8 @@ bool WorldBuffTravelApplyAction::TrySummonFarAwayMembers(WorldBuffTravelStep ste
     if (!group)
         return false;
 
-    static std::map<ObjectGuid, time_t> lastSummonAttempt;
+    // [2026-10-22 崩溃修] 同上：按 bot 的节流状态，改成 thread_local 避免多 map 线程并发写
+    thread_local std::map<ObjectGuid, time_t> lastSummonAttempt;
     time_t now = time(nullptr);
     ObjectGuid botGuid = bot->GetObjectGuid();
     auto it = lastSummonAttempt.find(botGuid);

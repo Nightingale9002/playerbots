@@ -5,6 +5,11 @@
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/values/ThreatValues.h"
 #include "playerbot/strategy/values/PossibleAttackTargetsValue.h"
+#include "playerbot/DecisionWeights.h"
+#include "playerbot/DungeonRoute.h"
+#include "Grids/GridNotifiers.h"
+#include "Grids/GridNotifiersImpl.h"
+#include "Grids/CellImpl.h"
 
 using namespace ai;
 
@@ -121,6 +126,11 @@ void WaitForAttackStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers
     triggers.push_back(new TriggerNode(
         "will overaggro",
         NextAction::array(0, new NextAction("wait for attack keep safe distance", 20.0f), NULL)));
+
+    // [threat-ot 2026-10-19] DPS 即将 OT：优先跑向坦克（比"保安全距离"高，但仍低于真正走位/治疗）
+    triggers.push_back(new TriggerNode(
+        "dps will overaggro",
+        NextAction::array(0, new NextAction("move toward tank", 25.0f), NULL)));
 }
 
 void WaitForAttackStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
@@ -330,4 +340,116 @@ void TankPickUpStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 void HealInterruptStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)
 {
     InitCombatTriggers(triggers);
+}
+
+// [2026-10-22 站长口径] ① AoE 破控守卫
+void AoeCcGuardStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new AoeCcGuardMultiplier(ai));
+}
+
+float AoeCcGuardMultiplier::GetValue(Action* action)
+{
+    if (!action)
+        return 1.0f;
+
+    std::string const name = action->getName();
+    if (name == "follow" || name == "flee" || name == "co" || name == "nc" || name == "select new target")
+        return 1.0f;
+
+    float const radius = dw::Get("aoe.cc_guard.radius");
+    if (radius <= 0.0f)
+        return 1.0f;
+
+    uint32 const spellId = AI_VALUE2(uint32, "spell id", name);
+    if (!spellId)
+        return 1.0f;
+
+    SpellEntry const* si = sServerFacade.LookupSpellInfo(spellId);
+    if (!si)
+        return 1.0f;
+
+    bool isArea = false;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (si->Effect[i] && si->EffectRadiusIndex[i] > 0)
+        {
+            isArea = true;
+            break;
+        }
+    }
+    if (!isArea)
+        return 1.0f;
+
+    std::list<Unit*> units;
+    MaNGOS::AnyUnitFulfillingConditionInRangeCheck check(bot,
+        [this](Unit* u) -> bool
+        {
+            if (!u || !u->IsAlive() || u->GetTypeId() != TYPEID_UNIT)
+                return false;
+            if (!bot->IsEnemy(u))
+                return false;
+            return PossibleAttackTargetsValue::HasBreakableCC(u, bot) ||
+                   PossibleAttackTargetsValue::HasUnBreakableCC(u, bot);
+        }, radius);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnitFulfillingConditionInRangeCheck> searcher(units, check);
+    Cell::VisitAllObjects(bot, searcher, radius);
+
+    return units.empty() ? 1.0f : dw::Get("aoe.cc_guard.penalty");
+}
+
+// [2026-10-22 站长口径] ② 目标重选惩罚（等坦克仇恨期间别每 tick 清目标重选）
+void ReselectPenaltyStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new ReselectPenaltyMultiplier(ai));
+}
+
+float ReselectPenaltyMultiplier::GetValue(Action* action)
+{
+    if (!action || action->getName() != "select new target")
+        return 1.0f;
+    if (!bot || PlayerbotAI::IsTank(bot))
+        return 1.0f;
+    if (!WaitForAttackStrategy::ShouldWait(ai))
+        return 1.0f;
+    return dw::Get("target.reselect.waiting_penalty");
+}
+
+// [2026-10-22 站长口径] ③ 路上遇到安全可拉的怪 ⇒ pull 权重上调（不加触发器）
+void PullEncounterBoostStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new PullEncounterBoostMultiplier(ai));
+}
+
+float PullEncounterBoostMultiplier::GetValue(Action* action)
+{
+    if (!action)
+        return 1.0f;
+
+    std::string const name = action->getName();
+    if (name != "dungeon route pull" && name != "pull my target")
+        return 1.0f;
+
+    if (!bot || !bot->IsInWorld() || !bot->GetMap())
+        return 1.0f;
+    if (!dungeonroute::BossFirstMode() || !dungeonroute::RouteEnabled())
+        return 1.0f;
+
+    dungeonroute::MapRoute const* route = dungeonroute::GetMapRoute(bot->GetMap()->GetId());
+    if (!route)
+        return 1.0f;
+
+    dungeonroute::Target t;
+    if (!dungeonroute::FindTargetNearest(bot, *route, t, true) || !t.hasPullPoint || !t.guid)
+        return 1.0f;
+
+    Creature* c = bot->GetMap()->GetCreature(t.guid);
+    if (!c || !c->IsAlive())
+        return 1.0f;
+    if (bot->GetDistance(c) > dw::Get("pull.encounter.range"))
+        return 1.0f;
+    if (!dungeonroute::BossModePullSafe(bot, bot->GetMap(), *route, c))
+        return 1.0f;
+
+    return dw::Get("pull.encounter_boost");
 }

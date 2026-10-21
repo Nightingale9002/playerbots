@@ -93,8 +93,11 @@ bool TargetReachableValue::Calculate()
     if (bot->GetDistance(target) > 60.0f)
         return true;
 
-    PathFinder pathFinder(bot);
-    pathFinder.calculate(target->GetPositionX(), target->GetPositionY(), target->GetPositionZ());
+    // [2026-10-20 站长口径] 和**服务端怪物追击**对齐：用目标自己的 PathFinder 反查
+    //   "它能不能追到我"，而不是玩家的寻路过滤（玩家分支排除 steep 等，会把水里、
+    //   斜坡、平台上的目标误判成 PATHFIND_NOPATH → 放弃攻击 → 整波 skip）。
+    PathFinder pathFinder(target);
+    pathFinder.calculate(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
 
     // 只把"完全没有路"当作不可达。PATHFIND_INCOMPLETE 是"能更近一步"，仍算可达。
     return !(pathFinder.getPathType() & PATHFIND_NOPATH);

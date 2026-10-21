@@ -76,7 +76,10 @@ namespace ai
     {
     public:
         EnchantRandomItemAction(PlayerbotAI* ai) : CastRandomSpellAction(ai, "enchant random item") {}
-        virtual bool isUseful() override { return ai->HasSkill(SKILL_ENCHANTING); }
+        // [2026-10-22 崩溃修] 仿真里不做附魔/换装（静态 bot 也不该改装备）：
+        //   该动作会调 `RandomItemMgr::CalculateEnchantWeight`，实测在 map 线程里 SIGSEGV（符号落在随机附魔权重内部）。
+        //   仿真只需要打副本，附魔对推进毫无帮助，直接关掉。
+        virtual bool isUseful() override { return !sPlayerbotAIConfig.simMode && ai->HasSkill(SKILL_ENCHANTING); }
 
         virtual bool AcceptSpell(const SpellEntry* pSpellInfo) override
         {

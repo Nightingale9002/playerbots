@@ -50,6 +50,13 @@ namespace ai
         std::string GetTargetName() override { return "least hp target"; }
     };
 
+    class AttackNearestAddAction : public AttackAction
+    {
+    public:
+        AttackNearestAddAction(PlayerbotAI* ai) : AttackAction(ai, "attack nearest add") {}
+        std::string GetTargetName() override { return "nearest adds"; }
+    };
+
     class AttackEnemyPlayerAction : public AttackAction
     {
     public:

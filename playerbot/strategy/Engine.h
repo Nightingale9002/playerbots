@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <mutex>
 
 #include "Action.h"
 #include "Queue.h"
@@ -125,6 +126,9 @@ namespace ai
         std::list<Multiplier*> multipliers;
         AiObjectContext* aiObjectContext;
         std::map<std::string, Strategy*> strategies;
+        // [2026-10-22 崩溃修] ResetStrategies()（World 线程）与 map 线程的触发器检查并发访问 strategies 表，
+        //   实测 `Engine::ContainsStrategy` 迭代到被 clear 的节点直接 SIGSEGV。递归锁保护读写。
+        mutable std::recursive_mutex strategiesMutex;
         float lastRelevance;
         std::string lastAction;
         ActionExecutionListeners actionExecutionListeners;

@@ -158,6 +158,10 @@ public:
     uint32 randomGearMaxLevel;
     uint32 randomGearMaxDiff;
     bool randomGearUpgradeEnabled;
+    // [2026-10-21] 静态 bot 名单：关闭“定时重随机/重随机升级”，bot 的等级/天赋/装备/职责保持不变。
+    bool staticBots;
+    // [2026-10-22 站长口径] 进本换装时直接换"最好的装备"并忽略装等/阶段限制（默认 0）
+    bool equipBestGear;
     bool randomGearTabards;
     bool randomGearTabardsReplaceGuild;
     bool randomGearTabardsUnobtainable;

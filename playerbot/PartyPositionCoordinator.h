@@ -736,6 +736,47 @@ namespace partypos
     }
 
 
+
+    // [LOS 2026-10-19 站长口径] 远程/治疗/中距离的槽位必须能“看见”BOSS，否则会站成卡视角、放不出技能。
+    inline bool SlotHasLosTo(Unit* boss, Map* map, float x, float y, float z)
+    {
+        if (!map || !boss)
+            return true;
+        float const eye = 1.5f;
+        return map->IsInLineOfSight(x, y, z + eye,
+            boss->GetPositionX(), boss->GetPositionY(), boss->GetPositionZ() + eye, false);
+    }
+
+    // 槽位被墙/柱子挡住时，围绕原点找 3/5/8 码内“有视线 + 地面合法 + 无 hazard”的点。
+    inline bool AdjustForLos(Player* member, Map* map, Unit* boss, float& x, float& y, float& z)
+    {
+        if (SlotHasLosTo(boss, map, x, y, z))
+            return true;
+
+        static float const radius[] = { 3.0f, 5.0f, 8.0f };
+        for (float r : radius)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                float const a = float(i) * 3.14159265f / 4.0f;
+                float const nx = x + r * cosf(a);
+                float const ny = y + r * sinf(a);
+                float ground = z;
+                if (!TerrainOK(map, z, nx, ny, ground))
+                    continue;
+                if (!SafeFromHazards(member, nx, ny))
+                    continue;
+                if (!SlotHasLosTo(boss, map, nx, ny, ground))
+                    continue;
+                x = nx;
+                y = ny;
+                z = ground;
+                return true;
+            }
+        }
+        return false;
+    }
+
     inline bool SlotFor(Player* bot, Slot& out)
     {
         if (!bot)
@@ -1105,6 +1146,17 @@ namespace partypos
             if (!PathLooksWalkable(map, member->GetPositionX(), member->GetPositionY(),
                                    member->GetPositionZ(), x, y, z))
                 continue;
+
+            // [LOS 2026-10-19] 远程/治疗/中距离：槽位必须能看见 BOSS（LOS 专属模式除外）
+            if (!losMode && (role == ROLE_RANGED || role == ROLE_HEALER || role == ROLE_MID))
+            {
+                if (!AdjustForLos(member, map, danger, x, y, z))
+                {
+                    sLog.outDebug("[POSITION] %s 的 %u 号槽位无视线，跳过（避免卡视角）",
+                        member->GetName(), uint32(role));
+                    continue;
+                }
+            }
 
             slot.x = x;
             slot.y = y;

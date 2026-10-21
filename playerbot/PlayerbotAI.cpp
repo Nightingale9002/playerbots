@@ -19,6 +19,7 @@
 #include "LootObjectStack.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/BossStrategyHook.h"   // [BOSS 战策略 2026-10-16] 按 BOSS 自动挂载自定义策略
+#include "playerbot/BossArena.h"          // [2026-10-21] BOSS 场地 hold/bounds（数据化）
 #include "PlayerbotAI.h"
 #include "playerbot/PlayerbotFactory.h"
 #include "PlayerbotSecurity.h"
@@ -280,6 +281,31 @@ PlayerbotAI::~PlayerbotAI()
 
 void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 {
+    // [crash-fix 2026-10-19] 传送/移除世界期间 Player::UpdateAI 仍可能被调用，
+    //   此时 m_currMap 已被 ResetMap 置空，任何 bot->GetMap() 都会触发
+    //   "m_currMap" 断言并 abort（仿真 3 开 40 分钟必现）。先按 m_inWorld 挡掉。
+    if (!bot || !bot->IsInWorld())
+        return;
+
+    // [2026-10-22 站长口径] 进本换装：**进入副本/团本那一刻**换一次装备（不挂策略/触发器）。
+    //   开了 AiPlayerbot.EquipBestGear ⇒ UpdateGearAction 会直接换最好装备并忽略装等限制；
+    //   每个 (地图, 实例) 只做一次；离开副本后重置，下次进本再来。
+    if (sPlayerbotAIConfig.equipBestGear && bot->GetLevel() >= DEFAULT_MAX_LEVEL && bot->FindMap())
+    {
+        Map* gearMap = bot->FindMap();
+        if (gearMap->IsDungeon() || gearMap->IsRaid())
+        {
+            uint64 const gearKey = (uint64(gearMap->GetId()) << 32) | uint64(gearMap->GetInstanceId() + 1);
+            if (lastGearEntryKey != gearKey)
+            {
+                lastGearEntryKey = gearKey;
+                DoSpecificAction("update gear", Event(), true);
+            }
+        }
+        else
+            lastGearEntryKey = 0;
+    }
+
     // [BOT-ML 2026-10-17] 站长口径"加启动自动开跑"：没有玩家/GM 也能起场景。
     //   设 env BOT_SCENARIO=combat_single_target（或 combat_five_targets）⇒ 第一个跑起来的 bot
     //   自动 TestRegistry::StartTest()，脚本自己 spawn 队伍、pull 假人、engage 并 observe 6 分钟。
@@ -324,8 +350,11 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     //   这里只算增量，所以同一 bot 每次得到的是"这 5 秒的输出/治疗"。
     if (std::getenv("BOT_METRICS"))
     {
-        static std::map<ObjectGuid, std::pair<uint64, uint64>> lastFlush;
-        static std::map<ObjectGuid, std::pair<uint32, uint32>> lastFlushKd;
+        thread_local std::map<ObjectGuid, std::pair<uint64, uint64>> lastFlush;
+        thread_local std::map<ObjectGuid, std::pair<uint32, uint32>> lastFlushKd;
+        thread_local std::map<ObjectGuid, uint64> lastFlushTaken;
+        thread_local std::map<ObjectGuid, uint32> lastFlushCc;
+        thread_local std::map<ObjectGuid, uint32> lastFlushUnengaged;
         static uint32 lastFlushMs = 0;
         uint32 nowMs = sWorld.GetCurrentMSTime();
         if (lastFlushMs == 0)
@@ -342,6 +371,27 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
                 sPlayerbotAIConfig.logEvent(this, "bm_heal", std::to_string(heal - prev.second));
             prev = std::make_pair(dmg, heal);
 
+            // [rewards 2026-10-19] 非坦克承伤（5 秒增量）：离线把“自己 + 坦克”一起扣分
+            uint64 const taken = bot->botDamageTaken;
+            uint64& prevTaken = lastFlushTaken[bot->GetObjectGuid()];
+            if (taken > prevTaken)
+                sPlayerbotAIConfig.logEvent(this, "bm_dmg_taken", std::to_string(taken - prevTaken));
+            prevTaken = taken;
+
+            // [rewards 2026-10-19] 打醒控制次数（DPS 扣分项）
+            uint32 const brokeCc = bot->botBrokeCc;
+            uint32& prevCc = lastFlushCc[bot->GetObjectGuid()];
+            if (brokeCc > prevCc)
+                sPlayerbotAIConfig.logEvent(this, "bm_broke_cc", std::to_string(brokeCc - prevCc));
+            prevCc = brokeCc;
+
+            // [rewards 2026-10-19] 打了还没进战斗的怪（乱开怪 / ADD）
+            uint32 const unengaged = bot->botUnengagedHits;
+            uint32& prevUnengaged = lastFlushUnengaged[bot->GetObjectGuid()];
+            if (unengaged > prevUnengaged)
+                sPlayerbotAIConfig.logEvent(this, "bm_unengaged_hit", std::to_string(unengaged - prevUnengaged));
+            prevUnengaged = unengaged;
+
             // [rewards 2026-10-19] 击杀 / 死亡增量：奖励函数的"推进进度"与"自己死了"两项原始数据。
             //   灭团不单独记，离线用"同一副本内 30 秒内 >=3 次 bm_deaths"判定（见 kpi_score.ps1）。
             uint32 const kills = bot->botKills;
@@ -352,6 +402,109 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
             if (deaths > prevKd.second)
                 sPlayerbotAIConfig.logEvent(this, "bm_deaths", std::to_string(deaths - prevKd.second));
             prevKd = std::make_pair(kills, deaths);
+        }
+    }
+
+    // [rewards 2026-10-19 站长口径] 坦克开怪奖励：
+    //   + 开怪本身（一次 pull 加一次分）
+    //   - 拉到同一连锁组（spawn_group_linked_group）以外的怪
+    //   - 战斗过程中引到新 group 的 ADD
+    // 只统计 tank；非坦克由 bm_unengaged_hit 处理。
+    Map* botMap = bot->IsInWorld() ? bot->GetMap() : nullptr;
+    if (std::getenv("BOT_METRICS") && botMap && botMap->IsDungeon() && PlayerbotAI::IsTank(bot))
+    {
+        struct TankPullState
+        {
+            bool inCombat = false;
+            uint32 rootGroup = 0;
+            std::set<uint32> allowed;
+            std::set<uint32> seen;
+            uint32 lastCheck = 0;
+        };
+        thread_local std::map<ObjectGuid, TankPullState> tankPullStates;
+
+        Map* map = botMap;
+        uint32 const nowMs = sWorld.GetCurrentMSTime();
+        TankPullState& state = tankPullStates[bot->GetObjectGuid()];
+        if (nowMs - state.lastCheck >= 500)
+        {
+            state.lastCheck = nowMs;
+
+        std::set<uint32> groups;
+        auto addUnitGroup = [&](Unit* unit)
+        {
+            if (!unit || !unit->IsInWorld() || !unit->IsAlive() || unit->GetTypeId() != TYPEID_UNIT)
+                return;
+            uint32 const gid = map->GetSpawnManager().GetGroupIdForObject(unit->GetObjectGuid());
+            if (gid)
+                groups.insert(gid);
+        };
+
+        for (Unit* attacker : bot->getAttackers())
+            addUnitGroup(attacker);
+        for (auto& ref : bot->getHostileRefManager())
+        {
+            Unit* hater = ref.getSource() ? ref.getSource()->getOwner() : nullptr;
+            addUnitGroup(hater);
+        }
+        if (Group* group = bot->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->getSource();
+                if (!member || !member->IsInWorld())
+                    continue;
+                for (Unit* attacker : member->getAttackers())
+                    addUnitGroup(attacker);
+            }
+        }
+
+        if (groups.empty())
+        {
+            state.inCombat = false;
+            state.rootGroup = 0;
+            state.allowed.clear();
+            state.seen.clear();
+        }
+        else if (!state.inCombat)
+        {
+            state.inCombat = true;
+            state.rootGroup = *groups.begin();
+            state.allowed.clear();
+            state.allowed.insert(state.rootGroup);
+            std::vector<uint32> stack;
+            stack.push_back(state.rootGroup);
+            while (!stack.empty())
+            {
+                uint32 const gid = stack.back();
+                stack.pop_back();
+                SpawnGroup* sg = map->GetSpawnManager().GetSpawnGroup(gid);
+                if (!sg)
+                    continue;
+                for (uint32 linked : sg->GetGroupEntry().LinkedGroups)
+                {
+                    if (state.allowed.insert(linked).second)
+                        stack.push_back(linked);
+                }
+            }
+
+            state.seen = groups;
+            sPlayerbotAIConfig.logEvent(this, "bm_pull_open",
+                std::to_string(state.rootGroup) + ":" + std::to_string(groups.size()));
+            for (uint32 gid : groups)
+            {
+                if (!state.allowed.count(gid))
+                    sPlayerbotAIConfig.logEvent(this, "bm_pull_extra", std::to_string(gid));
+            }
+        }
+        else
+        {
+            for (uint32 gid : groups)
+            {
+                if (state.seen.insert(gid).second && !state.allowed.count(gid))
+                    sPlayerbotAIConfig.logEvent(this, "bm_add", std::to_string(gid));
+            }
+        }
         }
     }
 
@@ -965,7 +1118,7 @@ bool PlayerbotAI::IsInPvp()
 bool PlayerbotAI::IsInRaid()
 {
     bool inRaidFight = false;
-    if (IsSafe(bot))
+    if (IsSafe(bot) && bot->IsInWorld())
     {
         const Map* map = bot->GetMap();
         if (map && (map->IsDungeon() || map->IsRaid()))
@@ -2836,6 +2989,7 @@ void PlayerbotAI::DoNextAction(bool min)
 
     // [BOSS 战策略 2026-10-16] 按队伍正在打的 BOSS 自动挂载 / 卸载 custom::boss_*（见 BossStrategyHook.h）
     bossstrategy::Update(this);
+    bossarena::Tick(this);            // [2026-10-21] 场地 hold/bounds（ai_playerbot_boss_arena）
 }
 
 void PlayerbotAI::ReInitCurrentEngine()

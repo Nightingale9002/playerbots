@@ -19,6 +19,19 @@ bool UpdateGearAction::Execute(Event& event)
 {
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
 
+    // [2026-10-22 站长口径] 开启"最好装备"配置 ⇒ 忽略装等/副本阶段限制：
+    //   不走 gearProgressionSystemItems[phase] 那张表，直接按专精权重整套生成最好装备（再补宝石）。
+    //   这个函数就是原来的"进本按副本阶段换装"入口。
+    if (sPlayerbotAIConfig.equipBestGear && bot && bot->GetLevel() >= DEFAULT_MAX_LEVEL)
+    {
+        PlayerbotFactory factory(bot, bot->GetLevel());
+        factory.EquipGearBest();
+        uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
+        bot->SaveToDB();
+        sLog.outString("[GEAR] %s 进本换装 → 最佳装备（忽略装等限制，补宝石 %u）", bot->GetName(), filledGems);
+        return true;
+    }
+
     // Get bot class and spec
     const uint8 cls = bot->getClass();
     uint8 spec = AiFactory::GetPlayerSpecTab(bot);
@@ -166,6 +179,14 @@ bool UpdateGearAction::Execute(Event& event)
 
 bool UpdateGearAction::isUseful()
 {
+    // [2026-10-22 站长口径] 最好装备模式：在副本/团本里就允许换（不看阶段配置，也不看装等上限）
+    if (sPlayerbotAIConfig.equipBestGear && bot->GetLevel() >= DEFAULT_MAX_LEVEL)
+    {
+        Map* map = bot->FindMap();
+        if (map && (map->IsDungeon() || map->IsRaid()))
+            return true;
+    }
+
     if (sPlayerbotAIConfig.gearProgressionSystemEnabled)
     {
         // [进本换装 2026-10-15] 只要身处"配置了阶段的副本"里，就允许换装（不必等真人组队）。

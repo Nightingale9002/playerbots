@@ -49,6 +49,13 @@ namespace ai
 
     bool LeaveFarAwayAction::isUseful()
     {
+        // [2026-10-21 仿真] 仿真队伍是"纯 bot 组队"，没有真人 master；isUseful 里
+        //   `GrouperType==SOLO` / 死亡数 / 15 分钟无经验荣誉 等条件会触发
+        //   "leave far away" 自行退队 → sim 看到组长没队伍，记 `队伍被解散`。
+        //   仿真期间禁止这条自行退队逻辑。
+        if (sPlayerbotAIConfig.simMode)
+            return false;
+
         if (bot->InBattleGround())
             return false;
 

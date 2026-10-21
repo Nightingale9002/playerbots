@@ -102,6 +102,7 @@ namespace ai
             creators["has aggro"] = [](PlayerbotAI* ai) { return new HasAggroTrigger(ai); };
             // [threat margin 2026-10-19] 预测仇恨闸门（判据在值 will overaggro 里）
             creators["will overaggro"] = [](PlayerbotAI* ai) { return new WillOveraggroTrigger(ai); };
+            creators["dps will overaggro"] = [](PlayerbotAI* ai) { return new DpsWillOveraggroTrigger(ai); };
             // [pull-gate 2026-10-19] 附近敌对太多 ⇒ 不主动开怪
             creators["too many hostiles"] = [](PlayerbotAI* ai) { return new TooManyHostilesTrigger(ai); };
             // [defend-self 2026-10-19] 被近战贴脸且血量低 ⇒ 走位

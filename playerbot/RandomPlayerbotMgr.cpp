@@ -2309,11 +2309,22 @@ void RandomPlayerbotMgr::CheckPlayers()
 
 void RandomPlayerbotMgr::ScheduleRandomize(uint32 bot, uint32 time)
 {
+    // [2026-10-21] 静态 bot：不再安排定时重随机
+    if (sPlayerbotAIConfig.staticBots)
+        return;
     SetEventValue(bot, "randomize", 1, time);
 }
 
 void RandomPlayerbotMgr::ScheduleTeleport(uint32 bot, uint32 time)
 {
+    // [2026-10-21 仿真] 副本里的仿真队员不再安排"teleport"事件（离本检测里抓到的元凶）
+    if (sPlayerbotAIConfig.simMode)
+    {
+        Player* p = sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, bot));
+        if (p && p->FindMap() && p->FindMap()->IsDungeon() && p->GetGroup())
+            return;
+    }
+
     if (!time)
         time = 60 + urand(sPlayerbotAIConfig.randomBotTeleportMinInterval, sPlayerbotAIConfig.randomBotTeleportMaxInterval);
     SetEventValue(bot, "teleport", 1, time);
@@ -2744,6 +2755,10 @@ void RandomPlayerbotMgr::Revive(Player* player)
 
 void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth, bool activeOnly)
 {
+    // [2026-10-21 仿真] 仿真队员在副本里推进时禁止被随机传送拽出本（归队逻辑会跑丢人）
+    if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+        return;
+
     if (bot->IsBeingTeleported())
         return;
 
@@ -3307,6 +3322,10 @@ void RandomPlayerbotMgr::PrintTeleportCache()
 
 void RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot, bool activeOnly)
 {
+    // [2026-10-21 仿真] 副本里的仿真队员不按等级随机传送
+    if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+        return;
+
     if (bot->InBattleGround())
         return;
 
@@ -3518,6 +3537,10 @@ void RandomPlayerbotMgr::DisbandBotOnlyGroups()
 
 void RandomPlayerbotMgr::RandomTeleport(Player* bot)
 {
+    // [2026-10-21 仿真] 副本里的仿真队员不随机传送
+    if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+        return;
+
     if (bot->InBattleGround())
         return;
 
@@ -3580,6 +3603,10 @@ void RandomPlayerbotMgr::InstaRandomize(Player* bot)
 
 void RandomPlayerbotMgr::Randomize(Player* bot)
 {
+    // [2026-10-21] 静态 bot 名单：不重随机、不换装升级，等级/天赋/职责永远保持首次生成的样子。
+    if (sPlayerbotAIConfig.staticBots)
+        return;
+
     if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() || bot->GetSession()->isLogingOut())
         return;
 
@@ -3642,6 +3669,19 @@ void RandomPlayerbotMgr::UpdateGearSpells(Player* bot)
 
 void RandomPlayerbotMgr::RandomizeFirst(Player* bot)
 {
+    // [2026-10-21] 静态 bot 名单：不做首次重随机（等级/天赋/装备以库中数据为准）。
+    if (sPlayerbotAIConfig.staticBots)
+    {
+        return;
+    }
+
+    // [2026-10-21 仿真退役] 仿真期间不重随机：
+    //   RandomizeFirst 末尾有 `if (bot->GetGroup() && !hasPlayer) bot->RemoveFromGroup();`
+    //   ⇒ 正在打本的纯 bot 队伍会在 randomize 事件到点时被拆散（日志表现为 `队伍被解散`）。
+    //   同时重随机还会改专精/装备，破坏仿真中的固定职责。
+    if (sPlayerbotAIConfig.simMode && bot->GetGroup() && bot->FindMap() && bot->FindMap()->IsDungeon())
+        return;
+
     uint32 maxLevel = sPlayerbotAIConfig.randomBotMaxLevel;
     if (maxLevel > sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
         maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
@@ -5102,6 +5142,10 @@ void RandomPlayerbotMgr::ChangeStrategy(Player* player)
 
 void RandomPlayerbotMgr::RandomTeleportForRpg(Player* bot, bool activeOnly)
 {
+    // [2026-10-21 仿真] 副本里的仿真队员不因 RPG 行为被传走
+    if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+        return;
+
     uint32 race = bot->getRace();
     uint32 level = bot->GetLevel();
     sLog.outDetail("Random teleporting bot %s for RPG (%zu locations available)", bot->GetName(), rpgLocsCacheLevel[race][level].size());

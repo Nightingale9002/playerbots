@@ -102,7 +102,8 @@ void Engine::Reset()
 }
 
 void Engine::Init()
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     Reset();
 
     for (std::map<std::string, Strategy*>::iterator i = strategies.begin(); i != strategies.end(); i++)
@@ -406,7 +407,8 @@ void Engine::PruneUnhandledExternalEvents()
 }
 
 ActionNode* Engine::CreateActionNode(const std::string& name)
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     ActionNode* actionNode = nullptr;
     for (std::map<std::string, Strategy*>::iterator i = strategies.begin(); i != strategies.end(); i++)
     {
@@ -555,7 +557,8 @@ bool Engine::CanExecuteAction(const std::string& name, bool isUseful, bool isPos
 }
 
 void Engine::addStrategy(const std::string& name)
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     removeStrategy(name, initMode);
 
     Strategy* strategy = aiObjectContext->GetStrategy(name);
@@ -598,7 +601,8 @@ void Engine::addStrategies(std::string first, ...)
 }
 
 bool Engine::removeStrategy(const std::string& name, bool init)
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     std::map<std::string, Strategy*>::iterator i = strategies.find(name);
     if (i == strategies.end())
         return false;
@@ -616,7 +620,8 @@ bool Engine::removeStrategy(const std::string& name, bool init)
 }
 
 void Engine::removeAllStrategies()
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     strategies.clear();
     Init();
 }
@@ -628,12 +633,14 @@ void Engine::toggleStrategy(const std::string& name)
 }
 
 bool Engine::HasStrategy(const std::string& name)
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     return strategies.find(name) != strategies.end();
 }
 
 Strategy* Engine::GetStrategy(const std::string& name) const
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     auto i = strategies.find(name);
     if (i != strategies.end())
     {
@@ -702,7 +709,8 @@ void Engine::ProcessTriggers(bool minimal)
 }
 
 void Engine::PushDefaultActions()
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     for (std::map<std::string, Strategy*>::iterator i = strategies.begin(); i != strategies.end(); i++)
     {
         Strategy* strategy = i->second;
@@ -712,6 +720,7 @@ void Engine::PushDefaultActions()
 
 std::string Engine::ListStrategies()
 {   
+    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
     std::string s;
     if (strategies.empty())
         return s;
@@ -725,7 +734,8 @@ std::string Engine::ListStrategies()
 }
 
 std::list<std::string_view> Engine::GetStrategies()
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
     std::list<std::string_view> result;
     for (const auto& strategy : strategies)
     {
@@ -744,7 +754,8 @@ void Engine::PushAgain(ActionNode* actionNode, float relevance, const Event& eve
 }
 
 bool Engine::ContainsStrategy(StrategyType type)
-{
+{    std::lock_guard<std::recursive_mutex> strategiesLock(strategiesMutex);
+
 	for (std::map<std::string, Strategy*>::iterator i = strategies.begin(); i != strategies.end(); i++)
 	{
 		Strategy* strategy = i->second;
@@ -793,7 +804,8 @@ bool Engine::ListenAndExecute(Action* action, Event& event)
     //   刻意只记"换动作"的时刻，避免每 tick 写一行把 CSV 撑爆。
     if (actionExecuted && std::getenv("BOT_METRICS"))
     {
-        static std::map<ObjectGuid, std::string> lastRuleAction;
+        // [2026-10-22 崩溃修] 所有 map 线程共享 → 并发 insert 写坏红黑树；这里只是"本线程上一次动作"的增量状态
+        thread_local std::map<ObjectGuid, std::string> lastRuleAction;
         Player* hitBot = ai->GetBot();
         if (hitBot)
         {

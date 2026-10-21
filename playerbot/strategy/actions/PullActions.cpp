@@ -39,20 +39,39 @@ bool PullRequestAction::Execute(Event& event)
         return false;
     }
 
-    // [pull 2026-10-18 站长口径] 目标不在同一层 / 走不到 ⇒ 不接这个拉怪请求（否则坦克会一路直线冲过去）。
-    if (!PossibleAttackTargetsValue::CanReachTarget(target, bot))
+    // [2026-10-20 站长口径] 拉怪策略自己找"能拉到的位置"：LOS/距离检查不过时不再原地拒绝，
+    //   坦克在周围环形采样找有视线的点，走过去下一 tick 再拉。
+    Map* map = bot->GetMap();
+    float const bx = bot->GetPositionX(), by = bot->GetPositionY(), bz = bot->GetPositionZ();
+    float const tx = target->GetPositionX(), ty = target->GetPositionY(), tz = target->GetPositionZ();
+    auto findPullSpot = [&](float radius) -> bool
     {
-        sLog.outDetail("[Playerbot][pull] %s 拒绝拉怪目标 %s (entry %u): 不同层或不可达",
-            bot->GetName(), target->GetName(), target->GetEntry());
-        ai->TellPlayerNoFacing(requester, BOT_TEXT("The target can't be pulled"));
+        for (int i = 0; i < 12; ++i)
+        {
+            float const ang = float(i) * M_PI_F / 6.0f;
+            float const px = bx + radius * cosf(ang);
+            float const py = by + radius * sinf(ang);
+            float const pz = map->GetHeight(px, py, bz + 2.0f);
+            if (pz < -1000.0f)
+                continue;
+            if (!map->IsInLineOfSight(px, py, pz + 1.5f, tx, ty, tz + 1.0f, false))
+                continue;
+            bot->GetMotionMaster()->MovePoint(0, px, py, pz);
+            return true;
+        }
         return false;
-    }
+    };
 
-    if (!strategy->CanDoPullAction(target))
+    if (!PossibleAttackTargetsValue::CanReachTarget(target, bot) || !strategy->CanDoPullAction(target))
     {
-        std::ostringstream out; out << "Can't perform pull action '" << strategy->GetPullActionName() << "'";
-        ai->TellPlayerNoFacing(requester, out.str());
-        return false;
+        for (float r : {3.0f, 5.0f, 8.0f, 12.0f})
+            if (findPullSpot(r))
+                return true;
+
+        // [2026-10-20 站长口径] 四个半径都找不到能拉的位置：用 mmap 寻路继续往怪身上走，
+        //   走到进近战范围为止；返回 true 表示本 tick 已处理（在移动），下一 tick 重新判定。
+        bot->GetMotionMaster()->MovePoint(0, tx, ty, tz);
+        return true;
     }
 
     //Set position to return to after pulling.

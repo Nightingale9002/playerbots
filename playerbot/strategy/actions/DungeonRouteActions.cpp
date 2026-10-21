@@ -26,9 +26,12 @@ bool DungeonRouteMoveAction::Execute(Event& event)
     //   这里不再做"每 tick 收尾"；本文件只在真的起手时补一个 ord 提示。
 
     // 卡住保护：同一波超过 WAVE_GIVE_UP_MS 没有推进（且没在打）⇒ 放弃这波，下次瞄下一波
+    // [2026-10-22 站长口径] 只要还有怪在和我们战斗（包括**没登记进路线表**的怪）就不许跳过。
+    //   实测日志里出现「跳过 ord=N（wave stuck: no progress）」时，队伍其实正被一波未登记怪缠着。
     uint16 ord = dungeonroute::CurrentOrd(bot, *route);
     if (ord && dungeonroute::WaveStuckMs(bot) > dungeonroute::WAVE_GIVE_UP_MS &&
-        !dungeonroute::WaveInFight(bot, *route, ord))
+        !dungeonroute::WaveInFight(bot, *route, ord) &&
+        !dungeonroute::UnknownFighterInCombat(bot, *route))
     {
         dungeonroute::MarkSkipped(bot, ord, "wave stuck: no progress");
         return false;

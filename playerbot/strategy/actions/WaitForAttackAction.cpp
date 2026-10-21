@@ -174,3 +174,33 @@ bool WaitForAttackKeepSafeDistanceAction::isUseful()
 {
     return !ai->HasStrategy("stay", ai->GetState()) && (!ai->HasStrategy("guard", ai->GetState()) ||  WaitForAttackStrategy::GetSafeDistance() <= ai->GetRange("guard")) && ai->GetRange("flee") > 5.0f;
 }
+
+// [threat-ot 2026-10-19] DPS OT 的正确反应：靠近坦克，让坦克接手仇恨；不是一直向后逃。
+bool MoveTowardTankAction::Execute(Event& event)
+{
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+
+    Player* tank = nullptr;
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->getSource();
+        if (!member || member == bot || !member->IsInWorld() || !member->IsAlive())
+            continue;
+        if (PlayerbotAI::IsTank(member))
+        {
+            tank = member;
+            break;
+        }
+    }
+    if (!tank)
+        return false;
+
+    // 已经靠近坦克：交给正常攻击/走位
+    if (bot->GetDistance(tank) <= 6.0f)
+        return false;
+
+    // 跑向坦克 4 码（近战位）；移动本身会脱离当前目标，防止继续拉高仇恨
+    return MoveNear(tank, 4.0f);
+}

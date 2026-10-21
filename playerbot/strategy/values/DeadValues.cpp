@@ -72,7 +72,8 @@ WorldSafeLocsEntry const* GraveyardValue::GetAnotherAppropriateClosestGraveyard(
         return nullptr;
 
     uint32 botMapId = corpse->GetMapId();
-    uint32 botZoneId = corpse->GetZoneId();
+    // 尸体的 m_currMap 可能为空（离开世界 / 实例地图已被卸载），此时 WorldObject::GetZoneId() 会触发 MANGOS_ASSERT("GetTerrain") 直接 abort。
+    uint32 botZoneId = corpse->IsInWorld() ? corpse->GetZoneId() : sTerrainMgr.GetZoneId(corpse->GetMapId(), corpse->GetPositionX(), corpse->GetPositionY(), corpse->GetPositionZ());
 
     for (auto mapValues : sWorld.GetGraveyardManager().GetGraveyardMap())
     {

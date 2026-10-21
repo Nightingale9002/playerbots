@@ -111,6 +111,13 @@ namespace ai
             if (!sServerFacade.UnitIsDead(bot))
                 return false;
 
+            // [2026-10-21 仿真] 副本里不自动释放灵魂：
+            //   放了就会走"跑尸/找灵魂医者"→ RepopAction 把 bot 移出队伍并传回主城
+            //   （实测 543 一支队伍 13.8 秒被解散），同时 → 530 的传送被出本守卫拦下后每 tick 重试。
+            //   仿真自己会在单人阵亡 8 秒后就地复活（SimScenario `soloReviveAt`）。
+            if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+                return false;
+
             if (bot->GetCorpse())
                 return false;
 
@@ -164,9 +171,12 @@ namespace ai
     public:
         virtual bool Execute(Event& event) override
         {
-            Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
+            // [2026-10-21 仿真] 副本里的仿真队员永远不做"找灵魂医者复活"：
+            //   这条路径会 RemoveMember 退出队伍 + 传回主城，等于把仿真队伍拆了。复活交给 SimScenario。
+            if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+                return false;
 
-            sLog.outDetail("Repop bot #%d %s:%d <%s>", bot->GetGUIDLow(), bot->GetTeam() == ALLIANCE ? "A" : "H", bot->GetLevel(), bot->GetName());
+            Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
 
             SET_AI_VALUE(uint32, "death count", 0);
 

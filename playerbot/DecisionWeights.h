@@ -34,6 +34,14 @@ namespace dw
         if (key == "position.cover_distance") return -1.0f;
         if (key == "log.decision")            return 0.0f;
 
+        // [2026-10-22] 战斗策略工具（AoE 破控 / 目标重选 / 路上遭遇 pull）
+        if (key == "aoe.cc_guard.radius")             return 12.0f;
+        if (key == "aoe.cc_guard.penalty")            return 0.0f;
+        if (key == "target.reselect.waiting_penalty") return 0.2f;
+        if (key == "pull.encounter.range")            return 30.0f;
+        if (key == "pull.encounter_boost")            return 1.6f;
+        if (key == "pull.patrol.wait_max_sec")        return 30.0f;
+
         // 控制（CC）目标排序
         if (key == "cc.needs_control")        return 100.0f;
         if (key == "cc.dps")                  return 1.0f;

@@ -105,13 +105,9 @@ std::list<ObjectGuid> LooseMobsValue::Calculate()
     if (!group)
         return result;
 
-    AiObjectContext* context = ai->GetAiObjectContext();
-    if (!context)
-        return result;
-
-    std::list<ObjectGuid> const candidates = ::AiValueOr<std::list<ObjectGuid>>(context, "possible attack targets");
-
-    // 先收集候选（记下"受害者是不是治疗"和"受害者血量"，用来排序）
+    // [2026-10-21 站长口径] "有怪在打队友 ⇒ 坦克去拉回来" 必须是一条**策略**，
+    //   不能只依赖 possible attack targets（路线过滤会把非当前波的怪剔掉）。
+    //   这里直接从队伍成员的 attackers 里收集：正在打某个队友、且坦克没有仇恨的敌对单位。
     struct LooseRank
     {
         uint8 healer;           // 0 = 正在打治疗（最该先接），1 = 其它
@@ -120,31 +116,43 @@ std::list<ObjectGuid> LooseMobsValue::Calculate()
     };
 
     std::vector<LooseRank> ranked;
-    for (ObjectGuid const& guid : candidates)
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
     {
-        Unit* unit = ai->GetUnit(guid);
-        if (!unit || !unit->IsInWorld() || !unit->IsAlive())
+        Player* member = ref->getSource();
+        if (!member || !member->IsInWorld() || !member->IsAlive())
             continue;
 
-        Unit* victim = unit->GetVictim();
-        if (!victim || victim == bot)
-            continue;   // 打我的不算"漏"（那是我的责任）
+        for (Unit* attacker : member->getAttackers())
+        {
+            if (!attacker || !attacker->IsInWorld() || !attacker->IsAlive())
+                continue;
+            if (attacker->GetTypeId() != TYPEID_UNIT)
+                continue;
 
-        Player* victimPlayer = dynamic_cast<Player*>(victim);
-        if (!victimPlayer || victimPlayer->GetGroup() != group)
-            continue;
+            // 打坦克自己的不算"漏"（那是坦克的责任），坦克已有仇恨的也不算漏
+            if (attacker->GetVictim() == bot)
+                continue;
+            if (ThreatValue::GetTankThreat(ai, attacker) > 0.0f)
+                continue;
+            if (!bot->IsWithinDistInMap(attacker, 60.0f))
+                continue;
 
-        if (!sServerFacade.IsAlive(victimPlayer))
-            continue;
+            bool duplicate = false;
+            for (auto const& r : ranked)
+            {
+                if (r.guid == attacker->GetObjectGuid())
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate)
+                continue;
 
-        // 坦克已经有仇恨的目标不算漏
-        if (ThreatValue::GetTankThreat(ai, unit) > 0.0f)
-            continue;
-
-        // [tank 2026-10-19 站长口径] "target attacking healer 应该是 t 策略"：
-        //   正在打治疗的漏怪排在最前面（其次是"受害者血量最低"）。
-        bool const hitsHealer = PlayerbotAI::IsHeal(victimPlayer);
-        ranked.push_back({ hitsHealer ? 0 : 1, victimPlayer->GetHealthPercent(), guid });
+            bool const hitsHealer = PlayerbotAI::IsHeal(member);
+            ranked.push_back({ hitsHealer ? 0 : 1, (uint8)member->GetHealthPercent(), attacker->GetObjectGuid() });
+        }
     }
 
     std::sort(ranked.begin(), ranked.end(), [](LooseRank const& a, LooseRank const& b)

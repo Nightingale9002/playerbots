@@ -12,6 +12,12 @@ using namespace ai;
 
 bool ReviveFromCorpseAction::Execute(Event& event)
 {
+    // [2026-10-21 仿真] 副本里的仿真队员不跑尸：复活由 SimScenario 负责（单人 8 秒就地复活）。
+    //   这条路径（含 FindCorpse/SpiritHealer 的 TeleportTo 墓地）会往主城/野外地图传送，
+    //   实测被"出本守卫"拦下后每个 tick 重试 —— 6 分钟 678 次改道、40 次拦截。
+    if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+        return false;
+
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
     Player* master = ai->GetGroupMaster();
     Corpse* corpse = bot->GetCorpse();
@@ -60,6 +66,10 @@ bool ReviveFromCorpseAction::Execute(Event& event)
 
 bool FindCorpseAction::Execute(Event& event)
 {
+    // [2026-10-21 仿真] 同上：副本里不找尸体、不跑尸。
+    if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+        return false;
+
     if (bot->InBattleGround())
         return false;
 
@@ -230,6 +240,10 @@ bool FindCorpseAction::isUseful()
 
 bool SpiritHealerAction::Execute(Event& event)
 {
+    // [2026-10-21 仿真] 副本里不找灵魂医者：它会 TeleportTo 墓地（非副本地图）→ 被出本守卫拦住无限重试。
+    if (sPlayerbotAIConfig.simMode && bot->FindMap() && bot->FindMap()->IsDungeon() && bot->GetGroup())
+        return false;
+
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
     Corpse* corpse = bot->GetCorpse();
     if (!corpse)

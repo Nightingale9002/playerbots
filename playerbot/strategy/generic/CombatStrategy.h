@@ -36,6 +36,58 @@ namespace ai
         void InitReactionTriggers(std::list<TriggerNode*>& triggers) override;
     };
 
+    // [2026-10-22 站长口径] 战斗策略的三个"参数化乘数"（全部走 ai_playerbot_decision_weight，300s 热加载）：
+    //   ① aoe cc guard     ：附近有被控目标 ⇒ 压掉 AoE 动作（破控来自 AoE 溅射）
+    //   ② reselect penalty ：等坦克仇恨期间压低 "select new target"（避免 assist/重选每 tick 抖动）
+    //   ③ pull encounter   ：boss 优先模式下路上有"安全可拉"的怪 ⇒ 抬高 pull 权重（不新增触发器）
+    class AoeCcGuardStrategy : public Strategy
+    {
+    public:
+        AoeCcGuardStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "aoe cc guard"; }
+    private:
+        void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
+    };
+
+    class AoeCcGuardMultiplier : public Multiplier
+    {
+    public:
+        AoeCcGuardMultiplier(PlayerbotAI* ai) : Multiplier(ai, "aoe cc guard") {}
+        float GetValue(Action* action) override;
+    };
+
+    class ReselectPenaltyStrategy : public Strategy
+    {
+    public:
+        ReselectPenaltyStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "reselect penalty"; }
+    private:
+        void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
+    };
+
+    class ReselectPenaltyMultiplier : public Multiplier
+    {
+    public:
+        ReselectPenaltyMultiplier(PlayerbotAI* ai) : Multiplier(ai, "reselect penalty") {}
+        float GetValue(Action* action) override;
+    };
+
+    class PullEncounterBoostStrategy : public Strategy
+    {
+    public:
+        PullEncounterBoostStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "pull encounter boost"; }
+    private:
+        void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
+    };
+
+    class PullEncounterBoostMultiplier : public Multiplier
+    {
+    public:
+        PullEncounterBoostMultiplier(PlayerbotAI* ai) : Multiplier(ai, "pull encounter boost") {}
+        float GetValue(Action* action) override;
+    };
+
     class AvoidSpecificCreaturesStrategy : public Strategy
     {
     public:

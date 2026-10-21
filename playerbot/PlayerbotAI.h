@@ -799,6 +799,9 @@ protected:
     bool inCombat = false;
     bool isMoving = false;
     bool isWaiting = false;
+    // [2026-10-22 站长口径] 进本换装去重：记录本 bot 上一次所在 (地图, 实例)，进新副本时换一次装备
+    uint64 lastGearEntryKey = 0;
+
     BotCheatMask cheatMask = BotCheatMask::none;
     WorldPosition jumpDestination;
     uint32 jumpTime;

@@ -72,6 +72,20 @@ namespace ai
         virtual bool IsActive() override;
     };
 
+    // [threat-ot 2026-10-19] 只对 DPS 生效：即将 OT 时跑向坦克（坦克/治疗不受影响）。
+    class DpsWillOveraggroTrigger : public Trigger
+    {
+    public:
+        DpsWillOveraggroTrigger(PlayerbotAI* ai) : Trigger(ai, "dps will overaggro") {}
+        virtual bool IsActive() override
+        {
+            Player* bot = ai->GetBot();
+            if (!bot || PlayerbotAI::IsTank(bot) || PlayerbotAI::IsHeal(bot))
+                return false;
+            return AI_VALUE2(bool, "will overaggro", "current target");
+        }
+    };
+
     // [pull-gate 2026-10-19] 附近敌对太多（未进战斗时）⇒ 不主动开怪。
     //   半径/数量来自 AiPlayerbot.PullHostileRadius / PullHostileLimit（0 = 关）。
     class TooManyHostilesTrigger : public Trigger
@@ -764,7 +778,7 @@ namespace ai
     // `enemy casting` / `enemy casting interruptible` —— 附近**敌对且正在施放非近战法术**的单位。
     //   目标选择与缓存全部在值 `enemy casting target` / `enemy casting interruptible target` 里
     //   （见 strategy/values/NearestUnitsValue.h），触发器只做一次值查询 ⇒ 不重复扫描、天然限流。
-    class EnemyCastingTrigger : public Trigger
+    class EnemyCastingTrigger : public Trigger, public Qualified
     {
     public:
         EnemyCastingTrigger(PlayerbotAI* ai, std::string name = "enemy casting", std::string targetValue = "enemy casting target") :

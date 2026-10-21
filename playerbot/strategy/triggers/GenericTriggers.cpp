@@ -734,7 +734,11 @@ std::string TargetHasAuraTrigger::getName()
 
 bool EnemyCastingTrigger::IsActive()
 {
-    Value<ObjectGuid>* value = context->GetValue<ObjectGuid>(targetValue);
+    // [boss-rules 2026-10-19] 允许 `enemy casting::spellid::40425` 这种限定词：
+    //   只对指定法术/距离的读条生效；没有限定词时保持原行为。
+    Value<ObjectGuid>* value = getQualifier().empty()
+        ? context->GetValue<ObjectGuid>(targetValue)
+        : context->GetValue<ObjectGuid>(targetValue, getQualifier());
     if (!value)
         return false;
 
@@ -841,7 +845,30 @@ bool TeamMembersCloseTrigger::IsActive()
 
 bool TankAssistTrigger::IsActive()
 {
-    if (!AI_VALUE(bool, "has attackers"))
+    // [tank-rescue 2026-10-19 站长口径] 坦克自己没挨打、但队友（尤其治疗）被追时也要去救：
+    //   原判据只看坦克自己的 attackers ⇒ 治疗被追、坦克没被摸时永远不触发。
+    bool anyThreatened = AI_VALUE(bool, "has attackers");
+    if (!anyThreatened)
+    {
+        if (Group* group = ai->GetBot()->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref && !anyThreatened; ref = ref->next())
+            {
+                Player* member = ref->getSource();
+                if (!member || !member->IsInWorld() || !member->IsAlive())
+                    continue;
+                for (Unit* attacker : member->getAttackers())
+                {
+                    if (attacker && attacker->IsAlive())
+                    {
+                        anyThreatened = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!anyThreatened)
         return false;
 
     Unit* currentTarget = ai->GetUnit(AI_VALUE(ObjectGuid, "current target"));

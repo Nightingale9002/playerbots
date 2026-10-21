@@ -124,6 +124,7 @@ namespace ai
             creators["flee"] = [](PlayerbotAI* ai) { return new FleeAction(ai); };
             creators["flee with pet"] = [](PlayerbotAI* ai) { return new FleeWithPetAction(ai); };
             creators["wait for attack keep safe distance"] = [](PlayerbotAI* ai) { return new WaitForAttackKeepSafeDistanceAction(ai); };
+            creators["move toward tank"] = [](PlayerbotAI* ai) { return new MoveTowardTankAction(ai); };
             creators["shoot"] = [](PlayerbotAI* ai) { return new CastShootAction(ai); };
             creators["whipper root tuber"] = [](PlayerbotAI* ai) { return new UseWhipperRootTuberAction(ai); };
             creators["healthstone"] = [](PlayerbotAI* ai) { return new UseHealthstoneAction(ai); };
@@ -149,6 +150,7 @@ namespace ai
             creators["sit"] = [](PlayerbotAI* ai) { return new SitAction(ai); };
             creators["attack anything"] = [](PlayerbotAI* ai) { return new AttackAnythingAction(ai); };
             creators["attack least hp target"] = [](PlayerbotAI* ai) { return new AttackLeastHpTargetAction(ai); };
+            creators["attack nearest add"] = [](PlayerbotAI* ai) { return new AttackNearestAddAction(ai); };
             creators["attack enemy player"] = [](PlayerbotAI* ai) { return new AttackEnemyPlayerAction(ai); };
             creators["pull my target"] = [](PlayerbotAI* ai) { return new PullMyTargetAction(ai); };
             creators["pull rti target"] = [](PlayerbotAI* ai) { return new PullRTITargetAction(ai); };

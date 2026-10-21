@@ -4,6 +4,14 @@
 
 namespace ai
 {
+   // [threat-ot 2026-10-19 站长口径] DPS 即将 OT 时：跑向坦克，而不是继续向后跑。
+   class MoveTowardTankAction : public MovementAction
+   {
+   public:
+       MoveTowardTankAction(PlayerbotAI* ai) : MovementAction(ai, "move toward tank") {}
+       virtual bool Execute(Event& event) override;
+   };
+
    class WaitForAttackKeepSafeDistanceAction : public MovementAction
    {
    public:
