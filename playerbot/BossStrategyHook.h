@@ -246,13 +246,13 @@ namespace bossstrategy
         for (const std::string& name : removed)
         {
             ai->ChangeStrategy("-custom::" + name, BotState::BOT_STATE_COMBAT);
-            sLog.outString("[BOSSSTRAT] %s -custom::%s", bot->GetName(), name.c_str());
+            sLog.outError("[BOSSSTRAT] %s -custom::%s", bot->GetName(), name.c_str());
         }
 
         for (const std::string& name : added)
         {
             ai->ChangeStrategy("+custom::" + name, BotState::BOT_STATE_COMBAT);
-            sLog.outString("[BOSSSTRAT] %s +custom::%s", bot->GetName(), name.c_str());
+            sLog.outError("[BOSSSTRAT] %s +custom::%s", bot->GetName(), name.c_str());
         }
     }
 

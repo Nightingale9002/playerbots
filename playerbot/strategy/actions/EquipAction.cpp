@@ -264,7 +264,7 @@ void EquipAction::EquipItemToSlot(Player* requester, Item* item, uint8 targetSlo
     // [gems 2026-10-17 站长口径] 换装后补插空槽宝石（只补空槽 ⇒ 幂等，不拆已有宝石）
     uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
     if (filledGems)
-        sLog.outString("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
+        sLog.outError("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
 }
 
 void EquipAction::EquipItem(PlayerbotAI* ai, Player* requester, Item* item, bool silent)
@@ -346,7 +346,7 @@ void EquipAction::EquipItem(PlayerbotAI* ai, Player* requester, Item* item, bool
     // 钓鱼竿互换（FishAction → EquipItem）。只补空槽（onlyEmpty=true）⇒ 幂等，不拆已有宝石。
     uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
     if (filledGems)
-        sLog.outString("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
+        sLog.outError("[GEMS] %s 换装后补插 %u 颗", bot->GetName(), filledGems);
 }
 
 bool EquipUpgradesAction::Execute(Event& event)

@@ -28,7 +28,7 @@ bool UpdateGearAction::Execute(Event& event)
         factory.EquipGearBest();
         uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
         bot->SaveToDB();
-        sLog.outString("[GEAR] %s 进本换装 → 最佳装备（忽略装等限制，补宝石 %u）", bot->GetName(), filledGems);
+        sLog.outError("[GEAR] %s 进本换装 → 最佳装备（忽略装等限制，补宝石 %u）", bot->GetName(), filledGems);
         return true;
     }
 
@@ -125,7 +125,7 @@ bool UpdateGearAction::Execute(Event& event)
                     if (altItemId && oldItem && altItemId == oldItem->GetEntry())
                     {
                         // 旧件本身就是合格替代品（它没被别的格子占用）⇒ 保持不动
-                        sLog.outDetail("[GEAR] %s slot %u: item %u 已被别的格子占用，沿用旧件 %u",
+                        sLog.outError("[GEAR] %s slot %u: item %u 已被别的格子占用，沿用旧件 %u",
                             bot->GetName(), uint32(slot), pItemId, altItemId);
                         continue;
                     }
@@ -133,12 +133,12 @@ bool UpdateGearAction::Execute(Event& event)
                     if (!altItemId || RandomPlayerbotMgr::CanEquipUnseenItem(bot, slot, eDest, altItemId) != EQUIP_ERR_OK)
                     {
                         // 降为 detail：不再刷玩家频道，也不再刷 ERROR 级日志
-                        sLog.outDetail("[GEAR] Failed to equip item %u specified in AiPlayerbot.GearProgressionSystem.%u.%u.%u.%u (slot skipped, no alternative)",
+                        sLog.outError("[GEAR] Failed to equip item %u specified in AiPlayerbot.GearProgressionSystem.%u.%u.%u.%u (slot skipped, no alternative)",
                             pItemId, uint32(itemProgressionLevel), uint32(cls), uint32(spec), uint32(slot));
                         continue;
                     }
 
-                    sLog.outDetail("[GEAR] %s slot %u: item %u 与已装备件冲突，按专精权重改用替代品 %u",
+                    sLog.outError("[GEAR] %s slot %u: item %u 与已装备件冲突，按专精权重改用替代品 %u",
                         bot->GetName(), uint32(slot), pItemId, altItemId);
                     itemToEquip = altItemId;
                 }
@@ -172,7 +172,7 @@ bool UpdateGearAction::Execute(Event& event)
     // 新装备的插槽本来是空的，这一步就是"每次换装备后再补插一次"。
     uint32 const filledGems = PlayerbotFactory::FillGems(bot, true);
     if (filledGems)
-        sLog.outString("[GEMS] %s refilled %u gems", bot->GetName(), filledGems);
+        sLog.outError("[GEMS] %s refilled %u gems", bot->GetName(), filledGems);
 
     return true;
 }

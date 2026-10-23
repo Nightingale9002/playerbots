@@ -114,7 +114,7 @@ TestResult CommandPartySpawnBot::Execute(const std::string& params, Player* bot,
     {
         ctx.spawnedBots.push_back(borrowed->GetObjectGuid());
         ctx.borrowedBots.insert(borrowed->GetObjectGuid());
-        sLog.outString("[BOTTEST] borrowed online bot %s (class=%u) for test party",
+        sLog.outError("[BOTTEST] borrowed online bot %s (class=%u) for test party",
                        borrowed->GetName(), (uint32)borrowed->getClass());
         return TestResult::PASS;
     }

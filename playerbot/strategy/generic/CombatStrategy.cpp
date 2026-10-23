@@ -415,6 +415,85 @@ float ReselectPenaltyMultiplier::GetValue(Action* action)
     return dw::Get("target.reselect.waiting_penalty");
 }
 
+// [2026-10-22 站长口径] ⑥ 坦克被多个目标打时：提高威胁类动作权重，稳住场面
+void TankThreatStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new TankThreatMultiplier(ai));
+}
+
+float TankThreatMultiplier::GetValue(Action* action)
+{
+    if (!action || !bot || !bot->IsInWorld() || !PlayerbotAI::IsTank(bot))
+        return 1.0f;
+    if (bot->getAttackers().size() < 2)
+        return 1.0f;
+    if (action->getThreatType() == ActionThreatType::ACTION_THREAT_NONE)
+        return 1.0f;
+    return dw::Get("tank.threat.mult");
+}
+
+// [2026-10-22 站长口径] ⑦ DPS 被怪打时：压低输出动作（不要继续把仇恨抓在自己身上）
+void DpsOveraggroStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new DpsOveraggroMultiplier(ai));
+}
+
+float DpsOveraggroMultiplier::GetValue(Action* action)
+{
+    if (!action || !bot || !bot->IsInWorld() || PlayerbotAI::IsTank(bot))
+        return 1.0f;
+    if (bot->getAttackers().empty())
+        return 1.0f;
+
+    std::string const name = action->getName();
+    if (name == "dps assist" || name == "select new target" || name == "melee")
+        return dw::Get("dps.overaggro_penalty");
+    return 1.0f;
+}
+
+// [2026-10-22 站长口径] ④ 坦克拉怪护栏：战斗中有攻击者时不要反复 pull
+void TankPullGuardStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new TankPullGuardMultiplier(ai));
+}
+
+float TankPullGuardMultiplier::GetValue(Action* action)
+{
+    if (!action || !bot || !bot->IsInWorld())
+        return 1.0f;
+    if (!PlayerbotAI::IsTank(bot))
+        return 1.0f;
+    if (!bot->IsInCombat() || bot->getAttackers().empty())
+        return 1.0f;
+
+    std::string const name = action->getName();
+    if (name == "pull action" || name == "dungeon route pull" ||
+        name == "pull my target" || name == "pull start" || name == "pull end")
+        return dw::Get("pull.action.incombat_penalty");
+    return 1.0f;
+}
+
+// [2026-10-22 站长口径] ⑤ 非坦克等仇恨：ShouldWait 期间 DPS 等、少抢仇恨
+void DpsWaitThreatStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new DpsWaitThreatMultiplier(ai));
+}
+
+float DpsWaitThreatMultiplier::GetValue(Action* action)
+{
+    if (!action || !bot || !bot->IsInWorld())
+        return 1.0f;
+    if (PlayerbotAI::IsTank(bot) || !WaitForAttackStrategy::ShouldWait(ai))
+        return 1.0f;
+
+    std::string const name = action->getName();
+    if (name == "wait for attack keep safe distance")
+        return dw::Get("wait.attack.boost");
+    if (name == "dps assist" || name == "select new target" || name == "melee")
+        return dw::Get("wait.attack.dps_penalty");
+    return 1.0f;
+}
+
 // [2026-10-22 站长口径] ③ 路上遇到安全可拉的怪 ⇒ pull 权重上调（不加触发器）
 void PullEncounterBoostStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
 {

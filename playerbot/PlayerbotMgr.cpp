@@ -1404,7 +1404,7 @@ std::list<std::string> PlayerbotHolder::HandleRoute(Player* master, const std::s
         : (sw ? "强制开" : "强制关");
 
     messages.push_back(std::string("DungeonRoute 自动开怪: ") + state);
-    sLog.outString("[DUNGEONROUTE] .bot route %s by %s => %s",
+    sLog.outError("[DUNGEONROUTE] .bot route %s by %s => %s",
         arg.empty() ? "(query)" : arg.c_str(), master ? master->GetName() : "console", state);
     return messages;
 }

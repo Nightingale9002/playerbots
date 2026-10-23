@@ -2671,7 +2671,7 @@ bool RandomPlayerbotMgr::ProcessBot(Player* player)
             uint32 const filledGems = PlayerbotFactory::FillGems(player, true);
             SetEventValue(bot, "gemsFilled", 1, 0xFFFFFFFF);   // validIn 必须极大，否则会被 GetEventValue() 判成过期
             if (filledGems)
-                sLog.outString("[GEMS] %s 补插 %u 颗（历史 bot 一次性）", player->GetName(), filledGems);
+                sLog.outError("[GEMS] %s 补插 %u 颗（历史 bot 一次性）", player->GetName(), filledGems);
         }
     }
 

@@ -77,7 +77,7 @@ Creature* BossFocusManager::FindFocusMob()
     if (foundDead && !focusMob)
     {
         ctx.focusMobKilled = true;
-        sLog.outString("[BossFocus] boss (entry %u) confirmed DEAD", ctx.focusMobEntry);
+        sLog.outError("[BossFocus] boss (entry %u) confirmed DEAD", ctx.focusMobEntry);
     }
 
     return focusMob;
@@ -95,7 +95,7 @@ void BossFocusManager::RespawnFocusMob()
         if (focusMob)
         {
             ctx.focusMobGuid = focusMob->GetObjectGuid();
-            sLog.outString("[BossFocus] re-spawned %s (entry %u)", focusMob->GetName(), ctx.focusMobEntry);
+            sLog.outError("[BossFocus] re-spawned %s (entry %u)", focusMob->GetName(), ctx.focusMobEntry);
         }
     }
 }

@@ -88,6 +88,75 @@ namespace ai
         float GetValue(Action* action) override;
     };
 
+    // [2026-10-22 站长口径] ④ 坦克拉怪护栏：已在战斗中/已有攻击者时，压低 pull 类动作
+    //    （修"坦克一直救场"：拉怪动作反复触发，坦克不进入坦怪状态）
+    class TankPullGuardStrategy : public Strategy
+    {
+    public:
+        TankPullGuardStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "tank pull guard"; }
+    private:
+        void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
+    };
+
+    class TankPullGuardMultiplier : public Multiplier
+    {
+    public:
+        TankPullGuardMultiplier(PlayerbotAI* ai) : Multiplier(ai, "tank pull guard") {}
+        float GetValue(Action* action) override;
+    };
+
+    // [2026-10-22 站长口径] ⑤ 非坦克等仇恨：ShouldWait 期间压低输出动作、抬高等待动作
+    class DpsWaitThreatStrategy : public Strategy
+    {
+    public:
+        DpsWaitThreatStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "dps wait threat"; }
+    private:
+        void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
+    };
+
+    class DpsWaitThreatMultiplier : public Multiplier
+    {
+    public:
+        DpsWaitThreatMultiplier(PlayerbotAI* ai) : Multiplier(ai, "dps wait threat") {}
+        float GetValue(Action* action) override;
+    };
+
+    // [2026-10-22 站长口径] ⑥ 坦克多目标时提高威胁动作权重（稳住多只怪，减少 DPS 被打）
+    class TankThreatStrategy : public Strategy
+    {
+    public:
+        TankThreatStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "tank threat"; }
+    private:
+        void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
+    };
+
+    class TankThreatMultiplier : public Multiplier
+    {
+    public:
+        TankThreatMultiplier(PlayerbotAI* ai) : Multiplier(ai, "tank threat") {}
+        float GetValue(Action* action) override;
+    };
+
+    // [2026-10-22 站长口径] ⑦ DPS 被怪打时压低输出（先把仇恨交回坦克，而不是继续硬打）
+    class DpsOveraggroStrategy : public Strategy
+    {
+    public:
+        DpsOveraggroStrategy(PlayerbotAI* ai) : Strategy(ai) {}
+        std::string getName() override { return "dps overaggro"; }
+    private:
+        void InitCombatMultipliers(std::list<Multiplier*>& multipliers) override;
+    };
+
+    class DpsOveraggroMultiplier : public Multiplier
+    {
+    public:
+        DpsOveraggroMultiplier(PlayerbotAI* ai) : Multiplier(ai, "dps overaggro") {}
+        float GetValue(Action* action) override;
+    };
+
     class AvoidSpecificCreaturesStrategy : public Strategy
     {
     public:

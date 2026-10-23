@@ -698,7 +698,7 @@ bool PlayerbotAIConfig::Initialize()
     // [仿真 2026-10-18] 可控场景注入：本地 WSL 仿真开 1，云端必须 0（默认 0）
     simMode = config.GetBoolDefault("AiPlayerbot.SimMode", false);
     if (simMode)
-        sLog.outString("[SIM] AiPlayerbot.SimMode = 1 —— 仿真模式开启（.bot sim start/stop/status；仅本地使用）");
+        sLog.outError("[SIM] AiPlayerbot.SimMode = 1 —— 仿真模式开启（.bot sim start/stop/status；仅本地使用）");
     // [2026-10-19] 水里也走 mmap 路径 / 移动自救（跳跃、升降台传送），默认关，本地仿真打开
     waterPath = config.GetBoolDefault("AiPlayerbot.WaterPath", false);
     routeJumpAssist = config.GetBoolDefault("AiPlayerbot.RouteJumpAssist", true);

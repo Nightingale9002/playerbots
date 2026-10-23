@@ -300,7 +300,8 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
     // [2026-10-18 站长口径] 爆发的独立策略：所有职业都挂（触发器按职业注册；嗜血/英勇=团队爆发）
     combatEngine->addStrategy("burst");
     // [2026-10-22] 战斗策略参数化：AoE 破控守卫 / 目标重选惩罚 / pull 遭遇权重（全部走 DB 权重）
-    combatEngine->addStrategies("aoe cc guard", "reselect penalty", "pull encounter boost", NULL);
+    combatEngine->addStrategies("aoe cc guard", "reselect penalty", "pull encounter boost",
+        "tank pull guard", "dps wait threat", "tank threat", "dps overaggro", NULL);
 
     if (!player->InBattleGround())
     {
