@@ -1,4 +1,4 @@
-﻿
+
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "RandomItemMgr.h"
@@ -2607,7 +2607,7 @@ uint32 RandomItemMgr::CalculateSingleStatWeight(uint8 playerclass, uint8 spec, s
     }
 
     // [cap 2026-10-16] 站长口径（方案B）：上限型属性达标后降权（表在 ai_playerbot_weightscale_caps）
-    Player* const ctx = player ? player : m_weightPlayer;
+    Player* const ctx = player ? player : CurrentWeightPlayer();   // [2026-10-22] 线程局部，见头文件注释
     if (statWeight && ctx)
         statWeight = ApplyWeightCap(ctx, spec, stat, statWeight);
 

@@ -287,6 +287,17 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     if (!bot || !bot->IsInWorld())
         return;
 
+    // [2026-10-22 崩溃修] 先执行仿真排队的动作（本函数运行在 bot 自己的 map 线程里）。
+    {
+        std::string simAction;
+        {
+            std::lock_guard<std::mutex> guard(m_simActionMutex);
+            simAction.swap(m_simPendingAction);
+        }
+        if (!simAction.empty())
+            DoSpecificAction(simAction, Event(), true);
+    }
+
     // [2026-10-22 站长口径] 进本换装：**进入副本/团本那一刻**换一次装备（不挂策略/触发器）。
     //   开了 AiPlayerbot.EquipBestGear ⇒ UpdateGearAction 会直接换最好装备并忽略装等限制；
     //   每个 (地图, 实例) 只做一次；离开副本后重置，下次进本再来。

@@ -2,6 +2,8 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotFactory.h"
 
+#include <mutex>    // [2026-10-22 崩溃修] FillGems 的懒构建缓存要加锁（多 map 线程并发）
+
 #include "Server/SQLStorages.h"
 #include "Entities/ItemPrototype.h"
 #include "playerbot/PlayerbotAIConfig.h"
@@ -3067,7 +3069,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
         specId = sRandomItemMgr.GetDefaultSpecIdForClass(bot->getClass());
         if (specId == 0)
             return;   // 本职业连一条权重表都没有：保持原行为
-        sLog.outString("[GEAR] %s specId==0 -> fallback specId %u", bot->GetName(), specId);
+        sLog.outError("[GEAR] %s specId==0 -> fallback specId %u", bot->GetName(), specId);
     }
 
     // [gear 2026-10-16] 站长口径：野外只穿"前团本"（默认阶段的 ilvl 上限）。
@@ -5739,26 +5741,35 @@ uint32 PlayerbotFactory::FillGems(Player* bot, bool onlyEmpty)
 
     // 宝石候选表（物品id / 附魔id / 颜色掩码 / 物品等级），只建一次
     struct GemCandidate { uint32 itemId; uint32 enchantId; uint32 color; uint32 itemLevel; };
+    // [2026-10-22 崩溃修] 这张表和下面的 weightCache / loggedWeightSpecs 都是懒构建的 static，
+    //   而 FillGems 会被多个 map 线程同时调用（多副本同时进本换装）⇒ 两个线程同时
+    //   `if (empty()) push_back` 会把 vector 写坏：实测 `[GEMS] 宝石候选表：4294964818 个`
+    //   然后 `std::length_error vector::reserve` 直接 terminate。
+    //   ⇒ 构建与缓存访问统一加锁；候选表构建完即只读。
+    static std::mutex gemDataMtx;
     static std::vector<GemCandidate> gemCandidates;
-    if (gemCandidates.empty())
     {
-        for (uint32 itemId = 0; itemId < sItemStorage.GetMaxEntry(); ++itemId)
+        std::lock_guard<std::mutex> lock(gemDataMtx);
+        if (gemCandidates.empty())
         {
-            ItemPrototype const* proto = ObjectMgr::GetItemPrototype(itemId);
-            if (!proto || proto->Class != ITEM_CLASS_GEM || proto->SubClass == ITEM_SUBCLASS_GEM_SIMPLE)
-                continue;
+            for (uint32 itemId = 0; itemId < sItemStorage.GetMaxEntry(); ++itemId)
+            {
+                ItemPrototype const* proto = ObjectMgr::GetItemPrototype(itemId);
+                if (!proto || proto->Class != ITEM_CLASS_GEM || proto->SubClass == ITEM_SUBCLASS_GEM_SIMPLE)
+                    continue;
 
-            GemPropertiesEntry const* gemProp = sGemPropertiesStore.LookupEntry(proto->GemProperties);
-            if (!gemProp || !gemProp->spellitemenchantement || !gemProp->color)
-                continue;
+                GemPropertiesEntry const* gemProp = sGemPropertiesStore.LookupEntry(proto->GemProperties);
+                if (!gemProp || !gemProp->spellitemenchantement || !gemProp->color)
+                    continue;
 
-            if (!sSpellItemEnchantmentStore.LookupEntry(gemProp->spellitemenchantement))
-                continue;
+                if (!sSpellItemEnchantmentStore.LookupEntry(gemProp->spellitemenchantement))
+                    continue;
 
-            GemCandidate candidate = { itemId, gemProp->spellitemenchantement, gemProp->color, proto->ItemLevel };
-            gemCandidates.push_back(candidate);
+                GemCandidate candidate = { itemId, gemProp->spellitemenchantement, gemProp->color, proto->ItemLevel };
+                gemCandidates.push_back(candidate);
+            }
+            sLog.outError("[GEMS] 宝石候选表：%u 个", uint32(gemCandidates.size()));
         }
-        sLog.outString("[GEMS] 宝石候选表：%u 个", uint32(gemCandidates.size()));
     }
 
     if (gemCandidates.empty())
@@ -5767,9 +5778,16 @@ uint32 PlayerbotFactory::FillGems(Player* bot, bool onlyEmpty)
     // 同一 (职业,专精) 的宝石权重只算一次（CalculateEnchantWeight 内部要查 DBC/法术表）。
     // [cap 2026-10-16] 有上限表(方案B)的专精，权重与"该角色是否已达标"有关 ⇒ 不能跨角色缓存。
     static std::map<uint32, std::vector<uint32> > weightCache;
-    std::vector<uint32> localWeights;
+    // 缓存里的 vector 不能被别的线程边写边读 ⇒ 取用时一律拷贝到局部（候选表只有几百条，拷贝很便宜）。
+    std::vector<uint32> weights;
     bool const capAware = sRandomItemMgr.HasWeightCaps(specId);
-    std::vector<uint32>& weights = capAware ? localWeights : weightCache[specId];
+    if (!capAware)
+    {
+        std::lock_guard<std::mutex> lock(gemDataMtx);
+        auto it = weightCache.find(specId);
+        if (it != weightCache.end())
+            weights = it->second;
+    }
     if (weights.empty())
     {
         RandomItemMgr::WeightPlayerScope const weightScope(bot);   // 达标降权上下文
@@ -5784,9 +5802,14 @@ uint32 PlayerbotFactory::FillGems(Player* bot, bool onlyEmpty)
         // [gems 2026-10-17] 这条汇总日志按专精去重：FillGems 现在会被换装/补插反复调用，
         // 达标降权专精（capAware）每次都要重算权重，不去重会刷屏。
         static std::set<uint32> loggedWeightSpecs;
-        if (loggedWeightSpecs.insert(specId).second)
-            sLog.outString("[GEMS] 职业 %u 专精 %u：%u/%u 个宝石有属性收益%s", cls, specId, usable, uint32(weights.size()),
-                capAware ? "（含达标降权）" : "");
+        {
+            std::lock_guard<std::mutex> lock(gemDataMtx);
+            if (!capAware)
+                weightCache[specId] = weights;
+            if (loggedWeightSpecs.insert(specId).second)
+                sLog.outError("[GEMS] 职业 %u 专精 %u：%u/%u 个宝石有属性收益%s", cls, specId, usable, uint32(weights.size()),
+                    capAware ? "（含达标降权）" : "");
+        }
     }
 
     // 阶段性：默认阶段（野外 = 前团本）区间内的宝石优先
@@ -5921,7 +5944,7 @@ uint32 PlayerbotFactory::FillGems(Player* bot, bool onlyEmpty)
 
     // [GEMS] 汇总：只在本轮真的插了东西时输出（站长在 Server.log 里按 [GEMS] 验收）
     if (insertedGems)
-        sLog.outString("[GEMS] %s 插槽补插 %u 颗（扫描 %u 件带插槽装备，跳过已插满 %u 件，onlyEmpty=%u）",
+        sLog.outError("[GEMS] %s 插槽补插 %u 颗（扫描 %u 件带插槽装备，跳过已插满 %u 件，onlyEmpty=%u）",
             bot->GetName(), insertedGems, scannedItems, alreadyFullItems, onlyEmpty ? 1 : 0);
 
     return insertedGems;

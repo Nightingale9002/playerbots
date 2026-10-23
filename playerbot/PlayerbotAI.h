@@ -12,6 +12,7 @@
 #include <stack>
 #include <deque>
 #include <functional>
+#include <mutex>    // [2026-10-22 崩溃修] 仿真排队指令的跨线程保护
 #include "strategy/IterateItemsMask.h"
 #include "RandomPlayerbotMgr.h"
 
@@ -408,8 +409,19 @@ public:
 
     virtual void UpdateAI(uint32 elapsed, bool minimal = false);
 
+    // [2026-10-22 崩溃修] 仿真控制指令（SimScenario 在 World 线程）不能直接 DoSpecificAction ——
+    //   那会去碰 map 线程正在更新的 Map 容器（实测 SIGSEGV in Map::GetAnyTypeCreature）。
+    //   这里只排队，真正的执行发生在 bot 自己的 UpdateAI（map 线程）里。
+    void QueueSimAction(std::string const& action)
+    {
+        std::lock_guard<std::mutex> guard(m_simActionMutex);
+        m_simPendingAction = action;
+    }
     void HandleCommands();
 private:
+    std::mutex m_simActionMutex;
+    std::string m_simPendingAction;
+
     void UpdateAIInternal(uint32 elapsed, bool minimal = false) override;
 public:    
     static std::string BotStateToString(BotState state);

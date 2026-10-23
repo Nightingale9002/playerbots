@@ -188,12 +188,22 @@ class RandomItemMgr
         struct WeightCap { uint32 cap; uint32 capped; std::string altField; uint32 altCap; uint32 cap2; uint32 capped2; };
         std::map<std::pair<uint32, std::string>, WeightCap> m_weightCaps;
         // [cap 2026-10-16] "达标降权"上下文：加权函数原本只有 (职业,专精)，判不了是否达标，
-        // 用一个作用域守卫把当前角色挂进来（模块这段逻辑只跑在世界线程，单线程使用）。
-        Player* m_weightPlayer = nullptr;
+        // 用一个作用域守卫把当前角色挂进来。
+        // [2026-10-22 崩溃修] 原先是一个普通成员变量（全进程唯一）。地图是多线程更新的
+        // （MapUpdater worker），多张副本同时换装时会把别的线程的 Player* 覆盖进来；
+        // 一旦那个角色在它自己的线程里被删除（bot 下线 / 副本卸载），这边就是悬空指针 ——
+        // 实测 SIGABRT：`Attempt get value from nonexistent value field: 1527 (count: 234)`，
+        // 即把一个已回收复用的对象当成 Player 去读战斗等级字段。
+        // ⇒ 改为线程局部：每个 map 线程各存各的当前角色，作用域守卫只影响本线程。
+        static Player*& CurrentWeightPlayer()
+        {
+            static thread_local Player* player = nullptr;
+            return player;
+        }
         struct WeightPlayerScope
         {
-            explicit WeightPlayerScope(Player* p) : m_prev(instance().m_weightPlayer) { instance().m_weightPlayer = p; }
-            ~WeightPlayerScope() { instance().m_weightPlayer = m_prev; }
+            explicit WeightPlayerScope(Player* p) : m_prev(instance().CurrentWeightPlayer()) { instance().CurrentWeightPlayer() = p; }
+            ~WeightPlayerScope() { instance().CurrentWeightPlayer() = m_prev; }
             WeightPlayerScope(WeightPlayerScope const&) = delete;
             WeightPlayerScope& operator=(WeightPlayerScope const&) = delete;
             Player* m_prev;
