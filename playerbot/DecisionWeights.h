@@ -41,6 +41,25 @@ namespace dw
         if (key == "pull.encounter.range")            return 30.0f;
         if (key == "pull.encounter_boost")            return 1.6f;
         if (key == "pull.patrol.wait_max_sec")        return 30.0f;
+        // [2026-10-22] 拉怪安全判定总开关：1=严格（默认）  0=宽松（cheat 验证寻路：只拦巡逻怪）
+        if (key == "pull.safe.strict")                return 1.0f;
+        // [2026-10-22] boss 可达性（mmaps PathFinder）：终点容差 / 重查间隔 / 卡住判定窗口
+        if (key == "boss.path_tolerance_yd")          return 3.0f;
+        if (key == "boss.path_recheck_sec")           return 3.0f;
+        if (key == "boss.stuck_sec")                  return 90.0f;
+        // [2026-10-22] 坦克"去帮队友"的最大距离（超过就不追，避免被巡逻/空中怪牵走）
+        if (key == "sim.assist.max_dist")             return 60.0f;
+        // [2026-10-22] 坦克已在战斗中/有攻击者时，pull 类动作的权重乘数（压掉反复拉怪）
+        if (key == "pull.action.incombat_penalty")    return 0.05f;
+        // [2026-10-22] 非坦克等仇恨：等待动作权重、输出动作惩罚
+        if (key == "wait.attack.boost")               return 4.0f;
+        if (key == "wait.attack.dps_penalty")         return 0.2f;
+        // [2026-10-22] 坦克被多只怪打时提高威胁动作权重；DPS 被怪打时压低输出
+        if (key == "tank.threat.mult")                return 2.5f;
+        if (key == "dps.overaggro_penalty")           return 0.3f;
+        // [2026-10-22 站长口径] 540"同类怪攒够多少才清"的全局倍率：表里 engage_count × 这个值（下限 1）。
+        //   站长说 engage_count 偏大 ⇒ 数据调小后，再用这个倍率在线扫参（300s 热加载，不用重启）。
+        if (key == "mob.count.engage_scale")          return 1.0f;
 
         // 控制（CC）目标排序
         if (key == "cc.needs_control")        return 100.0f;

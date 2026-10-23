@@ -45,7 +45,7 @@ namespace dungeonroute
     const uint32 WAVE_GIVE_UP_MS = 90000;
     // [2026-10-18] "这一波没有可打目标"（友好 NPC / 小动物 / 全在远处没加载）时，
     //   等这么久就跳过——否则坦克会站在拉怪位一直不动。
-    const uint32 WAVE_NOT_LOADED_MS = 5000;
+    const uint32 WAVE_NOT_LOADED_MS = 15000;   // [2026-10-22 寻路修] 5s→15s：从"站到拉怪位"起算，给网格加载/怪走位留时间
     // ---------------------------------------------------------------------------
     // [2026-10-18 站长口径] 全图怪物清单 —— **与服务器共享 ObjectMgr 内存数据**
     //   ObjectMgr 启动时已把 `creature` 全表加载进内存（与 grid 是否加载无关），
@@ -116,7 +116,7 @@ namespace dungeonroute
         } worker{ mapId, &r };
 
         sObjectMgr.DoCreatureData(worker);
-        sLog.outString("[DUNGEONROUTE] 全图怪物清单 map=%u：刷点 %u（敌对 %u / 小动物 %u / NPC %u / 无模板 %u）",
+        sLog.outError("[DUNGEONROUTE] 全图怪物清单 map=%u：刷点 %u（敌对 %u / 小动物 %u / NPC %u / 无模板 %u）",
             mapId, r.total, r.hostileCount, r.critters, r.npcs, r.noTemplate);
         return cache.emplace(mapId, std::move(r)).first->second;
     }
@@ -219,6 +219,15 @@ namespace dungeonroute
         std::vector<BossSwitch> switches;        // boss 战后开关（门禁面板/桥控制台）
         // [2026-10-19 站长口径] 动态巡逻：不绝对按波次表，运行到附近再动态决策
         std::set<uint32> patrolGuids;             // 本图巡逻怪 guid（ai_playerbot_patrol）
+        // [2026-10-22 站长口径] "按同类怪数量动态调整权重"（表 ai_playerbot_mob_count_weight）：
+        //   附近该 entry 的活怪 < engageCount ⇒ 无视它继续推进；>= engageCount ⇒ 正常清，
+        //   且数量越多权重越高（等效距离 d/(1+weightPerCount*count)）。
+        struct CountWeightRule { float radius = 25.0f; uint32 engageCount = 8; float weightPerCount = 0.15f; };
+        std::map<uint32, CountWeightRule> countWeights;   // entry -> 规则
+        // [2026-10-23 站长口径] "无敌 + 击飞"类怪不拉，按躲地板处理（表 ai_playerbot_avoid_mob）。
+        //   这里只放数据；运行时由 route 动作把它们灌进 bot 的 "avoid creature list"，
+        //   交给引擎自带的 avoid specific creatures 策略去 move away。
+        std::set<uint32> avoidEntries;
         uint16 maxOrd = 0;
     };
 
@@ -254,12 +263,24 @@ namespace dungeonroute
         float bossBestDist = 1e9f;
         std::map<uint32, uint32> bossDeferUntil;
         std::set<uint32> bossLinksTried;
+        // [2026-10-22 站长口径] boss 可达性：PathFinder(mmaps) 判定 + 位置卡住判定
+        uint32 bossPathGuid = 0;
+        uint32 bossPathCheckAt = 0;
+        bool   bossPathOk = true;
+        float  bossPosX = 0.0f;
+        float  bossPosY = 0.0f;
+        uint32 bossPosAt = 0;
         // [2026-10-22 站长口径] "30 码内可拉但会引到巡逻怪" ⇒ 原地等它走开
         //   patrolWaitGuid = 挡路的巡逻怪 guid；每秒重判一次，最多等 patrolWaitMaxMs
         uint32 patrolWaitGuid = 0;
         uint32 patrolWaitAt = 0;
         uint32 patrolWaitSince = 0;
-        uint32 patrolWaitLogAt = 0;   // [2026-10-22] 已为"不可达 boss"试过的连接点下标（避免死循环）
+        uint32 patrolWaitLogAt = 0;
+        // [2026-10-22] 等满 30s 仍不安全的巡逻怪：短时间内不再挡路
+        //   （否则会"等 30s → 放弃这一只 → 下一 tick 又选中它 → 再等 30s"死循环，555 实测卡满 900 秒）
+        uint32 patrolIgnoreGuid = 0;
+        uint32 patrolIgnoreUntil = 0;
+        uint32 patrolWaitTargetGuid = 0;   // 因它而等的"想拉的那只怪"   // [2026-10-22] 已为"不可达 boss"试过的连接点下标（避免死循环）
         std::set<uint16> seenAlive;   // 见过活怪的波（用来区分"已清"与"远处未加载"）
         std::set<uint16> cleared;     // 确认已清的波
         std::set<uint32> bossSeen;    // 见过活的 boss 刷点
@@ -269,6 +290,22 @@ namespace dungeonroute
         uint32 switchWaitAt = 0;      // 开关没加载时的等待起点
         uint16 lockOrd = 0;           // 当前锁定的推进波（0 = 未锁定）
         uint32 lockUntil = 0;         // 锁定到期时间（毫秒）
+        // [2026-10-22 寻路修] "等网格加载"的计时起点：必须等**站到本波拉怪位之后**才开始计时。
+        //   原来用 WaveStuckMs（从进入本波开始算）⇒ 走路本身就要几秒，一到点就误判"未加载"整波跳过。
+        uint16 atPullOrd = 0;         // 正在哪个波/拉怪位上等（0 = boss 或未定）
+        uint32 atPullSince = 0;       // 第一次站上该拉怪位的时刻
+        // [2026-10-23 站长口径] 拉怪失败兜底：
+        //   unattackable = 不可攻击/永远无敌的目标（召唤物、无敌机关）⇒ 拉黑，继续推进（"应该逃跑"）；
+        //   approachGuid/At = "要贴近才能打"的目标 ⇒ 主动走近再试（2 秒节流）。
+        std::set<uint32> unattackable;
+        uint32 approachGuid = 0;
+        uint32 approachAt = 0;
+        // [2026-10-23] 不完整路径收束：路径检查节流（1.5s）+ 上次检查的目标
+        uint32 pathCheckAt = 0;
+        uint32 pathTargetGuid = 0;
+        // [2026-10-23] 目标级拉黑：同一只怪连续拉怪失败 N 次（打不了/不可交互/感知不到）⇒ 跳过，
+        //   避免整队死磕一只怪（实测 558 的 Raging Soul 被重试 175 次，整张图 0 进度）。
+        std::map<uint32, uint8> pullFailCount;
         // [2026-10-18] "有目标但走不过去"守卫：同一波移动 8 秒**位置没动过** ⇒ 放弃该波。
         //   用位置而不是"到目标距离"：绕路时距离可能先变大，但那不是卡住。
         uint16 moveOrd = 0;           // 正在朝哪一波移动（0 = 无）
@@ -386,6 +423,32 @@ namespace dungeonroute
                 it->second.pull.y = f[2].GetFloat();
                 it->second.pull.z = f[3].GetFloat();
             } while (anchors->NextRow());
+        }
+
+        // [2026-10-22 站长口径] 按同类怪数量动态调整权重（540：Creeping Oozeling / Shattered Hand Zealot）
+        std::unique_ptr<QueryResult> cwrules = WorldDatabase.PQuery(
+            "SELECT `entry`, `radius`, `engage_count`, `weight_per_count` FROM `ai_playerbot_mob_count_weight` "
+            "WHERE `map` = '%u'", mapId);
+        if (cwrules)
+        {
+            do
+            {
+                Field* f = cwrules->Fetch();
+                MapRoute::CountWeightRule r;
+                r.radius = f[1].GetFloat();
+                r.engageCount = f[2].GetUInt32();
+                r.weightPerCount = f[3].GetFloat();
+                route.countWeights[f[0].GetUInt32()] = r;
+            } while (cwrules->NextRow());
+        }
+
+
+        // [2026-10-23] 无敌+击飞类怪：加载"要躲"的 entry 列表
+        std::unique_ptr<QueryResult> avoidRows = WorldDatabase.PQuery(
+            "SELECT `entry` FROM `ai_playerbot_avoid_mob` WHERE `map` = '%u'", mapId);
+        if (avoidRows)
+        {
+            do { route.avoidEntries.insert(avoidRows->Fetch()[0].GetUInt32()); } while (avoidRows->NextRow());
         }
 
         // [2026-10-18 站长口径] "让 bot 知道每一波怪的位置"：用刷点坐标算**波中心**。
@@ -527,9 +590,9 @@ namespace dungeonroute
             }
         }
 
-        sLog.outString("[DUNGEONROUTE] map %u 已加载推进数据：%u 波 / %u 只 / boss 刷点 %u 个",
+        sLog.outError("[DUNGEONROUTE] map %u 已加载推进数据：%u 波 / %u 只 / boss 刷点 %u 个",
             mapId, uint32(route.waves.size()), uint32(route.guidOrd.size()), uint32(route.bosses.size()));
-        sLog.outString("[DUNGEONROUTE] map %u 波成员 %u：数据缺口(动态刷怪) %u / 小动物 %u / 非敌对NPC %u / 纯NPC波 %u",
+        sLog.outError("[DUNGEONROUTE] map %u 波成员 %u：数据缺口(动态刷怪) %u / 小动物 %u / 非敌对NPC %u / 纯NPC波 %u",
             mapId, totalMembers, missingMembers, critterMembers, npcMembers, trivialWaves);
     }
 
@@ -591,6 +654,43 @@ namespace dungeonroute
             if (MemberCreature(map, m))
                 return true;
         return false;
+    }
+
+    // [2026-10-22 站长口径] 540 策略的"攒够才清"门槛：表里的 engage_count × 全局倍率（可在线调，300s 热加载）。
+    inline uint32 EngageCount(MapRoute::CountWeightRule const& r)
+    {
+        float const scale = dw::Get("mob.count.engage_scale");   // 缺省值在 DecisionWeights.h 里（1.0）
+        float const v = float(r.engageCount) * (scale > 0.0f ? scale : 1.0f);
+        return uint32(std::max(1.0f, v));
+    }
+
+    // [2026-10-22 站长口径] 数一下某坐标附近"同 entry 的活怪"（用于 540 的按数量动态权重）。
+    //   只用路线成员 + 巡逻表：540 的 Creeping Oozeling / Shattered Hand Zealot 都在路线里，
+    //   这样不用做格子扫描，开销可控。
+    inline uint32 CountNearbyEntry(Map* map, MapRoute const& route, uint32 entry,
+                                   float x, float y, float z, float radius)
+    {
+        if (!map)
+            return 0;
+        uint32 n = 0;
+        float const r2 = radius * radius;
+        auto visit = [&](uint32 guid)
+        {
+            Creature* c = map->GetCreature(guid);
+            if (!c || !c->IsAlive() || !c->IsInWorld() || c->GetEntry() != entry)
+                return;
+            float const dx = c->GetPositionX() - x;
+            float const dy = c->GetPositionY() - y;
+            float const dz = c->GetPositionZ() - z;
+            if (dx * dx + dy * dy + dz * dz <= r2)
+                ++n;
+        };
+        for (auto const& kv : route.waves)
+            for (auto const& m : kv.second.members)
+                visit(m.guid);
+        for (uint32 pg : route.patrolGuids)
+            visit(pg);
+        return n;
     }
 
     // [2026-10-21 站长口径·兜底] 有没有"没登记进路线表"的怪正在打队伍。
@@ -671,7 +771,7 @@ namespace dungeonroute
         st.skip.erase(ord);
         st.skipUntil.erase(it);
         st.calcedAt = 0;
-        sLog.outString("[DUNGEONROUTE] 重新尝试之前暂跳过的波 ord=%u（到点复活）", uint32(ord));
+        sLog.outError("[DUNGEONROUTE] 重新尝试之前暂跳过的波 ord=%u（到点复活）", uint32(ord));
         return false;
     }
 
@@ -695,7 +795,7 @@ namespace dungeonroute
                 if (hold)
                 {
                     if (freshHold)
-                        sLog.outString("[DUNGEONROUTE] %s 有未登记怪在战斗 ⇒ 保持波次 ord=%u（不推进）",
+                        sLog.outError("[DUNGEONROUTE] %s 有未登记怪在战斗 ⇒ 保持波次 ord=%u（不推进）",
                             bot->GetName(), uint32(hold));
                     return hold;
                 }
@@ -798,7 +898,7 @@ namespace dungeonroute
         BotState& st = StateOf(bot);
         if (st.cleared.insert(ord).second)
         {
-            sLog.outString("[DUNGEONROUTE] %s 波已清 ord=%u（%s）",
+            sLog.outError("[DUNGEONROUTE] %s 波已清 ord=%u（%s）",
                 bot->GetName(), uint32(ord), why ? why : "");
         }
         st.seenAlive.erase(ord);
@@ -823,7 +923,7 @@ namespace dungeonroute
         BotState& st = StateOf(bot);
         if (st.skip.insert(ord).second)
         {
-            sLog.outString("[DUNGEONROUTE] %s 跳过 ord=%u（%s）",
+            sLog.outError("[DUNGEONROUTE] %s 跳过 ord=%u（%s）",
                 bot->GetName(), uint32(ord), why ? why : "");
         }
 
@@ -845,7 +945,7 @@ namespace dungeonroute
             return;
         BotState& st = StateOf(bot);
         if (st.bossSkipped.insert(dbGuid).second)
-            sLog.outString("[DUNGEONROUTE] %s 跳过 boss 刷点 %u（未加载/不可达，不算已死）",
+            sLog.outError("[DUNGEONROUTE] %s 跳过 boss 刷点 %u（未加载/不可达，不算已死）",
                 bot->GetName(), dbGuid);
         st.calcedAt = 0;
     }
@@ -939,7 +1039,7 @@ namespace dungeonroute
                 st.linkUsedAt = now;
                 st.linkWaitAt = 0;
                 bot->GetMotionMaster()->MoveJump(l.dx, l.dy, l.dz, 9.0f, 5.0f);
-                sLog.outString("[DUNGEONROUTE] %s 跳点 (%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f)",
+                sLog.outError("[DUNGEONROUTE] %s 跳点 (%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f)",
                     bot->GetName(), l.sx, l.sy, l.sz, l.dx, l.dy, l.dz);
                 return true;
             }
@@ -969,7 +1069,7 @@ namespace dungeonroute
                 float const maxXY = bot->GetSpeed(MOVE_RUN) * sPlayerbotAIConfig.jumpHSpeed * 1.05f + 0.5f;
                 if (speedXY > maxXY)
                 {
-                    sLog.outString("[DUNGEONROUTE] %s 跳跃链接不可行：vXY=%.1f > max=%.1f (dist=%.1f drop=%.1f)",
+                    sLog.outError("[DUNGEONROUTE] %s 跳跃链接不可行：vXY=%.1f > max=%.1f (dist=%.1f drop=%.1f)",
                         bot->GetName(), speedXY, maxXY, dist2d, drop);
                     continue;
                 }
@@ -978,7 +1078,7 @@ namespace dungeonroute
                 st.linkUsedAt = now;
                 st.linkWaitAt = 0;
                 bot->GetMotionMaster()->MoveJump(l.dx, l.dy, l.dz, speedXY, v0);
-                sLog.outString("[DUNGEONROUTE] %s 客户端式跳跃 (%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f) vXY=%.1f vZ=%.1f t=%.2f",
+                sLog.outError("[DUNGEONROUTE] %s 客户端式跳跃 (%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f) vXY=%.1f vZ=%.1f t=%.2f",
                     bot->GetName(), l.sx, l.sy, l.sz, l.dx, l.dy, l.dz, speedXY, v0, t);
                 return true;
             }
@@ -991,7 +1091,7 @@ namespace dungeonroute
             if (!st.linkWaitAt)
             {
                 st.linkWaitAt = now ? now : 1;
-                sLog.outString("[DUNGEONROUTE] %s 等升降台/传送点 (%.1f,%.1f,%.1f)",
+                sLog.outError("[DUNGEONROUTE] %s 等升降台/传送点 (%.1f,%.1f,%.1f)",
                     bot->GetName(), l.sx, l.sy, l.sz);
                 return true;
             }
@@ -1000,7 +1100,7 @@ namespace dungeonroute
                 st.linkWaitAt = 0;
                 st.linkUsedAt = now;
                 bot->TeleportTo(map->GetId(), l.dx, l.dy, l.dz, bot->GetOrientation());
-                sLog.outString("[DUNGEONROUTE] %s 升降台/传送点 -> (%.1f,%.1f,%.1f)",
+                sLog.outError("[DUNGEONROUTE] %s 升降台/传送点 -> (%.1f,%.1f,%.1f)",
                     bot->GetName(), l.dx, l.dy, l.dz);
                 return true;
             }
@@ -1031,8 +1131,32 @@ namespace dungeonroute
         const uint16 ord = target.boss ? 0 : (target.ord ? target.ord : CurrentOrd(bot, route));
         pullrec::SetRouteOrd(bot->GetGroup(), ord);
 
-        sLog.outString("[DUNGEONROUTE] %s 自动开怪起手 -> 记录器 ord=%u（%s）",
+        sLog.outError("[DUNGEONROUTE] %s 自动开怪起手 -> 记录器 ord=%u（%s）",
             bot->GetName(), uint32(ord), target.boss ? "boss" : "wave");
+
+        // [2026-10-23 站长口径] "开怪姿势"要先能量化：起手这一刻，目标周围 10/15/20 码内有多少敌对活怪。
+        //   只加观测、不改行为 —— 用来回答"到底是拉 1 只还是拉了一整窝"。
+        if (Creature* t = bot->GetMap() ? bot->GetMap()->GetCreature(target.guid) : nullptr)
+        {
+            uint32 c10 = 0, c15 = 0, c20 = 0;
+            auto countAt = [&](float radius, uint32& out)
+            {
+                for (auto const& kv : route.waves)
+                    for (auto const& m : kv.second.members)
+                    {
+                        Creature* c = MemberCreature(bot->GetMap(), m);
+                        if (!c || !c->IsAlive() || !c->IsInWorld() || !SessionCanFight(bot, c))
+                            continue;
+                        if (t->IsWithinDist(c, radius, false))
+                            ++out;
+                    }
+            };
+            countAt(10.0f, c10);
+            countAt(15.0f, c15);
+            countAt(20.0f, c20);
+            sLog.outError("[PULLSIZE] %s ord=%u target=%u near10=%u near15=%u near20=%u",
+                bot->GetName(), uint32(ord), target.guid, c10, c15, c20);
+        }
     }
 
     inline void PullEnd(Player* bot, const char* result)
@@ -1048,7 +1172,7 @@ namespace dungeonroute
         ai::PossibleAttackTargetsValue::FlushPriorityObs();
 
         if (result)
-            sLog.outString("[DUNGEONROUTE] %s 自动开怪拉怪结束（%s）", bot->GetName(), result);
+            sLog.outError("[DUNGEONROUTE] %s 自动开怪拉怪结束（%s）", bot->GetName(), result);
     }
 
     // ---- 目标选择 -----------------------------------------------------------------
@@ -1137,7 +1261,7 @@ namespace dungeonroute
                 st.seenAlive.insert(ord);
                 if (st.lockOrd == ord)
                     st.lockOrd = 0;
-                sLog.outString("[DUNGEONROUTE] 波 %u 的怪重新刷出 ⇒ 重新打开（不能算已清）", (uint32)ord);
+                sLog.outError("[DUNGEONROUTE] 波 %u 的怪重新刷出 ⇒ 重新打开（不能算已清）", (uint32)ord);
             }
             else
                 ++it;
@@ -1163,6 +1287,8 @@ namespace dungeonroute
             {
                 st.bossCleared.insert(b.guid);
                 st.bossSkipped.erase(b.guid);
+                // [2026-10-22 验证] 逐 boss 击杀留痕（boss_report.py 靠这行统计）
+                sLog.outError("[BOSSKILL] map=%u entry=%u guid=%u", map->GetId(), b.entry, b.guid);
             }
             else
                 st.bossSeen.insert(b.guid);
@@ -1298,6 +1424,7 @@ namespace dungeonroute
             if (c && !c->IsAlive())
             {
                 st.bossCleared.insert(b.guid);      // 尸体 = 已死
+                sLog.outError("[BOSSKILL] map=%u entry=%u guid=%u", map->GetId(), b.entry, b.guid);
                 continue;
             }
             // [boss-fix 2026-10-19] 不能再把“见过活的、现在没加载”当成已死：
@@ -1332,53 +1459,7 @@ namespace dungeonroute
         return false;
     }
 
-    // [2026-10-22 站长口径] boss 优先模式：路上遇到 30 码内的怪，拉之前先判断"拉它会不会引到别的怪"。
-    //   判据：目标 10 码内还有**别的波次**的敌对活怪、或未登记进路线的敌对活怪 ⇒ 视为会连带 ADD，先不拉它。
-    //   （同一波/同一刷怪组的成员不算"别的怪"——那本来就是要一起打的遭遇）
-    inline bool BossModePullSafe(Player* bot, Map* map, MapRoute const& route, Creature* target)
-    {
-        if (!bot || !map || !target)
-            return false;
 
-        uint16 const targetOrd = [&]()
-        {
-            auto it = route.guidOrd.find(target->GetGUIDLow());
-            return it == route.guidOrd.end() ? uint16(0) : it->second;
-        }();
-
-        auto risky = [&](uint32 guid) -> bool
-        {
-            if (guid == target->GetGUIDLow())
-                return false;
-            Creature* c = map->GetCreature(guid);
-            if (!c || !c->IsAlive() || !c->IsInWorld())
-                return false;
-            if (!SessionCanFight(bot, c))
-                return false;
-            if (!target->IsWithinDist(c, 10.0f, false))
-                return false;
-
-            auto it = route.guidOrd.find(guid);
-            uint16 const ord = it == route.guidOrd.end() ? uint16(0) : it->second;
-            // 同波 ⇒ 不算 ADD；不同波 / 未登记 ⇒ 有连带风险
-            return ord != targetOrd || ord == 0;
-        };
-
-        for (auto& kv : route.waves)
-        {
-            for (auto& m : kv.second.members)
-            {
-                if (risky(m.guid))
-                    return false;
-            }
-        }
-        for (uint32 pg : route.patrolGuids)
-        {
-            if (risky(pg))
-                return false;
-        }
-        return true;
-    }
 
     // [2026-10-22 站长口径] 与 BossModePullSafe 同样的判定，但**返回挡路的怪 guid**：
     //   用于区分"能不能等" —— 挡路的是巡逻怪 ⇒ 等它走开；是别的波/未登记怪 ⇒ 等也没用。
@@ -1386,6 +1467,10 @@ namespace dungeonroute
     {
         if (!bot || !map || !target)
             return 0;
+
+        // [2026-10-22 站长口径] 宽松模式（cheat 验证寻路专用）：pull.safe.strict=0 时
+        //   除了"巡逻怪会引到"以外都放行 —— 先让坦克把 boss/跳点/路口跑通，再回头收紧危险度。
+        bool const strict = dw::Get("pull.safe.strict") > 0.0f;
 
         auto ordOf = [&](uint32 guid) -> uint16
         {
@@ -1404,11 +1489,20 @@ namespace dungeonroute
                 return false;
             if (!SessionCanFight(bot, c))
                 return false;
+            // [2026-10-22 站长口径] 540 特殊策略：数量不够的同类怪（Oozeling/Zealot）不算"挡路"，
+            //   否则队伍会为了躲它们站着不动；等它们攒够数量才当正常目标处理。
+            auto cw = route.countWeights.find(c->GetEntry());
+            if (cw != route.countWeights.end() &&
+                CountNearbyEntry(map, route, c->GetEntry(),
+                    c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), cw->second.radius) < EngageCount(cw->second))
+                return false;
             if (!target->IsWithinDist(c, 10.0f, false))
                 return false;
             uint16 const ord = ordOf(guid);
             if (ord != targetOrd || ord == 0)
             {
+                if (!strict && !route.patrolGuids.count(guid))
+                    return false;              // 宽松模式：非巡逻怪不算 ADD 风险
                 blocker = guid;
                 return true;
             }
@@ -1419,10 +1513,21 @@ namespace dungeonroute
             for (auto& m : kv.second.members)
                 if (risky(m.guid))
                     return blocker;
+        BotState& pst = StateOf(bot);
+        uint32 const nowMs = WorldTimer::getMSTime();
         for (uint32 pg : route.patrolGuids)
+        {
+            if (pst.patrolIgnoreGuid == pg && pst.patrolIgnoreUntil > nowMs)
+                continue;                       // 这只巡逻怪刚被"等超时"过：先放行，避免死循环
             if (risky(pg))
                 return blocker;
+        }
         return 0;
+    }
+
+    inline bool BossModePullSafe(Player* bot, Map* map, MapRoute const& route, Creature* target)
+    {
+        return BossModePullBlocker(bot, map, route, target) == 0;
     }
 
     // [2026-10-22 站长口径] boss 优先：所有 boss 都不可达（挂起）时，按 link 跳到下一个连通区间再重查。
@@ -1492,7 +1597,7 @@ namespace dungeonroute
         out.lx = l.dx; out.ly = l.dy; out.lz = l.dz;
         out.px = l.sx; out.py = l.sy; out.pz = l.sz;
         out.hasPullPoint = true;
-        sLog.outString("[DUNGEONROUTE] %s 没有可达 boss ⇒ 走连接点#%u (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)，跳完重查 boss",
+        sLog.outError("[DUNGEONROUTE] %s 没有可达 boss ⇒ 走连接点#%u (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)，跳完重查 boss",
             bot->GetName(), uint32(bestIdx), l.sx, l.sy, l.sz, l.dx, l.dy, l.dz);
         return true;
     }
@@ -1540,7 +1645,7 @@ namespace dungeonroute
                     continue;                    // 还在挂起期：这次先走波次
                 st.bossDeferUntil.erase(dit);    // 到点：重新检查可达
                 st.bossLinksTried.clear();       // 连接点也重试
-                sLog.outString("[DUNGEONROUTE] %s 重新检查 boss 可达性 entry=%u（挂起到期）",
+                sLog.outError("[DUNGEONROUTE] %s 重新检查 boss 可达性 entry=%u（挂起到期）",
                     bot->GetName(), bp->entry);
             }
 
@@ -1554,20 +1659,85 @@ namespace dungeonroute
             float const tz = loaded ? c->GetPositionZ() : bp->z;
             float const dist = bot->GetDistance(tx, ty, tz);
 
-            // 卡住判定：45 秒没有靠近趋势
+            // [2026-10-22 站长口径] 可达性用**真实寻路**（mmaps PathFinder），不用"距离没缩短"这种代理：
+            //   绕墙、打架、等巡逻都会让距离暂时变大，但那不代表不可达。
+            uint32 const recheckMs = uint32(dw::Get("boss.path_recheck_sec") * 1000.0f);
+            bool const needPathCheck = (st.bossPathGuid != guid) || !st.bossPathCheckAt ||
+                WorldTimer::getMSTimeDiff(st.bossPathCheckAt, now) >= recheckMs;
+            if (needPathCheck)
+            {
+                st.bossPathCheckAt = now ? now : 1;
+                st.bossPathGuid = guid;
+
+                PathFinder pf(bot);
+                bool ok = pf.calculate(tx, ty, tz);
+                if (ok)
+                {
+                    auto& pts = pf.getPath();
+                    if (pts.empty())
+                        ok = false;
+                    else
+                    {
+                        Vector3 const& end = pts.back();
+                        float const ex = end.x - tx, ey = end.y - ty, ez = end.z - tz;
+                        if (std::sqrt(ex * ex + ey * ey + ez * ez) > dw::Get("boss.path_tolerance_yd"))
+                            ok = false;
+                    }
+                }
+
+                if (ok != st.bossPathOk)
+                {
+                    st.bossPathOk = ok;
+                    if (!ok)
+                    {
+                        // [2026-10-22 诊断] 打出 PathFinder 的真实结论，区分 "navmesh 没加载"(type=BLANK)
+                        //   与 "确实找不到路"(type=NOPATH)，以及路径点数/终点距离。
+                        PathFinder dbg(bot);
+                        bool const dbgOk = dbg.calculate(tx, ty, tz);
+                        float dbgEndDist = -1.0f;
+                        auto& dbgPts = dbg.getPath();
+                        if (!dbgPts.empty())
+                        {
+                            Vector3 const& e2 = dbgPts.back();
+                            float const dx2 = e2.x - tx, dy2 = e2.y - ty, dz2 = e2.z - tz;
+                            dbgEndDist = std::sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2);
+                        }
+                        sLog.outString("[DUNGEONROUTE] %s boss entry=%u 寻路不可达（mmaps dist=%.0f ok=%d type=%d pts=%u endDist=%.1f）⇒ 先试连接点",
+                            bot->GetName(), bp->entry, dist, dbgOk ? 1 : 0, int(dbg.getPathType()),
+                            uint32(dbgPts.size()), dbgEndDist);
+                    }
+                    else
+                        sLog.outString("[DUNGEONROUTE] %s boss entry=%u 寻路可达（dist=%.0f）",
+                            bot->GetName(), bp->entry, dist);
+                }
+            }
+
             if (st.bossGuid != guid)
             {
                 st.bossGuid = guid;
                 st.bossSince = now ? now : 1;
                 st.bossBestDist = dist;
+                st.bossPosX = bot->GetPositionX();
+                st.bossPosY = bot->GetPositionY();
+                st.bossPosAt = now ? now : 1;
             }
-            else if (dist < st.bossBestDist - 3.0f)
+
+            // 只有"路径可达、但 boss 目标在 stuck_sec 内位置几乎没动"才算卡住
+            bool stuck = false;
+            if (st.bossPathOk && st.bossPosAt &&
+                WorldTimer::getMSTimeDiff(st.bossPosAt, now) >= uint32(dw::Get("boss.stuck_sec") * 1000.0f))
             {
-                st.bossBestDist = dist;
-                st.bossSince = now ? now : 1;
+                float const mx = bot->GetPositionX() - st.bossPosX;
+                float const my = bot->GetPositionY() - st.bossPosY;
+                stuck = (mx * mx + my * my) < 4.0f;
+                st.bossPosX = bot->GetPositionX();
+                st.bossPosY = bot->GetPositionY();
+                st.bossPosAt = now ? now : 1;
             }
-            else if (st.bossSince && now > st.bossSince &&
-                     WorldTimer::getMSTimeDiff(st.bossSince, now) > 45000)
+
+            // [2026-10-22 站长口径] 不再用"PathFinder 说不可达"来挂起 boss（路线断点/门口/部分路径都会误判，
+            //   实测 183/218 次误判，而 boss 明明可达）。只有**位置卡住**才走连接点/挂起。
+            if (stuck)
             {
                 // [2026-10-22 站长口径] 走不过去先别放弃：如果图里有连接点（跳跃点/升降台/传送）
                 //   能让我们更靠近这个 boss，就先走过去把它执行了，跳完再重新检查可达性；
@@ -1603,7 +1773,7 @@ namespace dungeonroute
                     out.lx = l.dx; out.ly = l.dy; out.lz = l.dz;
                     out.px = l.sx; out.py = l.sy; out.pz = l.sz;
                     out.hasPullPoint = true;
-                    sLog.outString("[DUNGEONROUTE] %s boss entry=%u 45 秒走不过去 ⇒ 先执行连接点#%u "
+                    sLog.outError("[DUNGEONROUTE] %s boss entry=%u 走不过去（寻路不可达/卡住）⇒ 先执行连接点#%u "
                         "(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)，跳完再查可达",
                         bot->GetName(), bp->entry, uint32(li), l.sx, l.sy, l.sz, l.dx, l.dy, l.dz);
                     return true;
@@ -1612,7 +1782,7 @@ namespace dungeonroute
                 st.bossDeferUntil[guid] = (now ? now : 1) + 120000;
                 st.bossGuid = 0;
                 st.bossSince = 0;
-                sLog.outString("[DUNGEONROUTE] %s boss entry=%u 45 秒没有靠近（dist=%.0f，连接点都试过）⇒ 暂时挂起，改走波次/特殊寻路",
+                sLog.outError("[DUNGEONROUTE] %s boss entry=%u 寻路不可达/卡住（dist=%.0f，连接点都试过）⇒ 暂时挂起 120 秒，改走波次",
                     bot->GetName(), bp->entry, dist);
                 continue;
             }
@@ -1629,10 +1799,20 @@ namespace dungeonroute
                 auto wit = route.waves.find(bp->ord);
                 if (wit != route.waves.end() && wit->second.pull.has)
                 {
-                    out.px = wit->second.pull.x;
-                    out.py = wit->second.pull.y;
-                    out.pz = wit->second.pull.z;
-                    return true;
+                    // [寻路修C 2026-10-22] 只有锚点真的在 boss 附近（≤40 码）才拿它当拉怪位；
+                    //   否则就是 boss↔波次锚点映射错位（实测 547 Mennu 的锚点偏 367 码，队伍会朝地图另一头走）。
+                    //   这种情况按 boss 自身实际落点（tx,ty,tz：已加载用实时坐标，否则用刷点）过去。
+                    float const ax = wit->second.pull.x;
+                    float const ay = wit->second.pull.y;
+                    float const az = wit->second.pull.z;
+                    float const adx = ax - tx, ady = ay - ty, adz = az - tz;
+                    if (adx * adx + ady * ady + adz * adz <= 40.0f * 40.0f)
+                    {
+                        out.px = ax;
+                        out.py = ay;
+                        out.pz = az;
+                        return true;
+                    }
                 }
             }
 
@@ -1681,6 +1861,11 @@ namespace dungeonroute
         float nearestAliveDist = 1e18f;
         bool nearestAliveVisible = false;
         uint16 nearestAliveOrd = 0;
+        // [寻路修 2026-10-22] 不限距离的"本波最近活成员"：只用来决定**往哪走**。
+        //   巡逻怪会走开、静态锚点会落在空地（546 实测站在锚点上 tg=0 不动）⇒ 没有可拉目标时朝它走过去。
+        Member nearestAnyM;
+        float nearestAnyDist = 1e18f;
+        uint16 nearestAnyOrd = 0;
 
         // [2026-10-18 站长口径] "多波同时可见时不要来回横跳，只保证清完一波"：
         //   选中一波后锁定 LOCK_MS，期间只打这一波（除非它被清/被放弃）。
@@ -1696,6 +1881,9 @@ namespace dungeonroute
             nearestAliveDist = 1e18f;
             nearestAliveVisible = false;
             nearestAliveOrd = 0;
+            nearestAnyM = Member();
+            nearestAnyDist = 1e18f;
+            nearestAnyOrd = 0;
 
             for (auto& kv : route.waves)
             {
@@ -1714,13 +1902,17 @@ namespace dungeonroute
                     Creature* c = MemberCreature(map, m);
                     if (!c)
                         continue;
+                    // [2026-10-23] 已被判定"不可攻击/永远无敌"的目标不再选（否则整队站着发呆）
+                    if (st.unattackable.count(m.guid))
+                        continue;
+                    // [2026-10-23 站长口径] 无敌+击飞类怪不拉（按躲地板处理，交给 avoid specific creatures）
+                    if (route.avoidEntries.count(c->GetEntry()))
+                        continue;
                     if (!SessionCanFight(bot, c))
                         continue;                       // 友好 NPC / 小动物：不参与推进
 
-                    // [2026-10-19 简单图口径] 先跳过**水里**的波：Slave Pens 水池的怪 mmap 走不过去，
-                    //   反复"拉 1 只 → 跳波"会浪费大量时间；boss 走 bosses 列表，不受这里影响。
-                    if (c->IsInWater())
-                        continue;
+                    // [2026-10-22 站长口径] 取消"跳过水里怪"：现在 mmap/游泳已经能推进水中的怪，
+                    //   再过滤掉它们会让整波永远清不掉（546/547 实测卡 90 秒后整波跳过）。
 
                     // [全图清单] 清单里明确非敌对（小动物/任务 NPC）的跳过；
                     //   运行期动态刷怪不在清单里 ⇒ 保留（不能误杀真正要打的波）。
@@ -1728,7 +1920,20 @@ namespace dungeonroute
                     if (RosterLookup(map->GetId(), m.guid, rosterHostile) && !rosterHostile)
                         continue;
 
-                    float const d = bot->GetDistance(c);
+                    float d = bot->GetDistance(c);
+
+                    // [2026-10-22 站长口径] 540 特殊策略：按"附近同类怪数量"动态调整权重。
+                    //   数量 < engage_count ⇒ 无视它继续推进（不站下来打）；
+                    //   数量 >= engage_count ⇒ 正常打，且数量越多权重越高（等效距离缩短）。
+                    auto cwit = route.countWeights.find(c->GetEntry());
+                    if (cwit != route.countWeights.end())
+                    {
+                        uint32 const near = CountNearbyEntry(map, route, c->GetEntry(),
+                            c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), cwit->second.radius);
+                        if (near < EngageCount(cwit->second))
+                            continue;
+                        d = d / (1.0f + cwit->second.weightPerCount * float(near));
+                    }
 
                     // [2026-10-22 站长口径] boss 优先模式：只把"30 码内、视线内、且**拉它不会引到别的怪**"
                     //   的怪当成"路上遇到要先打的一波"；会 ADD 的、更远的都不主动拉（先打 boss）。
@@ -1743,6 +1948,7 @@ namespace dungeonroute
                             if (!st.patrolWaitGuid && route.patrolGuids.count(blocker))
                             {
                                 st.patrolWaitGuid = blocker;
+                                st.patrolWaitTargetGuid = c->GetGUIDLow();
                                 st.patrolWaitAt = 0;
                                 st.patrolWaitSince = 0;
                                 st.patrolWaitLogAt = 0;
@@ -1752,6 +1958,15 @@ namespace dungeonroute
                     }
 
                     st.seenAlive.insert(waveOrd);
+
+                    // [寻路修 2026-10-22] 记录"本波最近的活成员（不限距离）"，只用于走位。
+                    //   放在这里是因为上面已经滤掉水里/非敌对/会 ADD 的怪。
+                    if (d < nearestAnyDist)
+                    {
+                        nearestAnyDist = d;
+                        nearestAnyM = m;
+                        nearestAnyOrd = waveOrd;
+                    }
 
                     if (d < nearestAliveDist)
                     {
@@ -1795,7 +2010,7 @@ namespace dungeonroute
                     if (!st.patrolWaitLogAt || WorldTimer::getMSTimeDiff(st.patrolWaitLogAt, waitNow) >= 5000)
                     {
                         st.patrolWaitLogAt = waitNow ? waitNow : 1;
-                        sLog.outString("[DUNGEONROUTE] %s 30码内有可拉怪但会引到巡逻怪 %s ⇒ 原地等它走开（%us/%us）",
+                        sLog.outError("[DUNGEONROUTE] %s 30码内有可拉怪但会引到巡逻怪 %s ⇒ 原地等它走开（%us/%us）",
                             bot->GetName(), patrol->GetName(),
                             uint32(WorldTimer::getMSTimeDiff(st.patrolWaitSince, waitNow) / 1000),
                             uint32(maxWaitMs / 1000));
@@ -1804,14 +2019,34 @@ namespace dungeonroute
                 else
                 {
                     if (!stillThere)
-                        sLog.outString("[DUNGEONROUTE] %s 巡逻怪已走开 ⇒ 继续拉怪", bot->GetName());
-                    else
-                        sLog.outString("[DUNGEONROUTE] %s 等巡逻怪 %us 仍不安全 ⇒ 放弃这一只，继续推进",
+                        sLog.outError("[DUNGEONROUTE] %s 巡逻怪已走开 ⇒ 继续拉怪", bot->GetName());
+                    else if (dw::Get("pull.safe.strict") <= 0.0f)
+                    {
+                        // 宽松模式（cheat 验证寻路）：等满仍挡路就**直接拉**，并把这只巡逻怪忽略 20 秒，
+                        //   否则会陷入"等 30s→放弃→再选回同一只→再等"死循环（555 实测 900 秒零推进）。
+                        sLog.outError("[DUNGEONROUTE] %s 等巡逻怪 %us 仍不安全 ⇒ 宽松模式：直接拉（该巡逻忽略 20s）",
                             bot->GetName(), uint32(maxWaitMs / 1000));
+                        st.patrolIgnoreGuid = st.patrolWaitGuid;
+                        st.patrolIgnoreUntil = waitNow + 20000;
+                    }
+                    else
+                    {
+                        sLog.outError("[DUNGEONROUTE] %s 等巡逻怪 %us 仍不安全 ⇒ 跳过这只所在波，继续推进",
+                            bot->GetName(), uint32(maxWaitMs / 1000));
+                        st.patrolIgnoreGuid = st.patrolWaitGuid;
+                        st.patrolIgnoreUntil = waitNow + 20000;
+                        if (st.patrolWaitTargetGuid)
+                        {
+                            auto oit = route.guidOrd.find(st.patrolWaitTargetGuid);
+                            if (oit != route.guidOrd.end() && oit->second)
+                                MarkSkipped(bot, oit->second, "patrol wait 30s");
+                        }
+                    }
                     st.patrolWaitGuid = 0;
                     st.patrolWaitAt = 0;
                     st.patrolWaitSince = 0;
                     st.patrolWaitLogAt = 0;
+                    st.patrolWaitTargetGuid = 0;
                 }
             }
 
@@ -1841,7 +2076,10 @@ namespace dungeonroute
         for (uint32 pg : route.patrolGuids)
         {
             Creature* pc = map->GetCreature(pg);
-            if (!pc || !pc->IsAlive() || pc->IsInWater() || !SessionCanFight(bot, pc))
+            if (!pc || !pc->IsAlive() || !SessionCanFight(bot, pc))    // [2026-10-22] 水里怪不再排除
+                continue;
+            // [2026-10-23 站长口径] 无敌+击飞类怪（avoid_mob）即使登记成巡逻，也不去拉
+            if (route.avoidEntries.count(pc->GetEntry()))
                 continue;
             float const pd = bot->GetDistance(pc);
             if (pd > 40.0f || !IsVisible(bot, pc))
@@ -1946,6 +2184,25 @@ namespace dungeonroute
             return true;
         }
 
+        // [寻路修A 2026-10-22] 没有可拉目标 ⇒ 先朝"本波最近活成员的实时坐标"走。
+        //   原因：巡逻波（546 第一波这种）没有固定锚点，静态锚点/波心会落在空地，
+        //   实测队伍站在锚点上 tg=0 一动不动。走到 30 码内会重新命中上面的"有活目标"分支。
+        if (!nearestM.guid && nearestAnyM.guid)
+        {
+            Creature* c = map->GetCreature(nearestAnyM.guid);
+            if (c && c->IsAlive() && c->IsInWorld())
+            {
+                out = Target();
+                out.guid = nearestAnyM.guid;
+                out.entry = nearestAnyM.entry;
+                out.ord = nearestAnyOrd;
+                out.boss = false;
+                MakeApproachPoint(bot, c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), out);
+                out.hasPullPoint = true;
+                return true;
+            }
+        }
+
         // ② 没有活目标：朝最近的"锚点/波中心"走（mmap 联通的简单图直接走得过去）。
         //     [2026-10-19 站长口径] 有锚点优先走锚点：波还没加载时也要先站到拉怪位，
         //     而不是走到怪堆几何中心（那会直接踩进警戒圈）；没有锚点才退回波中心。
@@ -1979,6 +2236,13 @@ namespace dungeonroute
             }
 
             float const d = bot->GetDistance(tx, ty, tz);
+
+            // [2026-10-23 站长口径] "沿路线往前走、周围有怪就拉"：
+            //   如果我们已经站在本波拉怪位上却**没有可拉的怪**（nearestM/nearestAny 都空），
+            //   说明这波现在打不到（未刷新/不可达）⇒ 不要原地守着，直接推进到下一波。
+            if (d <= AT_PULL_POINT_DIST && st.lockOrd && waveOrd == st.lockOrd)
+                continue;
+
             if (d < goalDist)
             {
                 goalDist = d;
@@ -1991,6 +2255,10 @@ namespace dungeonroute
 
         if (goalOrd)
         {
+            // 推进到下一波时同步锁定 ord，保证"沿路线往前走"的顺序
+            st.lockOrd = goalOrd;
+            st.lockUntil = nowMs + LOCK_MS;
+
             out = Target();
             out.guid = 0;
             out.boss = false;
@@ -2019,6 +2287,7 @@ namespace dungeonroute
             if (c && !c->IsAlive())
             {
                 st.bossCleared.insert(b.guid);
+                sLog.outError("[BOSSKILL] map=%u entry=%u guid=%u", map->GetId(), b.entry, b.guid);
                 continue;
             }
             // [boss-fix 2026-10-19] 不能再把“见过活的、现在没加载”当成已死：
