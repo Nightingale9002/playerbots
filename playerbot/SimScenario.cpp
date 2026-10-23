@@ -62,6 +62,12 @@ namespace simscenario
             uint32 phaseSince = 0;
             uint32 enteredDungeonAt = 0;
             uint32 lastStatusAt = 0;
+            // [2026-10-23 站长口径] "保证进入战斗"：整组连续 N 秒没在战斗 ⇒ 给坦克排一次 attack anything
+            uint32 idleSince = 0;
+            uint32 forceEngageAt = 0;
+            uint32 tankAssistLogAt = 0;   // [2026-10-23] 坦克补目标日志节流（动作每 tick 都补）
+            uint32 tankAssistAt = 0;      // [2026-10-23] 坦克补目标动作节流（500ms）
+            uint32 oobCheckAt = 0;        // [2026-10-23] 越界检查节流（5s）
             uint32 leaderTryAt = 0;
             uint32 memberIdx = 1;        // 逐个进本：下一个要传的成员下标
             uint32 memberTryAt = 0;      // 该成员最近一次传送时间（0 = 还没传）
@@ -602,7 +608,7 @@ namespace simscenario
                 }
 
                 if (!group->AddMember(member->GetObjectGuid(), member->GetName()))
-                    sLog.outString("[SIM] run=%u g=%u 入队失败 member=%s", run.runId, run.index, member->GetName());
+                    sLog.outError("[SIM] run=%u g=%u 入队失败 member=%s", run.runId, run.index, member->GetName());
             }
 
             run.group = group;
@@ -656,7 +662,7 @@ namespace simscenario
                     heal = p;
             }
 
-            sLog.outString("[SIM] run=%u g=%u 候选 %u 人：%s", run.runId, run.index,
+            sLog.outError("[SIM] run=%u g=%u 候选 %u 人：%s", run.runId, run.index,
                 (uint32)run.guids.size(), poolDesc.c_str());
 
             if (!tank || !heal)
@@ -725,7 +731,7 @@ namespace simscenario
             run.tankGuid = tank->GetGUIDLow();
             run.healGuid = heal->GetGUIDLow();
 
-            sLog.outString("[SIM] run=%u g=%u 用真坦/真奶组队：tank=%s heal=%s 其余=%u 人；候选未用下线 %u",
+            sLog.outError("[SIM] run=%u g=%u 用真坦/真奶组队：tank=%s heal=%s 其余=%u 人；候选未用下线 %u",
                 run.runId, run.index, tank->GetName(), heal->GetName(),
                 (uint32)(party.size() > 2 ? party.size() - 2 : 0), dropped);
             return true;
@@ -741,12 +747,12 @@ namespace simscenario
 
             Player* tank = run.tankGuid ? FindPlayerInWorld(run.tankGuid) : nullptr;
             if (tank && !PlayerbotAI::IsTank(tank))
-                sLog.outString("[SIM] run=%u g=%u WARN 坦克 %s 不再带 tank 策略（专精/策略被重置？）",
+                sLog.outError("[SIM] run=%u g=%u WARN 坦克 %s 不再带 tank 策略（专精/策略被重置？）",
                     run.runId, run.index, tank->GetName());
 
             Player* heal = run.healGuid ? FindPlayerInWorld(run.healGuid) : nullptr;
             if (heal && !PlayerbotAI::IsHeal(heal))
-                sLog.outString("[SIM] run=%u g=%u WARN 治疗 %s 不再带 heal 策略（专精/策略被重置？）",
+                sLog.outError("[SIM] run=%u g=%u WARN 治疗 %s 不再带 heal 策略（专精/策略被重置？）",
                     run.runId, run.index, heal->GetName());
         }
 
@@ -754,7 +760,7 @@ namespace simscenario
         void LogDiagnostics(GroupRun& run)
         {
             dungeonroute::MapRoute const* route = dungeonroute::GetMapRoute(run.mapId);
-            sLog.outString("[SIM] run=%u g=%u diag route loaded=%d verified=%d waves=%u guidOrd=%u bosses=%u routeSwitch=%d routeEnabled=%d",
+            sLog.outError("[SIM] run=%u g=%u diag route loaded=%d verified=%d waves=%u guidOrd=%u bosses=%u routeSwitch=%d routeEnabled=%d",
                 run.runId, run.index,
                 route ? (route->loaded ? 1 : 0) : 0,
                 route ? (route->verified ? 1 : 0) : 0,
@@ -770,11 +776,11 @@ namespace simscenario
                 PlayerbotAI* botAI = p ? p->GetPlayerbotAI() : nullptr;
                 if (!botAI)
                 {
-                    sLog.outString("[SIM] run=%u g=%u diag bot=%u offline/no-ai", run.runId, run.index, guid);
+                    sLog.outError("[SIM] run=%u g=%u diag bot=%u offline/no-ai", run.runId, run.index, guid);
                     continue;
                 }
 
-                sLog.outString("[SIM] run=%u g=%u diag bot=%s cls=%u tank=%d heal=%d tankStrat=%d dungeonRoute=%d drive=%d leader=%d allowAct=%d map=%u instance=%u alive=%d combat=%d master=%s",
+                sLog.outError("[SIM] run=%u g=%u diag bot=%s cls=%u tank=%d heal=%d tankStrat=%d dungeonRoute=%d drive=%d leader=%d allowAct=%d map=%u instance=%u alive=%d combat=%d master=%s",
                     run.runId, run.index, p->GetName(), (uint32)p->getClass(),
                     PlayerbotAI::IsTank(p) ? 1 : 0,
                     PlayerbotAI::IsHeal(p) ? 1 : 0,
@@ -816,7 +822,7 @@ namespace simscenario
             PlayerbotAI* tankAI = tank ? tank->GetPlayerbotAI() : nullptr;
             if (!tank || !tankAI || !route)
             {
-                sLog.outString("[SIM] run=%u g=%u probe tank=%u ai=%d route=%d", run.runId, run.index,
+                sLog.outError("[SIM] run=%u g=%u probe tank=%u ai=%d route=%d", run.runId, run.index,
                     run.tankGuid, tankAI ? 1 : 0, route ? 1 : 0);
                 return;
             }
@@ -830,7 +836,7 @@ namespace simscenario
             if (found && target.hasPullPoint)
                 dist = tank->GetDistance(target.px, target.py, target.pz);
 
-            sLog.outString("[SIM] run=%u g=%u probe tank=%s pos=(%.1f,%.1f,%.1f) map=%u ord=%u find=%d tg=%u entry=%u boss=%d hasPull=%d dist=%.1f pull=(%.1f,%.1f,%.1f) act=%s pullStrat=%d",
+            sLog.outError("[SIM] run=%u g=%u probe tank=%s pos=(%.1f,%.1f,%.1f) map=%u ord=%u find=%d tg=%u entry=%u boss=%d hasPull=%d dist=%.1f pull=(%.1f,%.1f,%.1f) act=%s pullStrat=%d",
                 run.runId, run.index, tank->GetName(),
                 tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ(), tank->GetMapId(),
                 (uint32)ord, found ? 1 : 0, target.guid, target.entry, target.boss ? 1 : 0,
@@ -849,7 +855,7 @@ namespace simscenario
                 for (auto const& m : kv.second.members)
                     if (dungeonroute::MemberCreature(map, m))
                         ++alive;
-                sLog.outString("[SIM] run=%u g=%u probe wave ord=%u alive=%u/%u anchor=%d",
+                sLog.outError("[SIM] run=%u g=%u probe wave ord=%u alive=%u/%u anchor=%d",
                     run.runId, run.index, (uint32)kv.first, alive, (uint32)kv.second.members.size(),
                     kv.second.pull.has ? 1 : 0);
             }
@@ -858,7 +864,7 @@ namespace simscenario
             for (auto const& b : route->bosses)
                 if (dungeonroute::MemberCreature(map, dungeonroute::Member{ b.guid, b.entry }))
                     ++bossAlive;
-            sLog.outString("[SIM] run=%u g=%u probe bosses alive=%u/%u", run.runId, run.index,
+            sLog.outError("[SIM] run=%u g=%u probe bosses alive=%u/%u", run.runId, run.index,
                 bossAlive, (uint32)route->bosses.size());
         }
 
@@ -920,7 +926,7 @@ namespace simscenario
             s_prepare.active = true;
             s_prepare.startedAt = Now();
             s_prepare.guids = guids;
-            sLog.outString("[SIM] prepare start count=%u", (uint32)guids.size());
+            sLog.outError("[SIM] prepare start count=%u", (uint32)guids.size());
             messages.push_back("开始制备 " + std::to_string(guids.size()) + " 个 bot（登录→Randomize(70)→登记→下线）");
         }
 
@@ -955,7 +961,7 @@ namespace simscenario
                     "INSERT INTO ai_playerbot_random_bots (owner,bot,time,validIn,event,value) "
                     "VALUES (0,'%u',UNIX_TIMESTAMP(),0,'prepared',1)", guid);
 
-                sLog.outString("[SIM] prepare ok guid=%u %s lv=%u cls=%u", guid, bot->GetName(),
+                sLog.outError("[SIM] prepare ok guid=%u %s lv=%u cls=%u", guid, bot->GetName(),
                     bot->GetLevel(), (uint32)bot->getClass());
 
                 sRandomPlayerbotMgr.LogoutPlayerBot(guid);
@@ -964,7 +970,7 @@ namespace simscenario
 
             if (s_prepare.done >= s_prepare.guids.size() || now - s_prepare.startedAt > 900000)
             {
-                sLog.outString("[SIM] prepare finish %u/%u", (uint32)s_prepare.done, (uint32)s_prepare.guids.size());
+                sLog.outError("[SIM] prepare finish %u/%u", (uint32)s_prepare.done, (uint32)s_prepare.guids.size());
                 s_prepare.active = false;
             }
         }
@@ -1023,7 +1029,7 @@ namespace simscenario
 
             std::string names;
             FormatRunGuids(run, names);
-            sLog.outString("[SIM] run=%u g=%u %s map=%u inst=%u total=%.1fs indungeon=%.1fs bots=%s%s%s",
+            sLog.outError("[SIM] run=%u g=%u %s map=%u inst=%u total=%.1fs indungeon=%.1fs bots=%s%s%s",
                 run.runId, run.index, ok ? "done" : "FAILED", run.mapId, run.instanceId,
                 report.totalMs / 1000.0f, report.inDungeonMs / 1000.0f, names.c_str(),
                 error.empty() ? "" : " error=", error.c_str());
@@ -1031,7 +1037,7 @@ namespace simscenario
             // 整个 run 的 attempt 汇总（灭团即重置模式下这是最重要的产出）
             if (run.attemptsDone || !run.attemptSummary.empty())
             {
-                sLog.outString("[SIM] run=%u g=%u attempts=%u best=%u/%u seed=%u policy=%s %s",
+                sLog.outError("[SIM] run=%u g=%u attempts=%u best=%u/%u seed=%u policy=%s %s",
                     run.runId, run.index, run.attemptsDone,
                     (uint32)run.bestCleared, (uint32)run.routeWaves, run.baseSeed,
                     run.policy ? "continue" : "reset",
@@ -1048,14 +1054,14 @@ namespace simscenario
             {
                 dungeonroute::RouteRuntimeSwitch() = s_savedRouteSwitch;
                 s_routeOverridden = false;
-                sLog.outString("[SIM] 路线开关恢复为 %d", s_savedRouteSwitch);
+                sLog.outError("[SIM] 路线开关恢复为 %d", s_savedRouteSwitch);
             }
 
             if (s_activityPrioritiesOverridden)
             {
                 sPlayerbotAIConfig.disableActivityPriorities = s_savedDisableActivityPriorities;
                 s_activityPrioritiesOverridden = false;
-                sLog.outString("[SIM] 机器人活跃度优先级恢复为 %d", s_savedDisableActivityPriorities ? 1 : 0);
+                sLog.outError("[SIM] 机器人活跃度优先级恢复为 %d", s_savedDisableActivityPriorities ? 1 : 0);
             }
         }
 
@@ -1075,7 +1081,7 @@ namespace simscenario
                 run.attemptSummary += " | ";
             run.attemptSummary += line;
 
-            sLog.outString("[SIM] run=%u g=%u %s seed=%u policy=%s",
+            sLog.outError("[SIM] run=%u g=%u %s seed=%u policy=%s",
                 run.runId, run.index, line.c_str(), run.baseSeed, run.policy ? "continue" : "reset");
 
             run.attemptBest = 0;
@@ -1157,7 +1163,7 @@ namespace simscenario
                         if (!accountId)
                         {
                             // [2026-10-18] 单个角色账号缺失不终止整组：从候选里剔除并继续等（组不齐会走角色重选）
-                            sLog.outString("[SIM] run=%u g=%u 账号缺失，剔除候选 guid=%u",
+                            sLog.outError("[SIM] run=%u g=%u 账号缺失，剔除候选 guid=%u",
                                 run.runId, run.index, run.guids[i]);
                             run.guids.erase(run.guids.begin() + i);
                             run.nextLoginTryAt.erase(run.nextLoginTryAt.begin() + i);
@@ -1165,14 +1171,14 @@ namespace simscenario
                         }
 
                         sRandomPlayerbotMgr.AddPlayerBot(run.guids[i], accountId);
-                        nextTry = now + 15000;                 // 15s 内不重复发起
+                        nextTry = now + 3000;                  // [2026-10-22] 15s→3s：登录重试太慢是准备阶段的主要耗时
                     }
 
                     if (online == run.guids.size())
                     {
                         run.phase = PHASE_FORM;
                         run.phaseSince = now;
-                        sLog.outString("[SIM] run=%u g=%u online %u/%u in %.1fs", run.runId, run.index,
+                        sLog.outError("[SIM] run=%u g=%u online %u/%u in %.1fs", run.runId, run.index,
                             online, (uint32)run.guids.size(), (now - run.startedAt) / 1000.0f);
                     }
                     else if (now - run.phaseSince > 90000)
@@ -1200,7 +1206,7 @@ namespace simscenario
                         // 候选里没有真坦/真奶（种子/轮换随机导致）⇒ 不终止整个 run：
                         //   走一次重置换人重选（pickSeed 里叠加 roleRetries，保证换到不同的人）。
                         ++run.roleRetries;
-                        sLog.outString("[SIM] run=%u g=%u 角色不足（%s）⇒ 换人重选第 %u 次",
+                        sLog.outError("[SIM] run=%u g=%u 角色不足（%s）⇒ 换人重选第 %u 次",
                             run.runId, run.index, error.c_str(), run.roleRetries);
                         if (run.roleRetries > 20)
                         {
@@ -1219,7 +1225,7 @@ namespace simscenario
                         return false;
                     }
 
-                    sLog.outString("[SIM] run=%u g=%u group id=%u lead=%s members=%u tank=%s heal=%s",
+                    sLog.outError("[SIM] run=%u g=%u group id=%u lead=%s members=%u tank=%s heal=%s",
                         run.runId, run.index, run.group ? run.group->GetId() : 0,
                         run.group ? run.group->GetLeaderName() : "?",
                         run.group ? run.group->GetMembersCount() : 0,
@@ -1276,7 +1282,7 @@ namespace simscenario
                         {
                             run.leaderTeleported = true;
                             run.phaseSince = now;
-                            sLog.outString("[SIM] run=%u g=%u leader %s 已进本 map=%u inst=%u",
+                            sLog.outError("[SIM] run=%u g=%u leader %s 已进本 map=%u inst=%u",
                                 run.runId, run.index, leader->GetName(), run.mapId, leader->GetInstanceId());
                             return true;
                         }
@@ -1286,7 +1292,7 @@ namespace simscenario
 
                         run.leaderTryAt = now ? now : 1;
                         leader->TeleportTo(run.mapId, run.ex, run.ey, run.ez, run.eo);
-                        sLog.outString("[SIM] run=%u g=%u teleport leader %s -> map=%u (%.1f,%.1f,%.1f)",
+                        sLog.outError("[SIM] run=%u g=%u teleport leader %s -> map=%u (%.1f,%.1f,%.1f)",
                             run.runId, run.index, leader->GetName(), run.mapId, run.ex, run.ey, run.ez);
                         return true;
                     }
@@ -1319,7 +1325,7 @@ namespace simscenario
 
                             run.memberTryAt = now ? now : 1;
                             p->TeleportTo(run.mapId, run.ex, run.ey, run.ez, run.eo);
-                            sLog.outString("[SIM] run=%u g=%u teleport member %s（逐个传送）",
+                            sLog.outError("[SIM] run=%u g=%u teleport member %s（逐个传送）",
                                 run.runId, run.index, p->GetName());
                             return true;
                         }
@@ -1358,14 +1364,14 @@ namespace simscenario
                                 if (p->GetMapId() == run.mapId)
                                 {
                                     p->TeleportToHomebind();
-                                    sLog.outString("[SIM] run=%u g=%u 修正 instance：%s 在 inst=%u（队长 inst=%u）⇒ 送回主城",
+                                    sLog.outError("[SIM] run=%u g=%u 修正 instance：%s 在 inst=%u（队长 inst=%u）⇒ 送回主城",
                                         run.runId, run.index, p->GetName(), p->GetInstanceId(), leadInst);
                                 }
                                 else
                                 {
                                     p->TeleportTo(run.mapId, leader->GetPositionX(), leader->GetPositionY(),
                                                   leader->GetPositionZ(), leader->GetOrientation());
-                                    sLog.outString("[SIM] run=%u g=%u 修正 instance：%s 传回队长身边（inst=%u）",
+                                    sLog.outError("[SIM] run=%u g=%u 修正 instance：%s 传回队长身边（inst=%u）",
                                         run.runId, run.index, p->GetName(), leadInst);
                                 }
                             }
@@ -1396,7 +1402,7 @@ namespace simscenario
                         run.lastCleared = 0;
                         run.wipeSince = 0;
                         run.diagLeft = 8;
-                        sLog.outString("[SIM] run=%u g=%u IN DUNGEON map=%u inst=%u members=%u attempt=%u/%u t=%.1fs",
+                        sLog.outError("[SIM] run=%u g=%u IN DUNGEON map=%u inst=%u members=%u attempt=%u/%u t=%.1fs",
                             run.runId, run.index, run.mapId, run.instanceId, inside,
                             run.attempt, run.maxAttempts, (now - run.startedAt) / 1000.0f);
                         // 进本后第一次诊断：驱动判据/route 数据（拉不动怪时看这一行就够）
@@ -1416,6 +1422,67 @@ namespace simscenario
                 case PHASE_RUN:
                 {
                     CheckRoles(run, now);
+
+                    // [2026-10-23 站长口径] 越界救回：实测有组跑到 (-1867,5148,-37) / (10349,-6357,33.9)
+                    //   这种地图外坐标后永远卡死（离 boss 3678~12260 码）。每 5 秒检查一次：
+                    //   坐标非法或离副本入口 > 3000 码 ⇒ 传送回入口。
+                    if (!run.oobCheckAt || now - run.oobCheckAt >= 5000)
+                    {
+                        run.oobCheckAt = now;
+                        for (uint32 g : run.guids)
+                        {
+                            Player* p = FindPlayerInWorld(g);
+                            if (!p || !p->IsInWorld())
+                                continue;
+                            float const px = p->GetPositionX(), py = p->GetPositionY(), pz = p->GetPositionZ();
+                            bool const invalidCoord = !MapManager::IsValidMapCoord(px, py, pz);
+                            bool const tooFar = p->GetDistance(run.ex, run.ey, run.ez) > 3000.0f;
+                            if (invalidCoord || tooFar)
+                            {
+                                sLog.outError("[SIM] run=%u g=%u 越界救回 %s pos=(%.0f,%.0f,%.0f) invalid=%d far=%d ⇒ 回入口",
+                                    run.runId, run.index, p->GetName(), px, py, pz,
+                                    invalidCoord ? 1 : 0, tooFar ? 1 : 0);
+                                p->CombatStopWithPets(true);
+                                p->TeleportTo(run.mapId, run.ex, run.ey, run.ez, run.eo);
+                            }
+                        }
+                    }
+
+                    // [2026-10-23 站长口径] 保证进入战斗：整组连续 10 秒没有成员在战斗 ⇒
+                    //   给坦克排一次 attack anything（AI 自己找最近可打目标），每 10 秒最多一次。
+                    //   解决"坦克无目标/check values 站桩"，不是限制开怪。
+                    {
+                        bool anyFight = false;
+                        for (uint32 g : run.guids)
+                        {
+                            Player* p = FindPlayerInWorld(g);
+                            if (p && p->IsInCombat())
+                            {
+                                anyFight = true;
+                                break;
+                            }
+                        }
+                        uint32 const nowMs = now ? now : 1;
+                        if (anyFight)
+                            run.idleSince = 0;
+                        else
+                        {
+                            if (!run.idleSince)
+                                run.idleSince = nowMs;
+                            if (WorldTimer::getMSTimeDiff(run.idleSince, nowMs) >= 10000 &&
+                                (!run.forceEngageAt || WorldTimer::getMSTimeDiff(run.forceEngageAt, nowMs) >= 10000))
+                            {
+                                Player* tank = run.guids.empty() ? nullptr : FindPlayerInWorld(run.guids[0]);
+                                if (tank && tank->GetPlayerbotAI())
+                                {
+                                    tank->GetPlayerbotAI()->QueueSimAction("attack anything");
+                                    run.forceEngageAt = nowMs;
+                                    sLog.outError("[SIM] run=%u g=%u 连续 %us 未进战斗 ⇒ 强制 attack anything",
+                                        run.runId, run.index, uint32(WorldTimer::getMSTimeDiff(run.idleSince, nowMs) / 1000));
+                                }
+                            }
+                        }
+                    }
 
                     uint32 online = 0, alive = 0, inCombat = 0;
                     for (uint32 guid : run.guids)
@@ -1452,7 +1519,7 @@ namespace simscenario
                                 tz = leader->GetPositionZ();
                                 to = leader->GetOrientation();
                             }
-                            sLog.outString("[SIM] run=%u g=%u 离本检测+拉回: %s map=%u → %u pos=(%.1f,%.1f,%.1f)",
+                            sLog.outError("[SIM] run=%u g=%u 离本检测+拉回: %s map=%u → %u pos=(%.1f,%.1f,%.1f)",
                                 run.runId, run.index, p->GetName(), p->GetMapId(), run.mapId,
                                 p->GetPositionX(), p->GetPositionY(), p->GetPositionZ());
                             p->TeleportTo(run.mapId, tx, ty, tz, to);
@@ -1500,9 +1567,24 @@ namespace simscenario
                     uint16 cleared = 0;
                     uint16 realWaves = 0;
                     uint32 aliveMobs = 0;
-                    if (route && tank)
+                    if (route)
                     {
-                        Map* tmap = tank->GetMap();
+                        // [2026-10-22] 分母不能依赖 tank 是否存在/已加载：boss 优先模式下 tank 可能还在准备，
+                        //   以前这里直接跳过 ⇒ status 出现 cleared=0/0（555 等）。先用任意队员的 map，实在没有就只数波数。
+                        Map* tmap = tank ? tank->GetMap() : nullptr;
+                        if (!tmap)
+                        {
+                            for (uint32 g : run.guids)
+                            {
+                                Player* p = FindPlayerInWorld(g);
+                                if (p && p->FindMap())
+                                {
+                                    tmap = p->FindMap();
+                                    break;
+                                }
+                            }
+                        }
+
                         for (auto& kv : route->waves)
                         {
                             if (kv.second.allNonHostile)
@@ -1510,25 +1592,29 @@ namespace simscenario
                             ++realWaves;
 
                             bool anyAlive = false;
-                            for (auto& m : kv.second.members)
+                            if (tmap)
                             {
-                                // 用"活着"判据而不是"存在"：尸体/未加载都不算活怪，
-                                //   否则 dungeon 里尸体要等很久才消失，cleared 会滞后好几波。
-                                Creature* c = dungeonroute::MemberCreature(tmap, m);
-                                if (c && c->IsAlive())
+                                for (auto& m : kv.second.members)
                                 {
-                                    anyAlive = true;
-                                    ++aliveMobs;
+                                    // 用"活着"判据而不是"存在"：尸体/未加载都不算活怪，
+                                    //   否则 dungeon 里尸体要等很久才消失，cleared 会滞后好几波。
+                                    Creature* c = dungeonroute::MemberCreature(tmap, m);
+                                    if (c && c->IsAlive())
+                                    {
+                                        anyAlive = true;
+                                        ++aliveMobs;
+                                    }
                                 }
                             }
                             if (anyAlive)
                                 run.seenWaves.insert(kv.first);
-                            else if (run.seenWaves.count(kv.first))
+                            else if (tmap && run.seenWaves.count(kv.first))
                                 ++cleared;
                         }
                         run.routeWaves = realWaves;
                         // 只认尸体：每 tick 刷新 boss 死亡状态，网格卸载不算死
-                        dungeonroute::RefreshBossKnowledge(tmap, *route, *st);
+                        if (tmap)
+                            dungeonroute::RefreshBossKnowledge(tmap, *route, *st);
 
                         // [2026-10-19] 卡死判定不能只看"清整波"：水里的 1 只可打、其余不可达的波永远清不掉，
                         //   但每杀一只就是推进 ⇒ 用小怪存活数下降作为推进信号。
@@ -1580,7 +1666,7 @@ namespace simscenario
                             }
 
                             if (revived)
-                                sLog.outString("[SIM] run=%u g=%u 单人阵亡 %u 秒 → 就地复活 %u 人（deaths=%u）",
+                                sLog.outError("[SIM] run=%u g=%u 单人阵亡 %u 秒 → 就地复活 %u 人（deaths=%u）",
                                     run.runId, run.index, (uint32)((now - run.soloReviveAt) / 1000), revived, run.deaths);
                             run.soloReviveAt = 0;
                         }
@@ -1593,7 +1679,7 @@ namespace simscenario
                     // 只有"清掉一波"才算进展：单纯在战斗里磨不算（否则永远判不出卡死）。
                     if (cleared != run.lastCleared)
                     {
-                        sLog.outString("[SIM] run=%u g=%u progress cleared=%u→%u/%u skipped=%u",
+                        sLog.outError("[SIM] run=%u g=%u progress cleared=%u→%u/%u skipped=%u",
                             run.runId, run.index, (uint32)run.lastCleared, (uint32)cleared,
                             (uint32)run.routeWaves, (uint32)skipped);
                         run.lastProgressAt = now;
@@ -1658,7 +1744,7 @@ namespace simscenario
                                     if (!run.chaseLogAt || now - run.chaseLogAt > 5000)
                                     {
                                         run.chaseLogAt = now;
-                                        sLog.outString("[SIM] run=%u g=%u attempt=%u 15s 无伤害（目标 %s，距离 %.1f）⇒ 原地等待怪过来、不跳波",
+                                        sLog.outError("[SIM] run=%u g=%u attempt=%u 15s 无伤害（目标 %s，距离 %.1f）⇒ 原地等待怪过来、不跳波",
                                             run.runId, run.index, run.attempt, victim->GetName(), tank->GetDistance(victim));
                                     }
                                     run.lastVictimAt = now;
@@ -1674,14 +1760,14 @@ namespace simscenario
                                     Creature* vc = (victim->GetTypeId() == TYPEID_UNIT) ? (Creature*)victim : nullptr;
                                     bool const evading = vc && vc->GetMotionMaster()
                                         && vc->GetMotionMaster()->GetCurrentMovementGeneratorType() == HOME_MOTION_TYPE;
-                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 无伤害诊断: victim=%s entry=%u hp=%u inCombat=%d evade=%d dist=%.1f",
+                                    sLog.outError("[SIM] run=%u g=%u attempt=%u 无伤害诊断: victim=%s entry=%u hp=%u inCombat=%d evade=%d dist=%.1f",
                                         run.runId, run.index, run.attempt, victim->GetName(), victim->GetEntry(),
                                         (uint32)victim->GetHealth(), victim->IsInCombat() ? 1 : 0,
                                         evading ? 1 : 0, tank->GetDistance(victim));
                                     dungeonroute::MarkSkipped(tank, ord, "no damage 15s no combat");
                                     run.combatSkipDone = true;
                                     ForceDisengage(run);
-                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 目标 %s 15s 无伤害且已无战斗 ⇒ 跳过波 ord=%u",
+                                    sLog.outError("[SIM] run=%u g=%u attempt=%u 目标 %s 15s 无伤害且已无战斗 ⇒ 跳过波 ord=%u",
                                         run.runId, run.index, run.attempt, victim->GetName(), (uint32)ord);
                                 }
                                 run.lastVictimAt = now;
@@ -1692,38 +1778,71 @@ namespace simscenario
                         {
                             // [2026-10-21 站长口径] 队伍一部分在战斗时，其余人要去帮，**不要自己开下一波**；
                             //   坦克没目标时：① 优先打队友正在打的目标；② 否则 attack anything 重新锁定。
-                            //   这里不再用"15s 无目标"跳波（跳波只保留"追不到 / 近战仍无伤害"两种真卡死）。
+                            //   [2026-10-23 修] 以前**动作**也被 2 秒节流 ⇒ 坦克丢目标后要等 2 秒才补，
+                            //   战斗里等于每两秒空一次手。现在：**每 tick 都补动作**，只把日志节流到 5 秒。
                             if (!run.noVictimSince)
                                 run.noVictimSince = now;
 
-                            if (!run.combatAssistAt || now - run.combatAssistAt > 2000)
+                            Unit* assist = nullptr;
+                            for (uint32 g : run.guids)
                             {
-                                run.combatAssistAt = now;
+                                Player* p = FindPlayerInWorld(g);
+                                if (!p || p == tank || !p->GetVictim())
+                                    continue;
+                                Unit* v = p->GetVictim();
+                                if (!v || !v->IsAlive() || v->GetMapId() != run.mapId)
+                                    continue;
 
-                                Unit* assist = nullptr;
-                                for (uint32 g : run.guids)
+                                // [2026-10-22 站长口径] 坦克不要被"巡逻/游荡怪"牵走，也不要为帮队友跨半张图追：
+                                //   实例：546 的 Underbat（空中巡逻）把坦克从队伍拖走 128 次、距离 1000+ 码。
+                                if (v->GetTypeId() == TYPEID_UNIT)
                                 {
-                                    Player* p = FindPlayerInWorld(g);
-                                    if (!p || p == tank || !p->GetVictim())
-                                        continue;
-                                    Unit* v = p->GetVictim();
-                                    if (v && v->IsAlive() && v->GetMapId() == run.mapId)
-                                    {
-                                        assist = v;
-                                        break;
-                                    }
+                                    uint32 const vguid = v->GetGUIDLow();
+                                    bool const isPatrol = route->patrolGuids.count(vguid) > 0;
+                                    bool isBoss = false;
+                                    for (auto const& b : route->bosses)
+                                        if (b.guid == vguid) { isBoss = true; break; }
+                                    bool const isRouteMob = route->guidOrd.count(vguid) > 0;
+
+                                    Creature* vc = (Creature*)v;
+                                    uint8 mtype = 0;
+                                    if (vc->GetMotionMaster())
+                                        mtype = vc->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                                    bool const wandering = (mtype == WAYPOINT_MOTION_TYPE || mtype == RANDOM_MOTION_TYPE);
+
+                                    if (isPatrol || (!isRouteMob && !isBoss && wandering))
+                                        continue;                     // 巡逻/游荡的野怪：不主动去追
+                                    if (tank->GetDistance(v) > dw::Get("sim.assist.max_dist"))
+                                        continue;                     // 太远（多半已跑偏）
                                 }
 
-                                if (assist)
+                                assist = v;
+                                break;
+                            }
+
+                            // 动作：坦克没目标时补，但**不是每 tick**（每 tick 调 Attack 会和 AI 自己的选敌/走位打架），
+                            //   500ms 一次足够：丢目标后最多半秒空手，又不会把 AttackStart 刷爆。
+                            if (assist)
+                            {
+                                uint32 const nowMs2 = now ? now : 1;
+                                if (!run.tankAssistAt || WorldTimer::getMSTimeDiff(run.tankAssistAt, nowMs2) >= 500)
                                 {
+                                    run.tankAssistAt = nowMs2;
                                     tank->Attack(assist, true);
-                                    sLog.outString("[SIM] run=%u g=%u attempt=%u 坦克无目标 ⇒ 去帮队友打 %s(entry=%u)",
+                                }
+                                if (!run.tankAssistLogAt || now - run.tankAssistLogAt >= 5000)
+                                {
+                                    run.tankAssistLogAt = now;
+                                    sLog.outError("[SIM] run=%u g=%u attempt=%u 坦克无目标 ⇒ 去帮队友打 %s(entry=%u)",
                                         run.runId, run.index, run.attempt, assist->GetName(), assist->GetEntry());
                                 }
-                                else if (tank->GetPlayerbotAI())
-                                {
-                                    tank->GetPlayerbotAI()->DoSpecificAction("attack anything", Event(), true);
-                                }
+                            }
+                            else if (tank->GetPlayerbotAI() &&
+                                     (!run.combatAssistAt || now - run.combatAssistAt > 2000))
+                            {
+                                // [2026-10-22 崩溃修] World 线程不能直接调 AI：排队到坦克自己的 map 线程
+                                run.combatAssistAt = now;
+                                tank->GetPlayerbotAI()->QueueSimAction("attack anything");
                             }
 
                             run.lastVictim = ObjectGuid();
@@ -1772,7 +1891,7 @@ namespace simscenario
                             {
                                 // continue：死即复活，拉回入口继续推（不终止）
                                 uint32 const revived = ReviveParty(run, true);
-                                sLog.outString("[SIM] run=%u g=%u attempt=%u WIPE→continue 复活 %u 人（deaths=%u）",
+                                sLog.outError("[SIM] run=%u g=%u attempt=%u WIPE→continue 复活 %u 人（deaths=%u）",
                                     run.runId, run.index, run.attempt, revived, run.deaths);
                                 run.wipeSince = 0;
                                 run.lastDead = 0;
@@ -1792,7 +1911,7 @@ namespace simscenario
                                 run.phase = PHASE_RESET;
                                 run.phaseSince = now;
                                 run.nextResetTryAt = now;
-                                sLog.outString("[SIM] run=%u g=%u WIPE → reset：下一轮 attempt=%u/%u seed=%u",
+                                sLog.outError("[SIM] run=%u g=%u WIPE → reset：下一轮 attempt=%u/%u seed=%u",
                                     run.runId, run.index, run.attempt, run.maxAttempts, run.baseSeed);
                                 return true;
                             }
@@ -1828,7 +1947,7 @@ namespace simscenario
                         run.phase = PHASE_RESET;
                         run.phaseSince = now;
                         run.nextResetTryAt = now;
-                        sLog.outString("[SIM] run=%u g=%u STUCK → reset：下一轮 attempt=%u/%u",
+                        sLog.outError("[SIM] run=%u g=%u STUCK → reset：下一轮 attempt=%u/%u",
                             run.runId, run.index, run.attempt, run.maxAttempts);
                         return true;
                     }
@@ -1848,18 +1967,30 @@ namespace simscenario
                             if (route && dungeonroute::FindTargetNearest(driver, *route, t) && t.hasPullPoint)
                                 dist = driver->GetDistance(t.px, t.py, t.pz);
 
-                            char buf[256];
-                            snprintf(buf, sizeof(buf), "%s@(%.0f,%.0f) act=%s tgt=%s:%d%% dist=%.0f",
+                            // [2026-10-23 站长口径] 状态行里带"为什么不走"的原因码（不额外写日志）：
+                            //   drive=是否具备驱动资格；ok=FindTargetNearest 是否给出目标；
+                            //   curOrd=当前锁定波；defer=挂起的 boss 数；pw=是否在等巡逻；skip=已跳过波数
+                            dungeonroute::BotState& dsi = dungeonroute::StateOf(driver);
+                            bool const driveOk = driverAI ? dungeonroute::ShouldDrive(driverAI) : false;
+                            dungeonroute::Target dt2;
+                            bool const tgtOk = route && dungeonroute::FindTargetNearest(driver, *route, dt2);
+                            uint32 const curOrd = route ? dungeonroute::CurrentOrd(driver, *route) : 0;
+
+                            char buf[420];
+                            snprintf(buf, sizeof(buf),
+                                "%s@(%.0f,%.0f) act=%s tgt=%s:%d%% dist=%.0f drive=%d ok=%d ord=%u defer=%u pw=%u skip=%u clr=%u",
                                 driver->GetName(), driver->GetPositionX(), driver->GetPositionY(),
                                 driverAI ? driverAI->GetLastExecutedActionName(driverAI->GetState()).c_str() : "-",
                                 victim ? victim->GetName() : "-",
                                 (victim && victim->GetMaxHealth())
                                     ? (int)(100.0f * float(victim->GetHealth()) / float(victim->GetMaxHealth())) : 0,
-                                dist);
+                                dist, driveOk ? 1 : 0, tgtOk ? 1 : 0, (uint32)curOrd,
+                                (uint32)dsi.bossDeferUntil.size(), (uint32)(dsi.patrolWaitGuid ? 1 : 0),
+                                (uint32)dsi.skip.size(), (uint32)dsi.cleared.size());
                             driverInfo = buf;
                         }
 
-                        sLog.outString("[SIM] run=%u g=%u status t=%.0fs attempt=%u/%u seed=%u alive=%u/%u deaths=%u combat=%u cleared=%u/%u skipped=%u seen=%u mobs=%u tank=%s inst=%u driver=(%s)",
+                        sLog.outError("[SIM] run=%u g=%u status t=%.0fs attempt=%u/%u seed=%u alive=%u/%u deaths=%u combat=%u cleared=%u/%u skipped=%u seen=%u mobs=%u tank=%s inst=%u driver=(%s)",
                             run.runId, run.index, (now - run.startedAt) / 1000.0f,
                             run.attempt, run.maxAttempts, run.baseSeed,
                             alive, online, run.deaths, inCombat,
@@ -1971,7 +2102,7 @@ namespace simscenario
 
                     std::string names;
                     FormatRunGuids(run, names);
-                    sLog.outString("[SIM] run=%u g=%u reset done → attempt=%u/%u seed=%u names=%s",
+                    sLog.outError("[SIM] run=%u g=%u reset done → attempt=%u/%u seed=%u names=%s",
                         run.runId, run.index, run.attempt, run.maxAttempts, pickSeed, names.c_str());
                     return true;
                 }
@@ -2252,7 +2383,7 @@ namespace simscenario
 
             std::string names;
             FormatRunGuids(s_runs.back(), names);
-            sLog.outString("[SIM] start run=%u g=%u map=%u party=%u candidates=%u seed=%u attempt=1/%u policy=%s names=%s by=%s",
+            sLog.outError("[SIM] start run=%u g=%u map=%u party=%u candidates=%u seed=%u attempt=1/%u policy=%s names=%s by=%s",
                 runId, g, mapId, partySize, (uint32)party.size(), baseSeed, maxAttempts,
                 policy ? "continue" : "reset", names.c_str(), who);
         }
