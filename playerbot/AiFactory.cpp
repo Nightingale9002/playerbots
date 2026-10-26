@@ -296,6 +296,10 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
     combatEngine->addStrategies("mount", NULL);
     combatEngine->addStrategy("avoid mobs");
     combatEngine->addStrategy("dungeon");
+    // [2026-10-24] 群拉：aoe 策略常开，由模块自带触发器按"附近怪多"决定是否放 AoE
+    combatEngine->addStrategy("aoe");
+    // [2026-10-24] 战斗侧也要挂 dungeon route：漏怪补拉/低蓝过渡都是战斗触发器
+    combatEngine->addStrategy("dungeon route");
     combatEngine->addStrategy("avoid specific creatures");
     // [2026-10-18 站长口径] 爆发的独立策略：所有职业都挂（触发器按职业注册；嗜血/英勇=团队爆发）
     combatEngine->addStrategy("burst");

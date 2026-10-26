@@ -144,6 +144,12 @@ std::string PlayerbotTextMgr::GetBotText(ChatReplyType replyType, std::map<std::
             proper_list.push_back(text);
     }
 
+    // [2026-10-26 崩溃/卡死修] 这个 replyType 一条文本都没有时，`size() - 1` 会下溢成巨大值，
+    //   `urand(0, 巨大值)` 取到越界下标 ⇒ 读坏 std::string ⇒ 疯狂 malloc、地图线程卡死
+    //   （r103 实测：gdb 栈停在 ChatReplyAction → GetBotText → malloc，整服 3 分钟无日志、单核 128%）。
+    if (proper_list.empty())
+        return "";
+
     BotTextEntry textEntry = proper_list[urand(0, proper_list.size() - 1)];
     std::string botText;
     int32 localePrio = GetLocalePriority();

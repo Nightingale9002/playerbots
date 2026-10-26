@@ -404,6 +404,13 @@ namespace ai
             // [副本推进 2026-10-18] 运行期按波推进（只对 verified=1 的图 + 驱动坦克生效）
             creators["dungeon route move"] = [](PlayerbotAI* ai) { return new DungeonRouteMoveTrigger(ai); };
             creators["dungeon route pull"] = [](PlayerbotAI* ai) { return new DungeonRoutePullTrigger(ai); };
+            creators["dungeon loose mob"] = [](PlayerbotAI* ai) { return new DungeonLooseMobTrigger(ai); };
+            creators["dungeon tank ot"] = [](PlayerbotAI* ai) { return new DungeonTankOtTrigger(ai); };
+            creators["dungeon tank aoe"] = [](PlayerbotAI* ai) { return new DungeonTankAoeTrigger(ai); };
+            creators["dungeon tank reposition"] = [](PlayerbotAI* ai) { return new DungeonTankRepositionTrigger(ai); };
+            // [2026-10-25 站长口径] 坦克救场（最高优先级）+ 聚怪前的 DPS 停手
+            creators["dungeon tank engage"] = [](PlayerbotAI* ai) { return new DungeonTankEngageTrigger(ai); };
+            creators["dungeon dps hold fire"] = [](PlayerbotAI* ai) { return new DungeonDpsHoldFireTrigger(ai); };
 
             // Test framework triggers
 #ifdef GenerateBotTests

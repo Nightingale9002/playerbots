@@ -404,6 +404,14 @@ namespace ai
             // [副本推进 2026-10-18] 运行期按波推进（只对 verified=1 的图 + 驱动坦克生效）
             creators["dungeon route move"] = [](PlayerbotAI* ai) { return new DungeonRouteMoveAction(ai); };
             creators["dungeon route pull"] = [](PlayerbotAI* ai) { return new DungeonRoutePullAction(ai); };
+            creators["dungeon assist loose"] = [](PlayerbotAI* ai) { return new DungeonAssistLooseAction(ai); };
+            creators["dungeon tank taunt"] = [](PlayerbotAI* ai) { return new DungeonTankTauntAction(ai); };
+            creators["dungeon tank aoe"] = [](PlayerbotAI* ai) { return new DungeonTankAoeAction(ai); };
+            creators["dungeon tank reposition"] = [](PlayerbotAI* ai) { return new DungeonTankRepositionAction(ai); };
+            creators["dungeon mana sustain"] = [](PlayerbotAI* ai) { return new DungeonManaSustainAction(ai); };
+            // [2026-10-25 站长口径] 坦克救场（最高优先级）+ 聚怪前的 DPS 停手
+            creators["dungeon tank engage"] = [](PlayerbotAI* ai) { return new DungeonTankEngageAction(ai); };
+            creators["dungeon dps hold fire"] = [](PlayerbotAI* ai) { return new DungeonDpsHoldFireAction(ai); };
             creators["move to mc rune"] = [](PlayerbotAI* ai) { return new MoveToMCRuneAction(ai); };
             creators["douse mc rune aqual"] = [](PlayerbotAI* ai) { return new DouseMCRuneActionAqual(ai); };
             creators["douse mc rune eternal"] = [](PlayerbotAI* ai) { return new DouseMCRuneActionEternal(ai); };

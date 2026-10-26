@@ -194,6 +194,34 @@ bool SelectNewTargetAction::Execute(Event& event)
         return true;
 
     Unit* target = ai->GetUnit(AI_VALUE(ObjectGuid, "current target"));
+
+    // [2026-10-26 站长定案·bot 侧修 ①] **状态自愈**：
+    //   "invalid target" 触发器每 tick 把这里拉起来，而它下面会"先清目标再找"。
+    //   只要 AI 的 current target 一时为空（它和 bot->GetVictim() 是两个值），
+    //   就会每 tick 清一次目标 + AttackStop ⇒ bot 永远不出手（实测 8 分钟 2500~3400 次）。
+    //   这里先补：谁在打我们/我们在打谁，只要有活着的可攻击目标，就把 current target 补回去直接返回。
+    if (!target)
+    {
+        Unit* live = bot->GetVictim();
+        if (!live)
+        {
+            for (Unit* att : bot->getAttackers())
+            {
+                if (att && att->IsAlive())
+                {
+                    live = att;
+                    break;
+                }
+            }
+        }
+        if (live && live->IsAlive() && live->IsInWorld() && bot->CanAttack(live))
+        {
+            SET_AI_VALUE(ObjectGuid, "current target", live->GetObjectGuid());
+            if (!AI_VALUE(ObjectGuid, "attack target"))
+                SET_AI_VALUE(ObjectGuid, "attack target", live->GetObjectGuid());
+            return true;                 // 不清目标、不停攻击
+        }
+    }
     if (target && sServerFacade.UnitIsDead(target))
     {
         // Save the dead target for later looting
@@ -207,9 +235,14 @@ bool SelectNewTargetAction::Execute(Event& event)
     // Clear the target variables
     ObjectGuid attackTarget = AI_VALUE(ObjectGuid, "attack target");
     std::list<ObjectGuid> possible = AI_VALUE(std::list<ObjectGuid>, "possible targets no los");
-    if (attackTarget && find(possible.begin(), possible.end(), attackTarget) == possible.end())
+    // [2026-10-26 站长纠正] 只有目标**真的没了**（死亡/不在世界/不可攻击）才清 attack target。
+    //   原来只要它不在 "possible targets no los" 里就清 —— 那是个 LOS 过滤列表，
+    //   墙后面/水里/超视距都会不在里面，于是每 tick 把攻击目标擦掉、bot 永远打不出去。
+    if (attackTarget)
     {
-        SET_AI_VALUE(ObjectGuid, "attack target", ObjectGuid());
+        Unit* at = ai->GetUnit(attackTarget);
+        if (!at || !at->IsAlive() || !at->IsInWorld() || !bot->CanAttack(at))
+            SET_AI_VALUE(ObjectGuid, "attack target", ObjectGuid());
     }
 
     // Save the old target and clear the current target
@@ -270,6 +303,28 @@ bool SelectNewTargetAction::Execute(Event& event)
         {
             moreAttackers = true;
             return ai->DoSpecificAction("tank assist", event, true);
+        }
+    }
+
+    // [2026-10-26 站长纠正] assist 没接手时，**走全局选择目标策略**（我们本来就有）：
+    //   坦克 → "tank target"；其他人 → "dps target"（RTI > 坦克当前目标 > 威胁分级）。
+    //   全局策略也给不出目标 ⇒ 保持安静，不自己乱开怪。
+    if (!moreAttackers)
+    {
+        ObjectGuid global = ai->IsTank(bot)
+            ? AI_VALUE(ObjectGuid, "tank target")
+            : AI_VALUE(ObjectGuid, "dps target");
+        if (global)
+        {
+            Unit* gt = ai->GetUnit(global);
+            if (gt && gt->IsAlive() && gt->IsInWorld() && bot->CanAttack(gt))
+            {
+                SET_AI_VALUE(ObjectGuid, "attack target", global);
+                SET_AI_VALUE(ObjectGuid, "current target", global);
+                sLog.outDetail("[SNT] %s assist 未接手 ⇒ 走全局目标策略 %s(entry %u)",
+                    bot->GetName(), gt->GetName(), gt->GetEntry());
+                return ai->DoSpecificAction("attack anything", event, true);
+            }
         }
     }
 

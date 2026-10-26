@@ -23,5 +23,6 @@ namespace ai
 
     private:
         void InitNonCombatTriggers(std::list<TriggerNode*>& triggers) override;
+        void InitCombatTriggers(std::list<TriggerNode*>& triggers) override;
     };
 }

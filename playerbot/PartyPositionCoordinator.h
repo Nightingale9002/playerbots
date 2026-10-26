@@ -112,11 +112,20 @@ namespace partypos
     inline std::mutex& PlanMutex() { static std::mutex m; return m; }
     inline std::map<uint32, Plan>& Plans() { static std::map<uint32, Plan> p; return p; }
     inline std::map<uint8, std::set<uint32>>& ModeEntries() { static std::map<uint8, std::set<uint32>> e; return e; }
+    // [2026-10-26 站长口径] los_break = **读条触发**：boss/owner entry -> 需要断视线的技能 id
+    inline std::map<uint32, std::set<uint32>>& BreakSpells() { static std::map<uint32, std::set<uint32>> b; return b; }
 
     inline void SetModeEntries(std::map<uint8, std::set<uint32>> const& entries)
     {
         std::scoped_lock lock(PlanMutex());
         ModeEntries() = entries;
+    }
+
+    // [2026-10-26] los_break 的"读条技能表"（boss/owner entry -> spell ids）
+    inline void SetBreakSpells(std::map<uint32, std::set<uint32>> const& spells)
+    {
+        std::scoped_lock lock(PlanMutex());
+        BreakSpells() = spells;
     }
 
     inline char const* ModeName(uint8 mode)
@@ -503,11 +512,30 @@ namespace partypos
             } while (res->NextRow());
         }
 
+        // [2026-10-26 站长口径] los_break 改为**读条触发**：记下每个 boss/owner 的"断视线技能 id"，
+        //   只有它正在读这些技能时才进掩体；读条结束就回正常阵型。
+        std::map<uint32, std::set<uint32>> breakSpells;
+        std::unique_ptr<QueryResult> bres = WorldDatabase.Query(
+            "SELECT `boss_entry`,`owner_entry`,`spell_id` FROM `ai_playerbot_boss_ability` "
+            "WHERE `category` = 'los_break' AND `spell_id` <> 0");
+        if (bres)
+        {
+            do
+            {
+                Field* fields = bres->Fetch();
+                uint32 const sid = fields[2].GetUInt32();
+                if (uint32 boss = fields[0].GetUInt32())
+                    breakSpells[boss].insert(sid);
+                if (uint32 owner = fields[1].GetUInt32())
+                    breakSpells[owner].insert(sid);
+            } while (bres->NextRow());
+        }
+        SetBreakSpells(breakSpells);
+
         std::map<uint32, uint8> masks;
         std::unique_ptr<QueryResult> mres = WorldDatabase.Query(
             "SELECT DISTINCT `boss_entry`,`owner_entry`,`avoid_sectors` FROM `ai_playerbot_boss_ability` "
-            "WHERE `avoid_sectors` <> ''");
-        if (mres)
+            "WHERE `avoid_sectors` <> ''");        if (mres)
         {
             do
             {
@@ -851,9 +879,32 @@ namespace partypos
         return info->Rank >= 3;      // CREATURE_ELITE_WORLDBOSS
     }
 
-    inline bool Compute(Player* leader)
+    // [2026-10-26 站长口径] los_break 只在"正在读断视线技能"时生效（变形术/魔爆术这类）。
+    inline bool IsCastingBreakSpell(Unit* unit)
     {
-        if (!leader || !leader->IsInWorld())
+        Creature* c = dynamic_cast<Creature*>(unit);
+        if (!c)
+            return false;
+        std::set<uint32> ids;
+        {
+            std::scoped_lock lock(PlanMutex());
+            auto it = BreakSpells().find(c->GetEntry());
+            if (it == BreakSpells().end() || it->second.empty())
+                return false;
+            ids = it->second;
+        }
+        CurrentSpellTypes const types[] = { CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL };
+        for (CurrentSpellTypes t : types)
+        {
+            Spell* sp = c->GetCurrentSpell(t);
+            if (sp && sp->m_spellInfo && ids.count(sp->m_spellInfo->Id))
+                return true;
+        }
+        return false;
+    }
+
+    inline bool Compute(Player* leader)
+    {        if (!leader || !leader->IsInWorld())
             return false;
         Group* group = leader->GetGroup();
         Map* map = leader->GetMap();
@@ -884,6 +935,9 @@ namespace partypos
                 {
                     auto it = modeEntries.find(want);
                     if (it == modeEntries.end() || !it->second.count(attacker->GetEntry()))
+                        continue;
+                    // [2026-10-26 站长口径] los_break 是**读条触发**：boss 没在读那些技能就不进掩体
+                    if (want == MODE_LOS_BREAK && !IsCastingBreakSpell(attacker))
                         continue;
 
                     float score = dw::Get(std::string("position.mode.") + ModeName(want));

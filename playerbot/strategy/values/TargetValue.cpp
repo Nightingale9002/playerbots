@@ -173,6 +173,23 @@ ObjectGuid FollowTargetValue::Calculate()
         else
         {
             followTarget = ai->GetUnit(AI_VALUE(ObjectGuid, "master target"));
+            // [2026-10-25 站长口径] 没有真人 master（仿真/纯 bot 队）⇒ 跟**队伍坦克**：
+            //   坦克是队伍核心，队友必须跟着它走，而不是各走各的。
+            if (!followTarget)
+            {
+                if (Group* group = bot->GetGroup())
+                {
+                    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                    {
+                        Player* m = ref->getSource();
+                        if (m && m != bot && m->IsInWorld() && PlayerbotAI::IsTank(m))
+                        {
+                            followTarget = m;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 

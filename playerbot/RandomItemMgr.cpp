@@ -1,5 +1,7 @@
 
 #include "playerbot/playerbot.h"
+
+#include <mutex>
 #include "playerbot/PlayerbotAIConfig.h"
 #include "RandomItemMgr.h"
 #include "playerbot/PlayerbotAI.h"
@@ -188,6 +190,13 @@ bool RandomItemMgr::HandleConsoleCommand(ChatHandler* handler, char const* args)
 
 RandomItemList RandomItemMgr::Query(uint32 level, RandomItemType type, RandomItemPredicate* predicate)
 {
+    // [2026-10-26 并发修] 这两处 Cache 是**全局 std::map**，而这条链路会被 `Map::Update` 的多个
+    //   `MapUpdater::WorkerThread` 同时调进来（PlayerbotFactory::InitEquipment → RandomItemMgr::Query）。
+    //   并发 `operator[]` 插入 ⇒ 红黑树被写坏。实测 core：
+    //   `MapUpdater::WorkerThread → … → RandomItemMgr::Query → std::_Rb_tree_insert_and_rebalance` SIGSEGV。
+    static std::mutex s_itemCacheMutex;
+    std::scoped_lock lock(s_itemCacheMutex);
+
     RandomItemList &list = randomItemCache[(level - 1) / 10][type];
 
     RandomItemList result;
@@ -3769,6 +3778,10 @@ void RandomItemMgr::BuildEquipCache()
 
 RandomItemList RandomItemMgr::Query(uint32 level, uint8 clazz, uint8 spec, uint8 slot, uint32 quality)
 {
+    // [2026-10-26 并发修] 同上：equipCache 是全局 map，被多线程 worker 并发 `operator[]` 插入会崩。
+    static std::mutex s_equipCacheMutex;
+    std::scoped_lock lock(s_equipCacheMutex);
+
     BotEquipKey key(level, clazz, spec, slot, quality);
     RandomItemList items = equipCache[key];
 

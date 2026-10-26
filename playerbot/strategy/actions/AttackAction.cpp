@@ -7,6 +7,7 @@
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/generic/CombatStrategy.h"
 #include "playerbot/strategy/values/ThreatValues.h"
+#include "playerbot/DungeonRoute.h"
 
 using namespace ai;
 
@@ -133,13 +134,45 @@ bool AttackAction::Attack(Player* requester, Unit* target)
         //   放在这里（而不是 isUseful）是因为 current target 刚在几行前被设成本目标，值才对准它。
         if (!AI_VALUE(bool, "target reachable"))
         {
-            sLog.outDetail("[Playerbot][perception] %s 放弃攻击 %s (entry %u): mmap 无可行路径",
-                bot->GetName(), target->GetName(), target->GetEntry());
+            // [2026-10-24 诊断] "打不完的架"必须能看见：谁因为"够不着"拒绝攻击、目标在哪
+            {
+                static std::map<ObjectGuid, uint32> s_unreachLogAt;
+                uint32 const nnow = WorldTimer::getMSTime();
+                uint32& last = s_unreachLogAt[bot->GetObjectGuid()];
+                if (!last || WorldTimer::getMSTimeDiff(last, nnow ? nnow : 1) >= 10000)
+                {
+                    last = nnow ? nnow : 1;
+                    sLog.outError("[UNREACH] %s 放弃攻击 %s(entry=%u) self=(%.0f,%.0f) target=(%.0f,%.0f) dist=%.1f",
+                        bot->GetName(), target->GetName(), target->GetEntry(),
+                        bot->GetPositionX(), bot->GetPositionY(),
+                        target->GetPositionX(), target->GetPositionY(), bot->GetDistance(target));
+                }
+            }
+            // [2026-10-24 站长口径] 目标**已经在攻击范围内**就绝不允许"放弃攻击"：
+            //   实测 540：全队锁着同一只 12% 血的军团士兵，伤害一直是 0（可达检查把它拦掉了）。
+            //   规则：近战范围内 / 施法距离内 ⇒ 忽略"不可达"判定，照打。
+            {
+                bool const inMelee = bot->GetDistance(target) <= 8.0f;
+                float const spellR = ai->GetRange("spell");
+                bool const inSpell = spellR > 0.0f && bot->GetDistance(target) <= spellR;
+                if (inMelee || inSpell)
+                {
+                    // 不放弃：继续走正常攻击流程
+                    goto attack_proceed;
+                }
+            }
+
+            // [2026-10-24 站长规矩] 诊断一律 outError（outDetail 会被日志级别过滤掉，等于没写）
+            sLog.outError("[UNREACH] %s 放弃攻击 %s(entry=%u) self=(%.0f,%.0f) target=(%.0f,%.0f) dist=%.1f",
+                bot->GetName(), target->GetName(), target->GetEntry(),
+                bot->GetPositionX(), bot->GetPositionY(),
+                target->GetPositionX(), target->GetPositionY(), bot->GetDistance(target));
             if (verbose)
                 ai->TellPlayerNoFacing(requester, BOT_TEXT("The target can't be reached"));
 
             return false;
         }
+    attack_proceed:
 
         if (strategy)
         {
@@ -264,6 +297,10 @@ bool AttackAction::IsWaitingForTankThreat(Unit* target)
     if (ai->IsTank(bot))
         return false;
 
+    // [2026-10-24 站长口径] 治疗不能被仇恨门卡住：治疗要先保证奶得住，仇恨问题交给坦克/输出
+    if (PlayerbotAI::IsHeal(bot))
+        return false;
+
     Group* group = bot->GetGroup();
     if (!group)
         return false;
@@ -282,24 +319,83 @@ bool AttackAction::IsWaitingForTankThreat(Unit* target)
     if (!tank)
         return false;
 
-    if (ThreatValue::GetTankThreat(ai, target) > 0)
-        return false;
-
-    // 目标当前的受害者在队伍里（含自己）⇒ 它已经在打我们，允许还手
-    Unit* victim = target->GetVictim();
-    if (victim == bot)
-        return false;
-
-    if (Player* victimPlayer = dynamic_cast<Player*>(victim))
+    // [2026-10-26 站长口径] **priority=6 才豁免仇恨门**（必须立刻打、等坦克仇恨会出事）；
+    //   priority=5 不再豁免 —— 5 的职责只是"最高击杀优先级"，仇恨门照旧（MT 先拉、DPS 再打）。
+    if (PossibleAttackTargetsValue::ThreatTier(target, bot) >= 6)
     {
-        if (victimPlayer->GetGroup() == group)
-            return false;
+        dungeonroute::BotState& pst = dungeonroute::StateOf(bot);
+        uint32 const nowP = WorldTimer::getMSTime();
+        if (!pst.threatLogAt || WorldTimer::getMSTimeDiff(pst.threatLogAt, nowP ? nowP : 1) >= 30000)
+        {
+            pst.threatLogAt = nowP ? nowP : 1;
+            sLog.outError("[PRIO6] %s 目标 %s(entry %u) 优先级6 ⇒ 不适用仇恨门，直接开打",
+                bot->GetName(), target->GetName(), target->GetEntry());
+        }
+        return false;      // 允许攻击
     }
 
-    sLog.outDetail("[threat] %s: hold fire on %s (instance gate: tank %s has no threat on it yet)",
-        bot->GetName(), target->GetName(), tank->GetName());
+    // [2026-10-25 站长口径] **坦克没有仇恨，DPS 就不该开始打**：
+    //   原来这里只在"坦克仇恨 > 0"时才审判，坦克完全不在仇恨表上（tankThreat == 0）反而放行 ——
+    //   正好违反这条。现在无条件审判：坦克仇恨 < lead（含 0）就不许开打。
+    {
+        // [2026-10-24 站长口径·修正] "DPS 从一开始就不应该 OT，而不是 OT 了之后再停手"。
+        //   所以门槛放在**起手**：坦克还没把仇恨建立到固定值(absLead)之前，DPS 一律不许开打；
+        //   起手之后再用百分比保证坦克始终领先（坦克仇恨 ≥ 自己 × pct%）。
+        //   治疗不受这道门限制（奶要先保证奶得住）。
+        float const selfThreat = target->getThreatManager().getThreat(bot);
+        float const tankThreat = ThreatValue::GetTankThreat(ai, target);
+        uint32 const pct = sPlayerbotAIConfig.waitForAttackThreatPercent
+            ? sPlayerbotAIConfig.waitForAttackThreatPercent : 90;
+        // [2026-10-24 站长口径] 分档：起手 500 / boss 级 1000 / 不吃嘲讽 1500
+        uint32 absLead = sPlayerbotAIConfig.waitForAttackThreatLead;
+        if (target->GetTypeId() == TYPEID_UNIT)
+        {
+            Creature* tc = static_cast<Creature*>(target);
+            if (dungeonroute::IsRouteBoss(target->GetMapId(), tc->GetGUIDLow()))
+                absLead = sPlayerbotAIConfig.waitForAttackThreatLeadBoss;
+            if (dungeonroute::IsImmuneToTaunt(tc))
+                absLead = sPlayerbotAIConfig.waitForAttackThreatLeadImmune;
+        }
 
-    return true;
+        // ① 起手门槛：坦克仇恨没到固定值 ⇒ 不开打（selfThreat 此时通常为 0，以前这里直接放行 = OT 根因）
+        if (absLead != 0 && tankThreat < float(absLead))
+        {
+            // [2026-10-24] 门禁必须可观测：每 30 秒打一条（outDetail 在服务端日志级别下不显示）
+            {
+                dungeonroute::BotState& tst = dungeonroute::StateOf(bot);
+                ++tst.threatHolds;
+                uint32 const nowT = WorldTimer::getMSTime();
+                if (!tst.threatLogAt || WorldTimer::getMSTimeDiff(tst.threatLogAt, nowT ? nowT : 1) >= 30000)
+                {
+                    tst.threatLogAt = nowT ? nowT : 1;
+                    sLog.outError("[THREAT] %s 起手等待：tank=%.0f < lead=%u（累计 %u 次）",
+                        bot->GetName(), tankThreat, absLead, tst.threatHolds);
+                }
+            }
+            return true;
+        }
+        // ② 已经开打后：坦克仇恨必须领先自己到 pct%
+        bool const pctOk = (tankThreat * 100.0f >= selfThreat * float(pct));
+        bool const absOk = (absLead == 0) || (tankThreat - selfThreat >= float(absLead));
+        if (selfThreat > 1.0f && (!pctOk || !absOk))
+        {
+            // [2026-10-27 整合] 这条原来**每 tick 一条**（r93 实测一场 8573 条）：改为每 bot 30 秒最多一条。
+            dungeonroute::BotState& hst = dungeonroute::StateOf(bot);
+            uint32 const nowH = WorldTimer::getMSTime();
+            if (!hst.holdFireLogAt || WorldTimer::getMSTimeDiff(hst.holdFireLogAt, nowH ? nowH : 1) >= 30000)
+            {
+                hst.holdFireLogAt = nowH ? nowH : 1;
+                sLog.outError("[THREAT] %s hold fire on %s (tank %.0f vs self %.0f, pct %u%%, lead %u)",
+                    bot->GetName(), target->GetName(), tankThreat, selfThreat, pct, absLead);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // [2026-10-25 站长口径] 下面这段"受害者是队友 ⇒ 允许还手 / 坦克没仇恨 ⇒ 也允许"的旁路已删除：
+    //   "坦克没有仇恨 DPS 就不该开始打"，判断统一在上面那道门里做。
+    return false;
 }
 
 bool AttackAction::PetAttack(Player* requester, Unit* target)

@@ -4,6 +4,8 @@
 #include <iomanip>
 
 #include "playerbot/AiFactory.h"
+#include "playerbot/DungeonRoute.h"   // [2026-10-23] 危险 AoE 远离：读本图的 avoid_spell 列表
+#include "Entities/Totem.h"           // [2026-10-23] 萨满图腾策略：查土系图腾是否还在
 // [BOT-ML 2026-10-17] 无玩家开跑：BOT_SCENARIO=<测试名> 时由第一个 bot 自动 StartTest
 #include "playerbot/strategy/tests/TestRegistry.h"
 
@@ -296,6 +298,150 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         }
         if (!simAction.empty())
             DoSpecificAction(simAction, Event(), true);
+    }
+
+    // [2026-10-25 站长口径] OT 后停手已**搬到策略里**（`dungeon dps hold fire`，优先级 95）：
+    //   统一由"坦克仇恨 + 聚怪是否完成"决定是否开打，不再在这个函数里硬编码。
+
+    // [2026-10-23 站长指令] 危险 AoE 远离（燃烧新星这一类）：
+    //   当前攻击我们的怪正在念 avoid_spell 列表里的法术 ⇒ 立刻朝反方向退到 radius 外（本函数在 map 线程，可直接走位）
+    {
+        static thread_local uint32 s_lastAvoidSpellAt = 0;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (!s_lastAvoidSpellAt || WorldTimer::getMSTimeDiff(s_lastAvoidSpellAt, nowMs) >= 300)
+        {
+            s_lastAvoidSpellAt = nowMs;
+            Map* asMap = bot->FindMap();
+            dungeonroute::MapRoute const* asRoute = asMap ? dungeonroute::GetMapRoute(asMap->GetId()) : nullptr;
+            if (asRoute && !asRoute->avoidSpells.empty())
+            {
+                for (Unit* attacker : bot->getAttackers())
+                {
+                    if (!attacker || attacker->GetTypeId() != TYPEID_UNIT)
+                        continue;
+                    Spell* cur = attacker->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+                    if (!cur || !cur->m_spellInfo)
+                        continue;
+                    for (auto const& as : asRoute->avoidSpells)
+                    {
+                        if (as.spellId != cur->m_spellInfo->Id)
+                            continue;
+                        float const d = bot->GetDistance(attacker);
+                        if (d > as.radius)
+                            break;
+                        float dx = bot->GetPositionX() - attacker->GetPositionX();
+                        float dy = bot->GetPositionY() - attacker->GetPositionY();
+                        float len = std::sqrt(dx * dx + dy * dy);
+                        if (len < 0.01f) { dx = 1.0f; dy = 0.0f; len = 1.0f; }
+                        float const tx = attacker->GetPositionX() + dx / len * (as.radius + 5.0f);
+                        float const ty = attacker->GetPositionY() + dy / len * (as.radius + 5.0f);
+                        bot->GetMotionMaster()->MovePoint(0, tx, ty, bot->GetPositionZ());
+                        sLog.outError("[AVOIDSPELL] %s 躲 %s spell=%u dist=%.1f ⇒ 退到 %.0f 码外",
+                            bot->GetName(), attacker->GetName(), as.spellId, d, as.radius + 5.0f);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // [2026-10-23 站长指令] 萨满图腾策略：
+    //   ① 附近有怪正在放恐惧类技能 ⇒ 立刻插战栗图腾(8143)
+    //   ② 敌方"有恐惧技能"（ai_playerbot_cc_creature.has_fear=1）⇒ 常驻战栗图腾
+    //   ③ 否则敌方"有施法技能"（has_spell=1）⇒ 插根基图腾(8177)
+    if (bot->getClass() == CLASS_SHAMAN && bot->IsInCombat())
+    {
+        static thread_local uint32 s_lastTotemAt = 0;
+        static thread_local uint32 s_totemMapId = 0;
+        static thread_local std::map<uint32, std::pair<uint8, uint8>> s_ccCache;
+        uint32 const tnow = WorldTimer::getMSTime();
+        if (!s_lastTotemAt || WorldTimer::getMSTimeDiff(s_lastTotemAt, tnow) >= 800)
+        {
+            s_lastTotemAt = tnow;
+            Map* tmap = bot->FindMap();
+            if (tmap && s_totemMapId != tmap->GetId())
+            {
+                s_totemMapId = tmap->GetId();
+                s_ccCache.clear();
+                std::unique_ptr<QueryResult> q = WorldDatabase.PQuery(
+                    "SELECT `entry`,`has_fear`,`has_spell` FROM `ai_playerbot_cc_creature` WHERE `map` = '%u'",
+                    s_totemMapId);
+                if (q)
+                {
+                    do
+                    {
+                        Field* f = q->Fetch();
+                        s_ccCache[f[0].GetUInt32()] = std::make_pair(uint8(f[1].GetUInt32()), uint8(f[2].GetUInt32()));
+                    } while (q->NextRow());
+                }
+            }
+
+            // 收集正在打我们的怪
+            std::vector<Unit*> foes;
+            for (Unit* a : bot->getAttackers())
+                if (a && a->IsAlive())
+                    foes.push_back(a);
+            if (bot->GetVictim() && bot->GetVictim()->IsAlive())
+                foes.push_back(bot->GetVictim());
+
+            bool fearCasting = false, hasFearFoe = false, hasSpellFoe = false;
+            for (Unit* f : foes)
+            {
+                Spell* cur = f->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+                if (cur && cur->m_spellInfo)
+                {
+                    SpellEntry const* si = cur->m_spellInfo;
+                    bool const isFear = (si->Mechanic == MECHANIC_FEAR) ||
+                        si->EffectApplyAuraName[0] == SPELL_AURA_MOD_FEAR ||
+                        si->EffectApplyAuraName[1] == SPELL_AURA_MOD_FEAR ||
+                        si->EffectApplyAuraName[2] == SPELL_AURA_MOD_FEAR;
+                    if (isFear)
+                        fearCasting = true;
+                }
+                if (f->GetTypeId() == TYPEID_UNIT)
+                {
+                    auto it = s_ccCache.find(f->GetEntry());
+                    if (it != s_ccCache.end())
+                    {
+                        if (it->second.first)
+                            hasFearFoe = true;
+                        if (it->second.second)
+                            hasSpellFoe = true;
+                    }
+                }
+            }
+
+            // 土系图腾是否还在
+            bool earthTotemOk = false;
+            if (Totem* et = bot->GetTotem(TOTEM_SLOT_EARTH))
+                if (et->IsAlive() && bot->GetDistance(et) <= 25.0f)
+                    earthTotemOk = true;
+
+            if (fearCasting)
+            {
+                // [2026-10-23 站长指令] "有怪正在放恐惧"这一条**不受重复插限制**：直接插（只做 1 秒防刷屏节流）
+                static thread_local uint32 s_tremorBurstAt = 0;
+                if (!s_tremorBurstAt || WorldTimer::getMSTimeDiff(s_tremorBurstAt, tnow) >= 1000)
+                {
+                    s_tremorBurstAt = tnow;
+                    bot->CastSpell(bot, 8143, uint32(0));   // Tremor Totem
+                    sLog.outError("[TOTEM] %s 插战栗图腾（有怪正在放恐惧，无视重复插限制）", bot->GetName());
+                }
+            }
+            else if (hasFearFoe)
+            {
+                if (!earthTotemOk)
+                {
+                    bot->CastSpell(bot, 8143, uint32(0));   // Tremor Totem
+                    sLog.outError("[TOTEM] %s 插战栗图腾（敌方有恐惧技能）", bot->GetName());
+                }
+            }
+            else if (hasSpellFoe && !earthTotemOk)
+            {
+                bot->CastSpell(bot, 8177, uint32(0));       // Grounding Totem
+                sLog.outError("[TOTEM] %s 插根基图腾（敌方有单体法术）", bot->GetName());
+            }
+        }
     }
 
     // [2026-10-22 站长口径] 进本换装：**进入副本/团本那一刻**换一次装备（不挂策略/触发器）。
@@ -4835,6 +4981,31 @@ bool PlayerbotAI::CanCastSpell(std::string name, Unit* target, uint8 effectMask,
     return CanCastSpell(aiObjectContext->GetValue<uint32>("spell id", name)->Get(), target, 0, true, itemTarget, ignoreRange, ignoreInCombat, ignoreMount, checkResult);
 }
 
+// [2026-10-24 站长口径] 施法观测：每 bot 一个环形缓冲（最近 6 次）
+static std::map<uint64, std::deque<uint32>> s_lastCasts;
+static std::mutex s_lastCastsMutex;
+
+void PlayerbotAI::RecordSpellCast(ObjectGuid guid, uint32 spellId)
+{
+    if (!spellId)
+        return;
+    std::lock_guard<std::mutex> lock(s_lastCastsMutex);
+    auto& dq = s_lastCasts[guid.GetRawValue()];
+    dq.push_back(spellId);
+    if (dq.size() > 6)
+        dq.pop_front();
+}
+
+std::vector<uint32> PlayerbotAI::LastSpellCasts(ObjectGuid guid)
+{
+    std::lock_guard<std::mutex> lock(s_lastCastsMutex);
+    std::vector<uint32> out;
+    auto it = s_lastCasts.find(guid.GetRawValue());
+    if (it != s_lastCasts.end())
+        out.assign(it->second.begin(), it->second.end());
+    return out;
+}
+
 bool PlayerbotAI::CanCastSpell(uint32 spellid, Unit* target, uint8 effectMask, bool checkHasSpell, Item* itemTarget, bool ignoreRange, bool ignoreInCombat, bool ignoreMount, SpellCastResult* checkResult)
 {
     if (!spellid)
@@ -5025,8 +5196,11 @@ bool PlayerbotAI::CanCastSpell(uint32 spellid, Unit* target, uint8 effectMask, b
 	Spell *spell = new Spell(bot, spellInfo, false);
 
     spell->m_targets.setUnitTarget(target);
-    spell->SetCastItem(itemTarget ? itemTarget : aiObjectContext->GetValue<Item*>("item for spell", spellid)->Get());
-    spell->m_targets.setItemTarget(spell->GetCastItem());
+    // [2026-10-24 崩溃修] 只使用调用方**明确传入**的物品指针。
+    //   原来会回落到 AI 值 "item for spell"，那个缓存可能在物品被消耗/销毁后变成野指针，
+    //   随后 SpellCastTargets::setItemTarget 里解引用 ⇒ SIGSEGV（崩溃栈已确认两次）。
+    spell->SetCastItem(itemTarget);
+    spell->m_targets.setItemTarget(itemTarget);
 
     SpellCastResult result = spell->CheckCast(true);
     delete spell;
@@ -5261,8 +5435,11 @@ bool PlayerbotAI::CanCastSpell(uint32 spellid, float x, float y, float z, uint8 
     Spell* spell = new Spell(bot, spellInfo, false);
 
     spell->m_targets.setDestination(x, y, z);
-    spell->SetCastItem(itemTarget ? itemTarget : aiObjectContext->GetValue<Item*>("item for spell", spellid)->Get());
-    spell->m_targets.setItemTarget(spell->GetCastItem());
+    // [2026-10-24 崩溃修] 只使用调用方**明确传入**的物品指针。
+    //   原来会回落到 AI 值 "item for spell"，那个缓存可能在物品被消耗/销毁后变成野指针，
+    //   随后 SpellCastTargets::setItemTarget 里解引用 ⇒ SIGSEGV（崩溃栈已确认两次）。
+    spell->SetCastItem(itemTarget);
+    spell->m_targets.setItemTarget(itemTarget);
 
     SpellCastResult result = spell->CheckCast(true);
     delete spell;
@@ -5325,6 +5502,16 @@ bool PlayerbotAI::CastSpell(std::string name, Unit* target, Item* itemTarget, bo
 
 bool PlayerbotAI::CastSpell(uint32 spellId, Unit* target, Item* itemTarget, bool waitForSpell, uint32* outSpellDuration)
 {
+    struct CastRecorder
+    {
+        PlayerbotAI* ai; uint32 spell;
+        CastRecorder(PlayerbotAI* a, uint32 sp) : ai(a), spell(sp) {}
+        ~CastRecorder()
+        {
+            if (ai && ai->GetBot())
+                PlayerbotAI::RecordSpellCast(ai->GetBot()->GetObjectGuid(), spell);
+        }
+    } _castRecorder(this, spellId);
     if (!spellId)
         return false;
 

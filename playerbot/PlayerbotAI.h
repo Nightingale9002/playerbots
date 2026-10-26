@@ -412,6 +412,10 @@ public:
     // [2026-10-22 崩溃修] 仿真控制指令（SimScenario 在 World 线程）不能直接 DoSpecificAction ——
     //   那会去碰 map 线程正在更新的 Map 容器（实测 SIGSEGV in Map::GetAnyTypeCreature）。
     //   这里只排队，真正的执行发生在 bot 自己的 UpdateAI（map 线程）里。
+    // [2026-10-24 站长口径] 观测用：记录 bot 最近几次施法的 spell id（dump 里看坦克是不是只在普攻）
+    static std::vector<uint32> LastSpellCasts(ObjectGuid guid);
+    static void RecordSpellCast(ObjectGuid guid, uint32 spellId);
+
     void QueueSimAction(std::string const& action)
     {
         std::lock_guard<std::mutex> guard(m_simActionMutex);

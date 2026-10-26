@@ -450,6 +450,12 @@ delayedPackets ChatReplyAction::GenerateResponsePackets(const std::string json
 
 void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32 guid2, std::string msg, std::string chanName, std::string name)
 {
+    // [2026-10-27] 仿真模式禁用闲聊回复：r141/r143 的 world 卡死都发生在这条链路
+    //   （PlayerbotTextMgr::GetBotText + SayAction 里每次现编的 std::regex）。
+    //   副本跑测不需要寒暄，直接返回。
+    if (sPlayerbotAIConfig.simMode)
+        return;
+
     // if we're just commanding bots around, don't respond...
     // first one is for exact word matches
     if (noReplyMsgs.find(msg) != noReplyMsgs.end())

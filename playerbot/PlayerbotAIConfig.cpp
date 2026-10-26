@@ -658,6 +658,10 @@ bool PlayerbotAIConfig::Initialize()
     autoDisbandBotOnlyGroups = (uint8)config.GetIntDefault("AiPlayerbot.AutoDisbandBotOnlyGroups", 1);
     // [threat 2026-10-16 站长口径] 自己仇恨 ≥ 坦克仇恨的这个百分比就压着不出手（0 = 关）
     waitForAttackThreatPercent = (uint8)config.GetIntDefault("AiPlayerbot.WaitForAttackThreatPercent", 90);
+    // [threat 2026-10-24 站长口径] 固定仇恨差：坦克仇恨领先不足这个值 ⇒ 继续压着不出手（0 = 关）
+    waitForAttackThreatLead = (uint32)config.GetIntDefault("AiPlayerbot.WaitForAttackThreatLead", 500);
+    waitForAttackThreatLeadBoss = (uint32)config.GetIntDefault("AiPlayerbot.WaitForAttackThreatLeadBoss", 1000);
+    waitForAttackThreatLeadImmune = (uint32)config.GetIntDefault("AiPlayerbot.WaitForAttackThreatLeadImmune", 1500);
     // [threat 2026-10-16 站长口径] 开场"等坦克 pull back"的秒数上限（默认 5；游戏内可单 bot 覆盖）
     waitForAttackTime = (uint8)config.GetIntDefault("AiPlayerbot.WaitForAttackTime", 5);
     // [threat 2026-10-16 站长口径] 坦克离我 ≤ 这个距离且对该目标有仇恨 ⇒ 视为"已拉回来"，立刻开打

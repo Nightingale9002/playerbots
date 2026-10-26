@@ -288,6 +288,11 @@ public:
     bool randomBotGroupNearby;
     // [threat 2026-10-16 站长口径] 自己仇恨达到坦克仇恨的这个百分比就压着不出手（0 = 关）
     uint8 waitForAttackThreatPercent;
+    // [threat 2026-10-24 站长口径] 除了百分比，还要有**固定仇恨差**：坦克仇恨领先自己不足这个值就继续压着
+    uint32 waitForAttackThreatLead;
+    // [2026-10-24 站长口径] 分档固定仇恨：起手 500；boss 级 1000；不吃嘲讽 1500
+    uint32 waitForAttackThreatLeadBoss;
+    uint32 waitForAttackThreatLeadImmune;
     // [threat 2026-10-16 站长口径] 开场"等坦克 pull back"的秒数上限（默认值，游戏内可单 bot 覆盖）
     uint8 waitForAttackTime;
     // [threat 2026-10-16 站长口径] 坦克离我 ≤ 这个距离且对该目标有仇恨 ⇒ 视为"已拉回来"，立刻开打

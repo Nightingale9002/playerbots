@@ -37,7 +37,11 @@
 #include "playerbot/DecisionWeights.h"
 // [自动进本 2026-10-18] 不在副本里时先把队伍带进本，再交给按波推进
 #include "playerbot/DungeonRun.h"
+// [2026-10-25 站长口径] "一波"由刷怪系统自己分组（SpawnGroup / CreatureGroup），
+//   不靠人工 guid 表、也不靠坐标聚类 ⇒ 这里要拿 Creature::GetCreatureGroup()->GetGroupId()。
+#include "Maps/SpawnGroup.h"
 #include <algorithm>
+#include <mutex>       // [2026-10-25] 固化路线生成的跨线程互斥
 
 namespace dungeonroute
 {
@@ -102,6 +106,16 @@ namespace dungeonroute
                     ++r->noTemplate;
                 else if (info->CreatureType == CREATURE_TYPE_CRITTER)
                     ++r->critters;
+                else if (info->UnitFlags & (UNIT_FLAG_UNTARGETABLE | UNIT_FLAG_UNINTERACTIBLE |
+                                            UNIT_FLAG_NOT_ATTACKABLE_1))
+                {
+                    // [2026-10-27 站长口径] **不可选中/不可交互的单位不作为波成员**：
+                    //   546 的 Large AOI Underbat(18409) = UNINTERACTIBLE|IMMUNE_TO_PLAYER，
+                    //   之前被当成敌对怪并进波次 ⇒ 波永远清不掉。
+                    //   ⚠ 不能用 IMMUNE_TO_PLAYER 单独判：555 的 Cabal Ritualist 等"阶段免疫"
+                    //   会被误剔（实测 67 只），也不能按 faction 判（Wastewalker Slave 是脚本入战的）。
+                    ++r->npcs;
+                }
                 else if (info->NpcFlags)
                     ++r->npcs;
                 else
@@ -141,6 +155,16 @@ namespace dungeonroute
     const uint32 MOVE_STUCK_MS = 8000;
     // 认为"已经站在拉怪位"的距离（码）
     const float AT_PULL_POINT_DIST = 3.5f;
+    // [2026-10-25 修复] 判"某个点安不安全"时，只看这一点周围多远之内的怪。
+    //   原来这个 30 写死在 SafePointVisitor 里，而 UnsafeStandOffender 又按 **bot 的位置**搜 30 码，
+    //   于是判 20 码外的候选点时 30~50 码那一段成了盲区 ⇒ 探出来的"安全点"其实踩在怪脸上。
+    const float THREAT_SCREEN_RADIUS = 30.0f;
+    // [2026-10-25] "遇到就清"的观察半径：一个刷怪网格格的尺度。
+    //   比这更远的怪通常还没加载（走过去自然会刷出来）；墙后的本来就不该算"路上遇到"。
+    const float LIVE_GROUP_SCAN_DIST = 60.0f;
+    // [2026-10-25 站长口径] 现场普查半径：一次决策能"看见"多大一片已加载的怪。
+    //   副本很小，这个半径基本覆盖当前房间到下一个房间；再远的等走过去自然加载。
+    const float LIVE_CENSUS_DIST = 120.0f;
     // boss 阶段没有锚点：走到离它多远处拉
     const float BOSS_PULL_DIST = 22.0f;
     // [2026-10-18] 图**未放行**时的重查间隔：`verified` 是站长实测后手动 UPDATE 的，
@@ -228,6 +252,93 @@ namespace dungeonroute
         //   这里只放数据；运行时由 route 动作把它们灌进 bot 的 "avoid creature list"，
         //   交给引擎自带的 avoid specific creatures 策略去 move away。
         std::set<uint32> avoidEntries;
+        // [2026-10-28] 每个"要躲的怪"的自定义危险半径（码，0=沿用仇恨圈）：
+        //   例 546 的 Underbog Mushroom(17990) 是 8 码 Spore Cloud（SpellRadius.dbc idx14），
+        //   比默认仇恨圈小得多；用仇恨圈躲会过度走位、还躲不掉真正的 8 码爆炸。
+        std::map<uint32, float> avoidRadius;
+        // [2026-10-24 站长指令] 会消失/打不到的怪（例：552 Protean Horror）：不当目标，消失就换下一个
+        std::set<uint32> skipEntries;
+
+        // [2026-10-23 站长指令] boss 前置条件（表 ai_playerbot_boss_require）：
+        //   例：555 Hellmaw 被放逐，直接选 boss 拉不了，必须先清掉周围 Cabal Ritualist。
+        struct BossRequire
+        {
+            uint32 reqEntry = 0;
+            float radius = 40.0f;
+        };
+        std::vector<std::pair<uint32, BossRequire>> bossRequires;   // (boss_entry, rule)
+
+        // [2026-10-23 站长指令] 副本进度链（key-node 粒度）：
+        //   kind = kill_entry（清指定 entry）/ boss（打指定 boss）/ room_clear（anchor 半径内清空）
+        struct Stage
+        {
+            uint16 ord = 0;
+            std::string kind;
+            uint32 targetEntry = 0;
+            float ax = 0.0f, ay = 0.0f;
+            float radius = 0.0f;
+            uint32 countLimit = 0;   // [2026-10-23] gauntlet：附近活怪超过这个数就先清，否则继续往前
+            float keepOut = 0.0f;    // [2026-10-23] 该阶段别靠近 anchor 这么近（269 清野兽时不要触发麦迪文）
+            // [2026-10-26 站长口径] kind='wait' 用：原地干等这么多毫秒再推进。
+            //   用途：Arcatraz 开头清完 4 个 warder 后，等会自己消失的 Protean 走干净再往前走
+            //   （以前用 skip_entry 按 entry 跳过，会把同 entry 的正常怪也跳过）。
+            uint32 waitMs = 0;
+            // [2026-10-26 站长指令] kind='link' 用：走到 (ax,ay) 附近的 route_link，然后跳到 (lx,ly,lz)。
+            //   link 数据仍只存在 `ai_playerbot_route_link`（单一来源），加载时按 src 最近匹配填进来。
+            float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+            uint8 lkind = 0;
+        };
+        std::vector<Stage> stages;   // 按 ord 升序
+        // [2026-10-23] interact_go 用：GO entry -> 该图内的 guid 列表
+        std::map<uint32, std::vector<uint32>> goGuids;
+        // [2026-10-23] talk_npc 用：NPC entry -> 该图内的 creature guid 列表
+        std::map<uint32, std::vector<uint32>> npcGuids;
+
+        // [2026-10-23 站长指令] "先拉这一只、别引太多"：进战斗前优先把指定 entry 单独拉过来
+        struct PullFirst
+        {
+            uint32 entry = 0;
+            float maxDist = 30.0f;    // 超过这个距离不主动去拉
+            uint32 maxAdds = 2;       // 目标周围（15 码）其它活怪超过这个数 ⇒ 先不拉，等/退
+        };
+        std::vector<PullFirst> pullFirst;
+        // [2026-10-23 站长口径] "adds 用连锁范围和连锁组判断，不要硬性距离"：
+        //   连锁范围 = creature_template.CallForHelp；连锁组 = spawn_group_spawn / creature_linking
+        std::map<uint32, uint32> spawnGroupOf;   // guid -> spawn group Id
+        std::map<uint32, uint32> linkMasterOf;   // guid -> master_guid (linked)
+
+        // [2026-10-23 站长指令] 危险 AoE（燃烧新星这类）：怪在念指定法术时，立刻后退到半径外
+        struct AvoidSpell
+        {
+            uint32 spellId = 0;
+            float radius = 25.0f;
+        };
+        std::vector<AvoidSpell> avoidSpells;
+        // [2026-10-24 站长指令] 552：怪物之间没打完之前不要开怪；也别一次拉很多
+        struct PullWait
+        {
+            float radius = 40.0f;
+            uint32 maxAssist = 1;
+            bool waitEnemyFight = true;
+        };
+        std::vector<PullWait> pullWaits;
+        // [2026-10-24 站长指令] 552 弓箭手：要**拉回很远**再打，否则它会一直往回跑、容易 add
+        // [2026-10-24 站长口径] 仇恨规则：默认 rank=1 / pct=100（队员仇恨不得超过第一仇恨的 100%）；
+        //   特殊 boss 需要"不超过第二/第三仇恨"时，往 ai_playerbot_threat_rule 里加行即可，不用改代码。
+        struct ThreatRule
+        {
+            uint32 entry = 0;
+            uint8 rank = 1;
+            float pct = 100.0f;
+        };
+        std::vector<ThreatRule> threatRules;
+
+        struct PullBack
+        {
+            uint32 entry = 0;
+            float dist = 40.0f;   // 把战斗位置拉到离它这么远
+        };
+        std::vector<PullBack> pullBacks;
         uint16 maxOrd = 0;
     };
 
@@ -281,6 +392,32 @@ namespace dungeonroute
         uint32 patrolIgnoreGuid = 0;
         uint32 patrolIgnoreUntil = 0;
         uint32 patrolWaitTargetGuid = 0;   // 因它而等的"想拉的那只怪"   // [2026-10-22] 已为"不可达 boss"试过的连接点下标（避免死循环）
+        // [2026-10-25 站长口径] 开怪准入：等"代价最小的那一刻"再拉。
+        //   存的是**等到什么时候**（不是节流）：到点前不再重算，避免每 tick 把等待时刻往后推。
+        uint32 pullWaitUntil = 0;
+        // [GHOST-FIGHT 2026-10-27] 幽灵战斗（顶着战斗标记但没有任何交战）的确认起点；0 = 不在该状态
+        uint32 ghostCombatSince = 0;
+        // [2026-10-27 整合] [THREAT] hold fire 日志节流（原来每 tick 一条）
+        uint32 holdFireLogAt = 0;
+        // [2026-10-27 站长口径] 施法怪/够不着目标的挪位节流（冲上去 / 卡视野 / 后拉）
+        uint32 casterPosAt = 0;
+        uint32 pullCostAdds = 0;      // 上一次算出的代价（额外怪数），只用于日志/观察
+        uint32 pullCostPatrol = 0;    // 其中巡逻怪数
+        // [2026-10-25 站长口径] **聚怪门只检查开怪后 5 秒**：
+        //   boss 会召唤小怪 / 有 add 时，"等怪全聚到 5 码"永远不成立 ⇒ DPS 永久停手，
+        //   所以门只在开怪瞬间生效，超时 5 秒一律放行。
+        uint32 gatherSince = 0;
+        // [2026-10-25 性能] 现场普查的缓存：普查是**只读**的，500ms 内结果等价。
+        //   目标还活着、没被拉黑、没在战斗 ⇒ 直接复用，不重扫网格（这不是行为节流，是读缓存）。
+        uint32 liveCensusAt = 0;
+        uint32 liveCensusGuid = 0;
+        uint32 deadEndLogAt = 0;      // "拉怪位不可达 ⇒ 改朝怪本体走" 的日志节流
+        // [2026-10-25 站长口径] "跑通一个阶段就把这段路存下来"：
+        //   recStage = 正在记录的 stage；recPath = 这段路实际走过的路点；
+        //   stage 推进（= 这一段跑通了）就把 recPath 存库（verified=1），以后懒加载也能直接沿它走。
+        uint16 recStage = 0xFFFF;
+        std::vector<Vector3> recPath;
+        uint32 stagePathSeq = 0;      // 回放：已经走过这一段的第几个点（前向，不回退）
         std::set<uint16> seenAlive;   // 见过活怪的波（用来区分"已清"与"远处未加载"）
         std::set<uint16> cleared;     // 确认已清的波
         std::set<uint32> bossSeen;    // 见过活的 boss 刷点
@@ -303,9 +440,57 @@ namespace dungeonroute
         // [2026-10-23] 不完整路径收束：路径检查节流（1.5s）+ 上次检查的目标
         uint32 pathCheckAt = 0;
         uint32 pathTargetGuid = 0;
+        uint32 pullDbgAt = 0;      // [2026-10-23] PULLWHY 诊断节流
+        uint32 bossRequireLogAt = 0;   // [2026-10-23] boss 前置未满足的日志节流
+        uint16 stageOrd = 0;           // [2026-10-23] 进度链当前阶段（0=未初始化，>=9000=已完成）
+        uint32 stageWaitSince = 0;     // [2026-10-26] kind='wait' 阶段的起始时间
+        uint32 stageLogAt = 0;         // [2026-10-23] 进度链日志节流
+        std::set<uint16> stageSeen;    // [2026-10-23] 该阶段的目标"见过活的"（防止网格没加载就误判已清）
+        uint32 waveClearCount = 0;     // [2026-10-23] waves_clear：已清空次数
+        uint32 waveClearSince = 0;     // [2026-10-23] waves_clear：当前"空场"从何时开始（3 秒确认）
+        uint32 beaconAt = 0;           // [2026-10-23] event_guard：上次放时空道标的时间（60s 节流）
+        uint32 moveTgtLogAt = 0;       // [2026-10-24] MOVETGT 诊断节流
+        uint32 waveLogAt = 0;          // [2026-10-24] WAVE 诊断节流
+        uint32 pullBackPending = 0;        // [2026-10-24 站长口径] 拉完/挪位后的新站位：生效期间不再回原拉怪位
+        float standOverrideX = 0, standOverrideY = 0, standOverrideZ = 0;
+        uint32 standOverrideUntil = 0;
+        // [2026-10-25 修] PULLSAFE 挪出来的"安全拉怪点"就是**这一次拉怪的站位点**（不只是拉完之后的站位）。
+        //   原因：挪到安全点后，PullAction 的 stand_override_hold 直接 return false 挡着不开怪，
+        //   而 MoveAction/PullTrigger 还按**原拉怪位**算距离 ⇒ 把坦克推回原拉怪位，
+        //   到了原拉怪位 PullAction 又把人送回安全点 ⇒ 两个动作互顶，一次开怪都不发生
+        //   （r92 557 Pandemonius：坐标在拉怪位 0 码 ↔ 安全点 8 码之间来回，单组钉死 8 分钟）。
+        bool safePullPoint = false;
+        // [2026-10-25 只读诊断] 越界（站在导航网格外）日志节流：定位"谁在什么时刻被丢出有效区域"
+        // [2026-10-26 站长口径] 波卡死判据的"正在走近"豁免：记离拉怪位的距离变化
+        float  waveLastDist = -1.0f;    // 上一次采样时离当前拉怪位的距离
+        uint32 waveLastDistAt = 0;
+        uint32 waveApproachAt = 0;      // 最后一次"距离在缩短"的时间（20 秒内有效）
+
+        uint32 oobLogAt = 0;
+        // 连续几次(每 10s 一次)判"在网格外"才算越界：避开"刚传送到入口、网格还没加载"那几秒的误报
+        uint8 oobStrikes = 0;
+        // 记第一次判越界时的坐标：只有"基本没动"才继续累加 strikes（击飞兜底只救真卡住的人）
+        float oobX = 0.0f, oobY = 0.0f, oobZ = 0.0f;
+        // [2026-10-25 站长口径] 站位调整"找不到安全点"的日志节流（此时**不移动**，等巡逻怪走过来）
+        uint32 reposFailAt = 0;
+        // [2026-10-26 修] "等代价最小的开怪时刻"的起始时间：总等待上限 10s，防止巡逻外推每 2~8s 又给一个
+        //   "更便宜的时刻" ⇒ 无限推迟、整组空转 18 分钟（r100：`waiting_best_window` + 1100s 未进战斗）。
+        uint32 pullCostWaitSince = 0;
+    // [2026-10-24] pulled from unsafe spot -> pullback after combat starts
+        uint32 assistGuid = 0;          // [2026-10-24] 当前正在补拉的怪（拉到坦克身上就清空）
+        uint32 threatHolds = 0;        // [2026-10-24] 起手门"压着不出手"次数
+        uint32 threatLogAt = 0;        // [2026-10-24] 起手门日志节流
+        uint32 directMoveGuid = 0;     // [2026-10-24] 最近一次直接 MovePoint 的目标
+        uint32 directMoveAt = 0;       // [2026-10-24] 直接 MovePoint 节流（20s）
+        float moveCheckX = 0, moveCheckY = 0;   // [2026-10-24] "原地不动"检测：上次移动过的位置
+        uint32 moveCheckAt = 0;                 // 采样时间
+        uint32 lastMovedAt = 0;                 // 上次确认"真的移动了"的时间
         // [2026-10-23] 目标级拉黑：同一只怪连续拉怪失败 N 次（打不了/不可交互/感知不到）⇒ 跳过，
         //   避免整队死磕一只怪（实测 558 的 Raging Soul 被重试 175 次，整张图 0 进度）。
         std::map<uint32, uint8> pullFailCount;
+        // [2026-10-24 站长指令] 会消失的怪（Protean Horror 这类）：**按具体 guid 临时跳过**，
+        //   不能按 entry 一刀切（同一个 entry 也有正常可打的）
+        std::map<uint32, uint32> guidSkipUntil;
         // [2026-10-18] "有目标但走不过去"守卫：同一波移动 8 秒**位置没动过** ⇒ 放弃该波。
         //   用位置而不是"到目标距离"：绕路时距离可能先变大，但那不是卡住。
         uint16 moveOrd = 0;           // 正在朝哪一波移动（0 = 无）
@@ -380,6 +565,17 @@ namespace dungeonroute
         std::unique_ptr<QueryResult> rows = WorldDatabase.PQuery(
             "SELECT r.guid, r.ord, r.group_id, c.id FROM `ai_playerbot_dungeon_route` r "
             "JOIN `creature` c ON c.guid = r.guid WHERE r.map = '%u' ORDER BY r.ord, r.guid", mapId);
+        // [2026-10-24 站长口径] mmap 确实不可达的怪：**从一开始就跳过**（不登记进波次/guidOrd）。
+        //   数据来源：离线 navmesh flood（ai_playerbot_unreachable，按 guid）。
+        std::set<uint32> unreachable;
+        {
+            std::unique_ptr<QueryResult> ur = WorldDatabase.PQuery(
+                "SELECT `guid` FROM `ai_playerbot_unreachable` WHERE `map` = '%u'", mapId);
+            if (ur)
+            {
+                do { unreachable.insert(ur->Fetch()[0].GetUInt32()); } while (ur->NextRow());
+            }
+        }
         if (rows)
         {
             do
@@ -391,6 +587,8 @@ namespace dungeonroute
                 uint32 entry = f[3].GetUInt32();
                 if (!guid || !ord)
                     continue;
+                if (unreachable.count(guid))
+                    continue;   // [2026-10-24] 不可达的怪不参与推进
 
                 Wave& w = route.waves[ord];      // map 保证按 ord 构造，缺的 ord 后面会补默认值
                 if (!w.ord)
@@ -406,24 +604,10 @@ namespace dungeonroute
             } while (rows->NextRow());
         }
 
-        std::unique_ptr<QueryResult> anchors = WorldDatabase.PQuery(
-            "SELECT `ord`, `pull_x`, `pull_y`, `pull_z` FROM `ai_playerbot_wave_anchor` "
-            "WHERE `map` = '%u'", mapId);
-        if (anchors)
-        {
-            do
-            {
-                Field* f = anchors->Fetch();
-                uint16 ord = uint16(f[0].GetUInt32());
-                auto it = route.waves.find(ord);
-                if (it == route.waves.end())
-                    continue;
-                it->second.pull.has = true;
-                it->second.pull.x = f[1].GetFloat();
-                it->second.pull.y = f[2].GetFloat();
-                it->second.pull.z = f[3].GetFloat();
-            } while (anchors->NextRow());
-        }
+        // [2026-10-26 站长口径] `ai_playerbot_wave_anchor` 表**已废弃并删除**（只做统计用，运行时不再读）：
+        //   拉怪位一律由 `MakeApproachPoint()` 实时计算；下表留空 ⇒ `Wave::pull.has=false`，
+        //   所有用到 pull 点的地方都会走实时计算分支。
+        //   （历史：这里原本 SELECT ord,pull_x,pull_y,pull_z 覆盖实时点。）
 
         // [2026-10-22 站长口径] 按同类怪数量动态调整权重（540：Creeping Oozeling / Shattered Hand Zealot）
         std::unique_ptr<QueryResult> cwrules = WorldDatabase.PQuery(
@@ -443,12 +627,273 @@ namespace dungeonroute
         }
 
 
-        // [2026-10-23] 无敌+击飞类怪：加载"要躲"的 entry 列表
+        // [2026-10-23] 无敌+击飞类怪：加载"要躲"的 entry 列表（[2026-10-28] 带自定义危险半径）
         std::unique_ptr<QueryResult> avoidRows = WorldDatabase.PQuery(
-            "SELECT `entry` FROM `ai_playerbot_avoid_mob` WHERE `map` = '%u'", mapId);
+            "SELECT `entry`, `radius` FROM `ai_playerbot_avoid_mob` WHERE `map` = '%u'", mapId);
         if (avoidRows)
         {
-            do { route.avoidEntries.insert(avoidRows->Fetch()[0].GetUInt32()); } while (avoidRows->NextRow());
+            do
+            {
+                Field* f = avoidRows->Fetch();
+                uint32 const entry = f[0].GetUInt32();
+                float const radius = f[1].GetFloat();
+                route.avoidEntries.insert(entry);
+                if (radius > 0.0f)
+                    route.avoidRadius[entry] = radius;
+            } while (avoidRows->NextRow());
+        }
+
+        // [2026-10-26 站长指令] **禁用 skip_entry**：
+        //   会消失的临时召唤怪（例：Arcatraz 的 Protean Nightmare/Horror/Spawn）与要正常清的怪
+        //   共用同一个 entry，按 entry 跳过 ⇒ 该打的怪也被跳过（实测 552 一整段都不打）。
+        //   表保留（ai_playerbot_skip_entry），这里不再加载 ⇒ skipEntries 恒为空集，行为回到"全都按正常波次处理"。
+        //   等"会消失的怪"处理逻辑改成按**运行时状态**（目标消失/自动 despawn）判定后再启用。
+        /*
+        {
+            std::unique_ptr<QueryResult> skRows = WorldDatabase.PQuery(
+                "SELECT `entry` FROM `ai_playerbot_skip_entry` WHERE `map` = '%u'", mapId);
+            if (skRows)
+            {
+                do { route.skipEntries.insert(skRows->Fetch()[0].GetUInt32()); } while (skRows->NextRow());
+            }
+        }
+        */
+
+        // [2026-10-23 站长指令] boss 前置条件：某些 boss 必须先清掉指定怪才能拉
+        std::unique_ptr<QueryResult> reqRows = WorldDatabase.PQuery(
+            "SELECT `boss_entry`, `req_entry`, `radius` FROM `ai_playerbot_boss_require` WHERE `map` = '%u'", mapId);
+        if (reqRows)
+        {
+            do
+            {
+                Field* f = reqRows->Fetch();
+                MapRoute::BossRequire r;
+                r.reqEntry = f[1].GetUInt32();
+                r.radius = f[2].GetFloat();
+                route.bossRequires.emplace_back(f[0].GetUInt32(), r);
+            } while (reqRows->NextRow());
+        }
+
+        // [2026-10-23 站长指令] 副本进度链
+        std::unique_ptr<QueryResult> stageRows = WorldDatabase.PQuery(
+            "SELECT `stage_ord`, `kind`, `target_entry`, `anchor_x`, `anchor_y`, `radius`, `count_limit`, `keep_out`, `wait_ms` "
+            "FROM `ai_playerbot_dungeon_stage` WHERE `map` = '%u' ORDER BY `stage_ord`", mapId);
+        if (stageRows)
+        {
+            do
+            {
+                Field* f = stageRows->Fetch();
+                MapRoute::Stage s;
+                s.ord = f[0].GetUInt16();
+                s.kind = f[1].GetString();
+                s.targetEntry = f[2].GetUInt32();
+                s.ax = f[3].GetFloat();
+                s.ay = f[4].GetFloat();
+                s.radius = f[5].GetFloat();
+                s.countLimit = f[6].GetUInt32();
+                s.keepOut = f[7].GetFloat();
+                s.waitMs = f[8].GetUInt32();
+                route.stages.push_back(s);
+            } while (stageRows->NextRow());
+        }
+
+        // [2026-10-19] 跳点/升降台连接点：**必须在 stage 匹配之前加载**——
+        //   下面 kind='link' 的阶段要按 src 最近匹配 route.links；之前这一段放在后面，
+        //   匹配时 links 还是空的 ⇒ 所有 link 阶段都被 "15 码没有 route_link" 跳过（547 实测）。
+        {
+            std::unique_ptr<QueryResult> links = WorldDatabase.PQuery(
+                "SELECT src_x, src_y, src_z, dst_x, dst_y, dst_z, kind FROM `ai_playerbot_route_link` WHERE map = '%u'",
+                mapId);
+            if (links)
+            {
+                do
+                {
+                    Field* f = links->Fetch();
+                    RouteLink l;
+                    l.sx = f[0].GetFloat();
+                    l.sy = f[1].GetFloat();
+                    l.sz = f[2].GetFloat();
+                    l.dx = f[3].GetFloat();
+                    l.dy = f[4].GetFloat();
+                    l.dz = f[5].GetFloat();
+                    l.kind = f[6].GetUInt8();
+                    route.links.push_back(l);
+                } while (links->NextRow());
+            }
+        }
+
+        // [2026-10-26 站长指令] kind='link' 的阶段：按 src(anchor_x/anchor_y) 最近的 route_link 填 dst。
+        //   link 数据只存 ai_playerbot_route_link，避免两份坐标漂移。
+        for (auto& s : route.stages)
+        {
+            if (s.kind != "link")
+                continue;
+            float bestD = 1e18f;
+            RouteLink const* best = nullptr;
+            for (auto const& l : route.links)
+            {
+                float const dx = l.sx - s.ax, dy = l.sy - s.ay;
+                float const d = std::sqrt(dx * dx + dy * dy);
+                if (d < bestD)
+                {
+                    bestD = d;
+                    best = &l;
+                }
+            }
+            if (best && bestD <= 15.0f)
+            {
+                s.lx = best->dx; s.ly = best->dy; s.lz = best->dz;
+                s.lkind = best->kind;
+            }
+            else
+            {
+                sLog.outError("[STAGE] map %u stage %u kind=link 但 (%.1f,%.1f) 附近 15 码没有 route_link ⇒ 这条阶段会被跳过",
+                    mapId, uint32(s.ord), s.ax, s.ay);
+            }
+        }
+
+        // [2026-10-23] interact_go：把阶段里用到的 GO 在该图的 guid 都载入
+        std::string goList;
+        for (auto const& s : route.stages)
+        {
+            if (s.kind != "interact_go" || !s.targetEntry)
+                continue;
+            if (!goList.empty()) goList += ",";
+            goList += std::to_string(s.targetEntry);
+        }
+        if (!goList.empty())
+        {
+            std::unique_ptr<QueryResult> goRows = WorldDatabase.PQuery(
+                "SELECT `id`, `guid` FROM `gameobject` WHERE `map` = '%u' AND `id` IN (%s)",
+                mapId, goList.c_str());
+            if (goRows)
+            {
+                do
+                {
+                    Field* f = goRows->Fetch();
+                    route.goGuids[f[0].GetUInt32()].push_back(f[1].GetUInt32());
+                } while (goRows->NextRow());
+            }
+        }
+
+        // [2026-10-23] talk_npc：把阶段里要对话的 NPC guid 载入
+        std::string npcList;
+        for (auto const& s : route.stages)
+        {
+            if (s.kind != "talk_npc" || !s.targetEntry)
+                continue;
+            if (!npcList.empty()) npcList += ",";
+            npcList += std::to_string(s.targetEntry);
+        }
+        if (!npcList.empty())
+        {
+            std::unique_ptr<QueryResult> npcRows = WorldDatabase.PQuery(
+                "SELECT `id`, `guid` FROM `creature` WHERE `map` = '%u' AND `id` IN (%s)",
+                mapId, npcList.c_str());
+            if (npcRows)
+            {
+                do
+                {
+                    Field* f = npcRows->Fetch();
+                    route.npcGuids[f[0].GetUInt32()].push_back(f[1].GetUInt32());
+                } while (npcRows->NextRow());
+            }
+        }
+
+        // [2026-10-23 站长指令] "先拉这一只、别引太多"
+        std::unique_ptr<QueryResult> pfRows = WorldDatabase.PQuery(
+            "SELECT `entry`, `max_dist`, `max_adds` FROM `ai_playerbot_pull_first` WHERE `map` = '%u'", mapId);
+        if (pfRows)
+        {
+            do
+            {
+                Field* f = pfRows->Fetch();
+                MapRoute::PullFirst p;
+                p.entry = f[0].GetUInt32();
+                p.maxDist = f[1].GetFloat();
+                p.maxAdds = f[2].GetUInt32();
+                route.pullFirst.push_back(p);
+            } while (pfRows->NextRow());
+        }
+
+        // [2026-10-23] 连锁组数据：spawn_group + creature_linking（只载本图的怪）
+        if (!route.pullFirst.empty())
+        {
+            std::unique_ptr<QueryResult> sgRows = WorldDatabase.PQuery(
+                "SELECT s.`Guid`, s.`Id` FROM `spawn_group_spawn` s "
+                "JOIN `creature` c ON c.guid = s.Guid WHERE c.map = '%u'", mapId);
+            if (sgRows)
+            {
+                do
+                {
+                    Field* f = sgRows->Fetch();
+                    route.spawnGroupOf[f[0].GetUInt32()] = f[1].GetUInt32();
+                } while (sgRows->NextRow());
+            }
+
+            std::unique_ptr<QueryResult> lkRows = WorldDatabase.PQuery(
+                "SELECT l.`guid`, l.`master_guid` FROM `creature_linking` l "
+                "JOIN `creature` c ON c.guid = l.guid WHERE c.map = '%u'", mapId);
+            if (lkRows)
+            {
+                do
+                {
+                    Field* f = lkRows->Fetch();
+                    route.linkMasterOf[f[0].GetUInt32()] = f[1].GetUInt32();
+                } while (lkRows->NextRow());
+            }
+        }
+
+        // [2026-10-23 站长指令] 危险法术列表（念到就跑）
+        {
+            std::unique_ptr<QueryResult> asRows = WorldDatabase.PQuery(
+                "SELECT `spell_id`, `radius` FROM `ai_playerbot_avoid_spell` WHERE `map` = '%u'", mapId);
+            if (asRows)
+            {
+                do
+                {
+                    Field* f = asRows->Fetch();
+                    MapRoute::AvoidSpell s;
+                    s.spellId = f[0].GetUInt32();
+                    s.radius = f[1].GetFloat();
+                    route.avoidSpells.push_back(s);
+                } while (asRows->NextRow());
+            }
+        }
+
+        // [2026-10-24 站长指令] 等怪之间打完再开怪 / 不要一次拉很多
+        {
+            std::unique_ptr<QueryResult> pwRows = WorldDatabase.PQuery(
+                "SELECT `radius`,`max_assist`,`wait_enemy_fight` FROM `ai_playerbot_pull_wait` WHERE `map` = '%u'", mapId);
+            if (pwRows)
+            {
+                do
+                {
+                    Field* f = pwRows->Fetch();
+                    MapRoute::PullWait w;
+                    w.radius = f[0].GetFloat();
+                    w.maxAssist = f[1].GetUInt32();
+                    w.waitEnemyFight = f[2].GetUInt32() != 0;
+                    route.pullWaits.push_back(w);
+                } while (pwRows->NextRow());
+            }
+        }
+
+        // [2026-10-24] 弓箭手类：拉回很远再打
+        {
+            std::unique_ptr<QueryResult> pbRows = WorldDatabase.PQuery(
+                "SELECT `entry`, `dist` FROM `ai_playerbot_pullback` WHERE `map` = '%u'", mapId);
+            if (pbRows)
+            {
+                do
+                {
+                    Field* f = pbRows->Fetch();
+                    MapRoute::PullBack b;
+                    b.entry = f[0].GetUInt32();
+                    b.dist = f[1].GetFloat();
+                    route.pullBacks.push_back(b);
+                } while (pbRows->NextRow());
+            }
         }
 
         // [2026-10-18 站长口径] "让 bot 知道每一波怪的位置"：用刷点坐标算**波中心**。
@@ -511,30 +956,9 @@ namespace dungeonroute
             }
         }
 
-        // [2026-10-19] 跳点 / 升降台连接点（表不存在时静默为空）
-        {
-            std::unique_ptr<QueryResult> links = WorldDatabase.PQuery(
-                "SELECT src_x, src_y, src_z, dst_x, dst_y, dst_z, kind FROM `ai_playerbot_route_link` WHERE map = '%u'",
-                mapId);
-            if (links)
-            {
-                do
-                {
-                    Field* f = links->Fetch();
-                    RouteLink l;
-                    l.sx = f[0].GetFloat();
-                    l.sy = f[1].GetFloat();
-                    l.sz = f[2].GetFloat();
-                    l.dx = f[3].GetFloat();
-                    l.dy = f[4].GetFloat();
-                    l.dz = f[5].GetFloat();
-                    l.kind = f[6].GetUInt8();
-                    route.links.push_back(l);
-                } while (links->NextRow());
-            }
-        }
+        // [2026-10-19] 跳点 / 升降台连接点：已提前到 stage 匹配之前加载（见上），这里不再重复查询。
 
-        // [2026-10-19] boss 战后开关（门禁面板/桥控制台）：挂在 boss_entry 上
+        // [2026-10-19] boss 战后开关（门禁面板 / 桥控制台）：挂在 boss_entry 上
         {
             std::unique_ptr<QueryResult> switches = WorldDatabase.PQuery(
                 "SELECT boss_entry, go_guid, go_entry, x, y, z, kind, note "
@@ -565,6 +989,11 @@ namespace dungeonroute
         for (auto& kv : route.waves)
         {
             uint32 known = 0, hostile = 0;
+            // [2026-10-27 站长口径] **非敌对 NPC / 小动物不是"波成员"**：
+            //   例 546 的 Underbat（faction 1712，不可选中/无敌）被并进波里 ⇒ 波永远清不掉、
+            //   拉怪还把它们算进去。加载时直接剔除（数据缺口/动态刷怪保留）。
+            std::vector<Member> keep;
+            keep.reserve(kv.second.members.size());
             for (auto& m : kv.second.members)
             {
                 ++totalMembers;
@@ -572,16 +1001,23 @@ namespace dungeonroute
                 if (rit == roster.byGuid.end())
                 {
                     ++missingMembers;
+                    keep.push_back(m);
                     continue;
                 }
                 ++known;
-                if (rit->second.info && rit->second.info->CreatureType == CREATURE_TYPE_CRITTER)
+                bool const critter = rit->second.info &&
+                    rit->second.info->CreatureType == CREATURE_TYPE_CRITTER;
+                if (critter)
                     ++critterMembers;
                 else if (!rit->second.hostile)
                     ++npcMembers;
                 else
                     ++hostile;
+                if (critter || !rit->second.hostile)
+                    continue;                       // 不可攻击：不阻塞波次、不参与拉怪
+                keep.push_back(m);
             }
+            kv.second.members.swap(keep);
             // 整波都在清单里且一个敌对都没有 ⇒ 纯 NPC/小动物波，开局就跳过（不用走过去等 5 秒）
             if (known > 0 && hostile == 0)
             {
@@ -652,6 +1088,1424 @@ namespace dungeonroute
     {
         for (auto& m : w.members)
             if (MemberCreature(map, m))
+                return true;
+        return false;
+    }
+
+    // [2026-10-24 站长口径] "不能攻击的目标不该算一波怪" —— 假人（Arcane Warder Target）、
+    //   友好 NPC、小动物、飞行/无敌脚本单位都不该阻塞波次推进。
+    //   WaveHasAlive 版本没有 bot 指针，这里用"没有可攻击目标"的通用判据（CanAttack 需要 bot）。
+    inline bool MemberFightable(Map* map, Member const& m)
+    {
+        Creature* c = MemberCreature(map, m);
+        if (!c)
+            return false;
+        if (CreatureInfo const* info = c->GetCreatureInfo())
+        {
+            if (info->CreatureType == CREATURE_TYPE_CRITTER)
+                return false;
+            if (info->NpcFlags != 0)                 // 商人/任务/对话类 NPC
+                return false;
+        }
+        return true;
+    }
+
+    inline bool WaveHasFightable(Map* botMap, Wave const& w)
+    {
+        for (auto& m : w.members)
+            if (MemberFightable(botMap, m))
+                return true;
+        return false;
+    }
+
+    // [2026-10-24 站长口径] 有 bot 指针时用**核心的 CanAttack** 判据（覆盖假人/无敌/脚本单位），
+    //   这样"不能攻击的目标"一律不算一波怪。
+    // [2026-10-24 站长口径] 判断"这一只是不是本图 boss（路线表 boss_spawn 里的）"
+    // [2026-10-25] 威胁圈半径 = "离它多近会被它 aggro"的纯几何量：
+    //   max(它对目标的攻击距离, 全局 aggroDistance)；巡逻怪会移动 ⇒ 多算 5 码。
+    //   抽出来是为了让"判一个点安不安全"和"要退到多远"用**同一个数**，不再各写一份。
+    inline float ThreatRingRadius(Player* bot, Creature* c)
+    {
+        if (!bot || !c)
+            return 0.0f;
+        // [2026-10-28 站长口径] 表里给了自定义半径就用它（例：蘑菇 Spore Cloud 8 码），
+        //   不再用默认仇恨圈（20+ 码）去躲 8 码的地板技。
+        MapRoute const* rt = GetMapRoute(c->GetMapId());
+        if (rt)
+        {
+            auto it = rt->avoidRadius.find(c->GetEntry());
+            if (it != rt->avoidRadius.end() && it->second > 0.0f)
+                return it->second;
+        }
+        float aggro = std::max(c->GetAttackDistance(bot), sPlayerbotAIConfig.aggroDistance);
+        if (c->GetMotionMaster())
+        {
+            uint8 const mt = c->GetMotionMaster()->GetCurrentMovementGeneratorType();
+            if (mt == WAYPOINT_MOTION_TYPE || mt == RANDOM_MOTION_TYPE)
+                aggro += 5.0f;
+        }
+        return aggro;
+    }
+
+    // [2026-10-24 站长口径] "不踩仇恨圈"：候选点 30 码内、LOS 通过、**还没进战斗**的敌对怪，
+    //   若候选点落在 max(GetAttackDistance, AggroDistance)+margin 之内 ⇒ 不安全（会引到不该引的怪）。
+    struct SafePointVisitor
+    {
+        Player* bot;
+        float px, py, pz;
+        float margin;
+        // [2026-10-25 崩溃修] 只记 guid，不跨"遍历结束"持有 Creature*：
+        //   实测 core 崩在 `DungeonTankRepositionTrigger::IsActive` → `Object::GetUInt32Value`，
+        //   就是遍历结束后继续用 visitor 里那只怪（期间它可能被刷怪系统移除/重刷）。
+        //   一律用 guid 回查 Map，拿到的才保证是活指针。
+        ObjectGuid offenderGuid;
+
+        // [2026-10-26 修] 本次**要拉的这一波**要排除：拉怪位本来就该落在目标波仇恨圈边上，
+        //   不排除的话它自己永远被判"不安全"（实测 offender 就是待拉的怪/boss）。
+        std::set<uint32> const* excludeLow;
+
+        SafePointVisitor(Player* b, float x, float y, float z, float m, std::set<uint32> const* ex = nullptr)
+            : bot(b), px(x), py(y), pz(z), margin(m), excludeLow(ex) {}
+
+        bool operator()(Creature* c)
+        {
+            if (offenderGuid || !c || !c->IsAlive() || !c->IsInWorld())
+                return true;
+            if (c->IsInCombat())
+                return true;
+            if (!bot->CanAttack(c))
+                return true;
+            // [2026-10-24 站长口径] 小动物/等级差太大不会主动 aggro ⇒ 不算威胁（否则坦克为蟑螂乱挪位）
+            if (c->IsCritter())
+                return true;
+            if (c->GetLevel() + 10 <= bot->GetLevel())
+                return true;
+            if (excludeLow && excludeLow->count(c->GetGUIDLow()))
+                return true;                       // 待拉的这一波：它本来就在圈里
+            if (!c->IsWithinDist3d(px, py, pz, THREAT_SCREEN_RADIUS))
+                return true;
+            if (!c->IsWithinLOS(px, py, pz))
+                return true;
+            if (c->IsWithinDist3d(px, py, pz, ThreatRingRadius(bot, c) + margin))
+                offenderGuid = c->GetObjectGuid();
+            return true;
+        }
+
+        // Cell::VisitAllObjects 需要 GridRefManager 的 Visit 重载（照 GridNotifiers 的写法）
+        template<class T>
+        void Visit(GridRefManager<T>&) {}
+        void Visit(CreatureMapType& m)
+        {
+            for (CreatureMapType::iterator itr = m.begin(); itr != m.end(); ++itr)
+            {
+                Creature* c = itr->getSource();
+                if (c)
+                    (*this)(c);
+            }
+        }
+    };
+
+    inline Creature* UnsafeStandOffender(Player* bot, float x, float y, float z, float margin = 5.0f,
+                                         std::set<uint32> const* excludeLow = nullptr)
+    {
+        if (!bot || !bot->GetMap())
+            return nullptr;
+        SafePointVisitor visitor(bot, x, y, z, margin, excludeLow);
+        // [2026-10-25 修复] 原来固定按 **bot 的位置**搜 30 码，但被评估的点最远可以离 bot 30 多码，
+        //   要判这个点安不安全得看它自己周围 30 码 —— 那最远到 bot 外 60 码。
+        //   照 bot 的位置搜 ⇒ 30~60 码那一段是盲区，探出的"安全点"可能正踩在没被搜到的怪身上，
+        //   挪过去立刻又被判不安全（REPOS 每 tick 触发的元凶之一）。
+        //   以"被评估点到 bot 的距离 + 筛查半径"为搜索半径，才算覆盖被评估点完整一圈。
+        Cell::VisitAllObjects(bot, visitor, bot->GetDistance(x, y, z) + THREAT_SCREEN_RADIUS);
+        return visitor.offenderGuid ? bot->GetMap()->GetCreature(visitor.offenderGuid) : nullptr;
+    }
+
+    // [2026-10-25 站长口径] **安全分**（取代"是/否"）：
+    //   权重：普通怪 0.2 / 精英 1 / boss 3；被**我们要打的那一波**覆盖不算危险（exclude）。
+    //   返回分值：< 0.2 安全（可停留/开拉）；0.2~0.8 只能路过；>= 0.8 危险。
+    const float SAFE_SCORE_OK = 0.5f;        // < 0.5 安全（可停留/开拉）
+    const float SAFE_SCORE_TRANSIT = 2.5f;   // 0.5~2.5 只能路过；>= 2.5 危险
+    const float SAFETY_W_TRASH = 0.2f;
+    const float SAFETY_W_ELITE = 1.0f;
+    const float SAFETY_W_BOSS = 3.0f;
+
+    // 前置声明（定义在本文件后面，安全分里要用它判 boss 权重）
+    inline bool IsRouteBoss(uint32 mapId, uint32 guidLow);
+
+    struct SafetyScoreVisitor
+    {
+        Player* bot;
+        float px, py, pz, margin;
+        std::set<ObjectGuid> const* exclude;
+        float score;        // 静止怪的分（从严）
+        float patrolScore;  // **确实在巡逻**的怪的分（可以放宽：它会走开）
+
+        SafetyScoreVisitor(Player* b, float x, float y, float z, float m, std::set<ObjectGuid> const* ex)
+            : bot(b), px(x), py(y), pz(z), margin(m), exclude(ex), score(0.0f), patrolScore(0.0f) {}
+
+        // TypeContainerVisitor 协议：其它类型直接忽略，只处理 Creature
+        template<class T> void Visit(GridRefManager<T>&) {}
+        void Visit(Creature& c) { operator()(&c); }
+
+        bool operator()(Creature* c)
+        {
+            if (!c || !c->IsAlive() || !c->IsInWorld())
+                return true;
+            if (c->IsInCombat())                       // 已经在打的，归战斗逻辑管
+                return true;
+            if (exclude && exclude->count(c->GetObjectGuid()))   // 正是我们要拉的那一波
+                return true;
+            if (!bot->CanAttack(c) || c->IsCritter())
+                return true;
+            if (c->GetLevel() + 10 <= bot->GetLevel())
+                return true;
+
+            float const R = ThreatRingRadius(bot, c) + margin;
+            if (R <= 0.1f)
+                return true;
+            float const d = std::sqrt((c->GetPositionX() - px) * (c->GetPositionX() - px) +
+                                      (c->GetPositionY() - py) * (c->GetPositionY() - py));
+            if (d >= R)
+                return true;
+            if (!c->IsWithinLOS(px, py, pz))
+                return true;
+
+            float w = SAFETY_W_TRASH;
+            CreatureInfo const* ci = c->GetCreatureInfo();
+            if (ci && ci->Rank >= CREATURE_ELITE_NORMAL)
+                w = SAFETY_W_ELITE;
+            if (IsRouteBoss(bot->GetMapId(), c->GetGUIDLow()))
+                w = SAFETY_W_BOSS;
+            float const add = w * (R - d) / R;
+            // [2026-10-25 站长口径] **只有确实在巡逻的怪**才允许放宽（它会走开）；
+            //   站桩的怪一律从严，能不引就不引。
+            uint8 const dmt = c->GetDefaultMovementType();
+            bool const patrolling = (dmt == WAYPOINT_MOTION_TYPE || dmt == RANDOM_MOTION_TYPE);
+            if (patrolling)
+                patrolScore += add;
+            else
+                score += add;
+            return true;
+        }
+    };
+
+    inline float SafetyScore(Player* bot, float x, float y, float z,
+                             std::set<ObjectGuid> const* exclude = nullptr, float margin = 3.0f,
+                             float* outPatrol = nullptr)
+    {
+        if (!bot || !bot->GetMap())
+            return 0.0f;
+        SafetyScoreVisitor v(bot, x, y, z, margin, exclude);
+        Cell::VisitAllObjects(bot, v, bot->GetDistance(x, y, z) + THREAT_SCREEN_RADIUS);
+        if (outPatrol)
+            *outPatrol = v.patrolScore;
+        return v.score;
+    }
+
+    // [2026-10-25 站长口径] **坦克的"集火目标"**：坦克对它堆高仇恨，全队打它，杀一个减一个。
+    //   选法：priority 5（Legionnaire）优先 > 血量最少的精英 > 最近的。
+    inline Creature* FindTankFocusTarget(Player* bot)
+    {
+        if (!bot || !bot->GetMap())
+            return nullptr;
+        Group* grp = bot->GetGroup();
+        if (!grp)
+            return nullptr;
+
+        Creature* best = nullptr;
+        float bestScore = -1.0f;
+        std::set<ObjectGuid> seen;
+        for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->getSource();
+            if (!m || !m->IsInWorld())
+                continue;
+            for (Unit* a : m->getAttackers())
+            {
+                if (!a || !a->IsAlive() || a->GetTypeId() != TYPEID_UNIT || a->GetMapId() != bot->GetMapId())
+                    continue;
+                if (!seen.insert(a->GetObjectGuid()).second)
+                    continue;
+                Creature* c = static_cast<Creature*>(a);
+                if (c->IsCritter() || !bot->CanAttack(c))
+                    continue;
+                bool const prio5 = (PossibleAttackTargetsValue::ThreatTier(c, bot) >= 5);
+                float const hpPct = c->GetMaxHealth() ? float(c->GetHealth()) * 100.0f / float(c->GetMaxHealth()) : 100.0f;
+                // 分数：priority5 压倒一切（+1000），其次血量越低越优先（0~100）
+                float const score = (prio5 ? 1000.0f : 0.0f) + (100.0f - hpPct);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = c;
+                }
+            }
+        }
+        return best;
+    }
+
+    // [2026-10-25 站长口径] 其它怪的"基础仇恨"：**治疗仇恨接近时就补**（不等超过）。
+    //   阈值与门禁同一个百分比（默认 90%）。返回"需要坦克补仇恨"的那只怪。
+    inline Creature* FindHealerThreatPressure(Player* bot)
+    {
+        if (!bot || !bot->GetMap())
+            return nullptr;
+        Group* grp = bot->GetGroup();
+        if (!grp)
+            return nullptr;
+        Player* healer = nullptr;
+        for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->getSource();
+            if (m && m != bot && m->IsInWorld() && m->IsAlive() && PlayerbotAI::IsHeal(m))
+            {
+                healer = m;
+                break;
+            }
+        }
+        if (!healer)
+            return nullptr;
+
+        uint32 const pct = sPlayerbotAIConfig.waitForAttackThreatPercent
+            ? sPlayerbotAIConfig.waitForAttackThreatPercent : 90;
+
+        Creature* worst = nullptr;
+        float worstRatio = 0.0f;
+        std::set<ObjectGuid> seen;
+        for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->getSource();
+            if (!m || !m->IsInWorld())
+                continue;
+            for (Unit* a : m->getAttackers())
+            {
+                if (!a || !a->IsAlive() || a->GetTypeId() != TYPEID_UNIT || a->GetMapId() != bot->GetMapId())
+                    continue;
+                if (!seen.insert(a->GetObjectGuid()).second)
+                    continue;
+                Creature* c = static_cast<Creature*>(a);
+                if (c->IsCritter() || !bot->CanAttack(c))
+                    continue;
+                float const tankT = c->getThreatManager().getThreat(bot);
+                float const healT = c->getThreatManager().getThreat(healer);
+                // 治疗仇恨已经到坦克的 pct% ⇒ 该补了
+                if (healT * 100.0f >= tankT * float(pct))
+                {
+                    float const ratio = healT / (tankT > 0.01f ? tankT : 0.01f);
+                    if (ratio > worstRatio)
+                    {
+                        worstRatio = ratio;
+                        worst = c;
+                    }
+                }
+            }
+        }
+        return worst;
+    }
+
+    // 前置声明（定义在本文件后面）
+    inline Player* GroupTank(Player* bot);
+
+    // [2026-10-25 站长口径] **DPS 按"仇恨余量"选目标**：
+    //   对战斗中的每只怪算 room = 坦克仇恨×100/pct − 自己仇恨，挑 room 最大的那只打。
+    //   一只都没有（全被自己顶满）⇒ 返回 nullptr，由停手门停手。
+    inline Creature* FindThreatHeadroomTarget(Player* bot, float* outRoom = nullptr, float* outBestTankT = nullptr)
+    {
+        if (!bot || !bot->GetMap())
+            return nullptr;
+        Group* grp = bot->GetGroup();
+        if (!grp)
+            return nullptr;
+        Player* tank = GroupTank(bot);
+        if (!tank)
+            return nullptr;
+
+        uint32 const pct = sPlayerbotAIConfig.waitForAttackThreatPercent
+            ? sPlayerbotAIConfig.waitForAttackThreatPercent : 90;
+
+        Creature* best = nullptr;
+        float bestRoom = 0.0f;
+        float bestTankT = 0.0f;
+        std::set<ObjectGuid> seen;
+        for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->getSource();
+            if (!m || !m->IsInWorld())
+                continue;
+            for (Unit* a : m->getAttackers())
+            {
+                if (!a || !a->IsAlive() || a->GetTypeId() != TYPEID_UNIT || a->GetMapId() != bot->GetMapId())
+                    continue;
+                if (!seen.insert(a->GetObjectGuid()).second)
+                    continue;
+                Creature* c = static_cast<Creature*>(a);
+                if (c->IsCritter() || !bot->CanAttack(c))
+                    continue;
+                float const tankT = c->getThreatManager().getThreat(tank);
+                float const myT = c->getThreatManager().getThreat(bot);
+                float const room = tankT * 100.0f / float(pct) - myT;
+                if (room > bestRoom)
+                {
+                    bestRoom = room;
+                    bestTankT = tankT;
+                    best = c;
+                }
+            }
+        }
+        if (outRoom)
+            *outRoom = bestRoom;
+        if (outBestTankT)
+            *outBestTankT = bestTankT;
+        return best;
+    }
+
+    // [2026-10-25 站长口径] 这个点能不能**停留/开拉**：
+    //   静止怪的分必须 < 0.5（从严，能不引就不引）；
+    //   巡逻怪的分只要 < 2.5（它确实会走开）。
+    inline bool IsSafeStandPoint(Player* bot, float x, float y, float z,
+                                 std::set<ObjectGuid> const* exclude = nullptr, float* outScore = nullptr)
+    {
+        float patrol = 0.0f;
+        float const stat = SafetyScore(bot, x, y, z, exclude, 3.0f, &patrol);
+        if (outScore)
+            *outScore = stat + patrol;
+        return stat < SAFE_SCORE_OK && patrol < SAFE_SCORE_TRANSIT;
+    }
+
+    // [2026-10-25 站长口径] "一波"不该由我聚类、也不是人工编号 —— 刷怪系统本来就分了组：
+    //   同一个 CreatureGroup（日志里的 "... Group 001"）就是一波。
+    //   没有组的落单怪按 entry 归，避免同一批同种怪被拆成一堆独立目标。
+    //   为什么不再用 guid 表：副本刷点每次进本都随机（SpawnGroup::Update 里 shuffle / chance /
+    //   m_chosenEntries），"这个 guid 是哪只怪"本身就不稳定。
+    inline uint32 PullGroupKey(Creature* c)
+    {
+        if (!c)
+            return 0;
+        if (CreatureGroup* g = c->GetCreatureGroup())
+            return g->GetGroupId();
+        return 0x80000000u | (c->GetEntry() & 0x7FFFFFFFu);
+    }
+
+    // [2026-10-25 崩溃修] 同样只收 guid：遍历结束后一律用 Map 回查，不跨遍历持有 Creature*。
+    struct LiveHostileVisitor
+    {
+        Player* bot;
+        std::vector<ObjectGuid> found;
+
+        explicit LiveHostileVisitor(Player* b) : bot(b) {}
+
+        bool operator()(Creature* c)
+        {
+            if (!c || !c->IsAlive() || !c->IsInWorld())
+                return true;
+            if (c->IsInCombat())                       // 已经打起来的归战斗逻辑管
+                return true;
+            if (!SessionCanFight(bot, c))
+                return true;
+            if (c->IsCritter())
+                return true;
+            if (c->GetLevel() + 10 <= bot->GetLevel())  // 不会主动 aggro 的低级怪不算
+                return true;
+            if (!bot->GetMap()->IsInLineOfSight(bot->GetPositionX(), bot->GetPositionY(),
+                    bot->GetPositionZ() + 1.5f, c->GetPositionX(), c->GetPositionY(),
+                    c->GetPositionZ() + 1.0f, false))
+                return true;                            // 墙后的不算"路上遇到"
+            found.push_back(c->GetObjectGuid());
+            return true;
+        }
+
+        template<class T>
+        void Visit(GridRefManager<T>&) {}
+        void Visit(CreatureMapType& m)
+        {
+            for (CreatureMapType::iterator itr = m.begin(); itr != m.end(); ++itr)
+            {
+                Creature* c = itr->getSource();
+                if (c)
+                    (*this)(c);
+            }
+        }
+    };
+
+    inline Creature* NearestLiveHostile(Player* bot, float radius = LIVE_GROUP_SCAN_DIST)
+    {
+        if (!bot || !bot->GetMap())
+            return nullptr;
+        LiveHostileVisitor visitor(bot);
+        Cell::VisitAllObjects(bot, visitor, radius);
+        Creature* best = nullptr;
+        float bestD = 1e18f;
+        for (ObjectGuid const& g : visitor.found)
+        {
+            Creature* c = bot->GetMap()->GetCreature(g);
+            if (!c || !c->IsAlive())
+                continue;
+            float const d = bot->GetDistance(c);
+            if (d < bestD)
+            {
+                bestD = d;
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    // 前置声明：实现在本文件后面（§接近点 / §目标选择）
+    inline void MakeApproachPoint(Player* bot, float tx, float ty, float tz, Target& t);
+    inline bool FindBossTarget(Player* bot, MapRoute const& route, BotState& st, Target& out);
+    inline bool NextPathNode(Player* bot, uint32 mapId, float& x, float& y, float& z);
+    inline bool StageTarget(Player* bot, Map* map, MapRoute const& route, BotState& st, Target& out);
+
+    // [2026-10-25 站长口径] "只打挡路的"：点到线段的距离（2D），用来判断一只怪在不在走廊上。
+    inline float DistToSegment2D(float px, float py, float ax, float ay, float bx, float by)
+    {
+        float const vx = bx - ax;
+        float const vy = by - ay;
+        float const len2 = vx * vx + vy * vy;
+        if (len2 < 1e-6f)
+        {
+            float const dx = px - ax, dy = py - ay;
+            return std::sqrt(dx * dx + dy * dy);
+        }
+        float t = ((px - ax) * vx + (py - ay) * vy) / len2;
+        if (t < 0.0f)
+            t = 0.0f;
+        if (t > 1.0f)
+            t = 1.0f;
+        float const cx = ax + vx * t;
+        float const cy = ay + vy * t;
+        float const dx = px - cx, dy = py - cy;
+        return std::sqrt(dx * dx + dy * dy);
+    }
+
+    // [2026-10-25 站长口径] **控制分配**：同一只怪只给一个人控（20 秒有效），避免重复控；
+    //   坦克不参与控制 —— 坦克负责把怪**拉离**被控目标。
+    inline std::map<uint64, uint32>& CcAssign()
+    {
+        static std::map<uint64, uint32> m;
+        return m;
+    }
+    inline std::mutex& CcMutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    // 各职业可用的"硬控"法术（按等级从高到低，用 bot->HasSpell 挑第一个会的）
+    inline std::vector<uint32> CcSpellsFor(Player* bot)
+    {
+        std::vector<uint32> out;
+        if (!bot)
+            return out;
+        switch (bot->getClass())
+        {
+            case CLASS_MAGE:     { uint32 const s[] = {12826, 118, 28271, 28272}; out.assign(s, s + 4); break; }
+            case CLASS_ROGUE:    { uint32 const s[] = {11297, 6770, 8643, 408}; out.assign(s, s + 4); break; }
+            case CLASS_HUNTER:   { uint32 const s[] = {14311, 14310, 1499, 13809}; out.assign(s, s + 4); break; }
+            case CLASS_DRUID:    { uint32 const s[] = {26989, 9853, 5196}; out.assign(s, s + 3); break; }
+            case CLASS_WARLOCK:  { uint32 const s[] = {6215, 6213, 5782}; out.assign(s, s + 3); break; }
+            case CLASS_PALADIN:  { uint32 const s[] = {20066, 10308, 5589}; out.assign(s, s + 3); break; }
+            case CLASS_SHAMAN:   { uint32 const s[] = {2484}; out.assign(s, s + 1); break; }
+            default: break;
+        }
+        return out;
+    }
+
+    // [2026-10-25 站长口径] **聚怪**：怪必须聚到一起才能开始打。
+    //   汇聚半径 5 码；本次战斗里只要有敌对活怪离坦克 >5 码就算"还没聚齐"。
+    //   另外统计"没朝坦克走"的数量（它的 victim 不是坦克）—— 这种必须由坦克去卡视野。
+    const float GATHER_RADIUS = 5.0f;
+
+    struct GatherState
+    {
+        uint32 pending = 0;
+        uint32 notApproaching = 0;
+        Creature* farthest = nullptr;
+        float maxDist = 0.0f;
+    };
+
+    // [2026-10-25 站长口径] 队伍里的坦克（所有"以坦克为核心"的判定都用它）
+    inline Player* GroupTank(Player* bot)
+    {
+        if (!bot)
+            return nullptr;
+        Group* grp = bot->GetGroup();
+        if (!grp)
+            return nullptr;
+        for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->getSource();
+            if (m && m->IsInWorld() && m->IsAlive() && PlayerbotAI::IsTank(m))
+                return m;
+        }
+        return nullptr;
+    }
+
+    // [2026-10-25] 坦克在某个目标上的仇恨（坦克不在仇恨表上时返回 0）
+    inline float ThreatOfTankOn(Player* bot, Unit* target)
+    {
+        Player* tank = GroupTank(bot);
+        if (!tank || !target)
+            return 0.0f;
+        return target->getThreatManager().getThreat(tank);
+    }
+
+    inline GatherState ComputeGather(Player* bot)
+    {
+        GatherState g;
+        if (!bot)
+            return g;
+        Group* grp = bot->GetGroup();
+        if (!grp)
+            return g;
+
+        std::set<ObjectGuid> seen;
+        for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->getSource();
+            if (!m || !m->IsInWorld())
+                continue;
+            for (Unit* a : m->getAttackers())
+            {
+                if (!a || !a->IsAlive() || a->GetTypeId() != TYPEID_UNIT || a->GetMapId() != bot->GetMapId())
+                    continue;
+                if (!seen.insert(a->GetObjectGuid()).second)
+                    continue;
+                Creature* c = static_cast<Creature*>(a);
+                if (c->IsCritter())
+                    continue;
+                float const d = bot->GetDistance(c);
+                if (d > GATHER_RADIUS)
+                {
+                    ++g.pending;
+                    if (d > g.maxDist)
+                    {
+                        g.maxDist = d;
+                        g.farthest = c;
+                    }
+                }
+                if (c->GetVictim() != bot)
+                    ++g.notApproaching;
+            }
+        }
+        return g;
+    }
+
+    // [2026-10-25 站长口径] **现场在前、表退到辅助**：
+    //   打谁 / 往哪走，只看"这个副本此刻真的刷出来了哪些怪"（已加载 + 敌对 + 能打）。
+    //   波次表、ord、锚点**只作为记录/标签**，不再决定行为 —— 因为副本刷点每次进本都随机，
+    //   表里那个 guid 这一趟可能根本没刷出来（[WAVE] alive=0 就是这么来的）。
+    //   分组用刷怪系统自己的 CreatureGroup（PullGroupKey），不做坐标聚类。
+    inline bool FindLiveGroupTarget(Player* bot, Map* map, MapRoute const& route, BotState& st, Target& out)
+    {
+        if (!bot || !map)
+            return false;
+
+        // [2026-10-25 站长口径] **只打挡路的**：走廊 = 我 → 下一个路点（固化路线优先，没有就用 boss 方向 70 码）。
+        //   一只怪只有当"它的仇恨圈会盖住走廊"时才打（走过去一定会被它拉进战斗），
+        //   侧房/岔路里的怪一律跳过 —— 否则坦克会在门口一路清小怪，永远到不了 boss。
+        float const corAx = bot->GetPositionX();
+        float const corAy = bot->GetPositionY();
+        float corBx = 0.0f, corBy = 0.0f;
+        bool haveCorridor = false;
+        {
+            float npx = 0, npy = 0, npz = 0;
+            if (NextPathNode(bot, map->GetId(), npx, npy, npz))
+            {
+                corBx = npx;
+                corBy = npy;
+                haveCorridor = true;
+            }
+            else
+            {
+                Target bossTgt;
+                if (FindBossTarget(bot, route, st, bossTgt))
+                {
+                    float const dx = bossTgt.px - corAx;
+                    float const dy = bossTgt.py - corAy;
+                    float const len = std::sqrt(dx * dx + dy * dy);
+                    if (len > 1.0f)
+                    {
+                        float const stp = std::min(70.0f, len);
+                        corBx = corAx + dx / len * stp;
+                        corBy = corAy + dy / len * stp;
+                        haveCorridor = true;
+                    }
+                }
+            }
+        }
+        // 在走廊上吗？判据用"它的威胁圈会不会覆盖走廊"，不是拍一个固定宽度。
+        auto blocksCorridor = [&](Creature* c) -> bool
+        {
+            if (!haveCorridor)
+                return true;                     // 没有走廊信息时退化为"见到就打"
+            float const d = DistToSegment2D(c->GetPositionX(), c->GetPositionY(),
+                corAx, corAy, corBx, corBy);
+            return d <= ThreatRingRadius(bot, c) + 5.0f;
+        };
+
+        LiveHostileVisitor visitor(bot);
+        Cell::VisitAllObjects(bot, visitor, LIVE_CENSUS_DIST);
+
+        Creature* best = nullptr;
+        float bestD = 1e18f;
+
+        // [2026-10-25 性能] 普查是**只读**的：500ms 内、目标还活着没被打黑 ⇒ 直接复用上次结果，
+        //   不重扫网格。（这不是行为节流 —— 决策仍然每 tick 做，只是数据不用重算。）
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (st.liveCensusGuid && st.liveCensusAt &&
+            WorldTimer::getMSTimeDiff(st.liveCensusAt, nowMs ? nowMs : 1) < 500)
+        {
+            Creature* cached = map->GetCreature(st.liveCensusGuid);
+            if (cached && cached->IsAlive() && cached->IsInWorld() && !cached->IsInCombat() &&
+                !route.avoidEntries.count(cached->GetEntry()) &&
+                !st.unattackable.count(cached->GetGUIDLow()) && blocksCorridor(cached))
+            {
+                best = cached;
+                bestD = bot->GetDistance(cached);
+            }
+        }
+
+        if (!best)
+        {
+            LiveHostileVisitor visitor(bot);
+            Cell::VisitAllObjects(bot, visitor, LIVE_CENSUS_DIST);
+            for (ObjectGuid const& g : visitor.found)
+            {
+                Creature* c = map->GetCreature(g);
+                if (!c || !c->IsAlive() || !c->IsInWorld())
+                    continue;
+                if (route.avoidEntries.count(c->GetEntry()))   // 躲地板/无敌击飞类：不主动拉
+                    continue;
+                if (st.unattackable.count(c->GetGUIDLow()))    // 已经被判定打不了
+                    continue;
+                if (!blocksCorridor(c))                        // 侧房里的怪：不打，直接过
+                    continue;
+                float const d = bot->GetDistance(c);
+                if (d < bestD)
+                {
+                    bestD = d;
+                    best = c;
+                }
+            }
+            st.liveCensusAt = nowMs ? nowMs : 1;
+            st.liveCensusGuid = best ? best->GetGUIDLow() : 0;
+        }
+        if (!best)
+            return false;
+
+        out = Target();
+        out.guid = best->GetGUIDLow();
+        out.entry = best->GetEntry();
+        out.ord = 0;          // 只用于记录（拉怪日志）；不再代表"第几波"
+        out.boss = false;
+        out.dynamic = true;
+        // 已经贴到"开怪距离"以内 ⇒ 就地拉；否则算一个接近点（含拉怪位安全判定）
+        if (bestD <= sPlayerbotAIConfig.aggroDistance)
+        {
+            out.px = bot->GetPositionX();
+            out.py = bot->GetPositionY();
+            out.pz = bot->GetPositionZ();
+            out.hasPullPoint = true;
+        }
+        else
+        {
+            // [2026-10-25 修] 拉怪位改"**沿寻路上**离怪 aggro 距离的那个点"：
+            //   原来 MakeApproachPoint 是"从怪直线退 N 码"，那个点经常落在墙里/柱子后 ——
+            //   不在导航面上 ⇒ 后面的 PathFinder 到它必然失败 ⇒ 坦克走到路径末端就 return false 干等。
+            //   用寻路点本身就保证在导航面上，方向也一定朝向目标。
+            bool got = false;
+            PathFinder pf(bot);
+            if (pf.calculate(best->GetPositionX(), best->GetPositionY(), best->GetPositionZ()))
+            {
+                Movement::PointsArray const& path = pf.getPath();
+                Vector3 const* keep = nullptr;              // 最后一个"仍在 aggro 距离之外"的路径点
+                for (auto const& p : path)
+                {
+                    float const ddx = p.x - best->GetPositionX();
+                    float const ddy = p.y - best->GetPositionY();
+                    float const d = std::sqrt(ddx * ddx + ddy * ddy);
+                    if (d <= sPlayerbotAIConfig.aggroDistance)
+                        break;
+                    keep = &p;
+                }
+                if (!keep && !path.empty())
+                    keep = &path.front();
+                if (keep)
+                {
+                    out.px = keep->x;
+                    out.py = keep->y;
+                    out.pz = keep->z;
+                    out.hasPullPoint = true;
+                    got = true;
+                }
+            }
+            if (!got)
+            {
+                MakeApproachPoint(bot, best->GetPositionX(), best->GetPositionY(), best->GetPositionZ(), out);
+                if (!out.hasPullPoint)      // 兜底：朝怪本体走
+                {
+                    out.px = best->GetPositionX();
+                    out.py = best->GetPositionY();
+                    out.pz = best->GetPositionZ();
+                    out.hasPullPoint = true;
+                }
+            }
+        }
+        return true;
+    }
+
+    // [2026-10-25 站长口径] 现场没有活怪时"朝 boss 走"：**必须沿寻路**，不能直线。
+    //   做法：对 boss 的接近点做一次 mmaps 寻路，取路径上**走一段就停**的那个点（默认 70 码）当路标；
+    //   走到哪儿网格就加载到哪儿，一旦刷出新的一批怪，现场普查立刻接管（见组打组）。
+    //   这样不会出现"盯一个 465 码外的点走一整局"。
+    const float BOSS_WAYPOINT_STEP = 70.0f;
+    // [2026-10-25 站长口径] stage 路标步长：沿现算路径走多远的点当"这一步的目标"。
+    const float STAGE_WAYPOINT_STEP = 25.0f;
+
+    // [2026-10-25 站长口径] 路线固化：把"入口 → 各 boss"的 mmap 折线**一次性算出来**存库，
+    //   运行期只沿这些点走，不再实时对几百码外寻路（目标那片 tile 没加载，实时算必失败）。
+    //   ⚠ 这不是"边走边学"：点是用全图载格 + PathFinder 算出来的确定值，不是某次走歪的记录。
+    struct PathNode
+    {
+        uint32 bossGuid = 0;
+        uint32 seq = 0;
+        float x = 0, y = 0, z = 0;
+    };
+
+    const float MAP_PATH_SAMPLE_DIST = 18.0f;   // 折线采样间隔（码）
+
+    inline std::map<uint32, std::vector<PathNode>>& MapPathCache()
+    {
+        static std::map<uint32, std::vector<PathNode>> cache;
+        return cache;
+    }
+
+    // [2026-10-25 竞态修] 同一张图可能有多个实例跑在不同地图线程上：
+    //   生成是 DELETE+INSERT，如果别人在生成中途读库，会缓存到"半成品"（实测 553 读到 4 个点）。
+    //   这里用 "正在生成" 标记：生成期间其他线程读到就**不缓存**，等下一轮再读完整数据。
+    inline std::mutex& MapPathMutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::set<uint32>& MapPathGenerating()
+    {
+        static std::set<uint32> s;
+        return s;
+    }
+
+    inline void LoadMapPath(uint32 mapId)
+    {
+        std::lock_guard<std::mutex> lock(MapPathMutex());
+        std::map<uint32, std::vector<PathNode>>& cache = MapPathCache();
+        if (cache.count(mapId))
+            return;
+        if (MapPathGenerating().count(mapId))
+            return;                    // 别人正在生成：这次先不缓存，交给实时寻路
+
+        std::vector<PathNode>& nodes = cache[mapId];
+        std::unique_ptr<QueryResult> res = WorldDatabase.PQuery(
+            "SELECT `boss_guid`,`seq`,`x`,`y`,`z` FROM `ai_playerbot_map_path` WHERE `map` = '%u' ORDER BY `seq`",
+            mapId);
+        if (!res)
+            return;
+        do
+        {
+            Field* f = res->Fetch();
+            PathNode n;
+            n.bossGuid = f[0].GetUInt32();
+            n.seq = f[1].GetUInt32();
+            n.x = f[2].GetFloat();
+            n.y = f[3].GetFloat();
+            n.z = f[4].GetFloat();
+            nodes.push_back(n);
+        } while (res->NextRow());
+
+        sLog.outError("[PATHGEN] map=%u 已加载固化路线 %u 个点", mapId, uint32(nodes.size()));
+    }
+
+    // 一次性生成：全图按直线强制载格（mmap tile 也随之加载）→ 逐 boss 寻路 → 每 18 码采一点写库。
+    inline bool GenerateMapPath(Player* bot, MapRoute const& route)
+    {
+        if (!bot || !bot->GetMap() || route.bosses.empty())
+            return false;
+        Map* map = bot->GetMap();
+        uint32 const mapId = map->GetId();
+
+        // 抢"生成权"：同一张图同一时刻只允许一个线程生成
+        {
+            std::lock_guard<std::mutex> lock(MapPathMutex());
+            if (MapPathGenerating().count(mapId))
+                return false;
+            auto cit = MapPathCache().find(mapId);
+            if (cit != MapPathCache().end() && !cit->second.empty())
+                return false;                 // 已经有完整路线
+            MapPathGenerating().insert(mapId);
+        }
+        // 生成失败也要把标记摘掉
+        struct GenGuard
+        {
+            uint32 mapId;
+            ~GenGuard()
+            {
+                std::lock_guard<std::mutex> lock(MapPathMutex());
+                MapPathGenerating().erase(mapId);
+            }
+        } guard{mapId};
+
+        std::vector<BossSpawn const*> ordered;
+        ordered.reserve(route.bosses.size());
+        for (auto const& b : route.bosses)
+            if (b.guid)
+                ordered.push_back(&b);
+        std::sort(ordered.begin(), ordered.end(), [](BossSpawn const* a, BossSpawn const* b)
+        {
+            bool const aHas = a->ord != 0;
+            bool const bHas = b->ord != 0;
+            if (aHas != bHas)
+                return aHas;
+            if (aHas && a->ord != b->ord)
+                return a->ord < b->ord;
+            return a->guid < b->guid;
+        });
+        if (ordered.empty())
+            return false;
+
+        WorldDatabase.PExecute("DELETE FROM `ai_playerbot_map_path` WHERE `map` = '%u'", mapId);
+
+        float sx = bot->GetPositionX();
+        float sy = bot->GetPositionY();
+        float sz = bot->GetPositionZ();
+        uint32 seq = 0;
+        uint32 legs = 0;
+        uint32 written = 0;
+
+        for (BossSpawn const* bp : ordered)
+        {
+            float tx = bp->x, ty = bp->y, tz = bp->z;
+            if (Creature* c = map->GetCreature(bp->guid))
+            {
+                tx = c->GetPositionX();
+                ty = c->GetPositionY();
+                tz = c->GetPositionZ();
+            }
+
+            // 先把直线经过的格全部载进来（这样 mmap tile 也齐了，PathFinder 才可能给出完整路径）
+            for (int i = 0; i <= 40; ++i)
+            {
+                float const t = float(i) / 40.0f;
+                map->ForceLoadGrid(sx + (tx - sx) * t, sy + (ty - sy) * t);
+            }
+
+            PathFinder pf(bot);
+            if (!pf.calculate(tx, ty, tz))
+            {
+                sLog.outError("[PATHGEN] map=%u boss=%u 寻路失败，跳过", mapId, bp->guid);
+                continue;
+            }
+            Movement::PointsArray const& path = pf.getPath();
+            if (path.empty())
+            {
+                sLog.outError("[PATHGEN] map=%u boss=%u 空路径，跳过", mapId, bp->guid);
+                continue;
+            }
+
+            float px = sx, py = sy;
+            float acc = 0.0f;
+            for (auto const& p : path)
+            {
+                float const dx = p.x - px;
+                float const dy = p.y - py;
+                acc += std::sqrt(dx * dx + dy * dy);
+                px = p.x;
+                py = p.y;
+                if (acc < MAP_PATH_SAMPLE_DIST)
+                    continue;
+                acc = 0.0f;
+                WorldDatabase.PExecute(
+                    "INSERT INTO `ai_playerbot_map_path` (`map`,`boss_guid`,`seq`,`x`,`y`,`z`) "
+                    "VALUES ('%u','%u','%u','%f','%f','%f')",
+                    mapId, bp->guid, ++seq, p.x, p.y, p.z);
+                ++written;
+            }
+
+            sx = tx;
+            sy = ty;
+            sz = tz;
+            ++legs;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(MapPathMutex());
+            MapPathCache().erase(mapId);      // 生成完让下一次读取重新从库里拿完整数据
+        }
+        sLog.outError("[PATHGEN] map=%u 生成完成：%u 段 / %u 个点", mapId, legs, written);
+        return written > 0;
+    }
+
+    // [2026-10-25] 走不通的路点：记下来跳过（否则坦克每 tick 盯一个到不了的点，原地不动）。
+    inline std::set<uint64>& SkippedPathNodes()
+    {
+        static std::set<uint64> s;
+        return s;
+    }
+
+    inline void SkipPathNodeAt(uint32 mapId, float x, float y, float z)
+    {
+        std::map<uint32, std::vector<PathNode>>& cache = MapPathCache();
+        auto it = cache.find(mapId);
+        if (it == cache.end())
+            return;
+        for (PathNode const& n : it->second)
+        {
+            float const dx = n.x - x, dy = n.y - y, dz = n.z - z;
+            if (dx * dx + dy * dy + dz * dz <= 4.0f)     // 2 码内算同一个点
+            {
+                uint64 const key = (uint64(mapId) << 32) | uint64(n.seq);
+                if (SkippedPathNodes().insert(key).second)
+                    sLog.outError("[PATHNODE] map=%u seq=%u 走不到 ⇒ 跳过这个路点", mapId, n.seq);
+                return;
+            }
+        }
+    }
+
+    // ---- [2026-10-25 站长口径] 按 stage 存/取路线：**跑通一段才存**，以后懒加载也能沿它走 ----
+    inline uint32 StageKey(uint32 mapId, uint16 stageOrd)
+    {
+        return (mapId << 16) | uint32(stageOrd);
+    }
+
+    inline std::map<uint32, std::vector<PathNode>>& StagePathCache()
+    {
+        static std::map<uint32, std::vector<PathNode>> c;
+        return c;
+    }
+
+    inline std::vector<PathNode> const* GetStagePath(uint32 mapId, uint16 stageOrd)
+    {
+        uint32 const key = StageKey(mapId, stageOrd);
+        std::map<uint32, std::vector<PathNode>>& cache = StagePathCache();
+        auto it = cache.find(key);
+        if (it == cache.end())
+        {
+            std::vector<PathNode>& nodes = cache[key];
+            std::unique_ptr<QueryResult> res = WorldDatabase.PQuery(
+                "SELECT `seq`,`x`,`y`,`z` FROM `ai_playerbot_map_path` "
+                "WHERE `map` = '%u' AND `stage_ord` = '%u' AND `verified` = 1 ORDER BY `seq`",
+                mapId, uint32(stageOrd));
+            if (res)
+            {
+                do
+                {
+                    Field* f = res->Fetch();
+                    PathNode n;
+                    n.seq = f[0].GetUInt32();
+                    n.x = f[1].GetFloat();
+                    n.y = f[2].GetFloat();
+                    n.z = f[3].GetFloat();
+                    nodes.push_back(n);
+                } while (res->NextRow());
+            }
+            if (!nodes.empty())
+                sLog.outError("[STAGEPATH] map=%u stage=%u 命中已保存路线 %u 个点", mapId,
+                    uint32(stageOrd), uint32(nodes.size()));
+        }
+        auto it2 = cache.find(key);
+        if (it2 == cache.end() || it2->second.empty())
+            return nullptr;
+        return &it2->second;
+    }
+
+    inline void SaveStagePath(uint32 mapId, uint16 stageOrd, std::vector<Vector3> const& pts)
+    {
+        if (pts.size() < 3)
+            return;
+        WorldDatabase.PExecute(
+            "DELETE FROM `ai_playerbot_map_path` WHERE `map` = '%u' AND `stage_ord` = '%u'",
+            mapId, uint32(stageOrd));
+        for (size_t i = 0; i < pts.size(); ++i)
+        {
+            WorldDatabase.PExecute(
+                "INSERT INTO `ai_playerbot_map_path` (`map`,`boss_guid`,`seq`,`x`,`y`,`z`,`stage_ord`,`verified`) "
+                "VALUES ('%u','0','%u','%f','%f','%f','%u','1')",
+                mapId, uint32(i + 1), pts[i].x, pts[i].y, pts[i].z, uint32(stageOrd));
+        }
+        StagePathCache().erase(StageKey(mapId, stageOrd));
+        sLog.outError("[STAGEPATH] map=%u stage=%u 跑通 ⇒ 保存 %u 个点", mapId, uint32(stageOrd),
+            uint32(pts.size()));
+    }
+
+    // 取"沿固化路线、在我前方最近的一个点"。没有路线返回 false。
+    inline bool NextPathNode(Player* bot, uint32 mapId, float& x, float& y, float& z)
+    {
+        std::map<uint32, std::vector<PathNode>>& cache = MapPathCache();
+        if (!cache.count(mapId))
+            LoadMapPath(mapId);
+        auto it = cache.find(mapId);
+        if (it == cache.end() || it->second.empty())
+            return false;
+
+        bool found = false;
+        float best = 1e18f;
+        for (PathNode const& n : it->second)
+        {
+            uint64 const key = (uint64(mapId) << 32) | uint64(n.seq);
+            if (SkippedPathNodes().count(key))       // 已知走不到的路点：跳过
+                continue;
+            float const d = bot->GetDistance(n.x, n.y, n.z);
+            if (d < 6.0f)              // 已经踩在这个点上了 ⇒ 看下一个
+                continue;
+            if (d < best)
+            {
+                best = d;
+                x = n.x;
+                y = n.y;
+                z = n.z;
+                found = true;
+            }
+        }
+        if (!found)
+            return false;
+        // 只取 45 码内的下一个点，太远说明路线在别处（或还没走到）⇒ 交给实时逻辑
+        return best <= 45.0f;
+    }
+
+    inline bool FindBossWaypoint(Player* bot, MapRoute const& route, BotState& st, Target& out,
+        float step = BOSS_WAYPOINT_STEP)
+    {
+        if (!bot || !bot->GetMap())
+            return false;
+
+        // [2026-10-25 站长口径] **按 stage + mmap 现算路径，在路径上取点**：
+        //   不再用"库里存的路点 + 按直线距离挑最近"—— 副本绕圈/上下层时那样会挑到另一条腿上的点，
+        //   那个点隔着墙/地板，PathFinder 到不了，坦克就钉在原地（dist 一直不变得就是这个）。
+        //   现在每次都：① 取当前 stage 的目标（没有 stage 就用最近的 boss）；
+        //              ② 对目标做一次 mmap 寻路；③ 在这条**新鲜路径**上取"沿路 ~25 码"的点。
+        //   路径点天然在导航面上，且天然是前向的 ⇒ 不需要"坏点兜底"。
+        float nx = 0, ny = 0, nz = 0;
+        uint32 const stageMapId = bot->GetMap()->GetId();
+        uint16 const curStage = st.stageOrd;
+
+        // [2026-10-25 站长口径] stage 推进 = 上一段**跑通了** ⇒ 把它存下来（verified=1）。
+        if (st.recStage != 0xFFFF && st.recStage != curStage && st.recPath.size() >= 3)
+            SaveStagePath(stageMapId, st.recStage, st.recPath);
+        if (st.recStage != curStage)
+        {
+            st.recStage = curStage;
+            st.recPath.clear();
+            st.stagePathSeq = 0;
+        }
+
+        // ① 这一段已经存过（跑通过）⇒ 沿它前向走一个点，不再现算
+        if (std::vector<PathNode> const* sp = GetStagePath(stageMapId, curStage))
+        {
+            for (PathNode const& n : *sp)
+            {
+                if (n.seq <= st.stagePathSeq)
+                    continue;
+                if (bot->GetDistance(n.x, n.y, n.z) <= 6.0f)
+                {
+                    st.stagePathSeq = n.seq;      // 走到了 ⇒ 前进
+                    continue;
+                }
+                out = Target();
+                out.guid = 0;
+                out.entry = 0;
+                out.ord = 0;
+                out.boss = false;
+                out.dynamic = true;
+                out.px = n.x;
+                out.py = n.y;
+                out.pz = n.z;
+                out.hasPullPoint = true;
+                return true;
+            }
+        }
+        float objX = 0.0f, objY = 0.0f, objZ = 0.0f;
+        bool haveObj = false;
+        {
+            Target obj;
+            if (!route.stages.empty() && StageTarget(bot, bot->GetMap(), route, st, obj))
+                haveObj = true;
+            else if (FindBossTarget(bot, route, st, obj))
+                haveObj = true;
+            if (haveObj)
+            {
+                objX = obj.px;
+                objY = obj.py;
+                objZ = obj.pz;
+                // [2026-10-25 站长口径] 目标若是一只**已加载的怪**，就寻路到它本体（它一定站在导航面上），
+                //   不要用"从它直退 22 码"的接近点 —— 那个点可能落在墙里/柱子里，寻路必失败。
+                if (obj.guid)
+                {
+                    if (Creature* oc = bot->GetMap()->GetCreature(obj.guid))
+                    {
+                        objX = oc->GetPositionX();
+                        objY = oc->GetPositionY();
+                        objZ = oc->GetPositionZ();
+                    }
+                }
+                PathFinder pfObj(bot);
+                if (pfObj.calculate(objX, objY, objZ))
+                {
+                    Movement::PointsArray const& pth = pfObj.getPath();
+                    float pxp = bot->GetPositionX();
+                    float pyp = bot->GetPositionY();
+                    float acc = 0.0f;
+                    Vector3 const* pick = nullptr;
+                    for (auto const& p : pth)
+                    {
+                        float const ddx = p.x - pxp;
+                        float const ddy = p.y - pyp;
+                        acc += std::sqrt(ddx * ddx + ddy * ddy);
+                        pxp = p.x;
+                        pyp = p.y;
+                        pick = &p;
+                        if (acc >= STAGE_WAYPOINT_STEP)
+                            break;
+                    }
+                    if (pick && bot->GetDistance(pick->x, pick->y, pick->z) > AT_PULL_POINT_DIST)
+                    {
+                        nx = pick->x;
+                        ny = pick->y;
+                        nz = pick->z;
+                        // [2026-10-25 站长口径] 边走边记这一段的路点；等这一 stage 跑通了再存库。
+                        float const lx = st.recPath.empty() ? bot->GetPositionX() : st.recPath.back().x;
+                        float const ly = st.recPath.empty() ? bot->GetPositionY() : st.recPath.back().y;
+                        float const rx = pick->x - lx;
+                        float const ry = pick->y - ly;
+                        if (std::sqrt(rx * rx + ry * ry) >= MAP_PATH_SAMPLE_DIST)
+                            st.recPath.push_back(Vector3(pick->x, pick->y, pick->z));
+                    }
+                }
+            }
+        }
+        if (nx != 0.0f || ny != 0.0f)
+        {
+            out = Target();
+            out.guid = 0;
+            out.entry = 0;
+            out.ord = 0;
+            out.boss = false;
+            out.dynamic = true;
+            out.px = nx;
+            out.py = ny;
+            out.pz = nz;
+            out.hasPullPoint = true;
+            return true;
+        }
+
+        // [2026-10-25 站长口径] 旧的"两级瞄准"兜底**已删除**：
+        //   全图（LoadAllGridsOnMaps）已经加载，不该再出现"tile 没加载导致寻路失败"；
+        //   真失败就如实报坐标，不再退化成"直扑几百码外的坐标"。
+        sLog.outError("[WAYPT] %s 寻路失败：map=%u stage=%u obj=(%.0f,%.0f,%.0f) hasObj=%d",
+            bot->GetName(), stageMapId, uint32(curStage), objX, objY, objZ, haveObj ? 1 : 0);
+        return false;
+    }
+    // [2026-10-25 站长口径] 巡逻怪的位置**不能只看此刻**：
+    //   "刚判安全、它一转身就走进来"是最常见的翻车。按当前朝向 + 移速外推 dt 秒后的位置。
+    // [2026-10-26 站长口径] 巡逻怪要**按路径**推演位置，不按当前朝向直线外推：
+    //   直线外推在拐角处必然推错，导致"更便宜的开怪时刻"永远不落地（r100 实测整组等 1100s）。
+    //   实现在 DungeonRouteActions.cpp（那里才能包含 WaypointMovementGenerator/WaypointManager）。
+    void PredictMobPosPath(Creature* c, float dtSec, float& x, float& y);
+
+    inline void PredictMobPos(Creature* c, float dtSec, float& x, float& y)
+    {
+        PredictMobPosPath(c, dtSec, x, y);
+    }
+
+    struct PullCostSample
+    {
+        uint32 adds = 0;         // 会被一起带进战斗的"非本组"怪数量
+        uint32 patrolAdds = 0;   // 其中正在移动的（巡逻/游走）
+        uint32 atMs = 0;         // 这个代价对应"多少毫秒之后"
+    };
+
+    // [2026-10-25 站长口径] 联动放行：某只怪**几乎总是**和某一波一起进战斗 ⇒ 它本来就是这一波的一部分，
+    //   不该再当 ADD 算（例：巡逻怪总在某组身边转）。
+    //   判据用**观察统计**，不是人填的表：每次在本组评估一次开怪，就记一次"它当时在不在威胁圈里"。
+    const float LINK_ALLOW_RATIO = 0.5f;    // 观察到"同时在圈内"的比例 ≥ 这个 ⇒ 视为联动
+    const uint32 LINK_ALLOW_MIN_SEEN = 20;  // 至少观察这么多次才认（避免偶然两次就放行）
+
+    struct LinkStats
+    {
+        uint32 seen = 0;
+        uint32 inside = 0;
+    };
+
+    // key = (本组 groupKey << 32) | 那只怪的 groupKey
+    inline std::map<uint64, LinkStats>& GroupLinkStats()
+    {
+        static std::map<uint64, LinkStats> stats;   // 只在进程内存里积累：同一趟跑测内就会生效
+        return stats;
+    }
+
+    // [2026-10-25] 拉动代价专用扫描：以**开打位置**（目标位置）为圆心，不做 LOS 过滤
+    //   （同一个房间里的怪即使此刻被柱子挡视线，开打后也会被引到；宁可多算，不要漏算）。
+    struct PullAddVisitor
+    {
+        Player* bot;
+        std::vector<ObjectGuid> found;
+
+        explicit PullAddVisitor(Player* b) : bot(b) {}
+
+        bool operator()(Creature* c)
+        {
+            if (!c || !c->IsAlive() || !c->IsInWorld())
+                return true;
+            if (c->IsInCombat())
+                return true;
+            if (!SessionCanFight(bot, c))
+                return true;
+            if (c->IsCritter())
+                return true;
+            if (c->GetLevel() + 10 <= bot->GetLevel())
+                return true;
+            found.push_back(c->GetObjectGuid());
+            return true;
+        }
+
+        template<class T>
+        void Visit(GridRefManager<T>&) {}
+        void Visit(CreatureMapType& m)
+        {
+            for (CreatureMapType::iterator itr = m.begin(); itr != m.end(); ++itr)
+            {
+                Creature* c = itr->getSource();
+                if (c)
+                    (*this)(c);
+            }
+        }
+    };
+
+    // [2026-10-25 站长口径] 拉动代价：dtSec 之后在**目标所在位置**开打，会有多少**不属于目标组**的怪
+    //   被一起带进战斗。判据 = "开打位置落进它的威胁圈"，而不是"坦克此刻站位" ——
+    //   站位通常离目标 25 码以上，开打后整队压上去，旁边那只就会被引到。
+    //   本组 = CreatureGroup（见 PullGroupKey），同组的一律不算 ADD。
+    inline PullCostSample PullCostAt(Player* bot, Creature* target, float dtSec, float margin)
+    {
+        PullCostSample r;
+        r.atMs = uint32(dtSec * 1000.0f);
+        if (!bot || !bot->GetMap() || !target)
+            return r;
+        uint32 const groupKey = PullGroupKey(target);
+
+        // 目标自己也会动（巡逻怪）：它 dt 秒后的位置才是"那时候在哪儿开打"。
+        float tx, ty;
+        PredictMobPos(target, dtSec, tx, ty);
+        // 目标"喊人"的半径：核心的求援判据（和 pullWaits 用的是同一个字段）。
+        float const assistR = target->GetCreatureInfo() && target->GetCreatureInfo()->CallForHelp > 0
+            ? float(target->GetCreatureInfo()->CallForHelp) : 5.0f;
+
+        PullAddVisitor visitor(bot);
+        Cell::VisitAllObjects(tx, ty, bot->GetMap(), visitor, LIVE_GROUP_SCAN_DIST);
+
+        for (ObjectGuid const& g : visitor.found)
+        {
+            Creature* c = bot->GetMap()->GetCreature(g);   // 回查，避免跨遍历持有失效指针
+            if (!c || !c->IsAlive() || c == target)
+                continue;
+            if (PullGroupKey(c) == groupKey)      // 同一波，本来就该一起打
+                continue;
+
+            float cx, cy;
+            PredictMobPos(c, dtSec, cx, cy);
+            float const dfx = tx - cx;
+            float const dfy = ty - cy;
+            float const dFight = std::sqrt(dfx * dfx + dfy * dfy);
+            float const reach = ThreatRingRadius(bot, c) + margin;
+
+            bool const inAssist = (dFight <= assistR);
+            bool const inRing = (dFight <= reach);
+            bool const isAdd = inRing || inAssist;
+
+            // 联动统计：seen = 它在判断范围内的观察次数；inside = 其中真的会被带进来的次数。
+            //   只在 dtSec == 0 这一次评估里记，否则一次决策会被算 5 遍。
+            if (dtSec <= 0.0f && dFight <= reach + LIVE_GROUP_SCAN_DIST)
+            {
+                LinkStats& ls = GroupLinkStats()[(uint64(groupKey) << 32) | uint64(PullGroupKey(c))];
+                if (ls.seen < 1000000)
+                    ++ls.seen;
+                if (isAdd && ls.inside < 1000000)
+                    ++ls.inside;
+                if (ls.seen >= LINK_ALLOW_MIN_SEEN &&
+                    float(ls.inside) >= LINK_ALLOW_RATIO * float(ls.seen))
+                    continue;                     // 几乎总在一起 ⇒ 放行，不算 ADD
+            }
+
+            if (!isAdd)
+                continue;
+
+            ++r.adds;
+            if (c->GetMotionMaster() && !c->IsStopped())
+                ++r.patrolAdds;
+        }
+        return r;
+    }
+
+    // [2026-10-25 站长口径] 开怪准入 = 等"代价最小的那一刻"：
+    //   ① 现在就没有额外怪 ⇒ 立刻拉；
+    //   ② 现在会带进来、但往后几秒有更便宜的时刻 ⇒ 等那一刻再拉；
+    //   ③ 等也没用（最小代价就是这样）⇒ 现在就拉 —— 站长口径：不可避免的那只就接受
+    //      （例：540 门口必须先开的军团士兵，它离入口最近那一刻仍会带一只静态怪）。
+    //   返回 0 = 现在就拉；>0 = 等这么多毫秒。
+    inline uint32 PullAdmissionDelayMs(Player* bot, Creature* target, PullCostSample* outNow = nullptr)
+    {
+        if (!bot || !target)
+            return 0;
+        // 脱战拉怪，余量取 5 码 —— 与 UnsafeStandOffender 的脱战口径一致（不另发明距离）。
+        float const margin = 5.0f;
+        PullCostSample const now = PullCostAt(bot, target, 0.0f, margin);
+        if (outNow)
+            *outNow = now;
+        if (now.adds == 0)
+            return 0;
+
+        PullCostSample best = now;
+        static float const horizon[] = {2.0f, 4.0f, 6.0f, 8.0f};
+        for (size_t i = 0; i < sizeof(horizon) / sizeof(horizon[0]); ++i)
+        {
+            PullCostSample const s = PullCostAt(bot, target, horizon[i], margin);
+            if (s.adds < best.adds)
+                best = s;
+        }
+        if (best.adds < now.adds)
+        {
+            // [2026-10-26 修] outNow 必须始终是**当前**这一刻的代价（以前被 best 覆盖，日志才会印出"代价=0 还在等"的假象）。
+            //   等窗口的次数/总时长限制在调用方（DungeonRouteActions 的 pullCostWaitSince）。
+            return best.atMs ? best.atMs : 2000;
+        }
+        return 0;
+    }
+
+    inline bool IsRouteBoss(uint32 mapId, uint32 guid)
+    {
+        MapRoute const* r = GetMapRoute(mapId);
+        if (!r)
+            return false;
+        for (auto const& b : r->bosses)
+            if (b.guid == guid)
+                return true;
+        return false;
+    }
+
+    // [2026-10-24 站长口径] 不吃嘲讽（对 Taunt 355 免疫）⇒ 仇恨门槛要高（1500）
+    inline bool IsImmuneToTaunt(Creature* c)
+    {
+        if (!c)
+            return false;
+        SpellEntry const* taunt = sSpellTemplate.LookupEntry<SpellEntry>(355);
+        if (!taunt)
+            return false;
+        return c->IsImmuneToSpellEffect(taunt, EFFECT_INDEX_0, false);
+    }
+
+    inline bool WaveHasFightable(Player* bot, Wave const& w)
+    {
+        Map* map = bot ? bot->GetMap() : nullptr;
+        for (auto& m : w.members)
+            if (SessionCanFight(bot, MemberCreature(map, m)))
                 return true;
         return false;
     }
@@ -1128,11 +2982,30 @@ namespace dungeonroute
         if (!bot || !bot->GetGroup())
             return;
 
+        // [2026-10-25 站长口径] **拉回**：起手后坦克要带怪退回拉怪位再打（怪会跟过来），
+        //   而不是走进房间、把隔壁那几组一起引进来（552 Arcatraz 实测：拉 2 只 → 6 个攻击者）。
+        //   由 DungeonTankRepositionAction 在战斗中每 tick 执行退回，退到就清标记。
+        {
+            BotState& pb = StateOf(bot);
+            if (target.hasPullPoint)
+            {
+                pb.pullBackPending = 1;
+                pb.standOverrideX = target.px;
+                pb.standOverrideY = target.py;
+                pb.standOverrideZ = target.pz;
+                pb.standOverrideUntil = WorldTimer::getMSTime() + 20000;
+                pb.safePullPoint = false;      // 这是"拉回点"，不是 PULLSAFE 的安全拉怪点
+            }
+        }
+
         const uint16 ord = target.boss ? 0 : (target.ord ? target.ord : CurrentOrd(bot, route));
         pullrec::SetRouteOrd(bot->GetGroup(), ord);
 
         sLog.outError("[DUNGEONROUTE] %s 自动开怪起手 -> 记录器 ord=%u（%s）",
             bot->GetName(), uint32(ord), target.boss ? "boss" : "wave");
+        // [2026-10-24 站长口径] 坦克拉怪效率也要按职业统计：每次真的起手记一条（含职业）
+        sLog.outError("[PULLED] bot=%s class=%u map=%u ord=%u boss=%d",
+            bot->GetName(), uint32(bot->getClass()), route.mapId, uint32(ord), target.boss ? 1 : 0);
 
         // [2026-10-23 站长口径] "开怪姿势"要先能量化：起手这一刻，目标周围 10/15/20 码内有多少敌对活怪。
         //   只加观测、不改行为 —— 用来回答"到底是拉 1 只还是拉了一整窝"。
@@ -1226,7 +3099,7 @@ namespace dungeonroute
     }
 
     // 维护"见过活怪 / 已清"：区分"已清"与"远处未加载"（见 CurrentOrdRaw 注释）
-    inline void RefreshWaveKnowledge(Map* map, MapRoute const& route, BotState& st)
+    inline void RefreshWaveKnowledge(Player* bot, Map* map, MapRoute const& route, BotState& st)
     {
         // [2026-10-21 假清修复] 灭团/出本后 map 上所有怪 GetCreature 都为空，
         //   不能据此把"见过活怪"的波判定为已清（543 出现过 66 秒 25/25 的假通关）。
@@ -1238,7 +3111,7 @@ namespace dungeonroute
             if (st.skip.count(kv.first) || st.cleared.count(kv.first))
                 continue;
 
-            if (WaveHasAlive(map, kv.second))
+            if (WaveHasFightable(bot, kv.second))
                 st.seenAlive.insert(kv.first);
             else if (st.seenAlive.count(kv.first))
             {
@@ -1254,7 +3127,7 @@ namespace dungeonroute
         for (auto it = st.cleared.begin(); it != st.cleared.end(); )
         {
             auto wit = route.waves.find(*it);
-            if (wit != route.waves.end() && WaveHasAlive(map, wit->second))
+            if (wit != route.waves.end() && WaveHasFightable(bot, wit->second))
             {
                 uint16 const ord = *it;
                 it = st.cleared.erase(it);
@@ -1288,7 +3161,8 @@ namespace dungeonroute
                 st.bossCleared.insert(b.guid);
                 st.bossSkipped.erase(b.guid);
                 // [2026-10-22 验证] 逐 boss 击杀留痕（boss_report.py 靠这行统计）
-                sLog.outError("[BOSSKILL] map=%u entry=%u guid=%u", map->GetId(), b.entry, b.guid);
+                sLog.outError("[BOSSKILL] map=%u inst=%u entry=%u guid=%u", map->GetId(),
+                    map->GetInstanceId(), b.entry, b.guid);
             }
             else
                 st.bossSeen.insert(b.guid);
@@ -1424,7 +3298,8 @@ namespace dungeonroute
             if (c && !c->IsAlive())
             {
                 st.bossCleared.insert(b.guid);      // 尸体 = 已死
-                sLog.outError("[BOSSKILL] map=%u entry=%u guid=%u", map->GetId(), b.entry, b.guid);
+                sLog.outError("[BOSSKILL] map=%u inst=%u entry=%u guid=%u", map->GetId(),
+                    map->GetInstanceId(), b.entry, b.guid);
                 continue;
             }
             // [boss-fix 2026-10-19] 不能再把“见过活的、现在没加载”当成已死：
@@ -1659,6 +3534,63 @@ namespace dungeonroute
             float const tz = loaded ? c->GetPositionZ() : bp->z;
             float const dist = bot->GetDistance(tx, ty, tz);
 
+            // [2026-10-23 站长指令] boss 前置条件：前置怪还活着（在 boss 周围 radius 内）⇒ **不选这个 boss，
+            //   也不许跳到后面的 boss**，而是把"最近的活前置怪"当作目标去清掉。
+            //   （第一版只 continue，结果 555 直接去选了尾王 Murmur、跨半张图，ritualist 永远不清）
+            if (!route.bossRequires.empty())
+            {
+                Creature* nearestReq = nullptr;
+                float nearestReqDist = 1e18f;
+                uint32 blockedByEntry = 0;
+                float blockedRadius = 0.0f;
+                for (auto const& br : route.bossRequires)
+                {
+                    if (br.first != bp->entry)
+                        continue;
+                    auto consider = [&](uint32 g)
+                    {
+                        Creature* rc = map->GetCreature(g);
+                        if (!rc || !rc->IsAlive() || !rc->IsInWorld())
+                            return;
+                        if (rc->GetEntry() != br.second.reqEntry)
+                            return;
+                        if (rc->GetDistance(tx, ty, tz) > br.second.radius)
+                            return;
+                        float const d = bot->GetDistance(rc);
+                        if (d < nearestReqDist)
+                        {
+                            nearestReqDist = d;
+                            nearestReq = rc;
+                            blockedByEntry = br.second.reqEntry;
+                            blockedRadius = br.second.radius;
+                        }
+                    };
+                    for (auto const& kv : route.guidOrd)
+                        consider(kv.first);
+                    for (uint32 pg : route.patrolGuids)
+                        consider(pg);
+                }
+                if (nearestReq)
+                {
+                    if (!st.bossRequireLogAt || WorldTimer::getMSTimeDiff(st.bossRequireLogAt, now ? now : 1) >= 10000)
+                    {
+                        st.bossRequireLogAt = now ? now : 1;
+                        sLog.outError("[DUNGEONROUTE] %s boss entry=%u 前置未满足（entry=%u 还有活着的，半径 %.0f）⇒ 先去清它 dist=%.1f",
+                            bot->GetName(), bp->entry, blockedByEntry, blockedRadius, nearestReqDist);
+                    }
+                    out = Target();
+                    out.guid = nearestReq->GetGUIDLow();
+                    out.entry = nearestReq->GetEntry();
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = nearestReq->GetPositionX();
+                    out.py = nearestReq->GetPositionY();
+                    out.pz = nearestReq->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+            }
+
             // [2026-10-22 站长口径] 可达性用**真实寻路**（mmaps PathFinder），不用"距离没缩短"这种代理：
             //   绕墙、打架、等巡逻都会让距离暂时变大，但那不代表不可达。
             uint32 const recheckMs = uint32(dw::Get("boss.path_recheck_sec") * 1000.0f);
@@ -1833,6 +3765,685 @@ namespace dungeonroute
     // ---- [模式A 2026-10-18] 最近目标 + 30 码视线内即停 ---------------------------------
     // 取代"必须踩 route 表精确锚点"的老逻辑：只要 30 码内有可攻击且视线内的怪就停下开拉；
     // 否则朝最近目标/刷点走过去。这样即使 route 表的 ord/锚点不准，队伍也能一路推进。
+    // [2026-10-23 站长指令] 进度链：按 stage 顺序推进，条件满足才进下一阶段。
+    //   返回 true ⇒ 本 tick 的目标由 stage 决定（不再走"见怪就拉"的波次逻辑，避免清无关小怪）。
+    inline bool StageTarget(Player* bot, Map* map, MapRoute const& route, BotState& st, Target& out)
+    {
+        if (route.stages.empty() || st.stageOrd >= 9000)
+            return false;
+
+        uint32 const now = WorldTimer::getMSTime();
+        auto logStage = [&](const char* msg, uint16 from, uint16 to)
+        {
+            if (!st.stageLogAt || WorldTimer::getMSTimeDiff(st.stageLogAt, now ? now : 1) >= 5000)
+            {
+                st.stageLogAt = now ? now : 1;
+                sLog.outError("[STAGE] %s map=%u %s stage %u -> %u",
+                    bot->GetName(), map->GetId(), msg, uint32(from), uint32(to));
+            }
+        };
+
+        auto findMember = [&](uint32 entry, float ax, float ay, float radius) -> Creature*
+        {
+            Creature* best = nullptr;
+            float bestD = 1e18f;
+            for (auto const& kv : route.guidOrd)
+            {
+                Creature* c = map->GetCreature(kv.first);
+                if (!c || !c->IsAlive() || !c->IsInWorld())
+                    continue;
+                if (entry && c->GetEntry() != entry)
+                    continue;
+                if (route.skipEntries.count(c->GetEntry()))
+                    continue;   // [2026-10-24] 会消失的怪不当阶段目标
+                if (!entry && !SessionCanFight(bot, c))
+                    continue;
+                if (radius > 0.0f)
+                {
+                    float const dx = c->GetPositionX() - ax;
+                    float const dy = c->GetPositionY() - ay;
+                    if (std::sqrt(dx * dx + dy * dy) > radius)
+                        continue;
+                }
+                float const d = bot->GetDistance(c);
+                if (d < bestD) { bestD = d; best = c; }
+            }
+            return best;
+        };
+
+        for (int guard = 0; guard < 8; ++guard)
+        {
+            if (st.stageOrd == 0)
+                st.stageOrd = route.stages.front().ord;
+
+            MapRoute::Stage const* cur = nullptr;
+            for (auto const& s : route.stages)
+                if (s.ord == st.stageOrd) { cur = &s; break; }
+            if (!cur) { st.stageOrd = 9000; return false; }
+
+            auto advance = [&](const char* why)
+            {
+                uint16 next = 9000;
+                for (auto const& s : route.stages)
+                    if (s.ord > st.stageOrd) { next = s.ord; break; }
+                logStage(why, st.stageOrd, next);
+                st.stageOrd = next;
+                st.stageWaitSince = 0;
+            };
+
+            // [2026-10-26 站长指令] kind='link'：走到连接点 src，然后跳/落到 dst，跳完推进下一阶段。
+            //   以前 `Target::linkHop` 只写不读（全模块没有消费点）⇒ 这些 link 从来没被执行过，
+            //   队伍只会"按残路径直冲 boss、到末端不可达就跳过"。现在把 link 当成和 boss 同级的阶段。
+            if (cur->kind == "link")
+            {
+                // [2026-10-26 修] 加载阶段 links 还没读进来（loader 顺序问题）⇒ 改成**每次按需匹配**：
+                //   在 route.links 里找 src 离 (ax,ay) 最近且 ≤15 码的那条。links 只有几条，开销可忽略。
+                RouteLink const* lk = nullptr;
+                {
+                    float bestD = 15.0f;
+                    for (auto const& l : route.links)
+                    {
+                        float const dx = l.sx - cur->ax, dy = l.sy - cur->ay;
+                        float const d = std::sqrt(dx * dx + dy * dy);
+                        if (d < bestD)
+                        {
+                            bestD = d;
+                            lk = &l;
+                        }
+                    }
+                }
+                if (!lk)
+                {
+                    sLog.outError("[STAGE] %s map=%u stage %u kind=link 但 (%.1f,%.1f) 15 码内没有 route_link ⇒ 跳过该阶段",
+                        bot->GetName(), map->GetId(), uint32(cur->ord), cur->ax, cur->ay);
+                    advance("link 未匹配到数据");
+                    continue;
+                }
+                // [2026-10-27 站长口径] 走向跳点时用 **link src 的 z**，不用 bot 当前 z：
+                //   之前 out.pz = bot->GetPositionZ()，bot 一旦在平台下层（水里），就会以水面高度
+                //   朝 anchor 的 x/y 走，永远到不了 5 码起跳圈、也上不去（547 实测）。
+                float const dSrc = bot->GetDistance(cur->ax, cur->ay, lk->sz);
+                if (dSrc > 5.0f)
+                {
+                    out = Target();
+                    out.guid = 0;
+                    out.entry = 0;
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = cur->ax;
+                    out.py = cur->ay;
+                    out.pz = lk->sz;
+                    out.hasPullPoint = true;
+                    return true;                          // 先走到连接点起点
+                }
+                // 到位：跳过去（kind 0/2 都是"跳/落"；MoveJump 不依赖寻路，能跨断崖/落水）
+                bot->GetMotionMaster()->MoveJump(lk->dx, lk->dy, lk->dz, 12.0f, 1.0f);
+                sLog.outError("[STAGE] %s map=%u 用连接点 stage %u：从 (%.1f,%.1f) 跳到 (%.1f,%.1f,%.1f)（kind=%u）",
+                    bot->GetName(), map->GetId(), uint32(cur->ord),
+                    cur->ax, cur->ay, lk->dx, lk->dy, lk->dz, uint32(lk->kind));
+                st.stageWaitSince = 0;
+                advance("连接点已跳");
+                continue;
+            }
+
+            // [2026-10-26 站长口径] kind='wait'：原地干等 waitMs 再推进（等会自己消失的临时召唤怪走干净）
+            if (cur->kind == "wait")
+            {
+                uint32 const nowW = now ? now : 1;
+                if (!st.stageWaitSince)
+                    st.stageWaitSince = nowW;
+                if (WorldTimer::getMSTimeDiff(st.stageWaitSince, nowW) >= cur->waitMs)
+                {
+                    advance("干等结束");
+                    continue;
+                }
+                out = Target();
+                out.guid = 0;
+                out.entry = 0;
+                out.ord = 0;
+                out.boss = false;
+                out.px = cur->ax;
+                out.py = cur->ay;
+                out.pz = bot->GetPositionZ();
+                out.hasPullPoint = true;
+                return true;
+            }
+
+            if (cur->kind == "kill_entry" || cur->kind == "room_clear")
+            {
+                Creature* c = findMember(cur->targetEntry, cur->ax, cur->ay, cur->radius);
+                // [2026-10-23] keep_out：太靠近 anchor 的怪先不打（269 清野兽时不能触发麦迪文事件）
+                if (c && cur->keepOut > 0.0f)
+                {
+                    float const dx = c->GetPositionX() - cur->ax;
+                    float const dy = c->GetPositionY() - cur->ay;
+                    if (std::sqrt(dx * dx + dy * dy) < cur->keepOut)
+                        c = nullptr;
+                }
+                if (!c)
+                {
+                    // [2026-10-23 修] 网格没加载时 creature 指针为空 ≠ 已清空。
+                    //   只有"这个阶段确实见过活的、现在一只都没有"才算清完；否则先去该阶段区域。
+                    if (!st.stageSeen.count(cur->ord))
+                    {
+                        float tx = 0, ty = 0, tz = 0;
+                        bool has = false;
+                        if (cur->radius > 0.0f)
+                        {
+                            tx = cur->ax; ty = cur->ay; tz = bot->GetPositionZ(); has = true;
+                        }
+                        else
+                        {
+                            for (auto const& kv : route.waves)
+                            {
+                                bool hit = false;
+                                for (auto const& m : kv.second.members)
+                                    if (m.entry == cur->targetEntry) { hit = true; break; }
+                                if (hit && kv.second.hasCenter)
+                                {
+                                    tx = kv.second.cx; ty = kv.second.cy; tz = kv.second.cz; has = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (has)
+                        {
+                            if (!st.stageLogAt || WorldTimer::getMSTimeDiff(st.stageLogAt, now ? now : 1) >= 5000)
+                            {
+                                st.stageLogAt = now ? now : 1;
+                                sLog.outError("[STAGE] %s map=%u 阶段 %u 目标未加载 ⇒ 先去它所在区域 (%.0f,%.0f)",
+                                    bot->GetName(), map->GetId(), uint32(cur->ord), tx, ty);
+                            }
+                            out = Target();
+                            out.guid = 0;
+                            out.entry = cur->targetEntry;
+                            out.ord = 0;
+                            out.boss = false;
+                            out.px = tx; out.py = ty; out.pz = tz;
+                            out.hasPullPoint = true;
+                            return true;
+                        }
+                        return false;
+                    }
+                    advance("条件满足（已清空）");
+                    continue;
+                }
+
+                st.stageSeen.insert(cur->ord);
+                out = Target();
+                out.guid = c->GetGUIDLow();
+                out.entry = c->GetEntry();
+                out.ord = 0;
+                out.boss = false;
+                out.px = c->GetPositionX();
+                out.py = c->GetPositionY();
+                out.pz = c->GetPositionZ();
+                out.hasPullPoint = true;
+                return true;
+            }
+
+            if (cur->kind == "boss")
+            {
+                BossSpawn const* bp = nullptr;
+                for (auto const& b : route.bosses)
+                    if (b.entry == cur->targetEntry) { bp = &b; break; }
+                if (!bp) { advance("阶段无此 boss，跳过"); continue; }
+
+                Creature* bc = map->GetCreature(bp->guid);
+                if (bc && !bc->IsAlive()) { advance("boss 已死"); continue; }
+
+                out = Target();
+                out.guid = bp->guid;
+                out.entry = bp->entry;
+                out.ord = 0;
+                out.boss = true;
+                out.px = bc ? bc->GetPositionX() : bp->x;
+                out.py = bc ? bc->GetPositionY() : bp->y;
+                out.pz = bc ? bc->GetPositionZ() : bp->z;
+                out.hasPullPoint = true;
+                return true;
+            }
+
+            if (cur->kind == "waves_clear")
+            {
+                // [2026-10-23 站长指令] 例如 542 The Maker：拉开关后要清 4 波小怪（波次由事件刷出来）。
+                //   以 anchor 为圆心、radius 内是否还有活怪判断"一波清空"；空场持续 3 秒记 1 波。
+                float const r = cur->radius > 0.0f ? cur->radius : 45.0f;
+                Creature* nearest = nullptr;
+                float nd = 1e18f;
+                uint32 alive = 0;
+                auto scan = [&](uint32 g)
+                {
+                    Creature* c = map->GetCreature(g);
+                    if (!c || !c->IsAlive() || !c->IsInWorld())
+                        return;
+                    if (!SessionCanFight(bot, c))
+                        return;
+                    float const dx = c->GetPositionX() - cur->ax;
+                    float const dy = c->GetPositionY() - cur->ay;
+                    if (std::sqrt(dx * dx + dy * dy) > r)
+                        return;
+                    ++alive;
+                    float const d = bot->GetDistance(c);
+                    if (d < nd) { nd = d; nearest = c; }
+                };
+                for (auto const& kv : route.guidOrd)
+                    scan(kv.first);
+                for (uint32 pg : route.patrolGuids)
+                    scan(pg);
+
+                if (alive > 0)
+                {
+                    st.waveClearSince = 0;
+                    out = Target();
+                    out.guid = nearest->GetGUIDLow();
+                    out.entry = nearest->GetEntry();
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = nearest->GetPositionX();
+                    out.py = nearest->GetPositionY();
+                    out.pz = nearest->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+
+                if (!st.waveClearSince)
+                {
+                    st.waveClearSince = now ? now : 1;
+                    // 空场：原地等着下一波（给个目标点，避免移动逻辑乱跑）
+                    out = Target();
+                    out.guid = 0;
+                    out.entry = 0;
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = cur->ax;
+                    out.py = cur->ay;
+                    out.pz = bot->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+                if (WorldTimer::getMSTimeDiff(st.waveClearSince, now ? now : 1) >= 3000)
+                {
+                    ++st.waveClearCount;
+                    st.waveClearSince = 0;
+                    sLog.outError("[STAGE] %s map=%u waves_clear 第 %u/%u 波清空",
+                        bot->GetName(), map->GetId(), st.waveClearCount, cur->countLimit);
+                    if (cur->countLimit && st.waveClearCount >= cur->countLimit)
+                    {
+                        st.waveClearCount = 0;
+                        advance("清波数达标");
+                        continue;
+                    }
+                }
+                out = Target();
+                out.guid = 0;
+                out.entry = 0;
+                out.ord = 0;
+                out.boss = false;
+                out.px = cur->ax;
+                out.py = cur->ay;
+                out.pz = bot->GetPositionZ();
+                out.hasPullPoint = true;
+                return true;
+            }
+
+            if (cur->kind == "interact_go")
+            {
+                // [2026-10-23 站长指令] 开关/阀门：走到 GO 旁边再 Use（545 蒸汽地窟的两个 Access Panel）
+                GameObject* useGo = nullptr;
+                float bestD = 1e18f;
+                auto it = route.goGuids.find(cur->targetEntry);
+                if (it != route.goGuids.end())
+                {
+                    for (uint32 gguid : it->second)
+                    {
+                        GameObject* g = map->GetGameObject(ObjectGuid(HIGHGUID_GAMEOBJECT, cur->targetEntry, gguid));
+                        if (!g)
+                            continue;
+                        float const d = bot->GetDistance(g);
+                        if (d < bestD) { bestD = d; useGo = g; }
+                    }
+                }
+                if (!useGo) { advance("GO 不存在/已用，跳过"); continue; }
+
+                if (bestD > 5.0f)
+                {
+                    out = Target();
+                    out.guid = 0;
+                    out.entry = cur->targetEntry;
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = useGo->GetPositionX();
+                    out.py = useGo->GetPositionY();
+                    out.pz = useGo->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+
+                if (!st.stageLogAt || WorldTimer::getMSTimeDiff(st.stageLogAt, now ? now : 1) >= 5000)
+                {
+                    st.stageLogAt = now ? now : 1;
+                    sLog.outError("[STAGE] %s map=%u 使用开关 entry=%u dist=%.1f",
+                        bot->GetName(), map->GetId(), cur->targetEntry, bestD);
+                }
+                useGo->Use(bot);
+                // [2026-10-24 修] 开关是一次性的：用掉就推进阶段（以前不推进 ⇒ 542/545 卡在"使用开关"反复刷）
+                advance("已使用开关");
+                continue;
+            }
+
+            if (cur->kind == "talk_npc")
+            {
+                // [2026-10-23 站长指令] 和 NPC 对话（进度链的一个 stage）：走到 5 码内 → gossip hello → 记完成
+                Creature* npc = nullptr;
+                float bestD = 1e18f;
+                auto it = route.npcGuids.find(cur->targetEntry);
+                if (it != route.npcGuids.end())
+                {
+                    for (uint32 nguid : it->second)
+                    {
+                        Creature* c = map->GetCreature(nguid);
+                        if (!c || !c->IsAlive() || !c->IsInWorld())
+                            continue;
+                        float const d = bot->GetDistance(c);
+                        if (d < bestD) { bestD = d; npc = c; }
+                    }
+                }
+                if (!npc)
+                {
+                    // NPC 还没进网格：朝它的刷点走（用 DB 坐标不可得，这里退化为等待并记录）
+                    advance("NPC 未加载/不存在，跳过");
+                    continue;
+                }
+                if (bestD > 5.0f)
+                {
+                    out = Target();
+                    out.guid = npc->GetGUIDLow();
+                    out.entry = npc->GetEntry();
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = npc->GetPositionX();
+                    out.py = npc->GetPositionY();
+                    out.pz = npc->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+
+                if (!st.stageLogAt || WorldTimer::getMSTimeDiff(st.stageLogAt, now ? now : 1) >= 5000)
+                {
+                    st.stageLogAt = now ? now : 1;
+                    sLog.outError("[STAGE] %s map=%u 对话 NPC entry=%u guid=%u dist=%.1f",
+                        bot->GetName(), map->GetId(), npc->GetEntry(), npc->GetGUIDLow(), bestD);
+                }
+                {
+                    WorldPacket gp;
+                    gp << npc->GetObjectGuid();
+                    bot->GetSession()->HandleGossipHelloOpcode(gp);
+                }
+                // [2026-10-23 站长指令] 需要"选一个选项才给东西"的 NPC（如 Sa'at 给时空道标）：
+                //   count_limit 当"选项序号"用；先 hello 再 select
+                if (cur->countLimit)
+                {
+                    WorldPacket sp;
+                    uint32 const menuId = bot->GetPlayerMenu() ? bot->GetPlayerMenu()->GetGossipMenu().GetMenuId() : 0;
+                    std::string code;
+                    sp << npc->GetObjectGuid() << menuId << uint32(cur->countLimit) << code;
+                    bot->GetSession()->HandleGossipSelectOptionOpcode(sp);
+                    sLog.outError("[STAGE] %s 对话选项 NPC entry=%u menu=%u option=%u",
+                        bot->GetName(), npc->GetEntry(), menuId, cur->countLimit);
+                }
+                advance("对话完成");
+                continue;
+            }
+
+            if (cur->kind == "gauntlet")
+            {
+                // [2026-10-23 站长指令] 540 天堂之路：一边无限刷怪一边往前走，把 Porung 引进战斗；
+                //   引来的怪太多（>= count_limit）就先清，否则会灭团。
+                uint32 crowd = 0;
+                Creature* nearestHostile = nullptr;
+                float nearestHostileDist = 1e18f;
+                float const crowdR = cur->radius > 0.0f ? cur->radius : 30.0f;
+                auto countOne = [&](uint32 g)
+                {
+                    Creature* c = map->GetCreature(g);
+                    if (!c || !c->IsAlive() || !c->IsInWorld())
+                        return;
+                    if (!SessionCanFight(bot, c))
+                        return;
+                    if (bot->GetDistance(c) > crowdR)
+                        return;
+                    ++crowd;
+                    float const d = bot->GetDistance(c);
+                    if (d < nearestHostileDist) { nearestHostileDist = d; nearestHostile = c; }
+                };
+                for (auto const& kv : route.guidOrd)
+                    countOne(kv.first);
+                for (uint32 pg : route.patrolGuids)
+                    countOne(pg);
+
+                if (cur->countLimit && crowd >= cur->countLimit && nearestHostile)
+                {
+                    out = Target();
+                    out.guid = nearestHostile->GetGUIDLow();
+                    out.entry = nearestHostile->GetEntry();
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = nearestHostile->GetPositionX();
+                    out.py = nearestHostile->GetPositionY();
+                    out.pz = nearestHostile->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+
+                // 人不多 ⇒ 继续往前，把目标 boss 引进来（目标不是 boss 时直接朝 anchor 走）
+                BossSpawn const* bp = nullptr;
+                for (auto const& b : route.bosses)
+                    if (b.entry == cur->targetEntry) { bp = &b; break; }
+                if (!bp)
+                {
+                    // 例：540 普通难度用的是 Shattered Hand Blood Guard(17461)，不在 boss_spawn 里
+                    if (cur->ax == 0.0f && cur->ay == 0.0f) { advance("gauntlet 无目标点"); continue; }
+                    float const dToAnchor = bot->GetDistance(cur->ax, cur->ay, bot->GetPositionZ());
+                    if (dToAnchor <= 8.0f) { advance("gauntlet 已到目标点"); continue; }
+                    out = Target();
+                    out.guid = 0;
+                    out.entry = cur->targetEntry;
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = cur->ax;
+                    out.py = cur->ay;
+                    out.pz = bot->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+                Creature* bc = map->GetCreature(bp->guid);
+                if (bc && !bc->IsAlive()) { advance("gauntlet 目标 boss 已死"); continue; }
+
+                out = Target();
+                out.guid = bp->guid;
+                out.entry = bp->entry;
+                out.ord = 0;
+                out.boss = true;
+                out.px = bc ? bc->GetPositionX() : bp->x;
+                out.py = bc ? bc->GetPositionY() : bp->y;
+                out.pz = bc ? bc->GetPositionZ() : bp->z;
+                out.hasPullPoint = true;
+                return true;
+            }
+
+            if (cur->kind == "walk_to")
+            {
+                // [2026-10-23 站长指令] 只走到指定点（例如走到麦迪文旁边触发事件），到了就推进
+                if (cur->ax == 0.0f && cur->ay == 0.0f) { advance("walk_to 无坐标"); continue; }
+                if (bot->GetDistance(cur->ax, cur->ay, bot->GetPositionZ()) <= 8.0f)
+                {
+                    advance("已到达目标点");
+                    continue;
+                }
+                out = Target();
+                out.guid = 0;
+                out.entry = 0;
+                out.ord = 0;
+                out.boss = false;
+                out.px = cur->ax;
+                out.py = cur->ay;
+                out.pz = bot->GetPositionZ();
+                out.hasPullPoint = true;
+                return true;
+            }
+
+            if (cur->kind == "event_guard")
+            {
+                // [2026-10-23 站长指令] 黑色沼泽：以麦迪文/时空门为中心只打半径内的怪；
+                //   优先拦"正在追麦迪文"的怪；有怪打麦迪文就放时空道标（物品 24289 → 法术 31479）。
+                float const r = cur->radius > 0.0f ? cur->radius : 60.0f;
+                Creature* nearest = nullptr;
+                float nd = 1e18f;
+                Creature* chasing = nullptr;
+                float cd = 1e18f;
+                bool medivhUnderAttack = false;
+                auto scan = [&](uint32 g)
+                {
+                    Creature* c = map->GetCreature(g);
+                    if (!c || !c->IsAlive() || !c->IsInWorld())
+                        return;
+                    if (!SessionCanFight(bot, c))
+                        return;
+                    float const dx = c->GetPositionX() - cur->ax;
+                    float const dy = c->GetPositionY() - cur->ay;
+                    if (std::sqrt(dx * dx + dy * dy) > r)
+                        return;
+                    bool const isChasing = (c->GetVictim() && c->GetVictim()->GetEntry() == 15608);
+                    if (isChasing)
+                    {
+                        medivhUnderAttack = true;
+                        float const d0 = bot->GetDistance(c);
+                        if (d0 < cd) { cd = d0; chasing = c; }
+                    }
+                    float const d = bot->GetDistance(c);
+                    if (d < nd) { nd = d; nearest = c; }
+                };
+                for (auto const& kv : route.guidOrd)
+                    scan(kv.first);
+                for (uint32 pg : route.patrolGuids)
+                    scan(pg);
+
+                if (medivhUnderAttack && !st.beaconAt)
+                {
+                    st.beaconAt = now ? now : 1;
+                    sLog.outError("[GUARD] %s 有怪在打麦迪文 ⇒ 放时空道标(24289/31479)", bot->GetName());
+                    bot->CastSpell(cur->ax, cur->ay, bot->GetPositionZ(), 31479, uint32(0));
+                }
+                if (st.beaconAt && WorldTimer::getMSTimeDiff(st.beaconAt, now ? now : 1) >= 60000)
+                    st.beaconAt = 0;   // 一分钟后再评估
+
+                Creature* pick = chasing ? chasing : nearest;
+                if (pick)
+                {
+                    out = Target();
+                    out.guid = pick->GetGUIDLow();
+                    out.entry = pick->GetEntry();
+                    out.ord = 0;
+                    out.boss = false;
+                    out.px = pick->GetPositionX();
+                    out.py = pick->GetPositionY();
+                    out.pz = pick->GetPositionZ();
+                    out.hasPullPoint = true;
+                    return true;
+                }
+                // 没有怪：原地守着（不推进，事件会继续刷）
+                out = Target();
+                out.guid = 0;
+                out.entry = 0;
+                out.ord = 0;
+                out.boss = false;
+                out.px = cur->ax;
+                out.py = cur->ay;
+                out.pz = bot->GetPositionZ();
+                out.hasPullPoint = true;
+                return true;
+            }
+
+            advance("未知阶段类型，跳过");
+        }
+        return false;
+    }
+
+    // [2026-10-23 站长指令] "先拉这一只、别引太多"：
+    //   如果有指定 entry 的活怪在 max_dist 内、LOS 可见 ⇒ 用它作为**唯一开怪目标**（忽略波次）；
+    //   它周围 15 码内其它活怪超过 max_adds ⇒ hold=true（先别拉，等/退，避免一次引一堆）。
+    inline bool PullFirstTarget(Player* bot, Map* map, MapRoute const& route, Target& out, bool& hold)
+    {
+        hold = false;
+        if (route.pullFirst.empty() || !map || !bot)
+            return false;
+        if (bot->IsInCombat())
+            return false;
+
+        for (auto const& rule : route.pullFirst)
+        {
+            Creature* best = nullptr;
+            float bestD = 1e18f;
+            auto consider = [&](uint32 g)
+            {
+                Creature* c = map->GetCreature(g);
+                if (!c || !c->IsAlive() || !c->IsInWorld())
+                    return;
+                if (c->GetEntry() != rule.entry)
+                    return;
+                float const d = bot->GetDistance(c);
+                if (d > rule.maxDist)
+                    return;
+                if (!bot->IsWithinLOS(c->GetPositionX(), c->GetPositionY(), c->GetPositionZ()))
+                    return;
+                if (d < bestD) { bestD = d; best = c; }
+            };
+            for (auto const& kv : route.guidOrd)
+                consider(kv.first);
+            for (uint32 pg : route.patrolGuids)
+                consider(pg);
+            if (!best)
+                continue;
+
+            // [2026-10-23 站长口径] 用"连锁范围 + 连锁组"判断会一起进战斗的怪，不用硬性距离：
+            //   连锁范围 = 目标的 CallForHelp（>0 时）否则 CreatureFamilyAssistanceRadius（默认 5）；
+            //   连锁组   = 核心自己的判定 AnyAssistCreatureInRangeCheck（和怪实际求援的规则一致）。
+            float chainRange = sWorld.getConfig(CONFIG_FLOAT_CREATURE_FAMILY_ASSISTANCE_RADIUS);
+            CreatureInfo const* ci = best->GetCreatureInfo();
+            if (ci && ci->CallForHelp > 0)
+                chainRange = float(ci->CallForHelp);
+
+            uint32 adds = 0;
+            {
+                CreatureList receivers;
+                MaNGOS::AnyAssistCreatureInRangeCheck u_check(best, bot, chainRange);
+                MaNGOS::CreatureListSearcher<MaNGOS::AnyAssistCreatureInRangeCheck> searcher(receivers, u_check);
+                Cell::VisitAllObjects(best, searcher, chainRange);
+                adds = uint32(receivers.size());
+            }
+
+            if (adds > rule.maxAdds)
+            {
+                hold = true;
+                return true;      // 先别拉（等巡逻走开/退一点）
+            }
+
+            out = Target();
+            out.guid = best->GetGUIDLow();
+            out.entry = best->GetEntry();
+            out.ord = 0;
+            out.boss = false;
+            // 就地起手（远距离拉），不再走到怪堆里
+            out.px = bot->GetPositionX();
+            out.py = bot->GetPositionY();
+            out.pz = bot->GetPositionZ();
+            out.hasPullPoint = true;
+            return true;
+        }
+        return false;
+    }
+
     inline bool FindTargetNearest(Player* bot, MapRoute const& route, Target& out,
                                   bool onlyCurrentWave = false)
     {
@@ -1841,21 +4452,89 @@ namespace dungeonroute
             return false;
 
         BotState& st = StateOf(bot);
-        RefreshWaveKnowledge(map, route, st);
+        RefreshWaveKnowledge(bot, map, route, st);
         RefreshBossKnowledge(map, route, st);
+
+        // [2026-10-23 站长指令] 有进度链的图：先按 stage 推进（只打该打的），阶段全部完成才回落到通用逻辑
+        if (!route.stages.empty() && StageTarget(bot, map, route, st, out))
+            return true;
 
         // [2026-10-22 站长口径] BOSS 优先模式的两条规矩：
         //   ① 路上遇到**30 码内、可拉**的敌对怪/敌对该波 ⇒ 先打它（不绕过、不硬冲 boss）；
         //   ② 附近没有可拉的怪 ⇒ 才按 boss 顺序去可达 boss；boss 不可达/挂起 ⇒ 落回波次/特殊寻路。
         bool const bossMode = BossFirstMode();
 
+        // [2026-10-25 站长口径] **现场在前、表退到辅助**：
+        //   ① 先看这个副本此刻刷出来的怪（CreatureGroup 分组，最近的一组先打）；
+        //   ② 现场没活怪 ⇒ 用最近的 boss 刷点当"路标"继续往里走（走过去网格就会加载出下一批）；
+        //   ③ 再不行才回落到旧的波次/连接点逻辑（那些只当兜底走位，不再决定打谁）。
+        if (bossMode)
+        {
+            bool inFight = bot->IsInCombat();
+            if (!inFight && bot->GetGroup())
+            {
+                for (GroupReference* ref = bot->GetGroup()->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* gm = ref->getSource();
+                    if (gm && gm->IsAlive() && gm->IsInCombat())
+                    {
+                        inFight = true;
+                        break;
+                    }
+                }
+            }
+            if (!inFight && FindLiveGroupTarget(bot, map, route, st, out))
+                return true;
+            if (!inFight && FindBossWaypoint(bot, route, st, out))
+                return true;
+        }
+
         // [2026-10-19 543 实测] 拉怪/移动只瞄 CurrentOrd（当前波）；否则会按“全图最近”
         //   跨波乱拉，和攻击目标过滤（唯一当前波）打架，出现“15s 无目标 → 跳波”。
         uint16 const curOrd = onlyCurrentWave ? CurrentOrd(bot, route) : 0;
 
+        // [2026-10-24 诊断] 当前波到底还有几只活着、中心在哪（553/557 卡"0 波"时看这一行）
+        if (onlyCurrentWave)
+        {
+            uint32 const nowW = WorldTimer::getMSTime();
+            if (!st.waveLogAt || WorldTimer::getMSTimeDiff(st.waveLogAt, nowW ? nowW : 1) >= 10000)
+            {
+                st.waveLogAt = nowW ? nowW : 1;
+                uint32 aliveN = 0;
+                float cx = 0, cy = 0;
+                std::string detail;   // [2026-10-24] 活口明细：guid(entry)@(x,y) dist_to_center
+                auto wit = route.waves.find(curOrd);
+                bool hasC = false;
+                if (wit != route.waves.end())
+                {
+                    for (auto const& m : wit->second.members)
+                    {
+                        Creature* mc = MemberFightable(map, m) ? MemberCreature(map, m) : nullptr;
+                        if (!mc)
+                            continue;
+                        ++aliveN;
+                        if (aliveN <= 4)
+                        {
+                            float const dcx = mc->GetPositionX() - wit->second.cx;
+                            float const dcy = mc->GetPositionY() - wit->second.cy;
+                            float const dc = std::sqrt(dcx * dcx + dcy * dcy);
+                            detail += " " + std::to_string(m.guid) + "(" + std::to_string(m.entry) + ")@" +
+                                std::to_string(int32(mc->GetPositionX())) + "," +
+                                std::to_string(int32(mc->GetPositionY())) + " d=" + std::to_string(uint32(dc));
+                        }
+                    }
+                    cx = wit->second.cx; cy = wit->second.cy; hasC = wit->second.hasCenter;
+                }
+                sLog.outError("[WAVE] %s map=%u curOrd=%u alive=%u center=(%.0f,%.0f) hasCenter=%d lockOrd=%u pos=(%.0f,%.0f)%s",
+                    bot->GetName(), map->GetId(), uint32(curOrd), aliveN, cx, cy, hasC ? 1 : 0,
+                    uint32(st.lockOrd), bot->GetPositionX(), bot->GetPositionY(), detail.c_str());
+            }
+        }
+
         const float STOP_DIST = 30.0f;       // 见敌即停（保留）
         const float PULL_ENGAGE_DIST = 30.0f; // 站长口径：停步点保留 30 码，拉不到由拉怪策略自己找位置/走近
         const float APPROACH_DIST = 22.0f;   // 走到离怪多近（沿用旧的 22 码）
+
 
         Member nearestM;                     // 最近的"活着的、可攻击的"怪
         float nearestAliveDist = 1e18f;
@@ -1905,8 +4584,21 @@ namespace dungeonroute
                     // [2026-10-23] 已被判定"不可攻击/永远无敌"的目标不再选（否则整队站着发呆）
                     if (st.unattackable.count(m.guid))
                         continue;
+                    // [2026-10-24] 这只刚"消失/打不到"过 ⇒ 60 秒内先换下一个（按 guid，不按 entry）
+                    {
+                        auto sk = st.guidSkipUntil.find(m.guid);
+                        if (sk != st.guidSkipUntil.end())
+                        {
+                            if (sk->second > WorldTimer::getMSTime())
+                                continue;
+                            st.guidSkipUntil.erase(sk);
+                        }
+                    }
                     // [2026-10-23 站长口径] 无敌+击飞类怪不拉（按躲地板处理，交给 avoid specific creatures）
                     if (route.avoidEntries.count(c->GetEntry()))
+                        continue;
+                    // [2026-10-24 站长指令] 会消失/打不到的怪：直接跳过
+                    if (route.skipEntries.count(c->GetEntry()))
                         continue;
                     if (!SessionCanFight(bot, c))
                         continue;                       // 友好 NPC / 小动物：不参与推进
@@ -2081,6 +4773,9 @@ namespace dungeonroute
             // [2026-10-23 站长口径] 无敌+击飞类怪（avoid_mob）即使登记成巡逻，也不去拉
             if (route.avoidEntries.count(pc->GetEntry()))
                 continue;
+            // [2026-10-24 站长指令] 会消失/打不到的怪：直接跳过
+            if (route.skipEntries.count(pc->GetEntry()))
+                continue;
             float const pd = bot->GetDistance(pc);
             if (pd > 40.0f || !IsVisible(bot, pc))
                 continue;
@@ -2117,11 +4812,40 @@ namespace dungeonroute
         //   找不到可达 boss（都打完/都挂起）⇒ 继续往下走原来的波次/特殊寻路。
         if (bossMode && !nearestM.guid)
         {
-            if (FindBossTarget(bot, route, st, out))
-                return true;
-            // [2026-10-22 站长口径] 所有 boss 都不可达 ⇒ 按 link 跳到下一个连通区间，跳完再重查 boss
-            if (FindLinkExplorationTarget(bot, route, st, out))
-                return true;
+            // [2026-10-24 修] 当前波还没清完 ⇒ **不许切 boss**。
+            //   实测：553 curOrd=1 却朝 300 码外的 boss 走、557/552 同样，结果当前波永远清不掉。
+            uint16 const curForBoss = CurrentOrd(bot, route);
+            bool waveLeft = false;
+            if (curForBoss)
+            {
+                auto wit = route.waves.find(curForBoss);
+                if (wit != route.waves.end() && WaveHasFightable(bot, wit->second))
+                    waveLeft = true;
+            }
+            // [2026-10-24 站长口径] "进入战斗就应该先解决进入战斗的，战斗后再继续朝 boss 走"：
+            //   队伍里任何人在战斗中 ⇒ 不切 boss 目标（否则坦克会把队伍拖着往 boss 走，打断当前战斗）。
+            bool groupInCombat = bot->IsInCombat();
+            if (!groupInCombat && bot->GetGroup())
+            {
+                for (GroupReference* ref = bot->GetGroup()->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* gm = ref->getSource();
+                    if (gm && gm->IsAlive() && gm->IsInCombat())
+                    {
+                        groupInCombat = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!waveLeft && !groupInCombat)
+            {
+                if (FindBossTarget(bot, route, st, out))
+                    return true;
+                // [2026-10-22 站长口径] 所有 boss 都不可达 ⇒ 按 link 跳到下一个连通区间，跳完再重查 boss
+                if (FindLinkExplorationTarget(bot, route, st, out))
+                    return true;
+            }
         }
 
         // ① 有活目标
@@ -2287,7 +5011,8 @@ namespace dungeonroute
             if (c && !c->IsAlive())
             {
                 st.bossCleared.insert(b.guid);
-                sLog.outError("[BOSSKILL] map=%u entry=%u guid=%u", map->GetId(), b.entry, b.guid);
+                sLog.outError("[BOSSKILL] map=%u inst=%u entry=%u guid=%u", map->GetId(),
+                    map->GetInstanceId(), b.entry, b.guid);
                 continue;
             }
             // [boss-fix 2026-10-19] 不能再把“见过活的、现在没加载”当成已死：
@@ -2430,8 +5155,68 @@ namespace dungeonroute
     }
 
 
+    // [2026-10-25 修] PULLSAFE 挪出来的"安全拉怪点"= **本次拉怪的站位点**。
+    //   生效期间（未过期、未进战斗、离原拉怪位 ≤60 码）返回它，调用方拿它当拉怪位判断"到没到位"；
+    //   旧逻辑只把它当"拉完之后别回旧位"，结果拉怪动作在安全点上被 stand_override_hold 挡住、
+    //   移动动作又按原拉怪位把坦克推回去 —— 两个动作互顶，永远不开怪。
+    inline bool SafePullPoint(Player* bot, Target const& target, float& x, float& y, float& z)
+    {
+        if (!bot)
+            return false;
+        BotState& st = StateOf(bot);
+        if (!st.safePullPoint)
+            return false;
+
+        uint32 const now = WorldTimer::getMSTime();
+        if (!st.standOverrideUntil || (now && now >= st.standOverrideUntil))
+        {
+            st.safePullPoint = false;
+            return false;
+        }
+        if (bot->IsInCombat())                 // 战斗中由挪位/站位逻辑接管，安全点不再当拉怪位
+            return false;
+        if (!target.hasPullPoint || bot->GetDistance(target.px, target.py, target.pz) > 60.0f)
+            return false;                      // 拉怪位换波了 / 队伍被兜底传回入口后留下的旧点
+
+        x = st.standOverrideX;
+        y = st.standOverrideY;
+        z = st.standOverrideZ;
+        return true;
+    }
+
     // ---- 驱动资格（"谁是驱动坦克"）------------------------------------------------
     // ① 坦克 bot；② 队伍里没有"真人坦克"；③ 多个 bot 坦克时 guid 最小的那个（避免抢拉）
+    // [GHOST-FIGHT 2026-10-27] "队伍真的在挨打吗"：任何成员/宠物身上有 attacker（= 有怪正在打我们）。
+    //   幽灵战斗的现场是 **atkM=0**（谁都没在打我们），这时 `IsInCombat` 只是战斗标记没散，
+    //   不该继续挡住路线推进（[GHOSTCOMBAT] r128/r130 实测：整组零攻击者、零推进）。
+    inline bool GroupUnderAttack(Player* bot)
+    {
+        if (!bot)
+            return false;
+
+        auto attacked = [](Player* p) -> bool
+        {
+            if (!p || !p->IsAlive() || !p->IsInWorld())
+                return false;
+            if (!p->getAttackers().empty())
+                return true;
+            if (Unit* pet = p->GetPet())
+                if (!pet->getAttackers().empty())
+                    return true;
+            return false;
+        };
+
+        if (attacked(bot))
+            return true;
+        if (Group* g = bot->GetGroup())
+        {
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+                if (attacked(ref->getSource()))
+                    return true;
+        }
+        return false;
+    }
+
     inline bool ShouldDrive(PlayerbotAI* ai)
     {
         if (!RouteEnabled())
@@ -2445,7 +5230,26 @@ namespace dungeonroute
         if (!dungeonrun::MaybeEnterDungeon(bot, RouteRuntimeSwitch()))
             return false;
         if (bot->IsInCombat())
-            return false;
+        {
+            // [GHOST-FIGHT 2026-10-27] 只剩战斗标记（没有 victim、队伍/宠物也没被任何怪打）时，
+            //   给 10 秒确认窗口；确认是幽灵战斗就**不再用 IsInCombat 挡推进**。
+            //   不主动清玩家战斗标记（那只是派生结果）：核心侧 CombatManager 的 30 秒无 victim
+            //   兜底会把怪脱战、引用自然消失，这里只是别让整队陪着干等。
+            BotState& st = StateOf(bot);
+            uint32 const nowMs = WorldTimer::getMSTime();
+            bool const ghost = !bot->GetVictim() && !GroupUnderAttack(bot);
+            if (!ghost)
+            {
+                st.ghostCombatSince = 0;
+                return false;
+            }
+            if (!st.ghostCombatSince)
+                st.ghostCombatSince = nowMs ? nowMs : 1;
+            if (WorldTimer::getMSTimeDiff(st.ghostCombatSince, nowMs ? nowMs : 1) < 10000)
+                return false;
+        }
+        else
+            StateOf(bot).ghostCombatSince = 0;
         if (!PlayerbotAI::IsTank(bot))
             return false;
 

@@ -119,6 +119,12 @@ bool PullStartAction::Execute(Event& event)
     if (strategy)
     {
         Unit* target = strategy->GetTarget();
+        // [2026-10-26 站长确认] **距离门**：离目标 >40 码就不是"在开拉"。
+        //   原来这里只要有目标就 return true ⇒ AI 以为正在开拉、走位动作不再执行，
+        //   而 PullAction 又因距离放不出技能 ⇒ 原地假开拉死锁
+        //   （实测幽暗沼泽：离目标 232 码卡了 7 分半，act=pull start）。
+        if (target && bot->GetDistance(target) > 40.0f)
+            return false;
         if (target)
         {
             if (strategy->GetPreActionName().empty())

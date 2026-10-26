@@ -28,6 +28,19 @@ using namespace ai;
 
 namespace
 {
+    // [2026-10-27 站长口径] **水中寻路**：副本/团本里允许 bot 在水里也走 mmap 路径。
+    //   以前一进水就把 generatePath 关掉（退化直线游）：撞池壁/台阶/落差停住、也上不了岸；
+    //   而 creature 的 MoveSpline 一直走寻路，所以怪能在水里正常游。这里把 bot 对齐到同一套规则。
+    //   野外保持原行为（性能考虑）；AiPlayerbot.WaterPath=1 仍可强制全局打开。
+    bool AllowWaterPathing(Player* bot)
+    {
+        if (!bot)
+            return false;
+        if (sPlayerbotAIConfig.waterPath)
+            return true;
+        Map* map = bot->GetMap();
+        return map && (map->IsDungeon() || map->IsRaid());
+    }
     // [safe-move 2026-10-18 站长口径] "附近敌对单位"扫描结果的按 bot 缓存（默认 1 秒）。
     //   只缓存 GUID+仇恨半径（不缓存 Unit*，避免单位在缓存期内销毁变成野指针）。
     const time_t COMBAT_HOSTILE_CACHE_SECONDS = 1;
@@ -1481,9 +1494,10 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
     }
 
     // [2026-10-19] 上游行为：水里/游泳时**不生成寻路**（退化成直线游，遇到池壁/落差就卡住）。
-    //   AiPlayerbot.WaterPath=1 时允许水里也走 mmap 路径（本地仿真用；云端默认 0）。
+    //   [2026-10-27 重构] 副本里不再关：AllowWaterPathing() 让 bot 和 creature 一样走 mmap
+    //   （能游泳、能沿岸/楼梯上岸）；野外仍按 WaterPath 配置。
     bool const inWater = bot->IsInWater() || sServerFacade.IsUnderwater(bot) || bot->HasMovementFlag(MOVEFLAG_SWIMMING);
-    bool generatePath = !noPath && !bot->IsFlying() && (!inWater || sPlayerbotAIConfig.waterPath);
+    bool generatePath = !noPath && !bot->IsFlying() && (!inWater || AllowWaterPathing(bot));
 
 #ifndef MANGOSBOT_ZERO
     if (bot->IsFreeFlying())
@@ -1622,7 +1636,9 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
     float maxDist = sPlayerbotAIConfig.sightDistance;           //Maximum distance a bot can move in one single action.
     float originalZ = z;                                        // save original destination height to check if bot needs to fly up
 
-    bool generatePath = !bot->IsFlying() && !bot->HasMovementFlag(MOVEFLAG_SWIMMING) && !bot->IsInWater() && !sServerFacade.IsUnderwater(bot);
+    bool const inWaterMove = bot->HasMovementFlag(MOVEFLAG_SWIMMING) || bot->IsInWater() ||
+                             sServerFacade.IsUnderwater(bot);
+    bool generatePath = !bot->IsFlying() && (!inWaterMove || AllowWaterPathing(bot));
     if (noPath)
         generatePath = false;
 

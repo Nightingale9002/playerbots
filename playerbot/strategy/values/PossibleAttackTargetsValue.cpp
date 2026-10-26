@@ -1288,6 +1288,12 @@ int PossibleAttackTargetsValue::ThreatTier(Unit* target, Player* bot)
     {
         switch (priority)
         {
+            case 6:
+                // [2026-10-26 站长口径] 6 = **必须立刻打，且不受"等坦克仇恨"门限制**
+                //   （原 ai_playerbot_dps_exempt 那张豁免表合并到这一档：Protean Spawn 这类
+                //     "等坦克仇恨就把队伍淹掉"的怪）。击杀优先级同样最高，且不因吃控制降级。
+                return 6;
+
             case 5:
                 // 任何情况必须立刻转火击杀：最高档，不降级
                 return 5;
@@ -1670,6 +1676,15 @@ bool PossibleAttackTargetsValue::IsValid(Unit* target, Player* player, float ran
         return true;
 
     if (player->GetPlayerbotAI() && !player->GetPlayerbotAI()->HasActivePlayerMaster()&& PAI_VALUE(ObjectGuid, "rti target") == target->GetObjectGuid())
+        return true;
+
+    // [2026-10-26 站长纠正] **"在战斗"本身就是有效目标**。
+    //   原来这里只认"有 current victim / 有 UNIT_FIELD_TARGET / 是玩家"，可是实测副本里存在这种怪：
+    //     cb=1、thr=5、atk=5、hp 一路掉到 15%、坦克就在 3 码，但 curvic=- 且 mot=IDLE（它选不出目标）。
+    //   这种"在战斗但没 victim"的怪会被判无效 ⇒ 不进 possible ⇒ attack target 被清 ⇒ 每 tick 重选 ⇒ 死循环。
+    //   注意：这不是"允许打未参战的怪"（那条只对坦克开放，见 AttackAnythingAction），
+    //   而是"已经在战斗的怪当然可以打"；DPS 的停手/等坦克仇恨仍由动作层 IsWaitingForTankThreat 把关。
+    if (target->IsInCombat())
         return true;
 
     return false;
