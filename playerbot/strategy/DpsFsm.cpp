@@ -962,6 +962,9 @@ namespace
             uint8 const form = s.bot->GetShapeshiftForm();
             if (form != FORM_CAT)
             {
+                // 已经挂着变形光环却仍认为"不在猫形态"时别再刷（实测 40 秒刷了 140 次 Cat Form）
+                if (AuraStacks(ai, s.bot, m, "cat form", s.bot) > 0)
+                    return false;
                 if (CastFirst(ai, m, s, { "cat form" }))
                     return true;
                 return false;
