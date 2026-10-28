@@ -259,6 +259,7 @@ uint32 stuckFightCleared = 0;
             bool useFsm = true;         // false = 这一轮关掉 DPS 状态机（A/B 对照基线）
             // 基线（用来算增量）
             uint64 dmg0 = 0, pet0 = 0, melee0 = 0, casts0 = 0;
+            std::map<uint32, uint64> spells0;   // 施法分布也要取增量，否则 top 里是历史累计
         };
 
         std::vector<DummyRun> s_dummies;
@@ -3362,7 +3363,13 @@ uint32 stuckFightCleared = 0;
                 melee = bot->botMeleeHits > d.melee0 ? bot->botMeleeHits - d.melee0 : 0;
                 casts = bot->botCasts > d.casts0 ? bot->botCasts - d.casts0 : 0;
 
-                std::vector<std::pair<uint32, uint64>> list(bot->botSpellCounts.begin(), bot->botSpellCounts.end());
+                std::vector<std::pair<uint32, uint64>> list;
+                for (auto const& kv : bot->botSpellCounts)
+                {
+                    uint64 const before = d.spells0.count(kv.first) ? d.spells0[kv.first] : 0;
+                    if (kv.second > before)
+                        list.push_back(std::make_pair(kv.first, kv.second - before));
+                }
                 std::sort(list.begin(), list.end(),
                     [](std::pair<uint32, uint64> const& a, std::pair<uint32, uint64> const& b) { return a.second > b.second; });
                 for (size_t i = 0; i < list.size() && i < 6; ++i)
@@ -3447,6 +3454,7 @@ uint32 stuckFightCleared = 0;
                     d.pet0 = bot->botPetDamageDealt;
                     d.melee0 = bot->botMeleeHits;
                     d.casts0 = bot->botCasts;
+                    d.spells0 = bot->botSpellCounts;
                     d.startMs = now;
                     sLog.outError("[DUMMY] id=%u spec=%s 假人已就位 %u 个，开始计时", d.id, d.spec.c_str(), (uint32)d.dummies.size());
                 }

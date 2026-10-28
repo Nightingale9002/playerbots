@@ -957,10 +957,15 @@ namespace
         bool const feral = (m->spec == Spec::Feral);
         if (feral)
         {
-            // 豹形态才按猫的循环；变形交给引擎（回 false 让它先变形）
+            // 豹形态才按猫的循环。原引擎在假人场景不会自己变形（实测整场在外形平砍），
+            // 所以这里先用一次变形动作，变形不成就交回引擎。
             uint8 const form = s.bot->GetShapeshiftForm();
             if (form != FORM_CAT)
+            {
+                if (CastFirst(ai, m, s, { "cat form" }))
+                    return true;
                 return false;
+            }
 
             bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
             bool const executeWindow = s.targetHp <= BurstHp(m);
@@ -1059,7 +1064,22 @@ namespace
 
         bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
         bool const executeWindow = s.targetHp <= BurstHp(m);
-        char const* seal = (s.bot->GetTeam() == HORDE) ? "seal of blood" : "seal of command";
+        // [2026-10-29 实测] 很多随机圣骑士没点"命令圣印"（它是天赋），直接按名字取会取不到 ⇒
+        //   一路空判、40 秒 0 伤害。这里给一串候选，取第一个"这个 bot 真会"的。
+        char const* seals[3] = {
+            (s.bot->GetTeam() == HORDE) ? "seal of blood" : "seal of command",
+            (s.bot->GetTeam() == HORDE) ? "seal of command" : "seal of blood",
+            "seal of righteousness"     // 所有圣骑士都学得到，兜底
+        };
+        char const* seal = "seal of righteousness";
+        for (char const* cand : seals)
+        {
+            if (SpellId(ai, s.bot, m, cand, false))
+            {
+                seal = cand;
+                break;
+            }
+        }
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
         if (!inRange)
@@ -1084,13 +1104,21 @@ namespace
                 break;
             case State::Burn:
             default:
+            {
                 st = State::Burn;
-                if (AuraStacks(ai, s.bot, m, seal, s.bot) == 0 && CastFirst(ai, m, s, { seal })) break;
+                // [2026-10-29 实测] 审判的伤害全靠圣印；圣印没挂上就判 = 白扔 CD
+                //   （假人场景实测 40 秒 210 次审判、只有 105 伤害）。这里改成"没圣印只挂圣印"。
+                if (AuraStacks(ai, s.bot, m, seal, s.bot) == 0)
+                {
+                    if (CastFirst(ai, m, s, { seal })) break;
+                    break;   // 圣印都挂不上（没学/没蓝）：先别空判
+                }
                 if (CastFirst(ai, m, s, { "judgement" })) break;
                 if (CastFirst(ai, m, s, { "crusader strike" })) break;
                 if (s.power > 40.0f && TryCastAt(ai, m, s, "consecration",
                         s.bot->GetPositionX(), s.bot->GetPositionY(), s.bot->GetPositionZ())) break;
                 break;
+            }
         }
 
         LogTransition(ai, m, s, st);
