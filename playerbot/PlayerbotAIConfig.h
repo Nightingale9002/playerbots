@@ -343,6 +343,10 @@ public:
     // [仿真 2026-10-18] 可控场景注入总开关（`.bot sim start/stop/status`）：
     //   **只在本地 WSL 仿真开 1**；云端必须 0（云端开了也只允许 GM 手动执行，仍不该开）。
     bool simMode;
+    // [2026-10-29] DPS 技能释放状态机（默认关，先接法师；打开后由状态机接管本 GCD 施法）
+    bool dpsFsm = false;
+    // [2026-10-29] DPS 状态机的离线调优参数文件（脚本改这个文件即可热生效，不用重编译/重启）
+    std::string dpsFsmTuneFile = "dpsfsm_tune.conf";
     // [2026-10-19] 允许"在水里/游泳时也走 mmap 路径"。
     //   上游 playerbots 在 IsInWater/游泳时把 generatePath 关掉（退化成直线游），
     //   水池/落差地形会卡住；默认 0 保持上游行为，本地仿真开 1。

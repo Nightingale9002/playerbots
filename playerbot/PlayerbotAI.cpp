@@ -20,6 +20,7 @@
 #include "strategy/values/LastSpellCastValue.h"
 #include "LootObjectStack.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/strategy/DpsFsm.h"   // [2026-10-29] DPS 技能释放状态机
 #include "playerbot/BossStrategyHook.h"   // [BOSS 战策略 2026-10-16] 按 BOSS 自动挂载自定义策略
 #include "playerbot/BossArena.h"          // [2026-10-21] BOSS 场地 hold/bounds（数据化）
 #include "PlayerbotAI.h"
@@ -1952,6 +1953,11 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     botOutgoingPacketHandlers.Handle(helper);
     masterIncomingPacketHandlers.Handle(helper);
     masterOutgoingPacketHandlers.Handle(helper);
+
+    // [2026-10-29 站长口径] DPS 技能释放状态机：开启时先由状态机决策本 GCD 的施法，
+    //   再走原引擎（其他动作/走位/打断保持不动）。默认关。
+    if (sPlayerbotAIConfig.dpsFsm)
+        dpsfsm::Tick(this);
 
 	DoNextAction(minimal);
     LogKillEvents();
@@ -4989,11 +4995,22 @@ void PlayerbotAI::RecordSpellCast(ObjectGuid guid, uint32 spellId)
 {
     if (!spellId)
         return;
-    std::lock_guard<std::mutex> lock(s_lastCastsMutex);
-    auto& dq = s_lastCasts[guid.GetRawValue()];
-    dq.push_back(spellId);
-    if (dq.size() > 6)
-        dq.pop_front();
+    {
+        std::lock_guard<std::mutex> lock(s_lastCastsMutex);
+        auto& dq = s_lastCasts[guid.GetRawValue()];
+        dq.push_back(spellId);
+        if (dq.size() > 6)
+            dq.pop_front();
+    }
+    // [2026-10-29 战斗取证] 技能释放计数（含失败尝试）：查"到底有没有在放技能"
+    if (Player* p = sObjectMgr.GetPlayer(guid))
+    {
+        if (!p->isRealPlayer())
+        {
+            ++p->botCasts;
+            ++p->botSpellCounts[spellId];
+        }
+    }
 }
 
 std::vector<uint32> PlayerbotAI::LastSpellCasts(ObjectGuid guid)

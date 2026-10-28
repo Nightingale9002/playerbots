@@ -286,7 +286,7 @@ bool AttackAction::Attack(Player* requester, Unit* target)
 //     6) 其余情况 ⇒ 返回 true = 现在先不出手（选目标/朝向可以做，"出手"这一步被拦下）。
 //   注意：门禁**不依赖** AiPlayerbot.WaitForAttackTime / WaitForAttackThreatPercent
 //   （那两个配置是全局的"等坦克"，关掉 0 时这道副本门禁依然生效）。
-bool AttackAction::IsWaitingForTankThreat(Unit* target)
+bool AttackAction::WaitingForTankThreat(PlayerbotAI* ai, Player* bot, Unit* target)
 {
     if (!target)
         return false;

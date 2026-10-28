@@ -397,6 +397,15 @@ namespace dungeonroute
         uint32 pullWaitUntil = 0;
         // [GHOST-FIGHT 2026-10-27] 幽灵战斗（顶着战斗标记但没有任何交战）的确认起点；0 = 不在该状态
         uint32 ghostCombatSince = 0;
+        // [2026-10-28 站长口径] "全员一起行动"：非战斗时有人阵亡/掉队就停住**一直等**（不设超时）；
+        //   regroupSince=开始等的时刻（0=不需要等）。
+        uint32 regroupSince = 0;
+        uint32 regroupLogAt = 0;
+        uint32 regroupSummonAt = 0;   // [2026-10-28] summon 重试节流（30s）
+        // [2026-10-28 站长口径] 掉队者详情（供 SimScenario 打 [REGROUP]，说明为什么追不上）
+        ObjectGuid regroupStraggler;
+        float regroupDist = 0.0f;
+        bool regroupStragglerDead = false;
         // [2026-10-27 整合] [THREAT] hold fire 日志节流（原来每 tick 一条）
         uint32 holdFireLogAt = 0;
         // [2026-10-27 站长口径] 施法怪/够不着目标的挪位节流（冲上去 / 卡视野 / 后拉）
@@ -5217,6 +5226,48 @@ namespace dungeonroute
         return false;
     }
 
+    // [2026-10-28 站长口径] **全员一起行动**：非战斗状态下，只要队里还有人没到位就停住等。
+    //   "没到位" = 有人死亡（等复活跑回）或存活队员离坦克 > 35 码。
+    //   这里只填"掉队者详情"（guid/距离/死活），日志与"等太久就 summon"由 SimScenario 处理。
+    inline bool GroupNeedsRegroup(Player* bot, BotState& st)
+    {
+        if (!bot)
+            return false;
+        Group* grp = bot->GetGroup();
+        if (!grp)
+            return false;
+        // 优先报"死亡"，其次报"最远"的那个
+        ObjectGuid farGuid;
+        float farDist = 0.0f;
+        for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->getSource();
+            if (!m || m == bot || m->GetMapId() != bot->GetMapId())
+                continue;
+            if (!m->IsAlive())
+            {
+                st.regroupStraggler = m->GetObjectGuid();
+                st.regroupStragglerDead = true;
+                st.regroupDist = 0.0f;
+                return true;
+            }
+            float const d = bot->GetDistance(m);
+            if (d > 35.0f && d > farDist)
+            {
+                farDist = d;
+                farGuid = m->GetObjectGuid();
+            }
+        }
+        if (!farGuid.IsEmpty())
+        {
+            st.regroupStraggler = farGuid;
+            st.regroupStragglerDead = false;
+            st.regroupDist = farDist;
+            return true;
+        }
+        return false;
+    }
+
     inline bool ShouldDrive(PlayerbotAI* ai)
     {
         if (!RouteEnabled())
@@ -5252,6 +5303,21 @@ namespace dungeonroute
             StateOf(bot).ghostCombatSince = 0;
         if (!PlayerbotAI::IsTank(bot))
             return false;
+
+        // [2026-10-28 站长口径] **全员一起行动**：脱战且有人阵亡/掉队 ⇒ 停住等。
+        //   这里只置状态、不推进；"等太久就把全队拉到坦克身边（summon）"由 SimScenario 负责。
+        {
+            BotState& rst = StateOf(bot);
+            uint32 const nowMs = WorldTimer::getMSTime();
+            if (bot->IsInCombat() || !GroupNeedsRegroup(bot, rst))
+                rst.regroupSince = 0;
+            else
+            {
+                if (!rst.regroupSince)
+                    rst.regroupSince = nowMs ? nowMs : 1;
+                return false;
+            }
+        }
 
         Map* map = bot->GetMap();
         if (!map || (!map->IsDungeon() && !map->IsRaid()))

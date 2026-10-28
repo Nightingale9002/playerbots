@@ -703,6 +703,9 @@ bool PlayerbotAIConfig::Initialize()
     simMode = config.GetBoolDefault("AiPlayerbot.SimMode", false);
     if (simMode)
         sLog.outError("[SIM] AiPlayerbot.SimMode = 1 —— 仿真模式开启（.bot sim start/stop/status；仅本地使用）");
+    // [2026-10-29] DPS 技能释放状态机（渐进接入，默认关；先只接法师）
+    dpsFsm = config.GetBoolDefault("AiPlayerbot.DpsFsm", false);
+    dpsFsmTuneFile = config.GetStringDefault("AiPlayerbot.DpsFsmTuneFile", "dpsfsm_tune.conf");
     // [2026-10-19] 水里也走 mmap 路径 / 移动自救（跳跃、升降台传送），默认关，本地仿真打开
     waterPath = config.GetBoolDefault("AiPlayerbot.WaterPath", false);
     routeJumpAssist = config.GetBoolDefault("AiPlayerbot.RouteJumpAssist", true);

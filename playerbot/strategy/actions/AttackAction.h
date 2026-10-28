@@ -21,7 +21,12 @@ namespace ai
 
         // [threat 2026-10-17 站长口径] 副本/团本专用门禁：非坦克不许打"坦克还没建立仇恨"的目标。
         // 返回 true = 现在还不该打这个目标。野外恒为 false（不限制）。
-        bool IsWaitingForTankThreat(Unit* target);
+    public:
+        bool IsWaitingForTankThreat(Unit* target) { return WaitingForTankThreat(ai, bot, target); }
+
+        // [2026-10-29] 同一道门的可复用入口：DPS 状态机在副本里也必须守它（否则状态机会 OT）。
+        // 参数名故意与成员同名，函数体一行不用改。
+        static bool WaitingForTankThreat(PlayerbotAI* ai, Player* bot, Unit* target);
 
 #ifdef GenerateBotHelp
         virtual std::string GetHelpName() { return "attack"; }
