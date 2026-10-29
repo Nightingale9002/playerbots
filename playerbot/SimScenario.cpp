@@ -3366,7 +3366,7 @@ uint32 stuckFightCleared = 0;
                     double bestEffCache = 0.0;
                     for (int attempt = 0; attempt < (bisApplied ? 0 : 12); ++attempt)
                     {
-                        factory.EquipGearBest();
+                        { PlayerbotFactory fac(bot, 70); fac.EquipGearBest(); }
                         score = double(bot->GetPlayerbotAI()
                             ? bot->GetPlayerbotAI()->GetEquipGearScore(bot, false, false) : 0);
                         hit = caster
@@ -4235,7 +4235,22 @@ uint32 stuckFightCleared = 0;
                                 d.id, d.spec.c_str(), spNow, apNow, d.meleeSpec ? 1 : 0);
                     }
                     if (d.meleeSpec && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
-                        sLog.outError("[DUMMY] id=%u spec=%s 流水完成后**主手仍为空**（wep=-1）", d.id, d.spec.c_str());
+                    {
+                        // [2026-10-30 实测] 偶发主手仍空（arms 5 目标整场 casts=0、dps=0）。
+                        //   兜底：退一步用 EquipGearBest 让它自己挑一把能用的武器，别带着空手跑测试。
+                        sLog.outError("[DUMMY] id=%u spec=%s 流水完成后**主手仍为空** ⇒ 回退 EquipGearBest", d.id, d.spec.c_str());
+                        { PlayerbotFactory fac(bot, 70); fac.EquipGearBest(); }
+                        bot->SetSkill(SKILL_SWORDS, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->SetSkill(SKILL_2H_SWORDS, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->SetSkill(SKILL_AXES, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->SetSkill(SKILL_2H_AXES, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->SetSkill(SKILL_MACES, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->SetSkill(SKILL_2H_MACES, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->SetSkill(SKILL_POLEARMS, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->SetSkill(SKILL_STAVES, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                        bot->UpdateDamagePhysical(BASE_ATTACK);
+                        bot->UpdateDamagePhysical(OFF_ATTACK);
+                    }
                     sLog.outError("[DUMMY] id=%u spec=%s BIS 流水完成：sp=%d ap=%d",
                         d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
