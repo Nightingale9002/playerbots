@@ -671,26 +671,8 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
     //   空转时只有一次 vector::empty() 判断，线上零开销。
     simscenario::Update();
 
-    // [2026-10-30 站长口径] **最后一道闸**：放在场景驱动之后，
-    //   无论前面（场景补敌 / 核心 Attack / 任何 ChaseTo(0)）把远程职业拉多近，
-    //   这里都把它纠回射程 —— 远程职业绝不进近战。
-    ForEachPlayerbot([](Player* b)
-    {
-        if (!b || !b->IsInWorld() || !b->GetPlayerbotAI() || !b->GetVictim())
-            return;
-        if (!b->GetPlayerbotAI()->HasStrategy("ranged", BotState::BOT_STATE_COMBAT))
-            return;
-        Unit* v = b->GetVictim();
-        if (!v->IsAlive())
-            return;
-        float shoot = b->GetPlayerbotAI()->GetRange("shoot");
-        if (shoot <= 0.0f)
-            shoot = 25.0f;
-        float const keep = shoot - 5.0f;
-        // 同上：MoveChase 的 offset 只管"范围判定"，不会让单位后退；用 DistanceYourself 拉开
-        if (b->GetDistance(v) < keep)
-            b->GetMotionMaster()->DistanceYourself(keep);
-    });
+    // [2026-10-30 已删除] 同 PlayerbotAI 里的"远程不变量"：实测无效且会崩（见那里的说明）。
+
 
 #ifdef MEMORY_MONITOR
     sMemoryMonitor.LogCount(sConfig.GetStringDefault("LogsDir") + "/" + "memory.csv");

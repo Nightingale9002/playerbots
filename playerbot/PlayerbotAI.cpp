@@ -1974,29 +1974,10 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     if (!skipEngine)
         DoNextAction(minimal);
 
-    // =====================================================================================
-    // [2026-10-30 站长口径] **硬性不变量：远程职业绝不走进近战**。
-    //   不管是核心 Attack、某个动作的 ChaseTo(0)、还是场景驱动的补敌，只要距离被拉近，
-    //   这里统一纠回射程（MoveChase 的 offset = 射程-5，留一点缓冲避免抖动）。
-    //   这条不依赖任何具体调用点，所以"无论怎么样"都不会贴脸。
-    // =====================================================================================
-    if (bot->IsInWorld() && HasStrategy("ranged", BotState::BOT_STATE_COMBAT))
-    {
-        Unit* victim = bot->GetVictim();
-        if (victim && victim->IsAlive())
-        {
-            float shoot = GetRange("shoot");
-            if (shoot <= 0.0f)
-                shoot = 25.0f;
-            float const keep = shoot - 5.0f;
-            // [2026-10-30 实测] `MoveChase(v, keep)` **不是"保持距离"**：
-            //   ChaseMovementGenerator 的移动目标仍是 0.5×接触距离（≈1.5~2 码），
-            //   `keep` 只用于"够不够得着"的范围判定；而且 Backpedal 对生物目标被跳过
-            //   ⇒ 只会一路冲进近战。真正能拉开距离的是 `DistanceYourself(dist)`。
-            if (bot->GetDistance(victim) < keep)
-                bot->GetMotionMaster()->DistanceYourself(keep);
-        }
-    }
+    // [2026-10-30 已删除] 这里曾有一条"远程职业绝不进近战"的不变量：
+    //   实测无效（`DistanceYourself` 只在 CHASE 态生效，且会被引擎下一 tick 覆盖），
+    //   更严重的是它会在目标失效时崩在 `ChaseMovementGenerator::DistanceYourself`。
+    //   远程站位问题已在引擎侧（`ReachTargetAction` 的接近距离）和场景侧（站位/后撤）解决。
 
     LogKillEvents();
 }
