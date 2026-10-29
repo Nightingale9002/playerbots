@@ -18,6 +18,7 @@
 #include <random>
 #include <algorithm>
 #include <functional>
+#include <cmath>
 
 using namespace ai;
 
@@ -256,6 +257,10 @@ uint32 stuckFightCleared = 0;
             float ringAngle = 0.0f;   // 共享堆时自己站的角度（一圈人围着打）
             bool centerPile = false;  // true = 假人就摆在 (x,y)（共享堆的堆主）
             bool sharedPile = false;  // true = 这一轮的木桩是全队共用的，收尾时谁都不许删
+            // [2026-10-30] 一堆一个专精后，**堆主也要站到自己那堆外面**（远程 18 码），
+            //   所以"堆心"和"bot 站位"必须分开存：(x,y,z) 一律是 bot 自己的站位，假人摆 pileX/Y/Z。
+            float pileX = 0.0f, pileY = 0.0f, pileZ = 0.0f;
+            bool pileSet = false;     // 堆心是否已确定（单组场景在第一次 Setup 时按"bot 东侧"算出）
             std::map<std::string, double> overrides;   // 本 bot 的参数覆盖（调优并发用）
             std::string armLabel;                      // 例如 "burst_hp=10" 或 "baseline"
             std::vector<std::pair<uint8, uint32>> bisPending;   // 静态 BIS：还没穿上的 (slot,item)
@@ -284,6 +289,8 @@ uint32 stuckFightCleared = 0;
         float const DUMMY_SPOT_X = 16222.3f;
         float const DUMMY_SPOT_Y = 16266.8f;
         float const DUMMY_SPOT_Z = 12.6f;
+        // 一堆多目标时假人围成的半径（m）：第 0 个假人永远在堆心正东 PILE_DUMMY_R 处
+        float const PILE_DUMMY_R = 2.0f;
 
         struct SpecKey
         {
@@ -3362,17 +3369,20 @@ uint32 stuckFightCleared = 0;
             //   随机 bot 常年骑在坐骑上 ⇒ 假人测试会变成"站着挨打、victim 永远是空"。
             if (bot->IsMounted())
                 bot->Unmount();
-            // bot 站在网格点、朝东；假人在它东边 standDist 码处（GM 岛面积小，这样不会掉进海里）
-            if (d.centerPile)
+            // [2026-10-30] (x,y,z) 一律是 bot 自己的站位（堆主也一样），假人的堆心在 pileX/Y/Z。
+            //   顺便按地图实际高度校正一次：GM 岛是座小山，17 个堆的 z 各不相同；
+            //   .map 与 vmap 差个一两码（房子/台阶）也能兜住，差太多就保留布局表里的值。
             {
-                // [2026-10-29 实测] 堆主原来固定站"堆心西侧 3 码"——堆主如果是猎人，
-                //   3 码正好落在 8 码射击死角里，自动射击永远起不来（整场只平砍）。
-                //   改成按这个专精自己的站位距离（近战 3 / 远程 18）。
-                float const off = d.meleeSpec ? 3.0f : d.standDist;
-                bot->TeleportTo(d.mapId, d.x - off, d.y, d.z, 0.0f);
+                float z = d.z;
+                if (Map* map = bot->GetMap())
+                {
+                    float const gz = map->GetHeight(d.x, d.y, z, false);
+                    if (std::fabs(gz - z) <= 6.0f)
+                        z = gz;
+                }
+                bot->TeleportTo(d.mapId, d.x, d.y, z, 0.0f);
+                d.z = z;
             }
-            else
-                bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
             sLog.outError("[DUMMY] id=%u 站位 %.1f 码（近战/远程区分）", d.id, d.standDist);
 
             if (PlayerbotAI* ai = bot->GetPlayerbotAI())
@@ -3661,13 +3671,20 @@ uint32 stuckFightCleared = 0;
                 {
                     ownerId = d.id;
                     d.centerPile = true;
-                    d.x = DUMMY_SPOT_X;
+                    d.pileX = DUMMY_SPOT_X;
+                    d.pileY = DUMMY_SPOT_Y;
+                    d.pileZ = DUMMY_SPOT_Z;
+                    d.pileSet = true;
+                    // 堆主也站到自己那一侧（远程 18 / 近战 3），量的是**离 0 号假人**的距离
+                    //   （假人在堆心正东 PILE_DUMMY_R 处；站到堆心西侧 3 码的话离假人是 5 码，近战够不着）
+                    d.x = DUMMY_SPOT_X + PILE_DUMMY_R - d.standDist;
                     d.y = DUMMY_SPOT_Y;
+                    d.z = DUMMY_SPOT_Z;
                 }
                 else
                 {
                     d.pileOwner = ownerId;
-                    d.x = DUMMY_SPOT_X + cos(d.ringAngle) * d.standDist;
+                    d.x = DUMMY_SPOT_X + PILE_DUMMY_R + cos(d.ringAngle) * d.standDist;
                     d.y = DUMMY_SPOT_Y + sin(d.ringAngle) * d.standDist;
                 }
 
@@ -3707,27 +3724,52 @@ uint32 stuckFightCleared = 0;
                     used.insert(g);
 
             uint32 const n = uint32(sizeof(s_specKeys) / sizeof(s_specKeys[0]));
-            // [2026-10-29 实测] 17 个人围着**同一个**木桩，近战会互相顶出去（combat 45 / arms 11 dps）。
-            //   改成"一轮里 3 堆、每堆 5~6 人"，既是一轮跑完，又不会挤。
-            uint32 const PILES = 3;
-            float const pileX[PILES] = { DUMMY_SPOT_X - 22.0f, DUMMY_SPOT_X, DUMMY_SPOT_X + 22.0f };
-            float const pileY[PILES] = { DUMMY_SPOT_Y, DUMMY_SPOT_Y, DUMMY_SPOT_Y };
-            uint32 ownerIds[PILES] = { 0, 0, 0 };
-            uint32 perPile[PILES] = { 0, 0, 0 };
-            uint32 ownerId = 0;
+            struct PileSpot
+            {
+                float x, y, z;          // 堆心：假人围在这个点 PILE_DUMMY_R 码一圈
+                float standAngle;       // bot 站位方向（弧度）：从 0 号假人（堆心正东 PILE_DUMMY_R）量起
+                float standZ;           // bot 站位处的实测地面高度（近战取 3 码点 / 远程取 18 码点）
+            };
+            // [2026-10-30 站长口径] 一个专精一堆：17 个专精 = 17 堆独立木桩，互不干扰。
+            //   ⚠️ GM 岛（map 1, DUMMY_SPOT）是座小山：z≈12.6 的平地只有沿海一条窄带，
+            //   **30 码见方的 17 堆场地放不下**（实测 5×4 / 4×5 网格最多只能到 19~20 码）。
+            //   所以沿岛的下层台阶排一条 17 点蛇形环带，每堆 z 取地形实测值（运行期再用
+            //   Map::GetHeight 校正一次），两两堆心最小间距 **34.1 码**（≥30 ⇒ AoE 不会跨堆）；
+            //   已避开岛上的房子（chairs 那片 WMO）和 Spirit Healer。
+            //   本表与上面的 s_specKeys 一一对应；坐标/高度来自 ad.exe 的 .map 采样（2026-10-30）。
+            static PileSpot const s_specPiles[] =
+            {
+                { 16346.0f, 16204.0f,  8.1f, 4.5815f,  6.1f },  // fire
+                { 16348.0f, 16238.0f, 13.3f, 1.7890f, 11.6f },  // frost
+                { 16320.0f, 16262.0f, 21.9f, 3.6652f, 23.6f },  // arcane
+                { 16286.0f, 16270.0f, 18.6f, 4.6688f, 19.9f },  // arms
+                { 16262.0f, 16296.0f, 14.2f, 3.5779f, 13.9f },  // fury
+                { 16274.0f, 16328.0f, 13.5f, 0.0000f, 12.8f },  // combat
+                { 16286.0f, 16360.0f, 27.8f, 1.2217f, 28.3f },  // assassination
+                { 16242.0f, 16342.0f, 14.9f, 0.9163f, 16.8f },  // bm
+                { 16210.0f, 16322.0f, 17.8f, 3.0543f, 17.6f },  // marks
+                { 16186.0f, 16294.0f, 13.8f, 1.8326f, 12.5f },  // affliction
+                { 16222.0f, 16272.0f, 12.9f, 3.3161f, 12.9f },  // destro
+                { 16210.0f, 16238.0f,  8.2f, 4.3633f,  7.5f },  // enhance
+                { 16254.0f, 16254.0f, 21.1f, 3.8834f, 22.7f },  // elemental
+                { 16272.0f, 16216.0f, 13.3f, 3.7961f, 14.2f },  // feral
+                { 16310.0f, 16228.0f, 26.6f, 2.4871f, 25.0f },  // balance
+                { 16302.0f, 16306.0f,  8.2f, 5.6287f,  8.3f },  // ret
+                { 16188.0f, 16354.0f, 18.5f, 5.6723f, 20.3f },  // shadow
+            };
+            if (uint32(sizeof(s_specPiles) / sizeof(s_specPiles[0])) != n)
+            {
+                messages.push_back("dummyall: 木桩布局表与专精表长度不一致（改专精表时别忘了它）");
+                return;
+            }
+
             uint32 started = 0;
             std::string skipped;
 
-            // 先按"每堆几个人"预分配角度（第 i 个专精 → 第 i%PILES 堆）
-            for (uint32 i = 0; i < n; ++i)
-                ++perPile[i % PILES];
-
-            uint32 seenInPile[PILES] = { 0, 0, 0 };
-
             for (uint32 i = 0; i < n; ++i)
             {
-                uint32 const pile = i % PILES;
                 SpecKey const& spec = s_specKeys[i];
+                PileSpot const& spot = s_specPiles[i];
                 Player* bot = FindOnlineBotOfClass(spec.cls, used);
                 uint32 loginGuid = 0;
                 if (!bot)
@@ -3771,25 +3813,24 @@ uint32 stuckFightCleared = 0;
                 d.mapId = 1;
                 d.standDist = melee ? 3.0f : 18.0f;
                 d.meleeSpec = melee;
-                d.z = DUMMY_SPOT_Z;
-                d.ringAngle = 6.2831853f * float(seenInPile[pile]) / float(perPile[pile] ? perPile[pile] : 1);
-                ++seenInPile[pile];
-                d.x = pileX[pile];
-                d.y = pileY[pile];
+                // 一堆一个专精：自己就是这堆的堆主，假人摆在 pileX/pileY（不共用别人的堆）。
+                d.pileX = spot.x;
+                d.pileY = spot.y;
+                d.pileZ = spot.z;
+                d.pileSet = true;
+                d.ringAngle = spot.standAngle;
+                // 站位量的是离 **0 号假人** 的距离（假人在堆心正东 PILE_DUMMY_R 处），
+                //   否则近战站在堆心西侧 3 码、离假人其实是 5 码，正好卡在 ATTACK_DISTANCE 边上。
+                d.x = spot.x + PILE_DUMMY_R + cos(spot.standAngle) * d.standDist;
+                d.y = spot.y + sin(spot.standAngle) * d.standDist;
+                d.z = spot.standZ;
 
-                d.sharedPile = true;
-                if (!ownerIds[pile])
-                {
-                    ownerIds[pile] = d.id;
-                    ownerId = d.id;
-                    d.centerPile = true;    // 本堆的堆主：假人就摆在 (x,y)
-                }
-                else
-                {
-                    d.pileOwner = ownerIds[pile];
-                    d.x = pileX[pile] + cos(d.ringAngle) * d.standDist;
-                    d.y = pileY[pile] + sin(d.ringAngle) * d.standDist;
-                }
+                // 一堆一个专精 ⇒ 这堆木桩就是本 run **私有**的：收尾时由 ReportDummy 撤掉自己这一批。
+                //   （旧规则"共享堆谁都不许删"仍保留给 `.rndbot sim arms`：多个臂共用一堆时 sharedPile=true，
+                //    堆主先收尾也不会删掉别人还在打的木桩。）
+                //   不这么清的话，下一轮开始前上一轮的 17 堆还在原地，AoE 会同时打到旧木桩 ⇒ dps 虚高。
+                d.sharedPile = false;
+                d.centerPile = true;
 
                 if (d.waitingLogin)
                 {
@@ -3807,10 +3848,11 @@ uint32 stuckFightCleared = 0;
                 ++started;
             }
 
-            sLog.outError("[DUMMY] dummyall 开跑：%u 个专精、%u 堆、每堆 %u 个木桩、%u 秒、堆主 id=%u/%u/%u、跳过=[%s]",
-                started, PILES, targets, seconds, ownerIds[0], ownerIds[1], ownerIds[2], skipped.c_str());
-            messages.push_back("整队假人开跑：" + std::to_string(started) + " 个专精 × "
-                + std::to_string(targets) + " 个木桩 × " + std::to_string(seconds) + " 秒"
+            sLog.outError("[DUMMY] dummyall 开跑：%u 个专精 = %u 堆独立木桩（每堆 %u 个）、%u 秒、"
+                "最小堆心间距 34.1 码（≥30）、跳过=[%s]",
+                started, started, targets, seconds, skipped.c_str());
+            messages.push_back("整队假人开跑：" + std::to_string(started) + " 个专精，各自独立木桩 × "
+                + std::to_string(targets) + " 个 × " + std::to_string(seconds) + " 秒"
                 + (skipped.empty() ? "" : "；跳过（无在线 bot）：" + skipped));
         }
 
@@ -3822,16 +3864,24 @@ uint32 stuckFightCleared = 0;
             if (!map)
                 return false;
 
-            float const r = 2.0f;
-            float const cx = d.centerPile ? d.x : (d.x + d.standDist);   // 共享堆时 (x,y) 就是堆心
-            float const cy = d.y;
+            float const r = PILE_DUMMY_R;
+            // [2026-10-30] 假人摆在自己那一堆的堆心（pileX/pileY），不是 bot 站位 (x,y)。
+            float cx = d.pileX;
+            float cy = d.pileY;
+            float cz = d.pileZ;
+            {
+                float const gz = map->GetHeight(cx, cy, cz, false);
+                if (std::fabs(gz - cz) <= 6.0f)
+                    cz = gz;
+                d.pileZ = cz;
+            }
             for (uint32 i = 0; i < d.targets; ++i)
             {
                 float const ang = (2.0f * 3.14159265358979f * float(i)) / float(d.targets);
                 float const px = cx + cos(ang) * r;
                 float const py = cy + sin(ang) * r;
                 // 190014 = 普通训练假人（100 万血、无技能、不还手）；faction 14 = 敌对，否则 bot 打不了
-                Creature* c = bot->SummonCreature(190014, px, py, d.z, ang,
+                Creature* c = bot->SummonCreature(190014, px, py, cz, ang,
                     TEMPSPAWN_TIMED_OR_DEAD_DESPAWN, d.durationMs + 120000, false, false, 0, 14);
                 if (!c)
                 {
@@ -3852,9 +3902,9 @@ uint32 stuckFightCleared = 0;
                 // 召唤出来的副本也补一遍（不依赖 DB 重载）：STUNNED 禁用转身，PACIFIED 让它不主动出手。
                 c->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_STUNNED | UNIT_FLAG_PACIFIED);
                 c->Relocate(px, py, c->GetPositionZ());
-                if (c->GetPositionZ() < d.z - 5.0f || c->GetPositionZ() > d.z + 20.0f)
-                    sLog.outError("[DUMMY] id=%u 假人落点异常 z=%.1f（bot z=%.1f）⇒ 可能掉进水里/地形下",
-                        d.id, c->GetPositionZ(), d.z);
+                if (c->GetPositionZ() < cz - 5.0f || c->GetPositionZ() > cz + 20.0f)
+                    sLog.outError("[DUMMY] id=%u 假人落点异常 z=%.1f（堆心 z=%.1f）⇒ 可能掉进水里/地形下",
+                        d.id, c->GetPositionZ(), cz);
                 // 模板血量可能没跟 SQL 对齐（实测只有几千）⇒ 强制拉到 100 万，2 分钟打不死
                 // 共享堆时一堆人围打：100 万撑不住（17 人 × 500 dps × 60s ≈ 51 万，留余量）
                 c->SetMaxHealth(5000000);
@@ -4004,6 +4054,16 @@ uint32 stuckFightCleared = 0;
 
                 if (!d.setupDone)
                     ApplyDummySetup(d, bot);
+
+                // [2026-10-30] 单组场景（`.rndbot sim dummy`）没在启动时给堆心：按老规矩摆在 bot 东侧
+                //   standDist 码处（ApplyDummySetup 刚算好近战/远程的 standDist）。dummyall/arms 已自带堆心。
+                if (!d.pileSet && !d.pileOwner)
+                {
+                    d.pileX = d.x + d.standDist;
+                    d.pileY = d.y;
+                    d.pileZ = d.z;
+                    d.pileSet = true;
+                }
 
                 // BIS 流水：每 tick 只穿一件（站长口径），穿完刷新武器技能/伤害再开始计时
                 if (!d.gearReady && bot->IsInWorld())
