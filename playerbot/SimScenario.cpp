@@ -256,6 +256,9 @@ uint32 stuckFightCleared = 0;
             bool waitingLogin = false;
             bool setupDone = false;
             uint32 pinnedGuid = 0;      // 调优时要"同一只 bot 复测"，不能每轮换人
+            uint8 tab = 0;              // 目标天赋树
+            bool respec = true;         // 开跑前按目标专精重天赋 + 换最好装备
+            bool respecced = false;
             bool useFsm = true;         // false = 这一轮关掉 DPS 状态机（A/B 对照基线）
             // 基线（用来算增量）
             uint64 dmg0 = 0, pet0 = 0, melee0 = 0, casts0 = 0;
@@ -277,27 +280,32 @@ uint32 stuckFightCleared = 0;
             char const* enable;
             char const* disable1;
             char const* disable2;
+            uint8 tab;          // 该职业的天赋树序号（talentTab.tabpage：0/1/2）
         };
 
         SpecKey const s_specKeys[] =
         {
-            { "fire",        CLASS_MAGE,    "fire",          "frost",        "arcane" },
-            { "frost",       CLASS_MAGE,    "frost",         "fire",         "arcane" },
-            { "arcane",      CLASS_MAGE,    "arcane",        "fire",         "frost" },
-            { "arms",        CLASS_WARRIOR, "arms",          "fury",         "protection" },
-            { "fury",        CLASS_WARRIOR, "fury",          "arms",         "protection" },
-            { "combat",      CLASS_ROGUE,   "combat",        "assassination","subtlety" },
-            { "assassination",CLASS_ROGUE,  "assassination", "combat",       "subtlety" },
-            { "bm",          CLASS_HUNTER,  "beast mastery", "marksmanship", "survival" },
-            { "marks",       CLASS_HUNTER,  "marksmanship",  "beast mastery","survival" },
-            { "affliction",  CLASS_WARLOCK, "affliction",    "demonology",   "destruction" },
-            { "destro",      CLASS_WARLOCK, "destruction",   "affliction",   "demonology" },
-            { "enhance",     CLASS_SHAMAN,  "enhancement",   "elemental",    "restoration" },
-            { "elemental",   CLASS_SHAMAN,  "elemental",     "enhancement",  "restoration" },
-            { "feral",       CLASS_DRUID,   "feral",         "balance",      "restoration" },
-            { "balance",     CLASS_DRUID,   "balance",       "feral",        "restoration" },
-            { "ret",         CLASS_PALADIN, "retribution",   "protection",   "holy" },
-            { "shadow",      CLASS_PRIEST,  "shadow",        "discipline",   "holy" },
+            // mage: 0=奥 1=火 2=冰 | warrior: 0=武器 1=狂暴 2=防护 | rogue: 0=刺杀 1=战斗 2=敏锐
+            { "fire",         CLASS_MAGE,    "fire",          "frost",         "arcane",       1 },
+            { "frost",        CLASS_MAGE,    "frost",         "fire",          "arcane",       2 },
+            { "arcane",       CLASS_MAGE,    "arcane",        "fire",          "frost",        0 },
+            { "arms",         CLASS_WARRIOR, "arms",          "fury",          "protection",   0 },
+            { "fury",         CLASS_WARRIOR, "fury",          "arms",          "protection",   1 },
+            { "combat",       CLASS_ROGUE,   "combat",        "assassination", "subtlety",     1 },
+            { "assassination",CLASS_ROGUE,   "assassination", "combat",        "subtlety",     0 },
+            // hunter: 0=兽王 1=射击 2=生存 | warlock: 0=痛苦 1=恶魔 2=毁灭
+            { "bm",           CLASS_HUNTER,  "beast mastery", "marksmanship",  "survival",     0 },
+            { "marks",        CLASS_HUNTER,  "marksmanship",  "beast mastery", "survival",     1 },
+            { "affliction",   CLASS_WARLOCK, "affliction",    "demonology",    "destruction",  0 },
+            { "destro",       CLASS_WARLOCK, "destruction",   "affliction",    "demonology",   2 },
+            // shaman: 0=元素 1=增强 2=恢复 | druid: 0=平衡 1=野性 2=恢复
+            { "enhance",      CLASS_SHAMAN,  "enhancement",   "elemental",     "restoration",  1 },
+            { "elemental",    CLASS_SHAMAN,  "elemental",     "enhancement",   "restoration",  0 },
+            { "feral",        CLASS_DRUID,   "feral",         "balance",       "restoration",  1 },
+            { "balance",      CLASS_DRUID,   "balance",       "feral",         "restoration",  0 },
+            // paladin: 0=神圣 1=防护 2=惩戒 | priest: 0=戒律 1=神圣 2=暗影
+            { "ret",          CLASS_PALADIN, "retribution",   "protection",    "holy",         2 },
+            { "shadow",       CLASS_PRIEST,  "shadow",        "discipline",    "holy",         2 },
         };
 
         SpecKey const* FindSpecKey(std::string const& key)
@@ -3158,6 +3166,25 @@ uint32 stuckFightCleared = 0;
         void ApplyDummySetup(DummyRun& d, Player* bot)
         {
             d.setupDone = true;
+
+            // [2026-10-29 站长口径] "毕业装 bot 也只有 500 dps" 的根因之一：随机 bot 的天赋树是随机的、
+            //   装备也是旧的（StaticBots=1 不会自己换）。这里按目标专精**重天赋 + 换最好装备**，
+            //   否则测的既不是毕业装、也不是这个专精的循环上限。
+            if (d.respec && !d.respecced)
+            {
+                d.respecced = true;
+                if (bot->GetLevel() >= 70)
+                {
+                    bot->resetTalents(true);
+                    sRandomPlayerbotMgr.SetValue(bot, "specNo", uint32(d.tab) + 1);
+                    PlayerbotFactory factory(bot, 70);
+                    factory.Randomize(false, false);
+                    sLog.outError("[DUMMY] id=%u spec=%s 已重天赋(tab=%u)+换装：sp=%d ap=%d",
+                        d.id, d.spec.c_str(), (uint32)d.tab,
+                        int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
+                        int(bot->GetTotalAttackPowerValue(BASE_ATTACK)));
+                }
+            }
             // 近战要贴脸、远程要离 18 码（猎人有 8 码死角），否则状态机整场卡在 Approach
             {
                 bool const melee = (d.cls == CLASS_WARRIOR || d.cls == CLASS_ROGUE
@@ -3192,7 +3219,7 @@ uint32 stuckFightCleared = 0;
         }
 
         bool StartDummy(std::list<std::string>& messages, std::string const& key, uint32 targets, uint32 seconds,
-                        uint32 pinnedGuid = 0, bool useFsm = true)
+                        uint32 pinnedGuid = 0, bool useFsm = true, bool respec = true)
         {
             SpecKey const* spec = FindSpecKey(key);
             if (!spec)
@@ -3249,14 +3276,16 @@ uint32 stuckFightCleared = 0;
                 d0.enable = spec->enable;
                 d0.disable1 = spec->disable1;
                 d0.disable2 = spec->disable2;
+                d0.tab = spec->tab;
+                d0.respec = respec;
                 d0.targets = targets;
                 d0.durationMs = seconds * 1000;
                 d0.startMs = Now();
                 d0.guid = pinnedGuid ? pinnedGuid : pick->guid;
                 d0.pinnedGuid = pinnedGuid;
                 d0.mapId = 1;
-                d0.x = DUMMY_SPOT_X + 12.0f * float(int(d0.id % 3) - 1);
-                d0.y = DUMMY_SPOT_Y;
+                d0.x = DUMMY_SPOT_X + 14.0f * float(int(d0.id % 3) - 1);
+                d0.y = DUMMY_SPOT_Y + 14.0f * float(int((d0.id / 3) % 2));
                 d0.z = DUMMY_SPOT_Z;
                 d0.waitingLogin = true;
                 d0.useFsm = useFsm;
@@ -3282,6 +3311,8 @@ uint32 stuckFightCleared = 0;
             d.enable = spec->enable;
             d.disable1 = spec->disable1;
             d.disable2 = spec->disable2;
+            d.tab = spec->tab;
+            d.respec = respec;
             d.targets = targets;
             d.durationMs = seconds * 1000;
             d.startMs = Now();
@@ -3290,9 +3321,9 @@ uint32 stuckFightCleared = 0;
             d.useFsm = useFsm;
             d.mapId = 1;
             // 每个场景错开 40 码（3x2 网格），这样才能同时跑很多组互不干扰
-            // GM 岛不大：3 个测点横排 ±12 码，假人再往东 standDist ⇒ 全部留在岛上
-            d.x = DUMMY_SPOT_X + 12.0f * float(int(d.id % 3) - 1);
-            d.y = DUMMY_SPOT_Y;
+            // GM 岛不大：3 列 × 2 行（列距 14、行距 14），假人再往东 standDist ⇒ 全部留在岛上
+            d.x = DUMMY_SPOT_X + 14.0f * float(int(d.id % 3) - 1);
+            d.y = DUMMY_SPOT_Y + 14.0f * float(int((d.id / 3) % 2));
             d.z = DUMMY_SPOT_Z;
 
             bot->CombatStopWithPets(true);
@@ -3345,6 +3376,7 @@ uint32 stuckFightCleared = 0;
                 c->SetHealth(c->GetMaxHealth());
                 d.dummies.push_back(c->GetObjectGuid());
             }
+            dpsfsm::SetScenarioTargets(d.guid, d.dummies);   // pack 只数自己的假人
             return !d.dummies.empty();
         }
 
@@ -3379,10 +3411,18 @@ uint32 stuckFightCleared = 0;
                 }
             }
 
-            std::string extra = "fsm=";
-            extra += d.useFsm ? "1" : "0";
+            std::string extra = "";
             if (bot)
             {
+                // 属性：用来判断这一轮到底是不是"毕业装"（法伤 / 攻强）
+                extra += "sp=" + std::to_string(int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)));
+                extra += " ap=" + std::to_string(int(bot->GetTotalAttackPowerValue(BASE_ATTACK))) + " ";
+                // pack = 该场景里 bot 半径 10/30 码看到的敌对数量（1 目标场景应当只有自己的假人）
+                int const pack10 = dpsfsm::PackCount(bot, 10.0f);
+                int const pack30 = dpsfsm::PackCount(bot, 30.0f);
+                extra += "pack=" + std::to_string(pack10) + "/" + std::to_string(pack30);
+                extra += " fsm=";
+                extra += d.useFsm ? "1" : "0";
                 extra += " incombat=";
                 extra += bot->IsInCombat() ? "1" : "0";
                 extra += " victim=";
@@ -3396,6 +3436,7 @@ uint32 stuckFightCleared = 0;
                 sec > 0.0 ? total / sec : 0.0, (unsigned long long)casts, (unsigned long long)melee,
                 top.empty() ? "-" : top.c_str());
 
+            dpsfsm::SetScenarioTargets(d.guid, std::vector<ObjectGuid>());
             // 收尾：撤假人 + 停手
             if (bot)
             {
@@ -3496,6 +3537,18 @@ uint32 stuckFightCleared = 0;
                         Event pullEvent("attack anything", first->GetObjectGuid());
                         bool const acted = bot->GetPlayerbotAI()->DoSpecificAction("attack anything", pullEvent, true);
                         bool const direct = bot->GetVictim() ? false : bot->Attack(first, true);
+                        // 动作路径偶尔不落地（实测 elemental/affliction 整场 incombat=0），
+                        //   补一次直接 Attack —— 现在先把坐骑下了，Unit::Attack 不会再被 mount 检查挡掉
+                        if (!bot->GetVictim() && !bot->IsMounted() && first->IsAlive())
+                            bot->Attack(first, true);
+                        // Unit::Attack 有个坑：如果 bot 还挂在目标的 m_attackers 里（但自己的 m_attacking 已清空），
+                        //   _addAttacker 返回 false ⇒ Attack 直接失败，而且之后每次都失败（实测整场 victim 拿不到）。
+                        //   先 CombatStop 把这个状态清干净，再咬一次。
+                        if (!bot->GetVictim() && !bot->IsMounted() && first->IsAlive())
+                        {
+                            bot->CombatStopWithPets(true);
+                            bot->Attack(first, true);
+                        }
                         if (!bot->GetVictim() && bot->IsMounted())
                         {
                             bot->Unmount();
@@ -3889,7 +3942,8 @@ uint32 stuckFightCleared = 0;
             uint32 seconds = args.size() > 3 ? uint32(atoi(args[3].c_str())) : 120;
             uint32 pinBot = args.size() > 4 ? uint32(atoi(args[4].c_str())) : 0;
             bool useFsm = !(args.size() > 5 && atoi(args[5].c_str()) == 0);
-            StartDummy(messages, args[1], targets, seconds, pinBot, useFsm);
+            bool respec = !(args.size() > 6 && atoi(args[6].c_str()) == 0);   // 第 7 个参数传 0 = 不重天赋
+            StartDummy(messages, args[1], targets, seconds, pinBot, useFsm, respec);
             return messages;
         }
 

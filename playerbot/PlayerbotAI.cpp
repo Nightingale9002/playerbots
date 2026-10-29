@@ -1956,10 +1956,11 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
 
     // [2026-10-29 站长口径] DPS 技能释放状态机：开启时先由状态机决策本 GCD 的施法，
     //   再走原引擎（其他动作/走位/打断保持不动）。默认关。
-    if (sPlayerbotAIConfig.dpsFsm)
-        dpsfsm::Tick(this);
-
-	DoNextAction(minimal);
+    // [2026-10-29] 假人场景里状态机全权负责技能：引擎这一步不再插施法（它原来会抢 GCD：
+    //   补 buff / 魔杖平射 / 重复挂圣印，实测把 DPS 压掉一大半）。副本里仍照旧走引擎。
+    bool const fsmHandled = sPlayerbotAIConfig.dpsFsm && dpsfsm::Tick(this);
+    if (!fsmHandled || !dpsfsm::SkipEngine(bot->GetGUIDLow()))
+        DoNextAction(minimal);
     LogKillEvents();
 }
 
@@ -5517,18 +5518,19 @@ bool PlayerbotAI::CastSpell(std::string name, Unit* target, Item* itemTarget, bo
     return result;
 }
 
+// [2026-10-29 实测] 旧写法在**函数作用域退出时无条件记录**，于是被拦下来的施法也算一次：
+//   实测 "arms 40 秒 621~1204 次施法"、"惩戒骑审判 375 次" 全是尝试次数。
+//   现在拆成两层：CastSpell 只在**真正成功**时记账，实际逻辑在 CastSpellBody 里。
 bool PlayerbotAI::CastSpell(uint32 spellId, Unit* target, Item* itemTarget, bool waitForSpell, uint32* outSpellDuration)
 {
-    struct CastRecorder
-    {
-        PlayerbotAI* ai; uint32 spell;
-        CastRecorder(PlayerbotAI* a, uint32 sp) : ai(a), spell(sp) {}
-        ~CastRecorder()
-        {
-            if (ai && ai->GetBot())
-                PlayerbotAI::RecordSpellCast(ai->GetBot()->GetObjectGuid(), spell);
-        }
-    } _castRecorder(this, spellId);
+    bool const ok = CastSpellBody(spellId, target, itemTarget, waitForSpell, outSpellDuration);
+    if (ok && spellId && bot)
+        PlayerbotAI::RecordSpellCast(bot->GetObjectGuid(), spellId);
+    return ok;
+}
+
+bool PlayerbotAI::CastSpellBody(uint32 spellId, Unit* target, Item* itemTarget, bool waitForSpell, uint32* outSpellDuration)
+{
     if (!spellId)
         return false;
 

@@ -594,6 +594,8 @@ public:
 
     virtual bool CastSpell(std::string name, Unit* target, Item* itemTarget = nullptr, bool waitForSpell = true, uint32* outSpellDuration = nullptr);
     bool CastSpell(uint32 spellId, Unit* target, Item* itemTarget = nullptr, bool waitForSpell = true, uint32* outSpellDuration = nullptr);
+    // [2026-10-29] 真正干活的实现；外层 CastSpell 只在成功时记 botCasts（原来失败也记）
+    bool CastSpellBody(uint32 spellId, Unit* target, Item* itemTarget, bool waitForSpell, uint32* outSpellDuration);
     bool CastSpell(uint32 spellId, GameObject* goTarget, Item* itemTarget = nullptr, bool waitForSpell = true, uint32* outSpellDuration = nullptr);
     bool CastSpell(uint32 spellId, float x, float y, float z, Item* itemTarget = nullptr, bool waitForSpell = true, uint32* outSpellDuration = nullptr);
     bool CastPetSpell(uint32 spellId, Unit* target);

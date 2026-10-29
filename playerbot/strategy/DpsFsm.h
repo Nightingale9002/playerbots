@@ -70,6 +70,20 @@ namespace ai
 
         Spec DetectSpec(PlayerbotAI* ai);
 
+        // 该 bot 半径 range 内看到的敌对数量（假人场景用来证明"1 目标就是 1 个目标"）
+        int PackCount(Player* bot, float range);
+
+        // 假人场景专用：声明"这一轮只有这些目标是自己的" ⇒ pack 统计只数它们，
+        //   避免多组同时跑时把邻居的假人算进 AoE 判断（1 目标场景被误判成群架）。
+        void SetScenarioTargets(uint32 guid, std::vector<ObjectGuid> const& targets);
+
+        // 假人场景：没有 victim 时自己咬上去（只对"声明过的场景目标"生效，副本里不改变行为）
+        bool EngageScenarioTarget(PlayerbotAI* ai);
+
+        // 假人场景里状态机已经全权处理技能：让引擎这一步不要再插自己的施法（避免抢 GCD）。
+        //   副本里返回 false（引擎照常跑），保证走位/打断/救人不受影响。
+        bool SkipEngine(uint32 guid);
+
         // [2026-10-29] 单只 bot 开关（A/B 对照：同一轮里一部分 bot 走状态机、一部分走原引擎）
         void SetBotEnabled(uint32 guid, bool on);
 

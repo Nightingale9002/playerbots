@@ -95,6 +95,11 @@ namespace
         std::set<std::string> flags;            // 一次性判断结果（如是否有强化灼烧）
 
         time_t lastTrinketTry = 0;
+        time_t sealAt = 0;       // 上一次成功挂圣印的时间（圣印 30 秒，不用每 tick 重挂）
+        std::map<uint32, time_t> failUntil;   // 技能 id → 这个时间点之前别再试（施法被拒的退避）
+        std::map<uint32, time_t> lastOk;       // 技能 id → 上次成功时间
+        uint32 hbLast = 0;                     // 这只 bot 上次打心跳的时间
+        time_t lastEngageLog = 0;              // "咬不上去"日志节流
         time_t lastSummary = 0;
         uint32 castCount = 0;
         uint32 tickCount = 0;
@@ -103,6 +108,7 @@ namespace
     std::mutex s_disabledMutex;
     std::set<uint32> s_disabled;      // A/B 对照：这些 guid 这一轮不走状态机
     std::set<uint32> s_forceDps;      // 假人测试：强制按 DPS 打（忽略坦/奶角色门）
+    std::map<uint32, std::set<ObjectGuid>> s_scenarioTargets;   // guid → 这一轮"自己的"假人
 
     std::mutex s_memMutex;
     std::unordered_map<uint32, std::unique_ptr<BotMem>> s_mem;
@@ -258,6 +264,14 @@ namespace
 
     int CountHostilesNear(PlayerbotAI* ai, Player* bot, float range)
     {
+        // 假人场景声明过目标集时，只数这些目标（否则会把邻居测点的假人算进 AoE 判断）
+        std::set<ObjectGuid> scenario;
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            auto it = s_scenarioTargets.find(bot->GetGUIDLow());
+            if (it != s_scenarioTargets.end())
+                scenario = it->second;
+        }
         if (!bot || !bot->GetMap() || !ai)
             return 0;
         auto* value = ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid>>("possible targets");
@@ -272,6 +286,8 @@ namespace
             if (bot->GetDistance(u) > range)
                 continue;
             if (!sServerFacade.IsHostileTo(bot, u))
+                continue;
+            if (!scenario.empty() && !scenario.count(u->GetObjectGuid()))
                 continue;
             ++n;
         }
@@ -333,15 +349,43 @@ namespace
             m->castCount = 0;
     }
 
-    bool TryCast(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, Unit* target)
+    // [2026-10-29 诊断结论] 原来只判 IsSpellReady 就放，失败也照样每 tick 重试（怒气不够、目标闪避条件、
+    //   移动中读条被静默取消…），统计里就出现 "40 秒 1204 次施法"。现在：①先跑一遍完整的 CanCastSpell
+    //   （Spell::CheckCast 的怒气/射程/朝向/条件都算上）；②失败按 globalCoolDown 退避，别死循环重试。
+    bool CastChecked(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, Unit* target, Unit* selfTarget = nullptr)
     {
         uint32 id = SpellId(ai, s.bot, m, name);
         if (!Ready(s.bot, id))
             return false;
-        if (!ai->CastSpell(id, target ? target : s.target))
+
+        time_t const now = time(nullptr);
+        auto it = m->failUntil.find(id);
+        if (it != m->failUntil.end() && now < it->second)
+            return false;
+
+        Unit* tgt = selfTarget ? selfTarget : (target ? target : s.target);
+        SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+        if (!ai->CanCastSpell(id, tgt, 0, false, nullptr, false, false, false, &res))
+        {
+            m->failUntil[id] = now + 2;   // 2 秒退避（≥ GCD），别每 tick 重试
+            return false;
+        }
+        if (!ai->CastSpell(id, tgt))
             return false;
         ++m->castCount;
+        m->lastOk[id] = now;
         return true;
+    }
+
+    bool TryCast(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, Unit* target)
+    {
+        return CastChecked(ai, m, s, name, target);
+    }
+
+    // 自身增益（圣印/守护/暗影形态/战斗怒吼…）必须打在自己身上：打敌人会被判为负面法术而失败
+    bool TryCastSelf(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        return CastChecked(ai, m, s, name, nullptr, s.bot);
     }
 
     bool TryCastAt(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, float x, float y, float z)
@@ -493,6 +537,10 @@ namespace
 
                 if (fire)
                 {
+                    // [2026-10-29] 大招/饰品原来只在"斩杀 Burst"里放 ⇒ 打木桩（满血）永远不用。
+                    //   燃烧/冰冷血脉/奥强这类"CD 好了就该放"，放进常规循环。
+                    if (UseTrinket(ai, m, s)) break;
+                    if (CastFirst(ai, m, s, { "combustion" })) break;
                     // 强化灼烧：目标身上叠层 <5 就补灼烧；没这天赋（从没见过该 debuff）就跳过。
 
                     // 叠层 debuff 与灼烧本体不是同一个 id（强化灼烧挂的是"火焰易伤"），两个名字都查。
@@ -508,11 +556,15 @@ namespace
                 }
                 else if (frost)
                 {
+                    if (UseTrinket(ai, m, s)) break;
+                    if (CastFirst(ai, m, s, { "icy veins" })) break;
                     // 水元素：没宠物又学会就叫一只（一次性开销，别�?tick 试）
                     if (!s.bot->GetPet() && CastFirst(ai, m, s, { "summon water elemental" })) break;
                 }
                 else
                 {
+                    if (UseTrinket(ai, m, s)) break;
+                    if (CastFirst(ai, m, s, { "arcane power" })) break;
                     // 奥：奥术冲击叠到 3 层就放奥术飞弹泄掉
 
                     int const blastStacks = AuraStacks(ai, s.bot, m, "arcane blast", s.bot);
@@ -578,12 +630,22 @@ namespace
         return Spec::Unknown;
     }
 
+    // [2026-10-29 实测] 英勇打击/顺劈/重殴这类"下一次挥击附带"的技能没有冷却，
+    //   每个 AI tick 都能重新施放 —— 实测 arms 40 秒刷了 1116 次、fury 934 次，
+    //   既白烧怒气也把施法统计搞脏。它们排进 CURRENT_MELEE_SPELL 就说明已经挂上了，不用再放。
+    bool TrySwing(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        if (s.bot->GetCurrentSpell(CURRENT_MELEE_SPELL))
+            return false;
+        return TryCast(ai, m, s, name, nullptr);
+    }
+
     // ============================ 战士 ============================
     bool TickWarrior(PlayerbotAI* ai, BotMem* m)
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
         if (m->spec == Spec::Protection) return false;   // 防御坦的技能后面单独做
 
@@ -612,7 +674,7 @@ namespace
             case State::Aoe:
                 if (CastFirst(ai, m, s, { "sweeping strikes" })) break;
                 if (CastFirst(ai, m, s, { "whirlwind" })) break;
-                if (s.rage >= 60 && CastFirst(ai, m, s, { "cleave" })) break;
+                if (s.rage >= 60 && TrySwing(ai, m, s, "cleave")) break;
                 break;
             case State::Burst:
                 if (UseTrinket(ai, m, s)) break;
@@ -623,11 +685,13 @@ namespace
             case State::Burn:
             default:
                 st = State::Burn;
+                if (UseTrinket(ai, m, s)) break;
+                if (fury && CastFirst(ai, m, s, { "death wish" })) break;
                 if (CastFirst(ai, m, s, { fury ? "bloodthirst" : "mortal strike" })) break;
                 if (CastFirst(ai, m, s, { "whirlwind" })) break;
                 if (CastFirst(ai, m, s, { "overpower" })) break;
                 if (!fury && CastFirst(ai, m, s, { "slam" })) break;
-                if (s.rage >= 60 && CastFirst(ai, m, s, { "heroic strike" })) break;
+                if (s.rage >= 60 && TrySwing(ai, m, s, "heroic strike")) break;
                 break;   // 怒气不够就等普攻，别硬放
         }
 
@@ -640,7 +704,7 @@ namespace
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
 
         bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
@@ -672,14 +736,22 @@ namespace
             {
                 st = State::Burn;
                 // 切割常驻：有星就先补，再攒星；终结技走毒�?剔骨
+                if (UseTrinket(ai, m, s)) break;
+                if (!mutilate && CastFirst(ai, m, s, { "adrenaline rush" })) break;
+                if (CastFirst(ai, m, s, { "blade flurry" })) break;
+                if (mutilate && CastFirst(ai, m, s, { "cold blood" })) break;
+                // 切割：原来 1 星就切（垃圾），改成 4 星以上才切；之后再用 5 星终结技
                 bool const sndUp = AuraStacks(ai, s.bot, m, "slice and dice", s.bot) > 0;
-                if (!sndUp && s.combo >= 1 && CastFirst(ai, m, s, { "slice and dice" })) break;
-                if (s.combo >= 4)
+                if (!sndUp && s.combo >= 4 && CastFirst(ai, m, s, { "slice and dice" })) break;
+                if (sndUp && s.combo >= 4)
                 {
                     if (mutilate && CastFirst(ai, m, s, { "envenom" })) break;
                     if (!mutilate && CastFirst(ai, m, s, { "eviscerate" })) break;
                 }
-                if (CastFirst(ai, m, s, { mutilate ? "mutilate" : "sinister strike" })) break;
+                // 毁灭/毁伤要求匕首 + 背后；随机 bot 经常不满足 ⇒ 一定留个邪恶攻击兜底，
+                //   否则整场 0 施法（实测 assassination 40 秒 casts=0、只有 2 次平砍）。
+                if (CastFirst(ai, m, s, mutilate ? std::initializer_list<char const*>{ "mutilate", "sinister strike" }
+                                                 : std::initializer_list<char const*>{ "sinister strike" })) break;
                 break;
             }
         }
@@ -693,7 +765,7 @@ namespace
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
 
         bool const mm = (m->spec == Spec::Marksmanship);
@@ -711,6 +783,12 @@ namespace
         int constexpr STEADY_CAST_MS = 1500;
         int constexpr AIMED_CAST_MS = 3000;
         uint32 const autoRemainMs = s.bot->getAttackTimer(RANGED_ATTACK);
+        // 自动射击没起手时计时器是 0，只按"窗口够不够"判会永远进 Weave（实测 marks 整场 casts=0）。
+        if (autoRemainMs == 0 && !s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        {
+            if (TryCast(ai, m, s, "auto shot", nullptr))
+                return true;
+        }
         uint32 const weaveMargin = uint32(TP(m, "weave_margin", 150.0));
         bool const canSteady = !s.moving && autoRemainMs > uint32(STEADY_CAST_MS + int(weaveMargin));
         bool const canAimed = !s.moving && autoRemainMs > uint32(AIMED_CAST_MS + int(weaveMargin));
@@ -744,7 +822,7 @@ namespace
             case State::Recover:
                 // 蝰蛇守护回蓝（有就用），否则平射
                 if (AuraStacks(ai, s.bot, m, "aspect of the viper", s.bot) == 0
-                    && CastFirst(ai, m, s, { "aspect of the viper" })) break;
+                    && TryCastSelf(ai, m, s, "aspect of the viper")) break;
                 CastFirst(ai, m, s, { "shoot" });
                 break;
             case State::Aoe:
@@ -765,6 +843,9 @@ namespace
             default:
             {
                 st = State::Burn;
+                if (UseTrinket(ai, m, s)) break;
+                if (CastFirst(ai, m, s, { "bestial wrath" })) break;
+                if (CastFirst(ai, m, s, { "kill command" })) break;
                 if (AuraStacks(ai, s.bot, m, "hunter's mark", s.target) == 0 && CastFirst(ai, m, s, { "hunter's mark" })) break;
                 if (AuraStacks(ai, s.bot, m, "serpent sting", s.target) == 0 && CastFirst(ai, m, s, { "serpent sting" })) break;
                 if (CastFirst(ai, m, s, { "multi-shot" })) break;
@@ -785,7 +866,7 @@ namespace
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
 
         bool const affliction = (m->spec == Spec::Affliction);
@@ -834,6 +915,7 @@ namespace
             default:
             {
                 st = State::Burn;
+                if (UseTrinket(ai, m, s)) break;
                 if (AuraStacks(ai, s.bot, m, "curse of elements", s.target) == 0
                     && AuraStacks(ai, s.bot, m, "curse of shadows", s.target) == 0
                     && AuraStacks(ai, s.bot, m, "curse of agony", s.target) == 0)
@@ -869,7 +951,7 @@ namespace
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
 
         bool const enhance = (m->spec == Spec::Enhancement);
@@ -904,7 +986,7 @@ namespace
             case State::Aoe:
                 if (CastFirst(ai, m, s, { "chain lightning" })) break;
                 if (CastFirst(ai, m, s, { "magma totem" })) break;
-                CastFirst(ai, m, s, { "lightning shield" });
+                TryCastSelf(ai, m, s, "lightning shield");
                 break;
             case State::Burst:
                 if (UseTrinket(ai, m, s)) break;
@@ -926,8 +1008,11 @@ namespace
             default:
             {
                 st = State::Burn;
+                if (UseTrinket(ai, m, s)) break;
                 if (enhance)
                 {
+                    if (CastFirst(ai, m, s, { "bloodlust" })) break;
+                    if (CastFirst(ai, m, s, { "heroism" })) break;
                     if (CastFirst(ai, m, s, { "stormstrike" })) break;
                     // 震击共用冷却：烈焰震击常驻，地球震击补位
                     if (AuraStacks(ai, s.bot, m, "flame shock", s.target) == 0 && CastFirst(ai, m, s, { "flame shock" })) break;
@@ -935,6 +1020,7 @@ namespace
                     break;   // 其余等普攻/风怒
 
                 }
+                if (CastFirst(ai, m, s, { "elemental mastery" })) break;
                 if (AuraStacks(ai, s.bot, m, "flame shock", s.target) == 0 && CastFirst(ai, m, s, { "flame shock" })) break;
                 if (CastFirst(ai, m, s, { "chain lightning" })) break;
                 CastFirst(ai, m, s, { "lightning bolt" });
@@ -951,7 +1037,7 @@ namespace
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
 
         bool const feral = (m->spec == Spec::Feral);
@@ -965,7 +1051,7 @@ namespace
                 // 已经挂着变形光环却仍认为"不在猫形态"时别再刷（实测 40 秒刷了 140 次 Cat Form）
                 if (AuraStacks(ai, s.bot, m, "cat form", s.bot) > 0)
                     return false;
-                if (CastFirst(ai, m, s, { "cat form" }))
+                if (TryCastSelf(ai, m, s, "cat form"))
                     return true;
                 return false;
             }
@@ -993,6 +1079,8 @@ namespace
                 default:
                 {
                     st = State::Burn;
+                    if (UseTrinket(ai, m, s)) break;
+                    if (CastFirst(ai, m, s, { "tiger's fury" })) break;
                     // 裂伤(�? 的流血易伤先挂，再割裂/扫击
                     if (CastFirst(ai, m, s, { "mangle (cat)" })) break;
                     if (AuraStacks(ai, s.bot, m, "rake", s.target) == 0 && CastFirst(ai, m, s, { "rake" })) break;
@@ -1045,6 +1133,8 @@ namespace
             case State::Burn:
             default:
                 st = State::Burn;
+                if (UseTrinket(ai, m, s)) break;
+                if (CastFirst(ai, m, s, { "force of nature" })) break;
                 if (AuraStacks(ai, s.bot, m, "moonfire", s.target) == 0 && CastFirst(ai, m, s, { "moonfire" })) break;
                 if (AuraStacks(ai, s.bot, m, "insect swarm", s.target) == 0 && CastFirst(ai, m, s, { "insect swarm" })) break;
                 if (s.moving && CastFirst(ai, m, s, { "moonfire" })) break;
@@ -1061,7 +1151,7 @@ namespace
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
         if (m->spec != Spec::Retribution) return false;
 
@@ -1109,12 +1199,22 @@ namespace
             default:
             {
                 st = State::Burn;
+                if (UseTrinket(ai, m, s)) break;
+                if (CastFirst(ai, m, s, { "avenging wrath" })) break;
                 // [2026-10-29 实测] 审判的伤害全靠圣印；圣印没挂上就判 = 白扔 CD
                 //   （假人场景实测 40 秒 210 次审判、只有 105 伤害）。这里改成"没圣印只挂圣印"。
-                if (AuraStacks(ai, s.bot, m, seal, s.bot) == 0)
+                // [2026-10-29 诊断结论] 圣印的光环 id 就是施法 id，而且**必须打在自己身上**
+                //   （原来的 CastFirst 没传 target ⇒ 对敌人放 ⇒ 判成负面法术失败 ⇒ 每 tick 重试，
+                //     再叠上"失败就 break"，整个 Burn 分支等于空转）。
+                uint32 const sealId = SpellId(ai, s.bot, m, seal, false);
+                if (sealId && !s.bot->HasAura(sealId))
                 {
-                    if (CastFirst(ai, m, s, { seal })) break;
-                    break;   // 圣印都挂不上（没学/没蓝）：先别空判
+                    if (TryCastSelf(ai, m, s, seal))
+                    {
+                        m->sealAt = time(nullptr);
+                        break;
+                    }
+                    // 挂不上（没学/没蓝）也不 break：接着打审判/十字军，别整段空转
                 }
                 if (CastFirst(ai, m, s, { "judgement" })) break;
                 if (CastFirst(ai, m, s, { "crusader strike" })) break;
@@ -1133,7 +1233,7 @@ namespace
     {
         Snapshot s;
         BuildSnapshot(ai, m, s);
-        if (!s.target) { LogTransition(ai, m, s, State::Idle); return true; }
+        if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
         if (m->spec != Spec::Shadow) return false;
 
@@ -1167,7 +1267,8 @@ namespace
             case State::Burn:
             default:
                 st = State::Burn;
-                if (AuraStacks(ai, s.bot, m, "shadowform", s.bot) == 0 && CastFirst(ai, m, s, { "shadowform" })) break;
+                if (UseTrinket(ai, m, s)) break;
+                if (AuraStacks(ai, s.bot, m, "shadowform", s.bot) == 0 && TryCastSelf(ai, m, s, "shadowform")) break;
                 if (AuraStacks(ai, s.bot, m, "shadow word: pain", s.target) == 0 && CastFirst(ai, m, s, { "shadow word: pain" })) break;
                 if (AuraStacks(ai, s.bot, m, "vampiric touch", s.target) == 0 && CastFirst(ai, m, s, { "vampiric touch" })) break;
                 if (CastFirst(ai, m, s, { "mind blast" })) break;
@@ -1185,6 +1286,86 @@ namespace ai
 {
     namespace dpsfsm
     {
+        bool SkipEngine(uint32 guid)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            return s_scenarioTargets.find(guid) != s_scenarioTargets.end();
+        }
+
+        bool EngageScenarioTarget(PlayerbotAI* ai)
+        {
+            Player* bot = ai ? ai->GetBot() : nullptr;
+            if (!bot || bot->GetVictim())
+                return false;
+
+            std::set<ObjectGuid> scenario;
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                auto it = s_scenarioTargets.find(bot->GetGUIDLow());
+                if (it == s_scenarioTargets.end())
+                    return false;      // 没声明场景 ⇒ 副本里照旧，不自动开怪
+                scenario = it->second;
+            }
+
+            Map* map = bot->GetMap();
+            if (!map)
+                return false;
+            for (ObjectGuid const& g : scenario)
+            {
+                Unit* u = map->GetUnit(g);
+                if (!u || !u->IsAlive())
+                    continue;
+                if (bot->GetDistance(u) > 45.0f)
+                    continue;
+                if (!sServerFacade.IsHostileTo(bot, u))
+                    continue;
+                bool ok = bot->Attack(u, true);   // 假人场景里就是要它开打
+                if (!ok || !bot->GetVictim())
+                {
+                    // Unit::Attack() 在本核心里有个不对称：bot 还挂在目标的 m_attackers 里、
+                    //   但自己的 m_attacking 已经空了 ⇒ _addAttacker 返回 false，Attack 直接失败，
+                    //   而且之后每次都失败（实测 shadow 整场 attack=0 / dist=2.0 / mounted=0）。
+                    //   先 CombatStop 把这个状态清干净再咬一次（此时本来就不在战斗，停了没副作用）。
+                    bot->CombatStopWithPets(true);
+                    ok = bot->Attack(u, true);
+                }
+                if (!ok || !bot->GetVictim())
+                {
+                    // 诊断：Attack 失败本身是核心里的 m_attackers 不对称（见 SimScenario 的兜底），
+                    //   这里至少让日志能看出来"是 Attack 返回 false，而不是找不到目标"。
+                    BotMem* mem = Mem(bot->GetGUIDLow());
+                    time_t const now = time(nullptr);
+                    if (now - mem->lastEngageLog >= 10)
+                    {
+                        mem->lastEngageLog = now;
+                        sLog.outError("[DPSFSM-ENGAGE] %s 咬不上去: attack=%d victim=%s mounted=%d dist=%.1f",
+                            bot->GetName(), ok ? 1 : 0,
+                            bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
+                            bot->IsMounted() ? 1 : 0, bot->GetDistance(u));
+                    }
+                    continue;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        void SetScenarioTargets(uint32 guid, std::vector<ObjectGuid> const& targets)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            if (targets.empty())
+                s_scenarioTargets.erase(guid);
+            else
+                s_scenarioTargets[guid] = std::set<ObjectGuid>(targets.begin(), targets.end());
+        }
+
+        int PackCount(Player* bot, float range)
+        {
+            if (!bot || !bot->GetPlayerbotAI())
+                return 0;
+            return CountHostilesNear(bot->GetPlayerbotAI(), bot, range);
+        }
+
         void SetBotForceDps(uint32 guid, bool on)
         {
             std::lock_guard<std::mutex> lock(s_disabledMutex);
@@ -1301,18 +1482,24 @@ namespace ai
             BotMem* m = Mem(bot->GetGUIDLow());
             ReloadTune();
 
-            static uint32 s_hbLast = 0;
             uint32 const hbNow = WorldTimer::getMSTime();
-            if (!s_hbLast || WorldTimer::getMSTimeDiff(s_hbLast, hbNow ? hbNow : 1) >= 10000)
+            if (!m->hbLast || WorldTimer::getMSTimeDiff(m->hbLast, hbNow ? hbNow : 1) >= 10000)
             {
-                s_hbLast = hbNow ? hbNow : 1;
+                m->hbLast = hbNow ? hbNow : 1;
                 sLog.outError("[DPSFSM-HB] %s spec=%s state=%s incombat=%d target=%s hp=%.0f res=%.0f ticks=%u casts=%u",
                     bot->GetName(), SpecName(m->spec), StateName(m->state), bot->IsInCombat() ? 1 : 0,
                     bot->GetVictim() ? bot->GetVictim()->GetName() : "-", bot->GetHealthPercent(), bot->GetPowerPercent(),
                     m->tickCount, m->castCount);
             }
 
-            if (!bot->IsInCombat())
+            // [2026-10-29 诊断结论] 原来只认 IsInCombat()：本核心里"有目标但还没造成/受到伤害"不算战斗，
+            //   于是远程 bot 永远不挥刀 -> 不进战斗 -> 状态机拒绝运行 -> 死锁（实测整场 incombat=0）。
+            //   只要有可攻击目标就进来，由状态机自己放出第一发伤害技能来起战斗。
+            // 假人场景：没有 victim 就自己咬上去（否则远程 bot 永远不造成伤害 ⇒ 不进战斗 ⇒ 死锁）
+            if (!bot->GetVictim())
+                EngageScenarioTarget(ai);
+
+            if (!bot->IsInCombat() && !bot->GetVictim())
             {
                 if (m->state != State::Idle)
                     m->state = State::Idle;
