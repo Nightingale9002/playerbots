@@ -3445,6 +3445,33 @@ uint32 stuckFightCleared = 0;
                 }
                 bot->TeleportTo(d.mapId, d.x, d.y, z, 0.0f);
                 d.z = z;
+
+                // [2026-10-30 实测] 落点网格里 `y+14` 那一排稳定 LOS 不通（远程专精整场 0 dps）。
+                //   这里做一次 LOS 自检：从站位看不到 0 号假人就在附近挪几个候选点，取第一个通视的。
+                if (bot->IsInWorld() && !d.dummies.empty()) if (Creature* d0 = bot->GetMap() ? bot->GetMap()->GetCreature(d.dummies[0]) : nullptr)
+                {
+                    bool losOk = bot->IsWithinLOSInMap(d0, true);
+                    if (!losOk)
+                    {
+                        static float const offs[5][2] = { {0.0f, 0.0f}, {-6.0f, 0.0f}, {0.0f, -6.0f},
+                                                          {-12.0f, 0.0f}, {0.0f, -12.0f} };
+                        for (auto const& o : offs)
+                        {
+                            float nx = d.x + o[0], ny = d.y + o[1], nz = d.z;
+                            bot->GetMap()->GetHeight(nx, ny, nz, false);
+                            bot->TeleportTo(d.mapId, nx, ny, nz, 0.0f);
+                            if (bot->IsWithinLOSInMap(d0, true))
+                            {
+                                d.x = nx; d.y = ny; d.z = nz;
+                                losOk = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!losOk)
+                        sLog.outError("[DUMMY] id=%u spec=%s 站位无视线（LOS 不通）⇒ 该样本会 0 dps",
+                            d.id, d.spec.c_str());
+                }
             }
             sLog.outError("[DUMMY] id=%u 站位 %.1f 码（近战/远程区分）", d.id, d.standDist);
 
