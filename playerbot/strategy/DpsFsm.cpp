@@ -100,6 +100,7 @@ namespace
         std::map<uint32, time_t> failUntil;   // 技能 id → 这个时间点之前别再试（施法被拒的退避）
         std::map<uint32, time_t> lastOk;       // 技能 id → 上次成功时间
         uint32 hbLast = 0;                     // 这只 bot 上次打心跳的时间
+        bool castThisTick = false;             // 本 tick 状态机是否真的放出了技能
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
         time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
         time_t lastSummary = 0;
@@ -289,6 +290,9 @@ namespace
 
     int CountHostilesNear(PlayerbotAI* ai, Player* bot, float range)
     {
+        // [2026-10-29 崩溃修] 不在世界里的 bot 调 GetMap() 会触发核心断言 m_currMap 直接关服
+        if (!bot || !bot->IsInWorld())
+            return 0;
         // 假人场景声明过目标集时，只数这些目标（否则会把邻居测点的假人算进 AoE 判断）
         std::set<ObjectGuid> scenario;
         {
@@ -404,6 +408,7 @@ namespace
             return false;
         ++m->castCount;
         m->lastOk[id] = now;
+        m->castThisTick = true;
         return true;
     }
 
@@ -1390,6 +1395,13 @@ namespace ai
             s_overrides.erase(guid);
         }
 
+        bool DidCastThisTick(uint32 guid)
+        {
+            std::lock_guard<std::mutex> lock(s_memMutex);
+            auto it = s_mem.find(guid);
+            return it != s_mem.end() && it->second && it->second->castThisTick;
+        }
+
         bool SkipEngine(uint32 guid)
         {
             std::lock_guard<std::mutex> lock(s_disabledMutex);
@@ -1399,7 +1411,7 @@ namespace ai
         bool EngageScenarioTarget(PlayerbotAI* ai)
         {
             Player* bot = ai ? ai->GetBot() : nullptr;
-            if (!bot || bot->GetVictim())
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetVictim())
                 return false;
 
             std::set<ObjectGuid> scenario;
@@ -1607,12 +1619,15 @@ namespace ai
                 return false;
 
             Player* bot = ai->GetBot();
+            if (!bot->IsInWorld() || !bot->IsAlive())
+                return false;
             {
                 std::lock_guard<std::mutex> lock(s_disabledMutex);
                 if (s_disabled.count(bot->GetGUIDLow()))
                     return false;
             }
             BotMem* m = Mem(bot->GetGUIDLow());
+            m->castThisTick = false;
             ReloadTune();
 
             uint32 const hbNow = WorldTimer::getMSTime();

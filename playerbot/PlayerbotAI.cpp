@@ -1959,7 +1959,12 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     // [2026-10-29] 假人场景里状态机全权负责技能：引擎这一步不再插施法（它原来会抢 GCD：
     //   补 buff / 魔杖平射 / 重复挂圣印，实测把 DPS 压掉一大半）。副本里仍照旧走引擎。
     bool const fsmHandled = sPlayerbotAIConfig.dpsFsm && dpsfsm::Tick(this);
-    if (!fsmHandled || !dpsfsm::SkipEngine(bot->GetGUIDLow()))
+    // [2026-10-29 实测] 只有"状态机这一 tick 真的放出了技能"才让引擎让位。
+    //   否则连走位/追击一起关掉 ⇒ 近战打不到人（fury 40 秒只有 11 次普攻、arms 2 次）。
+    bool const skipEngine = fsmHandled
+        && dpsfsm::SkipEngine(bot->GetGUIDLow())
+        && dpsfsm::DidCastThisTick(bot->GetGUIDLow());
+    if (!skipEngine)
         DoNextAction(minimal);
     LogKillEvents();
 }

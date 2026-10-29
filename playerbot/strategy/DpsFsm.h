@@ -87,6 +87,9 @@ namespace ai
         //   副本里返回 false（引擎照常跑），保证走位/打断/救人不受影响。
         bool SkipEngine(uint32 guid);
 
+        // 这一 tick 状态机是否真的放出了技能（只在这种情况下才让引擎让位，否则引擎要负责追击/走位）
+        bool DidCastThisTick(uint32 guid);
+
         // [2026-10-29] 调优并发：给**单只 bot** 覆盖某个参数，这样同一轮里可以用不同的参数值做 A/B。
         void SetParamOverride(uint32 guid, char const* key, double value);
         void ClearParamOverrides(uint32 guid);

@@ -3208,13 +3208,33 @@ uint32 stuckFightCleared = 0;
                         sLog.outError("[DUMMY] id=%u spec=%s 没找到 premade 天赋 [%s]，保留原天赋",
                             d.id, d.spec.c_str(), d.premade.c_str());
 
-                    // 装备：仍用"最好装备"那套（属性权重那部分之前已经调过）
+                    // 装备：`EquipGearBest` 的品质是按等级段 urand 出来的 ⇒ 会摇到很差的组合
+                    //   （实测火法 sp 只有 669、野性德 ap 3360 但没智力）。这里给一个**属性下限**，
+                    //   不达标就重摇几次（最多 5 次），把"毕业装"这个前提做扎实。
+                    bool const caster = (d.cls == CLASS_MAGE || d.cls == CLASS_WARLOCK
+                        || d.cls == CLASS_PRIEST
+                        || (d.cls == CLASS_DRUID && d.spec == "balance")
+                        || (d.cls == CLASS_SHAMAN && d.spec == "elemental")
+                        || (d.cls == CLASS_PALADIN && d.spec == "holy"));
+                    int const spFloor = caster ? 750 : 0;
+                    int const apFloor = caster ? 0 : 1800;
+
                     PlayerbotFactory factory(bot, 70);
-                    factory.EquipGearBest();
-                    sLog.outError("[DUMMY] id=%u spec=%s 换装完成：sp=%d ap=%d",
+                    int bestSp = 0, bestAp = 0;
+                    for (int attempt = 0; attempt < 5; ++attempt)
+                    {
+                        factory.EquipGearBest();
+                        int const sp = int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE));
+                        int const ap = int(bot->GetTotalAttackPowerValue(BASE_ATTACK));
+                        bestSp = std::max(bestSp, sp);
+                        bestAp = std::max(bestAp, ap);
+                        if ((caster && sp >= spFloor) || (!caster && ap >= apFloor))
+                            break;
+                    }
+                    sLog.outError("[DUMMY] id=%u spec=%s 换装完成：sp=%d ap=%d（下限 sp>=%d / ap>=%d）",
                         d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
-                        int(bot->GetTotalAttackPowerValue(BASE_ATTACK)));
+                        int(bot->GetTotalAttackPowerValue(BASE_ATTACK)), spFloor, apFloor);
                 }
             }
             // 近战要贴脸、远程要离 18 码（猎人有 8 码死角），否则状态机整场卡在 Approach
@@ -3761,8 +3781,8 @@ uint32 stuckFightCleared = 0;
                            + "/" + std::to_string(oh && oh->GetProto() ? int(oh->GetProto()->SubClass) : -1) + " ";
                 }
                 // pack = 该场景里 bot 半径 10/30 码看到的敌对数量（1 目标场景应当只有自己的假人）
-                int const pack10 = dpsfsm::PackCount(bot, 10.0f);
-                int const pack30 = dpsfsm::PackCount(bot, 30.0f);
+                int const pack10 = bot->IsInWorld() ? dpsfsm::PackCount(bot, 10.0f) : 0;
+                int const pack30 = bot->IsInWorld() ? dpsfsm::PackCount(bot, 30.0f) : 0;
                 extra += "pack=" + std::to_string(pack10) + "/" + std::to_string(pack30);
                 extra += " fsm=";
                 extra += d.useFsm ? "1" : "0";
