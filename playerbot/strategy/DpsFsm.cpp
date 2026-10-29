@@ -931,9 +931,13 @@ namespace
         int constexpr AIMED_CAST_MS = 3000;
         uint32 const autoRemainMs = s.bot->getAttackTimer(RANGED_ATTACK);
         // 自动射击没起手时计时器是 0，只按"窗口够不够"判会永远进 Weave（实测 marks 整场 casts=0）。
-        if (autoRemainMs == 0 && !s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        // [2026-10-29 实测] 自动射击不是普通法术：必须走引擎的 "auto shot" 动作
+        //   （CastAutoShotAction 会登记 CURRENT_AUTOREPEAT_SPELL）。而且**不能只看计时器**：
+        //   没有自动射击在跑时 getAttackTimer(RANGED_ATTACK) 也可能是非 0，于是永远不尝试。
+        //   这里改成"只要当前没有自动射击在跑，就每 tick 试一次"。
+        if (!s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) && !s.moving)
         {
-            if (TryCast(ai, m, s, "auto shot", nullptr))
+            if (ai->DoSpecificAction("auto shot", Event(), true))
                 return true;
         }
         uint32 const weaveMargin = uint32(TP(m, "weave_margin", 150.0));
@@ -1463,6 +1467,26 @@ namespace ai
             return s_scenarioTargets.find(guid) != s_scenarioTargets.end();
         }
 
+        // 这个专精是不是近战（决定 bot->Attack 的 meleeAttack 参数：远程职业传 true 会走去平砍）
+        bool IsMeleeSpec(Spec spec)
+        {
+            switch (spec)
+            {
+                case Spec::Arms:
+                case Spec::Fury:
+                case Spec::Protection:
+                case Spec::Combat:
+                case Spec::Assassination:
+                case Spec::Subtlety:
+                case Spec::Feral:
+                case Spec::Enhancement:
+                case Spec::Retribution:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         bool EngageScenarioTarget(PlayerbotAI* ai)
         {
             Player* bot = ai ? ai->GetBot() : nullptr;
@@ -1499,7 +1523,8 @@ namespace ai
                     u->GetCombatManager().SetEvadeState(EVADE_NONE);
                     u->GetCombatManager().StopEvade();
                 }
-                bool ok = bot->Attack(u, true);   // 假人场景里就是要它开打
+                bool const melee = IsMeleeSpec((Mem(bot->GetGUIDLow()))->spec);
+                bool ok = bot->Attack(u, melee);   // 远程职业必须传 false，否则会走进近战位平砍
                 bool const firstTry = ok;
                 if (!ok || !bot->GetVictim())
                 {
@@ -1508,7 +1533,7 @@ namespace ai
                     //   而且之后每次都失败（实测 shadow 整场 attack=0 / dist=2.0 / mounted=0）。
                     //   先 CombatStop 把这个状态清干净再咬一次（此时本来就不在战斗，停了没副作用）。
                     bot->CombatStopWithPets(true);
-                    ok = bot->Attack(u, true);
+                    ok = bot->Attack(u, melee);
                 }
                 if (!ok || !bot->GetVictim())
                 {

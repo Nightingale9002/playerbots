@@ -250,6 +250,7 @@ uint32 stuckFightCleared = 0;
             uint32 mapId = 1;
             float x = 0.0f, y = 0.0f, z = 0.0f;
             float standDist = 3.0f;   // bot 相对假人的站位距离
+            bool meleeSpec = false;   // 近战专精（决定 Attack(meleeAttack) 参数）
             uint32 pileOwner = 0;     // !=0：这一轮不自己召假人，共用这个 id 的假人堆
             float ringAngle = 0.0f;   // 共享堆时自己站的角度（一圈人围着打）
             bool centerPile = false;  // true = 假人就摆在 (x,y)（共享堆的堆主）
@@ -3231,6 +3232,20 @@ uint32 stuckFightCleared = 0;
                         if ((caster && sp >= spFloor) || (!caster && ap >= apFloor))
                             break;
                     }
+                    // [2026-10-29 站长口径] 猎人要有**合适的弹药**：没有弹药/弹药类型不对时
+                    //   自动射击与稳固射击全部失败 ⇒ 整场站着不动（实测 40 秒只有 1 次施法）。
+                    if (d.cls == CLASS_HUNTER)
+                    {
+                        Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+                        uint8 const sub = (ranged && ranged->GetProto()) ? ranged->GetProto()->SubClass : 0;
+                        uint32 const ammoId = (sub == ITEM_SUBCLASS_WEAPON_GUN) ? 31735 /*Timeless Shell*/
+                                                                              : 31737 /*Timeless Arrow*/;
+                        bot->StoreNewItemInBestSlots(ammoId, 1000);
+                        bot->SetUInt32Value(PLAYER_AMMO_ID, ammoId);
+                        sLog.outError("[DUMMY] id=%u spec=%s 已发弹药 id=%u（远程武器子类=%u，持有=%u）",
+                            d.id, d.spec.c_str(), ammoId, (uint32)sub, bot->GetItemCount(ammoId));
+                    }
+
                     if (caster)
                     {
                         bot->StoreNewItemInBestSlots(22832, 20);   // 超级法力药水 x20
@@ -3249,6 +3264,7 @@ uint32 stuckFightCleared = 0;
                     || (d.cls == CLASS_DRUID && d.spec == "feral")
                     || (d.cls == CLASS_SHAMAN && d.spec == "enhance"));
                 d.standDist = melee ? 3.0f : 18.0f;
+                d.meleeSpec = melee;
             }
             bot->CombatStopWithPets(true);
             // [2026-10-29 实测] 骑乘状态下 Unit::Attack 直接返回 false（"player cannot attack in mount state"），
@@ -3257,7 +3273,13 @@ uint32 stuckFightCleared = 0;
                 bot->Unmount();
             // bot 站在网格点、朝东；假人在它东边 standDist 码处（GM 岛面积小，这样不会掉进海里）
             if (d.centerPile)
-                bot->TeleportTo(d.mapId, d.x - 3.0f, d.y, d.z, 0.0f);
+            {
+                // [2026-10-29 实测] 堆主原来固定站"堆心西侧 3 码"——堆主如果是猎人，
+                //   3 码正好落在 8 码射击死角里，自动射击永远起不来（整场只平砍）。
+                //   改成按这个专精自己的站位距离（近战 3 / 远程 18）。
+                float const off = d.meleeSpec ? 3.0f : d.standDist;
+                bot->TeleportTo(d.mapId, d.x - off, d.y, d.z, 0.0f);
+            }
             else
                 bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
             sLog.outError("[DUMMY] id=%u 站位 %.1f 码（近战/远程区分）", d.id, d.standDist);
@@ -3276,6 +3298,12 @@ uint32 stuckFightCleared = 0;
             {
                 ai2->ChangeStrategy("-mount", BotState::BOT_STATE_NON_COMBAT);
                 ai2->ChangeStrategy("-mount", BotState::BOT_STATE_COMBAT);
+                // 猎人：必须开 "ranged"，引擎才知道按远程打（否则会走进近战位，自动射击永远起不来）
+                if (d.cls == CLASS_HUNTER)
+                {
+                    ai2->ChangeStrategy("+ranged", BotState::BOT_STATE_COMBAT);
+                    ai2->ChangeStrategy("+ranged", BotState::BOT_STATE_NON_COMBAT);
+                }
             }
             if (bot->IsMounted())
                 bot->Unmount();
@@ -3529,6 +3557,7 @@ uint32 stuckFightCleared = 0;
                 d.waitingLogin = (bot == nullptr);
                 d.mapId = 1;
                 d.standDist = melee ? 3.0f : 18.0f;
+                d.meleeSpec = melee;
                 d.z = DUMMY_SPOT_Z;
                 d.sharedPile = true;
                 d.armLabel = arm.label;
@@ -3650,6 +3679,7 @@ uint32 stuckFightCleared = 0;
                 d.waitingLogin = (bot == nullptr);
                 d.mapId = 1;
                 d.standDist = melee ? 3.0f : 18.0f;
+                d.meleeSpec = melee;
                 d.z = DUMMY_SPOT_Z;
                 d.ringAngle = 6.2831853f * float(seenInPile[pile]) / float(perPile[pile] ? perPile[pile] : 1);
                 ++seenInPile[pile];
@@ -3991,11 +4021,11 @@ uint32 stuckFightCleared = 0;
                         //   走引擎自己的 "attack anything" 动作才是和副本里同一条路径。
                         Event pullEvent("attack anything", first->GetObjectGuid());
                         bool const acted = bot->GetPlayerbotAI()->DoSpecificAction("attack anything", pullEvent, true);
-                        bool const direct = bot->GetVictim() ? false : bot->Attack(first, true);
+                        bool const direct = bot->GetVictim() ? false : bot->Attack(first, d.meleeSpec);
                         // 动作路径偶尔不落地（实测 elemental/affliction 整场 incombat=0），
                         //   补一次直接 Attack —— 现在先把坐骑下了，Unit::Attack 不会再被 mount 检查挡掉
                         if (!bot->GetVictim() && !bot->IsMounted() && first->IsAlive())
-                            bot->Attack(first, true);
+                            bot->Attack(first, d.meleeSpec);
                         // Unit::Attack 有个坑：如果 bot 还挂在目标的 m_attackers 里（但自己的 m_attacking 已清空），
                         //   _addAttacker 返回 false ⇒ Attack 直接失败，而且之后每次都失败（实测整场 victim 拿不到）。
                         //   先 CombatStop 把这个状态清干净，再咬一次。
@@ -4007,7 +4037,7 @@ uint32 stuckFightCleared = 0;
                                 first->GetCombatManager().StopEvade();
                             }
                             bot->CombatStopWithPets(true);
-                            bot->Attack(first, true);
+                            bot->Attack(first, d.meleeSpec);
                         }
                         if (!bot->GetVictim() && bot->IsMounted())
                         {
