@@ -4390,6 +4390,14 @@ uint32 stuckFightCleared = 0;
                             first ? first->GetFaction() : 0,
                             first ? first->GetPositionX() : 0.0f, first ? first->GetPositionY() : 0.0f);
                     }
+                    // [2026-10-30] 装备流水没走完之前先不要交战：边穿边打会让攻击状态被装备变更
+                    //   打断，出现"有武器、在战斗、够得着，但整场 0 平砍"（arms 约 4 成轮次）。
+                    if (!d.gearReady)
+                    {
+                        ++it;
+                        continue;
+                    }
+
                     // [2026-10-30 gdb 抓栈] MoveChase 是**场景驱动自己**发的（TickDummies），
                     //   一开打就把远程 bot 拽进近战（18.9 → 2.2 码，自动射击进死区）。
                     //   ⇒ 场景驱动层把远程 bot 钉回站位（不动引擎、不动状态机）。
