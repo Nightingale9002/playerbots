@@ -85,7 +85,9 @@ private:
     void UpdateTradeSkills();
     void SetRandomSkill(uint16 id);
     void InitReputations();
-    void InitSpells();
+public:
+    void InitSpells();   // 假人场景需要补训练师技能（Execute 等），提到 public
+private:
     void ClearSpells();
     void ClearSkills();
     bool InitLevelOne();

@@ -3311,6 +3311,10 @@ uint32 stuckFightCleared = 0;
                     }
 
                     PlayerbotFactory factory(bot, 70);
+                    // [2026-10-30 实证] 随机 bot 的法术表缺训练师技能：guid 92(武器战) 有 12294/1680 却**没有 5308(斩杀)**，
+                    //   guid 98(狂暴战) 连 2458(狂暴姿态) 都没有 ⇒ 状态机里写了也放不出来。
+                    //   InitSpells() = 15 轮 InitAvailableSpells()，把本职业本等级该会的训练师技能补齐。
+                    factory.InitSpells();
                     double bestScore = s_bestGearScore.count(gearKey) ? s_bestGearScore[gearKey] : 0.0;
                     double score = 0.0;
                     uint32 bestHit = 0;
