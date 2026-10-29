@@ -100,6 +100,7 @@ namespace
         std::map<uint32, time_t> lastOk;       // 技能 id → 上次成功时间
         uint32 hbLast = 0;                     // 这只 bot 上次打心跳的时间
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
+        time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
         time_t lastSummary = 0;
         uint32 castCount = 0;
         uint32 tickCount = 0;
@@ -639,6 +640,31 @@ namespace
         return Spec::Unknown;
     }
 
+    // [2026-10-29 站长口径] 近战输出要**找背**：毁伤/背刺/撕碎都要求站在目标背后，
+    //   其它近战站背后也不会被招架/躲闪。这里不自己写寻路——算出目标背后 0.8×攻击距离的点，
+    //   用引擎的 MovePoint 走过去；已经在背后就不动。
+    bool GetBehind(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!s.target || s.dist > 15.0f)
+            return false;
+        if (s.bot->IsFacingTargetsBack(s.target))
+            return false;
+
+        time_t const now = time(nullptr);
+        if (m->lastBehindTry && now - m->lastBehindTry <= 1)
+            return false;
+        m->lastBehindTry = now;
+
+        float const dist = s.bot->GetCombinedCombatReach(s.target, true) * 0.8f;
+        float const ang = s.target->GetOrientation();
+        float x = s.target->GetPositionX() - cos(ang) * dist;
+        float y = s.target->GetPositionY() - sin(ang) * dist;
+        float z = s.target->GetPositionZ();
+        s.bot->UpdateGroundPositionZ(x, y, z);
+        s.bot->GetMotionMaster()->MovePoint(0, x, y, z);
+        return true;
+    }
+
     // [2026-10-29 实测] 英勇打击/顺劈/重殴这类"下一次挥击附带"的技能没有冷却，
     //   每个 AI tick 都能重新施放 —— 实测 arms 40 秒刷了 1116 次、fury 934 次，
     //   既白烧怒气也把施法统计搞脏。它们排进 CURRENT_MELEE_SPELL 就说明已经挂上了，不用再放。
@@ -667,6 +693,7 @@ namespace
         if (s.casting) return true;
         if (m->spec == Spec::Protection) return false;   // 防御坦的技能后面单独做
 
+        GetBehind(ai, m, s);   // 绕背：只走位，不占这个 GCD   // 找背
         bool const fury = (m->spec == Spec::Fury);
         bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
         bool const executeWindow = s.targetHp <= BurstHp(m);
@@ -740,6 +767,7 @@ namespace
 
         bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
         bool const mutilate = (m->spec == Spec::Assassination);
+        GetBehind(ai, m, s);   // 绕背：只走位，不占这个 GCD   // 毁伤/背刺要背身
         bool const executeWindow = s.targetHp <= BurstHp(m);
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
@@ -993,6 +1021,7 @@ namespace
         if (s.casting) return true;
 
         bool const enhance = (m->spec == Spec::Enhancement);
+        if (enhance) GetBehind(ai, m, s);   // 增强萨找背
         bool const inRange = enhance ? (s.dist <= 5.0f) : (s.dist <= 25.0f);
         bool const executeWindow = s.targetHp <= BurstHp(m);
 
@@ -1094,6 +1123,7 @@ namespace
                 return false;
             }
 
+            GetBehind(ai, m, s);   // 撕碎要背身（只走位，不占 GCD）
             bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
             bool const executeWindow = s.targetHp <= BurstHp(m);
             State st = (m->state == State::Idle) ? State::Burn : m->state;
@@ -1193,6 +1223,7 @@ namespace
         if (s.casting) return true;
         if (m->spec != Spec::Retribution) return false;
 
+        GetBehind(ai, m, s);   // 绕背：只走位，不占这个 GCD   // 找背（不被招架/躲闪）
         bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
         bool const executeWindow = s.targetHp <= BurstHp(m);
         // [2026-10-29 实测] 很多随机圣骑士没点"命令圣印"（它是天赋），直接按名字取会取不到 ⇒
@@ -1357,6 +1388,12 @@ namespace ai
                     continue;
                 if (!sServerFacade.IsHostileTo(bot, u))
                     continue;
+                // 召唤物常被标成 evade，而 Unit::Attack 对 evade 目标直接 false ⇒ 先清掉再咬
+                if (u->GetCombatManager().IsInEvadeMode())
+                {
+                    u->GetCombatManager().SetEvadeState(EVADE_NONE);
+                    u->GetCombatManager().StopEvade();
+                }
                 bool ok = bot->Attack(u, true);   // 假人场景里就是要它开打
                 bool const firstTry = ok;
                 if (!ok || !bot->GetVictim())

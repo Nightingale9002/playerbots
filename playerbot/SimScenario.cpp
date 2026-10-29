@@ -3405,6 +3405,18 @@ uint32 stuckFightCleared = 0;
                 c->SetHealth(c->GetMaxHealth());
                 d.dummies.push_back(c->GetObjectGuid());
             }
+            // 召唤完立刻让假人咬 bot 一口：核心的"进入战斗"是双向的，先把假人→bot 这条建立起来，
+            //   免得状态机的第一次 Attack 因为 combat manager 还没初始化而被拒。
+            if (Creature* first = map->GetCreature(d.dummies[0]))
+            {
+                if (first->GetCombatManager().IsInEvadeMode())
+                {
+                    first->GetCombatManager().SetEvadeState(EVADE_NONE);
+                    first->GetCombatManager().StopEvade();
+                }
+                if (first->AI())
+                    first->AI()->AttackStart(bot);
+            }
             dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);   // pack 只数自己的假人（带 runId 防串）
             return !d.dummies.empty();
         }
@@ -3446,6 +3458,13 @@ uint32 stuckFightCleared = 0;
                 // 属性：用来判断这一轮到底是不是"毕业装"（法伤 / 攻强）
                 extra += "sp=" + std::to_string(int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)));
                 extra += " ap=" + std::to_string(int(bot->GetTotalAttackPowerValue(BASE_ATTACK))) + " ";
+                // 武器子类（证明刺杀贼是不是双匕首：16=dagger）
+                {
+                    Item* mh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                    Item* oh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+                    extra += "wep=" + std::to_string(mh && mh->GetProto() ? int(mh->GetProto()->SubClass) : -1)
+                           + "/" + std::to_string(oh && oh->GetProto() ? int(oh->GetProto()->SubClass) : -1) + " ";
+                }
                 // pack = 该场景里 bot 半径 10/30 码看到的敌对数量（1 目标场景应当只有自己的假人）
                 int const pack10 = dpsfsm::PackCount(bot, 10.0f);
                 int const pack30 = dpsfsm::PackCount(bot, 30.0f);
@@ -3560,6 +3579,12 @@ uint32 stuckFightCleared = 0;
                     }
                     if (!bot->GetVictim())
                     {
+                        // 先清 evade：召唤物没有 home 点会被标成回城，Unit::Attack 直接拒绝
+                        if (first->GetCombatManager().IsInEvadeMode())
+                        {
+                            first->GetCombatManager().SetEvadeState(EVADE_NONE);
+                            first->GetCombatManager().StopEvade();
+                        }
                         // [2026-10-29] 直接用 bot->Attack() 会被 bot 自己的 AI 立刻清掉
                         //   （实测：整场 incombat=1 / victim=- / casts=0，只有魔杖自动射击在打）。
                         //   走引擎自己的 "attack anything" 动作才是和副本里同一条路径。
