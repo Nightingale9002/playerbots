@@ -34,6 +34,28 @@ namespace ai
             }
         }
 
+        // [2026-10-30 站长口径] **引擎的接近距离：远程 bot 打到射程就停，不贴脸**。
+        //   原来 reach 动作直接按调用方给的 range 计算 offset：`reach melee` 的 range=0（且不查距离），
+        //   于是任何走到它面前的施法动作（猎人的陷阱 / 近战技 / 其它 reach melee 前置）都会把
+        //   带 "ranged" 策略的 bot 一路拽到 2~3 码，自动射击从此进死区（实测 18.9 → 2.2）。
+        //   这里给"敌对目标 + 有 ranged 策略"加下限 = 射程（AiPlayerbot.ShootDistance，兜底 25），
+        //   近战 bot（没有 ranged 策略）仍按调用方给的 range 走（0 = 贴脸）。
+        virtual float GetApproachRange(Unit* target) const
+        {
+            if (target && sServerFacade.IsHostileTo(bot, target) &&
+                ai->HasStrategy("ranged", BotState::BOT_STATE_COMBAT))
+            {
+                float shootDistance = ai->GetRange("shoot");
+                if (shootDistance <= 0.0f)
+                    shootDistance = 25.0f;   // 配置缺失时的兜底射程
+
+                if (range < shootDistance)
+                    return shootDistance;
+            }
+
+            return range;
+        }
+
         virtual bool Execute(Event& event) override
 		{
             Unit* target = GetTarget();
@@ -43,13 +65,14 @@ namespace ai
 
                 // Ignore movement if too far
                 const float distanceToTarget = bot->GetDistance(target, false, DIST_CALC_COMBAT_REACH);
-                float chaseDist = range;
+                const float approachRange = GetApproachRange(target);
+                float chaseDist = approachRange;
                 const bool inLos = bot->IsWithinLOSInMap(target, true);
                 const bool isFriend = sServerFacade.IsFriendlyTo(bot, target);
 
-                if (range > 0.0f)
+                if (approachRange > 0.0f)
                 {
-                    chaseDist = inLos ? range : (isFriend ? std::min(distanceToTarget * 0.9f, range) : range);
+                    chaseDist = inLos ? approachRange : (isFriend ? std::min(distanceToTarget * 0.9f, approachRange) : approachRange);
                     chaseDist = (chaseDist - sPlayerbotAIConfig.contactDistance);
                 }
 
@@ -101,7 +124,8 @@ namespace ai
                         if (bot->IsWithinLOSInMap(target, true))
                         {
                             // Check if the bot is already on the range required
-                            return bot->GetDistance(target, true, DIST_CALC_COMBAT_REACH) > range;
+                            // [2026-10-30] 同一套"接近距离"：远程 bot 在射程内就不要再走近战位
+                            return bot->GetDistance(target, true, DIST_CALC_COMBAT_REACH) > GetApproachRange(target);
                         }
 
                         return true;

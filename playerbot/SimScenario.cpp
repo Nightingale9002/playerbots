@@ -258,6 +258,8 @@ uint32 stuckFightCleared = 0;
             bool sharedPile = false;  // true = 这一轮的木桩是全队共用的，收尾时谁都不许删
             std::map<std::string, double> overrides;   // 本 bot 的参数覆盖（调优并发用）
             std::string armLabel;                      // 例如 "burst_hp=10" 或 "baseline"
+            std::vector<std::pair<uint8, uint32>> bisPending;   // 静态 BIS：还没穿上的 (slot,item)
+            bool gearReady = true;                              // 装备流水是否已完成
             std::vector<ObjectGuid> dummies;
             bool reported = false;
             uint32 lastPulseMs = 0;
@@ -3235,23 +3237,49 @@ uint32 stuckFightCleared = 0;
                     //   （从 item_template 静态筛出来的每专精 BIS：命中优先、其次物品等级）给 bot 穿同一套。
                     //   表不存在或该专精没数据时，回退到 EquipGearBest() 的重摇逻辑。
                     uint32 bisApplied = 0;
-                    if (auto bres = WorldDatabase.PQuery(
-                            "SELECT slot, item_id FROM ai_playerbot_bis_gear WHERE cls=%u AND spec='%s' ORDER BY slot",
-                            (uint32)d.cls, d.spec.c_str()))
+                    // [2026-10-29 实测] 17 个 bot 在同一 tick 里"清空+穿 16 件"会出现穿不全
+                    //   （实测 sp 2600 → 1216）。站长口径：**每 tick 穿一件**，做成流水；
+                    //   这里只清空槽位并建好待穿清单，实际穿戴放到 TickDummies 的脉冲里逐件做。
+                    bool const useBis = true;
+                    if (useBis)
                     {
-                        do
+                        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+                            if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                                bot->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+
+                        if (auto bres = WorldDatabase.PQuery(
+                                "SELECT slot, item_id FROM ai_playerbot_bis_gear WHERE cls=%u AND spec='%s' ORDER BY slot",
+                                (uint32)d.cls, d.spec.c_str()))
                         {
-                            Field* f = bres->Fetch();
-                            uint32 const itemId = f[1].GetUInt32();
-                            if (Item* item = bot->StoreNewItemInInventorySlot(itemId, 1))
+                            do
                             {
-                                ai::EquipAction::EquipItem(bot->GetPlayerbotAI(), bot, item, true);
-                                ++bisApplied;
-                            }
-                        } while (bres->NextRow());
+                                Field* f = bres->Fetch();
+                                d.bisPending.push_back(std::make_pair(f[0].GetUInt8(), f[1].GetUInt32()));
+                            } while (bres->NextRow());
+                        }
+                        d.gearReady = d.bisPending.empty();
+                        sLog.outError("[DUMMY] id=%u spec=%s BIS 流水：待穿 %u 件",
+                            d.id, d.spec.c_str(), (uint32)d.bisPending.size());
                     }
+
                     if (bisApplied)
                     {
+                        // [2026-10-29 实测] 换完武器必须**练满武器技能**：随机 bot 的武器技能是跟着
+                        //   原来那套装备练的，一旦换成没练过的类型（匕首/拳套/长柄…）技能就是 0，
+                        //   结果 ic=1 但白字几乎全 miss（melee=0），dps 掉到几十。
+                        static uint16 const weaponSkills[] = {
+                            SKILL_AXES, SKILL_2H_AXES, SKILL_BOWS, SKILL_CROSSBOWS, SKILL_DAGGERS,
+                            SKILL_FIST_WEAPONS, SKILL_GUNS, SKILL_MACES, SKILL_2H_MACES, SKILL_POLEARMS,
+                            SKILL_STAVES, SKILL_SWORDS, SKILL_2H_SWORDS, SKILL_THROWN, SKILL_WANDS };
+                        for (uint16 sk : weaponSkills)
+                            bot->SetSkill(sk, bot->GetLevel() * 5, bot->GetLevel() * 5);   // SetSkill(id, value, max)：别把 value 写成 1（=技能 1 级，全 miss）
+
+                        // [2026-10-29 实测] 换装后**必须重算武器伤害**：否则 m_weaponDamage 还是 0，
+                        //   技能与白字都打 0（实测 dmg=0、melee=0，而 wtimer/inreach/delay 全正常）。
+                        bot->UpdateDamagePhysical(BASE_ATTACK);
+                        bot->UpdateDamagePhysical(OFF_ATTACK);
+                        bot->UpdateAllStats();
+
                         int const sp = int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE));
                         int const ap = int(bot->GetTotalAttackPowerValue(BASE_ATTACK));
                         sLog.outError("[DUMMY] id=%u spec=%s 按静态 BIS 表换装 %u 件：sp=%d ap=%d GS=%u",
@@ -3842,8 +3870,8 @@ uint32 stuckFightCleared = 0;
                     first->GetCombatManager().SetEvadeState(EVADE_NONE);
                     first->GetCombatManager().StopEvade();
                 }
-                if (first->AI())
-                    first->AI()->AttackStart(bot);
+                // 同上：假人主动咬 bot 会让它自己走到 bot 脸上（远程场景致命），只给近战用
+                    /* 假人只当木桩：不主动咬 bot（否则它会自己走到 bot 脸上，远程职业进 8 码死角） */
             }
             dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);   // pack 只数自己的假人（带 runId 防串）
             return !d.dummies.empty();
@@ -3892,6 +3920,21 @@ uint32 stuckFightCleared = 0;
                 {
                     Item* mh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
                     Item* oh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+                    // 远程职业是否真的带着 "ranged" 策略（引擎的接近距离靠它判断）
+                    extra += bot->GetPlayerbotAI()
+                        && bot->GetPlayerbotAI()->HasStrategy("ranged", BotState::BOT_STATE_COMBAT)
+                        ? "ranged=1 " : "ranged=0 ";
+                    // 近战诊断：主手是否真有武器、攻击计时是否正常、是否在近战范围内、武器技能
+                    if (d.meleeSpec)
+                    {
+                        Item* mhi = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                        Unit* v = bot->GetVictim();
+                        extra += "mh=" + std::to_string(mhi ? int(mhi->GetEntry()) : -1);
+                        extra += " wtimer=" + std::to_string(bot->getAttackTimer(BASE_ATTACK));
+                        extra += " inreach=" + std::to_string(v ? (bot->CanReachWithMeleeAttack(v) ? 1 : 0) : -1);
+                        extra += " delay=" + std::to_string(mhi && mhi->GetProto() ? int(mhi->GetProto()->Delay) : -1);
+                        extra += " ";
+                    }
                     extra += "wep=" + std::to_string(mh && mh->GetProto() ? int(mh->GetProto()->SubClass) : -1)
                            + "/" + std::to_string(oh && oh->GetProto() ? int(oh->GetProto()->SubClass) : -1) + " ";
                 }
@@ -3961,6 +4004,48 @@ uint32 stuckFightCleared = 0;
 
                 if (!d.setupDone)
                     ApplyDummySetup(d, bot);
+
+                // BIS 流水：每 tick 只穿一件（站长口径），穿完刷新武器技能/伤害再开始计时
+                if (!d.gearReady && bot->IsInWorld())
+                {
+                    if (!d.bisPending.empty())
+                    {
+                        auto const item = d.bisPending.front();
+                        d.bisPending.erase(d.bisPending.begin());
+                        if (ItemPrototype const* proto = sObjectMgr.GetItemPrototype(item.second))
+                        {
+                            bool const twoHand = (proto->InventoryType == INVTYPE_2HWEAPON
+                                || proto->InventoryType == INVTYPE_RANGED || proto->InventoryType == INVTYPE_RANGEDRIGHT
+                                || proto->InventoryType == INVTYPE_THROWN);
+                            if (!(item.first == EQUIPMENT_SLOT_OFFHAND && twoHand))
+                                if (Item* it2 = bot->StoreNewItemInInventorySlot(item.second, 1))
+                                    ai::EquipAction::EquipItem(bot->GetPlayerbotAI(), bot, it2, true);
+                        }
+                        ++it;
+                        continue;                 // 这一 tick 只做这一件
+                    }
+
+                    d.gearReady = true;
+                    static uint16 const weaponSkills[] = {
+                        SKILL_AXES, SKILL_2H_AXES, SKILL_BOWS, SKILL_CROSSBOWS, SKILL_DAGGERS,
+                        SKILL_FIST_WEAPONS, SKILL_GUNS, SKILL_MACES, SKILL_2H_MACES, SKILL_POLEARMS,
+                        SKILL_STAVES, SKILL_SWORDS, SKILL_2H_SWORDS, SKILL_THROWN, SKILL_WANDS };
+                    for (uint16 sk : weaponSkills)
+                        bot->SetSkill(sk, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                    bot->UpdateDamagePhysical(BASE_ATTACK);
+                    bot->UpdateDamagePhysical(OFF_ATTACK);
+                    bot->UpdateAllStats();
+                    d.dmg0 = bot->botDamageDealt;
+                    d.pet0 = bot->botPetDamageDealt;
+                    d.melee0 = bot->botMeleeHits;
+                    d.casts0 = bot->botCasts;
+                    d.spells0 = bot->botSpellCounts;
+                    d.startMs = now;           // 装备齐了才开始计时
+                    sLog.outError("[DUMMY] id=%u spec=%s BIS 流水完成：sp=%d ap=%d",
+                        d.id, d.spec.c_str(),
+                        int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
+                        int(bot->GetTotalAttackPowerValue(BASE_ATTACK)));
+                }
 
                 // [2026-10-29 站长口径] 一堆木桩、所有专精同一轮一起打：
                 //   pileOwner 的 run 自己不召假人，等堆主召好后"加入"同一堆（各自仍然只数自己声明的目标）。
@@ -4071,6 +4156,12 @@ uint32 stuckFightCleared = 0;
                             first ? (first->GetCombatManager().IsInEvadeMode() ? 1 : 0) : -1,
                             first ? first->GetFaction() : 0);
                     }
+                    // [2026-10-30 gdb 抓栈] MoveChase 是**场景驱动自己**发的（TickDummies），
+                    //   一开打就把远程 bot 拽进近战（18.9 → 2.2 码，自动射击进死区）。
+                    //   ⇒ 场景驱动层把远程 bot 钉回站位（不动引擎、不动状态机）。
+                    if (!d.meleeSpec && bot->IsInWorld() && !bot->IsWithinDist3d(d.x, d.y, d.z, 2.0f))
+                        bot->GetMotionMaster()->MovePoint(0, d.x, d.y, d.z);
+
                     if (!bot->GetVictim())
                     {
                         // 先清 evade：召唤物没有 home 点会被标成回城，Unit::Attack 直接拒绝
@@ -4107,9 +4198,10 @@ uint32 stuckFightCleared = 0;
                             bot->Unmount();
                             sLog.outError("[DUMMY-PULSE] id=%u bot 又骑上坐骑了，强制下马", d.id);
                         }
-                        // 反向兜底：让假人先咬 bot（本核心里这是"进入战斗"的另一条链路）
-                        if (!bot->GetVictim() && first->AI())
-                            first->AI()->AttackStart(bot);
+                        // [2026-10-30 gdb 取证] 这句会让**假人**去追 bot（UnitAI::AttackStart →
+                        //   MoveChase(bot, 0)），假人贴到 2~3 码后猎人落进 8 码死角、自动射击停摆。
+                        //   只在近战场景保留这条"进入战斗"的兜底；远程场景不许假人动。
+                            /* 假人只当木桩：不主动咬 bot（否则它会自己走到 bot 脸上，远程职业进 8 码死角） */
                         sLog.outError("[DUMMY-PULSE] id=%u 出手: action=%d direct=%d victim=%s attacker=%d",
                             d.id, acted ? 1 : 0, direct ? 1 : 0,
                             bot->GetVictim() ? bot->GetVictim()->GetName() : "-",

@@ -1961,11 +1961,39 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     bool const fsmHandled = sPlayerbotAIConfig.dpsFsm && dpsfsm::Tick(this);
     // [2026-10-29 实测] 只有"状态机这一 tick 真的放出了技能"才让引擎让位。
     //   否则连走位/追击一起关掉 ⇒ 近战打不到人（fury 40 秒只有 11 次普攻、arms 2 次）。
-    bool const skipEngine = fsmHandled
-        && dpsfsm::SkipEngine(bot->GetGUIDLow())
-        && dpsfsm::DidCastThisTick(bot->GetGUIDLow());
+    // [2026-10-29 站长口径] 假人场景里由状态机**独占移动权**。
+    //   之前只在"这一 tick 真放出技能"时才让引擎让位，没放技能的 tick 引擎照样跑；
+    //   它的接近逻辑按**近战**算距离，于是把猎人一路拽到 2.3 码（实测 dist=2.3、autorepeat slot=0）。
+    //   现在只要状态机接管就不再让引擎动位置（站位由 SimScenario / GetBehind / 猎人后撤负责）。
+    // [2026-10-29 站长口径] **移动是引擎的职责，状态机只管技能**：
+    //   状态机只在"这一 tick 真放出了技能"时让引擎让位（避免抢 GCD），
+    //   其余 tick 引擎照常跑（追击/站位都归它）。远程职业被拉进近战的问题，
+    //   在**引擎侧**修（见 PlayerbotAI::GetRange("attack")）。
+    uint32 const guid = bot->GetGUIDLow();
+    bool const skipEngine = fsmHandled && dpsfsm::SkipEngine(guid) && dpsfsm::DidCastThisTick(guid);
     if (!skipEngine)
         DoNextAction(minimal);
+
+    // =====================================================================================
+    // [2026-10-30 站长口径] **硬性不变量：远程职业绝不走进近战**。
+    //   不管是核心 Attack、某个动作的 ChaseTo(0)、还是场景驱动的补敌，只要距离被拉近，
+    //   这里统一纠回射程（MoveChase 的 offset = 射程-5，留一点缓冲避免抖动）。
+    //   这条不依赖任何具体调用点，所以"无论怎么样"都不会贴脸。
+    // =====================================================================================
+    if (bot->IsInWorld() && HasStrategy("ranged", BotState::BOT_STATE_COMBAT))
+    {
+        Unit* victim = bot->GetVictim();
+        if (victim && victim->IsAlive())
+        {
+            float shoot = GetRange("shoot");
+            if (shoot <= 0.0f)
+                shoot = 25.0f;
+            float const keep = shoot - 5.0f;
+            if (bot->GetDistance(victim) < keep)
+                bot->GetMotionMaster()->MoveChase(victim, keep);
+        }
+    }
+
     LogKillEvents();
 }
 
@@ -7857,7 +7885,10 @@ float PlayerbotAI::GetRange(std::string type)
     if (type == "followraid") return sPlayerbotAIConfig.raidFollowDistance;
     if (type == "wandermin") return sPlayerbotAIConfig.wanderMinDistance;
     if (type == "wandermax") return sPlayerbotAIConfig.wanderMaxDistance;
-    if (type == "attack") return 0;
+    // [2026-10-29 站长口径] **引擎也不该把远程职业拉到近战**：
+    //   带 "ranged" 策略的 bot，攻击距离 = 射程（shootDistance），而不是 0（=贴脸）。
+    if (type == "attack")
+        return HasStrategy("ranged", BotState::BOT_STATE_COMBAT) ? sPlayerbotAIConfig.shootDistance : 0;
     return 0;
 }
 

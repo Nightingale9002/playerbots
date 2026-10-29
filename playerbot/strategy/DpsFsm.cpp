@@ -259,6 +259,36 @@ namespace
         return id;
     }
 
+    // [2026-10-29 站长口径] **有些技能不吃 GCD**（下一个平砍附带 / 无 GCD 的爆发技），
+    //   不能因为"公共冷却没转完"就把它们跳过。命中这些名字时绕过 GCD 检查。
+    bool NoGcd(char const* name)
+    {
+        static char const* kNOCD[] = {
+            "heroic strike", "cleave", "maul", "swipe", "thunder clap",       // 下一次平砍附带
+            "auto shot",                                                       // 自动射击
+            "cold blood", "presence of mind", "arcane power", "icy veins",     // 法师/盗贼爆发
+            "tiger's fury", "berserk", "kill command", "shamanistic rage",     // 德/猎/萨爆发
+            "bloodlust", "heroism", "use trinket",
+        };
+        for (char const* k : kNOCD)
+            if (strcmp(name, k) == 0)
+                return true;
+        return false;
+    }
+
+    // 自身 buff 的**剩余时间**（毫秒）：圣印 / 切割 / 节能施法这类都靠它做状态
+    int AuraRemain(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        uint32 id = SpellId(ai, s.bot, m, name, false);
+        if (!id)
+            return 0;
+        SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(id);
+        if (!holder)
+            return 0;
+        int const dur = holder->GetAuraDuration();
+        return dur < 0 ? 999999 : dur;    // 永久 buff
+    }
+
     bool Ready(Player* bot, uint32 id)
     {
         // IsSpellReady 同时覆盖：技能自身冷�?/ 分类冷却 / 公共冷却 / 沉默封锁
@@ -385,7 +415,12 @@ namespace
     bool CastChecked(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, Unit* target, Unit* selfTarget = nullptr)
     {
         uint32 id = SpellId(ai, s.bot, m, name);
-        if (!Ready(s.bot, id))
+        if (NoGcd(name))
+        {
+            if (!id || !s.bot->HasSpell(id))      // 不吃 GCD，但仍必须会这个技能
+                return false;
+        }
+        else if (!Ready(s.bot, id))
             return false;
 
         time_t const now = time(nullptr);
@@ -435,6 +470,58 @@ namespace
         return true;
     }
 
+    // =====================================================================================
+    // [2026-10-29 站长口径] **放什么技能、buff 什么时候续，都由"状态 → 优先级表"决定**，
+    //   不再用 if/else 把每个技能的优先级硬编码在处理器里。
+    //   一条 Entry 描述一件事：
+    //     name           技能名（走 SpellId 自动升级 rank）
+    //     target         施法目标（nullptr=当前目标；s.bot=自身；其它=指定单位）
+    //     requireAura    必须先有这个 aura（例如节能施法才丢火球）
+    //     minAuraRemain  续 buff 用：自身该 aura 剩余 < 这个毫秒数就续（<=0 表示"没有就补"）
+    //     auraOn         检查哪个 aura 的剩余（默认用 name）
+    //     minCombo       至少几个连击点
+    //     minEnergy      至少多少能量
+    //   表内按优先级从上往下试，第一条满足条件的就执行。
+    // =====================================================================================
+    struct Entry
+    {
+        char const* name = nullptr;
+        Unit* target = nullptr;
+        char const* requireAura = nullptr;
+        int minAuraRemain = 0;
+        char const* auraOn = nullptr;
+        int minCombo = 0;
+        int minEnergy = 0;
+    };
+
+    bool TryEntry(PlayerbotAI* ai, BotMem* m, Snapshot& s, Entry const& e)
+    {
+        if (!e.name)
+            return false;
+        if (e.requireAura && AuraStacks(ai, s.bot, m, e.requireAura, s.bot) == 0)
+            return false;
+        if (e.minCombo > 0 && s.combo < e.minCombo)
+            return false;
+        if (e.minEnergy > 0 && s.energy < e.minEnergy)
+            return false;
+        if (e.minAuraRemain > 0)
+        {
+            int const remain = AuraRemain(ai, m, s, e.auraOn ? e.auraOn : e.name);
+            if (remain >= e.minAuraRemain)     // 还够久，不用续
+                return false;
+        }
+        Unit* tgt = e.target ? e.target : s.target;
+        return CastChecked(ai, m, s, e.name, tgt);
+    }
+
+    bool TryTable(PlayerbotAI* ai, BotMem* m, Snapshot& s, std::initializer_list<Entry> const& table)
+    {
+        for (Entry const& e : table)
+            if (TryEntry(ai, m, s, e))
+                return true;
+        return false;
+    }
+
     bool CastFirst(PlayerbotAI* ai, BotMem* m, Snapshot& s, std::initializer_list<char const*> names, Unit* target = nullptr)
     {
         for (char const* n : names)
@@ -478,6 +565,13 @@ namespace
         bool const inRange = s.dist <= castRange;
 
         s.gcd = GcdActive(s.bot, SpellId(ai, s.bot, m, filler));
+
+        // 节能施法：优先级表——有 clearcasting 状态时，最贵的读条法术排到最前
+        if (!s.casting && TryTable(ai, m, s, {
+                { "fireball",   nullptr, "clearcasting" },
+                { "frostbolt",  nullptr, "clearcasting" },
+                { "arcane blast", nullptr, "clearcasting" } }))
+            return true;
 
         State st = m->state;
         if (st == State::Idle)
@@ -890,10 +984,11 @@ namespace
                 int const finCp = int(TP(m, "fin_cp", 5.0));      // 终结技要几星
                 int const evisEnergy = int(TP(m, "fin_energy", 45.0));  // 放终结技前至少留这么多能量
 
-                bool const sndUp = AuraStacks(ai, s.bot, m, "slice and dice", s.bot) > 0;
-                if (!sndUp && s.combo >= sndCp && s.energy >= finisherCost + builderCost
-                    && CastFirst(ai, m, s, { "slice and dice" })) break;
-                if (sndUp && s.combo >= finCp && s.energy >= evisEnergy
+                // 切割：优先级表里一条"剩余 < 2.5s 且连击点够就续"的自身 buff 条目
+                if (TryTable(ai, m, s, {
+                        { "slice and dice", s.bot, nullptr, 2500, nullptr, sndCp, 0 } }))
+                    break;
+                if (s.combo >= finCp && s.energy >= evisEnergy
                     && CastFirst(ai, m, s, { finisher })) break;
                 // 毁灭/毁伤要求匕首 + 背后；随机 bot 经常不满足 ⇒ 一定留个邪恶攻击兜底，
                 //   否则整场 0 施法（实测 assassination 40 秒 casts=0、只有 2 次平砍）。
@@ -916,8 +1011,9 @@ namespace
         if (s.casting) return true;
 
         bool const mm = (m->spec == Spec::Marksmanship);
-        // [2026-10-29] 8 码内是猎人死角：不能读条、也打不了远程 ⇒ 交回引擎（它会用近战/后撤处理），
-        //   否则状态机会一直卡在 Approach（实测假人贴脸 2.8 码时整场 0 输出）。
+
+        // 8 码内是猎人死角：移动交给引擎（它现在会按射程停住，见 GetRange("attack")），
+        //   状态机这里只判断"能不能打"。
         if (s.dist < 8.0f)
             return false;
         bool const inRange = s.dist <= 35.0f;
@@ -937,12 +1033,33 @@ namespace
         //   这里改成"只要当前没有自动射击在跑，就每 tick 试一次"。
         if (!s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) && !s.moving)
         {
-            if (ai->DoSpecificAction("auto shot", Event(), true))
+            // [2026-10-29 站长口径] 自动射击走"双通道"：
+            //   ① 引擎动作 CastAutoShotAction（会登记 CURRENT_AUTOREPEAT_SPELL）
+            //   ② 动作被拒时直接 CastSpell 一发，再检查登记是否成功
+            //   两路结果都记日志，方便判断到底是"动作不可用"还是"武器/弹药问题"。
+            bool okAction = ai->DoSpecificAction("auto shot", Event(), true);
+            bool okCast = false;
+            if (!okAction)
+                okCast = TryCast(ai, m, s, "auto shot", s.target);
+            bool const registered = s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
+
+            uint32 const nowSec = uint32(time(nullptr));
+            if (m->lastEngageLog + 5 <= nowSec)
+            {
+                m->lastEngageLog = nowSec;
+                sLog.outError("[DPSFSM-AUTO] %s 自动射击: action=%d cast=%d registered=%d dist=%.1f",
+                    s.bot->GetName(), okAction ? 1 : 0, okCast ? 1 : 0, registered ? 1 : 0, s.dist);
+            }
+            if (okAction || okCast)
                 return true;
         }
         uint32 const weaveMargin = uint32(TP(m, "weave_margin", 150.0));
+        // [2026-10-29 站长口径] 猎人的时间轴要单独算：
+        //   读条技（稳固 1.5s / 瞄准 3s）只在"距下一发自动射击还够"时读；
+        //   瞬发技（多重/奥术/毒蛇/印记）也不能贴着自动射击放，否则这一发自动射击会被推迟。
         bool const canSteady = !s.moving && autoRemainMs > uint32(STEADY_CAST_MS + int(weaveMargin));
         bool const canAimed = !s.moving && autoRemainMs > uint32(AIMED_CAST_MS + int(weaveMargin));
+        bool const canInstant = !s.moving && (autoRemainMs == 0 || autoRemainMs > 700);
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
         if (s.pack30 >= AoEPack(m))
@@ -969,7 +1086,11 @@ namespace
             case State::Approach:
                 break;
             case State::Weave:
-                break;   // 等自动射击出膛，这一 tick 什么都不放
+                // [2026-10-29 实测] 时间轴窗口不好时不能整场空转：
+                //   有的 bot（无弹药/动作被拒）根本拉不起自动射击，会卡在 Weave 到结束（casts=0）。
+                //   兜底：放一发能吃 GCD 的瞬发，至少不浪费整段时间。
+                if (CastFirst(ai, m, s, { "arcane shot", "multi-shot" })) break;
+                break;
             case State::Recover:
                 // 蝰蛇守护回蓝（有就用），否则平射
                 if (AuraStacks(ai, s.bot, m, "aspect of the viper", s.bot) == 0
@@ -977,8 +1098,8 @@ namespace
                 CastFirst(ai, m, s, { "shoot" });
                 break;
             case State::Aoe:
-                if (TryCastAt(ai, m, s, "volley", s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ())) break;
-                if (CastFirst(ai, m, s, { "multi-shot" })) break;
+                if (canInstant && TryCastAt(ai, m, s, "volley", s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ())) break;
+                if (canInstant && CastFirst(ai, m, s, { "multi-shot" })) break;
                 if (canSteady && CastFirst(ai, m, s, { "steady shot" })) break;
                 st = State::Weave;
                 break;
@@ -997,15 +1118,29 @@ namespace
                 if (UseTrinket(ai, m, s)) break;
                 if (CastFirst(ai, m, s, { "bestial wrath" })) break;
                 if (CastFirst(ai, m, s, { "kill command" })) break;
-                if (AuraStacks(ai, s.bot, m, "hunter's mark", s.target) == 0 && CastFirst(ai, m, s, { "hunter's mark" })) break;
-                if (AuraStacks(ai, s.bot, m, "serpent sting", s.target) == 0 && CastFirst(ai, m, s, { "serpent sting" })) break;
-                if (CastFirst(ai, m, s, { "multi-shot" })) break;
+                if (canInstant && AuraStacks(ai, s.bot, m, "hunter's mark", s.target) == 0
+                    && CastFirst(ai, m, s, { "hunter's mark" })) break;
+                if (canInstant && AuraStacks(ai, s.bot, m, "serpent sting", s.target) == 0
+                    && CastFirst(ai, m, s, { "serpent sting" })) break;
                 if (mm && canAimed && CastFirst(ai, m, s, { "aimed shot" })) break;
-                if (CastFirst(ai, m, s, { "arcane shot" })) break;
                 if (canSteady && CastFirst(ai, m, s, { "steady shot" })) break;
+                if (canInstant && CastFirst(ai, m, s, { "multi-shot" })) break;
+                if (canInstant && CastFirst(ai, m, s, { "arcane shot" })) break;
                 st = State::Weave;   // 自动射击窗口不够：等，别读条顶掉
                 break;
             }
+        }
+
+        // [2026-10-29 站长口径] 自动射击的"核心链路"：
+        //   核心 `Player::CastSpell()` 在**每次施法前**都会 `InterruptSpell(CURRENT_AUTOREPEAT_SPELL)`，
+        //   所以每放一发稳固/奥术/多重，自动射击就会被顶掉；只在"没登记时"补挂的话，
+        //   中间那 0.5 秒起手（m_AutoRepeatFirstCast）会把自动射击饿死（实测 40 秒只出 1 发）。
+        //   正确做法：**每发技能之后立刻重新挂自动射击**（Auto Shot 不吃 GCD，已在 NoGcd 白名单）。
+        if (!s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) && !s.moving && s.dist >= 8.0f)
+        {
+            if (!TryCast(ai, m, s, "auto shot", s.target))
+                ai->DoSpecificAction("auto shot", Event(), true);
+
         }
 
         LogTransition(ai, m, s, st);
@@ -1329,6 +1464,13 @@ namespace
                 break;
             }
         }
+        // 圣印：优先级表——剩余 < 2s 就续；候选按"本专精会什么"排（第一条满足就执行）
+        if (TryTable(ai, m, s, {
+                { seal, s.bot, nullptr, 2000 },
+                { "seal of righteousness", s.bot, nullptr, 2000 },
+                { "seal of command", s.bot, nullptr, 2000 },
+                { "seal of blood", s.bot, nullptr, 2000 } }))
+            return true;
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
         if (!inRange)
