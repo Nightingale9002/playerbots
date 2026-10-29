@@ -265,6 +265,7 @@ uint32 stuckFightCleared = 0;
             std::string armLabel;                      // 例如 "burst_hp=10" 或 "baseline"
             std::vector<std::pair<uint8, uint32>> bisPending;   // 静态 BIS：还没穿上的 (slot,item)
             std::map<uint32, int> bisRetry;                     // 每个 itemId 已重试次数
+            bool lowHpDummy = false;                            // true = 低血木桩（用来验证斩杀这类"目标低血"技能）
             bool gearReady = true;                              // 装备流水是否已完成
             std::vector<ObjectGuid> dummies;
             bool reported = false;
@@ -3436,7 +3437,7 @@ uint32 stuckFightCleared = 0;
         }
 
         bool StartDummy(std::list<std::string>& messages, std::string const& key, uint32 targets, uint32 seconds,
-                        uint32 pinnedGuid = 0, bool useFsm = true, bool respec = true)
+                        uint32 pinnedGuid = 0, bool useFsm = true, bool respec = true, bool lowHpDummy = false)
         {
             SpecKey const* spec = FindSpecKey(key);
             if (!spec)
@@ -3532,6 +3533,7 @@ uint32 stuckFightCleared = 0;
             d.tab = spec->tab;
             d.premade = spec->premade;
             d.respec = respec;
+            d.lowHpDummy = lowHpDummy;      // 低血木桩（验证斩杀/低血段循环）
             d.targets = targets;
             d.durationMs = seconds * 1000;
             d.startMs = Now();
@@ -3922,8 +3924,18 @@ uint32 stuckFightCleared = 0;
                         d.id, c->GetPositionZ(), cz);
                 // 模板血量可能没跟 SQL 对齐（实测只有几千）⇒ 强制拉到 100 万，2 分钟打不死
                 // 共享堆时一堆人围打：100 万撑不住（17 人 × 500 dps × 60s ≈ 51 万，留余量）
-                c->SetMaxHealth(5000000);
-                c->SetHealth(c->GetMaxHealth());
+                if (d.lowHpDummy)
+                {
+                    // [2026-10-30] 低血木桩：核心对 "斩杀(5308)" 这类技能有 TargetAuraState=2（目标 <20% 血）硬门，
+                    //   500 万血木桩永远进不了窗 ⇒ 专门造一个 12% 血的木桩来验证低血段循环。
+                    c->SetMaxHealth(200000);
+                    c->SetHealth(24000);            // 12%
+                }
+                else
+                {
+                    c->SetMaxHealth(5000000);
+                    c->SetHealth(c->GetMaxHealth());
+                }
                 d.dummies.push_back(c->GetObjectGuid());
             }
             // 召唤完立刻让假人咬 bot 一口：核心的"进入战斗"是双向的，先把假人→bot 这条建立起来，
@@ -4699,7 +4711,8 @@ uint32 stuckFightCleared = 0;
             uint32 pinBot = args.size() > 4 ? uint32(atoi(args[4].c_str())) : 0;
             bool useFsm = !(args.size() > 5 && atoi(args[5].c_str()) == 0);
             bool respec = !(args.size() > 6 && atoi(args[6].c_str()) == 0);   // 第 7 个参数传 0 = 不重天赋
-            StartDummy(messages, args[1], targets, seconds, pinBot, useFsm, respec);
+            bool const lowHp = (args.size() > 7 && atoi(args[7].c_str()) != 0);
+            StartDummy(messages, args[1], targets, seconds, pinBot, useFsm, respec, lowHp);
             return messages;
         }
 
