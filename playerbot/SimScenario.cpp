@@ -3315,6 +3315,37 @@ uint32 stuckFightCleared = 0;
                     //   guid 98(狂暴战) 连 2458(狂暴姿态) 都没有 ⇒ 状态机里写了也放不出来。
                     //   InitSpells() = 15 轮 InitAvailableSpells()，把本职业本等级该会的训练师技能补齐。
                     factory.InitSpells();
+                    // [2026-10-30] InitSpells 仍可能漏掉关键输出技能（实测武器战依旧没有 5308 斩杀）。
+                    //   这里对"核心输出白名单"直接补学兜底（学会了但职业用不了也无害）。
+                    {
+                        static uint32 const keySpells[] = {
+                            5308,   // Execute
+                            1680,   // Whirlwind
+                            12294,  // Mortal Strike
+                            23881,  // Bloodthirst
+                            35395,  // Crusader Strike
+                            20271,  // Judgement
+                            6774,   // Slice and Dice
+                            32645,  // Envenom
+                            26865,  // Eviscerate
+                            33876,  // Mangle (cat)
+                            24248,  // Ferocious Bite
+                            27008,  // Rip
+                            9846,   // Tiger Fury
+                            27019,  // Steady Shot
+                            27021,  // Multi-Shot
+                            14325,  // Hunters Mark
+                            30451,  // Arcane Blast
+                            11129,  // Combustion
+                            12472,  // Icy Veins
+                            17962,  // Conflagrate
+                            17364,  // Stormstrike
+                            25454,  // Earth Shock
+                        };
+                        for (uint32 sp : keySpells)
+                            if (!bot->HasSpell(sp))
+                                bot->learnSpell(sp, false);
+                    }
                     double bestScore = s_bestGearScore.count(gearKey) ? s_bestGearScore[gearKey] : 0.0;
                     double score = 0.0;
                     uint32 bestHit = 0;

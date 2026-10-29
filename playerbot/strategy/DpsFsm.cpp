@@ -1051,7 +1051,21 @@ namespace
                 if (UseTrinket(ai, m, s)) break;
                 // [2026-10-30] 低血段（<BurstHp）先打斩杀：核心对斩杀有 TargetAuraState=2 的门，
                 //   只有目标 <20% 血才成立；不放在最前会被猛击/致死把怒气吃光（实测低血木桩仍只出致死）。
-                if (executeWindow && CastFirst(ai, m, s, { "execute" })) break;
+                if (executeWindow)
+                {
+                    uint32 const exId = SpellId(ai, s.bot, m, "execute", false);
+                    bool const has = exId && s.bot->HasSpell(exId);
+                    SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+                    bool const can = exId != 0 && ai->CanCastSpell(exId, s.target, 0, false, nullptr, false, false, false, &res);
+                    static time_t lastExLog = 0;
+                    if (lastExLog + 3 <= time(nullptr))
+                    {
+                        lastExLog = time(nullptr);
+                        sLog.outError("[EXECUTE-DBG] %s exId=%u has=%d can=%d res=%d hp=%.1f burst=%.0f rage=%.0f",
+                            s.bot->GetName(), exId, has ? 1 : 0, can ? 1 : 0, int(res), s.targetHp, BurstHp(m), s.rage);
+                    }
+                    if (CastFirst(ai, m, s, { "execute" })) break;
+                }
                 if (fury && CastFirst(ai, m, s, { "death wish" })) break;
                 // [2026-10-30 修] 狂暴战必须在**狂暴姿态**：旋风斩(1680) Stances=0x40000 只要狂暴姿态，
                 //   实测 bot 默认战斗姿态(17) ⇒ whirlwind 每次都被判 ONLY_SHAPESHIFT(89)、整场 0 次。
