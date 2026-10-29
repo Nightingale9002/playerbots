@@ -3231,6 +3231,11 @@ uint32 stuckFightCleared = 0;
                         if ((caster && sp >= spFloor) || (!caster && ap >= apFloor))
                             break;
                     }
+                    if (caster)
+                    {
+                        bot->StoreNewItemInBestSlots(22832, 20);   // 超级法力药水 x20
+                        sLog.outError("[DUMMY] id=%u spec=%s 已发法力药水 x20", d.id, d.spec.c_str());
+                    }
                     sLog.outError("[DUMMY] id=%u spec=%s 换装完成：sp=%d ap=%d（下限 sp>=%d / ap>=%d）",
                         d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
@@ -3266,6 +3271,15 @@ uint32 stuckFightCleared = 0;
                 ai->ChangeStrategy("-" + d.disable2, BotState::BOT_STATE_COMBAT);
                 ai->ChangeStrategy("-" + d.disable2, BotState::BOT_STATE_NON_COMBAT);
             }
+            // 骑乘状态下 Unit::Attack 直接返回 false（实测猎人 mounted=1 ⇒ 整场 attack=0）
+            if (PlayerbotAI* ai2 = bot->GetPlayerbotAI())
+            {
+                ai2->ChangeStrategy("-mount", BotState::BOT_STATE_NON_COMBAT);
+                ai2->ChangeStrategy("-mount", BotState::BOT_STATE_COMBAT);
+            }
+            if (bot->IsMounted())
+                bot->Unmount();
+
             for (auto const& kv : d.overrides)
                 dpsfsm::SetParamOverride(d.guid, kv.first.c_str(), kv.second);
             dpsfsm::SetBotEnabled(d.guid, d.useFsm);
@@ -3708,6 +3722,14 @@ uint32 stuckFightCleared = 0;
                 //   而 Unit::Attack() 对 evade 目标直接返回 false（"victim in evade mode"）⇒ 远程 bot 永远开不了打。
                 c->GetCombatManager().SetEvadeState(EVADE_NONE);
                 c->GetCombatManager().StopEvade();
+                // [2026-10-29 站长口径] 假人**不要转身**：它一转，近战就得绕背，绕背又打断输出。
+                //   站桩 + 固定朝向（朝东），近战就能稳定站在背后打。
+                // 假人本来就不该转身：模板侧由 dev/232_测试假人_不转身.sql 设成 STUNNED|PACIFIED，
+                // 这里给召唤出来的副本补同一组标志（不等 DB 重载）。
+                c->GetMotionMaster()->MoveIdle();
+                // DB 里 232_测试假人_不转身.sql 已经把模板设成 STUNNED|PACIFIED；
+                // 召唤出来的副本也补一遍（不依赖 DB 重载）：STUNNED 禁用转身，PACIFIED 让它不主动出手。
+                c->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_STUNNED | UNIT_FLAG_PACIFIED);
                 c->Relocate(px, py, c->GetPositionZ());
                 if (c->GetPositionZ() < d.z - 5.0f || c->GetPositionZ() > d.z + 20.0f)
                     sLog.outError("[DUMMY] id=%u 假人落点异常 z=%.1f（bot z=%.1f）⇒ 可能掉进水里/地形下",

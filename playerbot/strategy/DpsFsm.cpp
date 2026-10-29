@@ -103,6 +103,7 @@ namespace
         bool castThisTick = false;             // 本 tick 状态机是否真的放出了技能
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
         time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
+        time_t lastPotionTry = 0;              // 上一次尝试喝药水的时间
         time_t lastSummary = 0;
         uint32 castCount = 0;
         uint32 tickCount = 0;
@@ -668,6 +669,58 @@ namespace
         return Spec::Unknown;
     }
 
+    // [2026-10-29 站长口径] 法力职业的**法力药水**：在背包里找"使用后回蓝"的消耗品，
+    //   蓝低于阈值就喝（核心的 CastItemUseSpell 会正常消耗物品并应用效果）。
+    //   注意：不用 ai->DoSpecificAction("mana potion")，那个动作的 isUseful 依赖 AI 自己的战斗状态，
+    //   假人场景里会被判成"不 useful"，实测一次都没喝到。
+    bool UseManaPotion(BotMem* m, Snapshot& s)
+    {
+        if (s.power > float(TP(m, "potion_mana", 35.0)))
+            return false;
+
+        time_t const now = time(nullptr);
+        if (m->lastPotionTry && now - m->lastPotionTry < 3)
+            return false;
+        m->lastPotionTry = now;
+
+        for (int slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+            Item* item = s.bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!item)
+                continue;
+            ItemPrototype const* proto = item->GetProto();
+            if (!proto)
+                continue;
+
+            for (int e = 0; e < MAX_ITEM_PROTO_SPELLS; ++e)
+            {
+                uint32 const spellId = proto->Spells[e].SpellId;
+                if (!spellId || proto->Spells[e].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+                    continue;
+                SpellEntry const* entry = sServerFacade.LookupSpellInfo(spellId);
+                if (!entry)
+                    continue;
+
+                bool energize = false;
+                for (int i = 0; i < 3; ++i)
+                    if (entry->Effect[i] == SPELL_EFFECT_ENERGIZE)
+                        energize = true;
+                if (!energize)
+                    continue;
+                if (!s.bot->IsSpellReady(spellId))
+                    continue;
+
+                SpellCastTargets targets;
+                targets.setUnitTarget(s.bot);
+                s.bot->CastItemUseSpell(item, targets, 0, 0);
+                sLog.outError("[DPSFSM] %s 喝法力药水（item=%u, res=%.0f%%）",
+                    s.bot->GetName(), proto->ItemId, s.power);
+                return true;
+            }
+        }
+        return false;
+    }
+
     // [2026-10-29 站长口径] 近战输出要**找背**：毁伤/背刺/撕碎都要求站在目标背后，
     //   其它近战站背后也不会被招架/躲闪。这里不自己写寻路——算出目标背后 0.8×攻击距离的点，
     //   用引擎的 MovePoint 走过去；已经在背后就不动。
@@ -1076,6 +1129,7 @@ namespace
             case State::Approach:
                 break;
             case State::Recover:
+                if (UseManaPotion(m, s)) break;
                 CastFirst(ai, m, s, { "shoot" });
                 break;
             case State::Aoe:
@@ -1215,6 +1269,7 @@ namespace
             case State::Approach:
                 break;
             case State::Recover:
+                if (UseManaPotion(m, s)) break;
                 CastFirst(ai, m, s, { "shoot" });
                 break;
             case State::Aoe:
@@ -1413,6 +1468,9 @@ namespace ai
             Player* bot = ai ? ai->GetBot() : nullptr;
             if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetVictim())
                 return false;
+            // 骑乘状态 Unit::Attack 直接 false（猎人整场 0 输出的根因）
+            if (bot->IsMounted())
+                bot->Unmount();
 
             std::set<ObjectGuid> scenario;
             {
