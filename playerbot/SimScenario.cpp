@@ -264,6 +264,7 @@ uint32 stuckFightCleared = 0;
             std::map<std::string, double> overrides;   // 本 bot 的参数覆盖（调优并发用）
             std::string armLabel;                      // 例如 "burst_hp=10" 或 "baseline"
             std::vector<std::pair<uint8, uint32>> bisPending;   // 静态 BIS：还没穿上的 (slot,item)
+            std::map<uint32, int> bisRetry;                     // 每个 itemId 已重试次数
             bool gearReady = true;                              // 装备流水是否已完成
             std::vector<ObjectGuid> dummies;
             bool reported = false;
@@ -4097,9 +4098,21 @@ uint32 stuckFightCleared = 0;
                             bool const twoHand = (proto->InventoryType == INVTYPE_2HWEAPON
                                 || proto->InventoryType == INVTYPE_RANGED || proto->InventoryType == INVTYPE_RANGEDRIGHT
                                 || proto->InventoryType == INVTYPE_THROWN);
+                            bool ok = true;
                             if (!(item.first == EQUIPMENT_SLOT_OFFHAND && twoHand))
+                            {
                                 if (Item* it2 = bot->StoreNewItemInInventorySlot(item.second, 1))
                                     ai::EquipAction::EquipItem(bot->GetPlayerbotAI(), bot, it2, true);
+                                else
+                                    ok = false;
+                            }
+                            // [2026-10-30 实测] 穿装偶发失败（背包/唯一性/双手冲突）会留下空槽
+                            //   ——最致命的是主手空着（`mh=-1`，dps 掉到 10~20）。失败就重排队重试。
+                            if (!ok && ++d.bisRetry[item.second] <= 3)
+                                d.bisPending.push_back(item);
+                            else if (!ok)
+                                sLog.outError("[DUMMY] id=%u spec=%s BIS 穿戴失败 slot=%u item=%u（已重试 3 次）",
+                                    d.id, d.spec.c_str(), (uint32)item.first, item.second);
                         }
                         ++it;
                         continue;                 // 这一 tick 只做这一件
@@ -4135,6 +4148,8 @@ uint32 stuckFightCleared = 0;
                             sLog.outError("[DUMMY] id=%u spec=%s 装备自检异常：sp=%d ap=%d（本专精 melee=%d）",
                                 d.id, d.spec.c_str(), spNow, apNow, d.meleeSpec ? 1 : 0);
                     }
+                    if (d.meleeSpec && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+                        sLog.outError("[DUMMY] id=%u spec=%s 流水完成后**主手仍为空**（wep=-1）", d.id, d.spec.c_str());
                     sLog.outError("[DUMMY] id=%u spec=%s BIS 流水完成：sp=%d ap=%d",
                         d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
