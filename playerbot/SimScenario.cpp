@@ -4145,16 +4145,18 @@ uint32 stuckFightCleared = 0;
                     {
                         d.lastPulseMs = now;
                         sLog.outError("[DUMMY-PULSE] id=%u bot=%s incombat=%d victim=%s dummy=%s alive=%d dist=%.1f "
-                            "mounted=%d hostile=%d hostileBack=%d evade=%d faction=%u",
+                            "moving=%d gen=%u mounted=%d hostile=%d hostileBack=%d evade=%d faction=%u dummypos=(%.1f,%.1f)",
                             d.id, bot->GetName(), bot->IsInCombat() ? 1 : 0,
                             bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
                             first ? first->GetName() : "-", first ? (first->IsAlive() ? 1 : 0) : -1,
                             first ? bot->GetDistance(first) : -1.0f,
+                            bot->IsMoving() ? 1 : 0, uint32(bot->GetMotionMaster()->GetCurrentMovementGeneratorType()),
                             bot->IsMounted() ? 1 : 0,
                             first ? (sServerFacade.IsHostileTo(bot, first) ? 1 : 0) : -1,
                             first ? (sServerFacade.IsHostileTo(first, bot) ? 1 : 0) : -1,
                             first ? (first->GetCombatManager().IsInEvadeMode() ? 1 : 0) : -1,
-                            first ? first->GetFaction() : 0);
+                            first ? first->GetFaction() : 0,
+                            first ? first->GetPositionX() : 0.0f, first ? first->GetPositionY() : 0.0f);
                     }
                     // [2026-10-30 gdb 抓栈] MoveChase 是**场景驱动自己**发的（TickDummies），
                     //   一开打就把远程 bot 拽进近战（18.9 → 2.2 码，自动射击进死区）。

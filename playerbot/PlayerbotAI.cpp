@@ -1989,8 +1989,12 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
             if (shoot <= 0.0f)
                 shoot = 25.0f;
             float const keep = shoot - 5.0f;
+            // [2026-10-30 实测] `MoveChase(v, keep)` **不是"保持距离"**：
+            //   ChaseMovementGenerator 的移动目标仍是 0.5×接触距离（≈1.5~2 码），
+            //   `keep` 只用于"够不够得着"的范围判定；而且 Backpedal 对生物目标被跳过
+            //   ⇒ 只会一路冲进近战。真正能拉开距离的是 `DistanceYourself(dist)`。
             if (bot->GetDistance(victim) < keep)
-                bot->GetMotionMaster()->MoveChase(victim, keep);
+                bot->GetMotionMaster()->DistanceYourself(keep);
         }
     }
 

@@ -687,8 +687,9 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
         if (shoot <= 0.0f)
             shoot = 25.0f;
         float const keep = shoot - 5.0f;
+        // 同上：MoveChase 的 offset 只管"范围判定"，不会让单位后退；用 DistanceYourself 拉开
         if (b->GetDistance(v) < keep)
-            b->GetMotionMaster()->MoveChase(v, keep);
+            b->GetMotionMaster()->DistanceYourself(keep);
     });
 
 #ifdef MEMORY_MONITOR
