@@ -3250,6 +3250,20 @@ uint32 stuckFightCleared = 0;
                     bool const useBis = true;
                     if (useBis)
                     {
+                        // [2026-10-30 实测] 只清装备槽不够：反复换装会把旧装备堆在背包里，
+                        //   一旦背包塞满 `StoreNewItemInInventorySlot` 就失败 ⇒ 该槽位空着
+                        //   （实测 combat rogue 主手 mh=-1、wep=-1/13、dps 只有 16）。
+                        //   换装前把背包（含各背包格）也清空，保证 15~16 件都能穿上。
+                        for (int i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+                            if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                                bot->DestroyItem(INVENTORY_SLOT_BAG_0, i, true);
+                        for (int b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+                        {
+                            if (Bag* bag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, b))
+                                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                                    if (bag->GetItemByPos(j))
+                                        bot->DestroyItem(b, j, true);
+                        }
                         for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
                             if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
                                 bot->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
