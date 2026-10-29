@@ -3250,6 +3250,18 @@ uint32 stuckFightCleared = 0;
                     //   （实测 sp 2600 → 1216）。站长口径：**每 tick 穿一件**，做成流水；
                     //   这里只清空槽位并建好待穿清单，实际穿戴放到 TickDummies 的脉冲里逐件做。
                     bool const useBis = true;
+                    // [2026-10-30 实测] **必须在穿装之前**把武器技能练满：`Player::CanUseItem` 会检查
+                    //   该武器子类对应的技能，没练过 ⇒ 装备直接失败、主手空着（实测 combat 贼主手是
+                    //   1H 剑 Andonisus，bot 没练剑 ⇒ `mh=-1`，40 秒只有 10~16 dps）。
+                    //   原来只在"流水全部穿完"之后才练技能，顺序反了。
+                    {
+                        static uint16 const preWeaponSkills[] = {
+                            SKILL_AXES, SKILL_2H_AXES, SKILL_BOWS, SKILL_CROSSBOWS, SKILL_DAGGERS,
+                            SKILL_FIST_WEAPONS, SKILL_GUNS, SKILL_MACES, SKILL_2H_MACES, SKILL_POLEARMS,
+                            SKILL_STAVES, SKILL_SWORDS, SKILL_2H_SWORDS, SKILL_THROWN, SKILL_WANDS };
+                        for (uint16 sk : preWeaponSkills)
+                            bot->SetSkill(sk, bot->GetLevel() * 5, bot->GetLevel() * 5);
+                    }
                     if (useBis)
                     {
                         // [2026-10-30 实测] 只清装备槽不够：反复换装会把旧装备堆在背包里，
