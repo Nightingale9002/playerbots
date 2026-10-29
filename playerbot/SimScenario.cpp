@@ -4115,6 +4115,20 @@ uint32 stuckFightCleared = 0;
                     d.casts0 = bot->botCasts;
                     d.spells0 = bot->botSpellCounts;
                     d.startMs = now;           // 装备齐了才开始计时
+                    // [2026-10-30] 自检：确认这套装备确实是按**本专精**的 BIS 穿的
+                    //   （实测出现过 feral sp=1324/ap=863、enhance sp=998/ap=594 这种"穿了法系装"）
+                    {
+                        int const spNow = int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE));
+                        int const apNow = int(bot->GetTotalAttackPowerValue(BASE_ATTACK));
+                        // 猎人/增强/野性这类"吃攻强"的专精不看 sp，按物理装备判定
+                        bool const physicalGear = d.meleeSpec || d.cls == CLASS_HUNTER
+                            || d.spec == "enhance" || d.spec == "feral";
+                        bool const looksWrong = physicalGear ? (apNow < 1200 && spNow > 400)
+                                                             : (spNow < 300 && apNow > 1500);
+                        if (looksWrong)
+                            sLog.outError("[DUMMY] id=%u spec=%s 装备自检异常：sp=%d ap=%d（本专精 melee=%d）",
+                                d.id, d.spec.c_str(), spNow, apNow, d.meleeSpec ? 1 : 0);
+                    }
                     sLog.outError("[DUMMY] id=%u spec=%s BIS 流水完成：sp=%d ap=%d",
                         d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
