@@ -5,7 +5,8 @@
 #include "playerbot/Talentspec.h"   // premade 天赋（按专精固定一套）
 #include "playerbot/DungeonRoute.h"
 #include "playerbot/DpsExempt.h"
-#include "playerbot/strategy/DpsFsm.h"   // [2026-10-29] 假人场景 A/B：单只 bot 开关 DPS 状态机
+#include "playerbot/strategy/DpsFsm.h"
+#include "playerbot/strategy/actions/EquipAction.h"   // [2026-10-29] 假人场景 A/B：单只 bot 开关 DPS 状态机
 #include "playerbot/CoverSpot.h"   // 卡视野点库（离线预筛 + 运行期取点）
 #include "MotionGenerators/PathFinder.h"
 #include "playerbot/DungeonRun.h"
@@ -3217,21 +3218,83 @@ uint32 stuckFightCleared = 0;
                         || (d.cls == CLASS_DRUID && d.spec == "balance")
                         || (d.cls == CLASS_SHAMAN && d.spec == "elemental")
                         || (d.cls == CLASS_PALADIN && d.spec == "holy"));
-                    int const spFloor = caster ? 750 : 0;
-                    int const apFloor = caster ? 0 : 1800;
+                    // [2026-10-29 站长口径] 装备要"从数据库里挑 **GS 最高、且满足命中要求** 的那套"。
+                    //   做法：`EquipGearBest()` 本来就是从 item_template 按专精挑装（唯一随机的是品质），
+                    //   所以把它当**候选生成器**：反复重摇，只在"命中达到该专精上限"的候选里保留 GS 最高的那套；
+                    //   并记住该专精的历史最好档位，让后续同专精 bot 一起收敛到同一档。
+                    static std::map<std::string, double> s_bestGearScore;
+                    std::string const gearKey = std::to_string(d.cls) + ":" + d.premade;
 
-                    PlayerbotFactory factory(bot, 70);
-                    int bestSp = 0, bestAp = 0;
-                    for (int attempt = 0; attempt < 5; ++attempt)
+                    // 命中上限（TBC 对 boss，rating）：法术 202、近战/远程特殊攻击 142
+                    uint32 const hitRating = caster
+                        ? bot->GetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + CR_HIT_SPELL)
+                        : bot->GetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + CR_HIT_MELEE);
+                    uint32 const hitTarget = caster ? 202 : 142;
+
+                    // [2026-10-29 站长口径] **静态 BIS 表**：优先按 `ai_playerbot_bis_gear`
+                    //   （从 item_template 静态筛出来的每专精 BIS：命中优先、其次物品等级）给 bot 穿同一套。
+                    //   表不存在或该专精没数据时，回退到 EquipGearBest() 的重摇逻辑。
+                    uint32 bisApplied = 0;
+                    if (auto bres = WorldDatabase.PQuery(
+                            "SELECT slot, item_id FROM ai_playerbot_bis_gear WHERE cls=%u AND spec='%s' ORDER BY slot",
+                            (uint32)d.cls, d.spec.c_str()))
                     {
-                        factory.EquipGearBest();
+                        do
+                        {
+                            Field* f = bres->Fetch();
+                            uint32 const itemId = f[1].GetUInt32();
+                            if (Item* item = bot->StoreNewItemInInventorySlot(itemId, 1))
+                            {
+                                ai::EquipAction::EquipItem(bot->GetPlayerbotAI(), bot, item, true);
+                                ++bisApplied;
+                            }
+                        } while (bres->NextRow());
+                    }
+                    if (bisApplied)
+                    {
                         int const sp = int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE));
                         int const ap = int(bot->GetTotalAttackPowerValue(BASE_ATTACK));
-                        bestSp = std::max(bestSp, sp);
-                        bestAp = std::max(bestAp, ap);
-                        if ((caster && sp >= spFloor) || (!caster && ap >= apFloor))
+                        sLog.outError("[DUMMY] id=%u spec=%s 按静态 BIS 表换装 %u 件：sp=%d ap=%d GS=%u",
+                            d.id, d.spec.c_str(), bisApplied, sp, ap,
+                            bot->GetPlayerbotAI() ? bot->GetPlayerbotAI()->GetEquipGearScore(bot, false, false) : 0);
+                    }
+
+                    PlayerbotFactory factory(bot, 70);
+                    double bestScore = s_bestGearScore.count(gearKey) ? s_bestGearScore[gearKey] : 0.0;
+                    double score = 0.0;
+                    uint32 bestHit = 0;
+                    uint32 hit = 0;
+                    bool hitOk = false;
+                    double bestEffCache = 0.0;
+                    for (int attempt = 0; attempt < (bisApplied ? 0 : 12); ++attempt)
+                    {
+                        factory.EquipGearBest();
+                        score = double(bot->GetPlayerbotAI()
+                            ? bot->GetPlayerbotAI()->GetEquipGearScore(bot, false, false) : 0);
+                        hit = caster
+                            ? bot->GetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + CR_HIT_SPELL)
+                            : bot->GetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + CR_HIT_MELEE);
+                        hitOk = (hit >= hitTarget);
+
+                        // 选择口径（站长口径）：**先满足命中，再比 GS**
+                        //   用 eff = GS + 2000*min(命中, 上限)：命中每一档（远大于 GS 量级的 100 左右）
+                        //   都优先于 GS，命中打满之后才按 GS 排序。
+                        double const eff = score + 2000.0 * double(hit < hitTarget ? hit : hitTarget);
+                        double const bestEff = bestScore + 2000.0 * double(bestHit < hitTarget ? bestHit : hitTarget);
+                        if (eff > bestEff)
+                        {
+                            bestScore = score;
+                            bestHit = hit;
+                            bestEffCache = eff;
+                            hitOk = true;
+                            break;                  // 命中与 GS 都更好：收工
+                        }
+                        if (eff >= bestEff)
                             break;
                     }
+                    s_bestGearScore[gearKey] = bestScore;
+                    sLog.outError("[DUMMY] id=%u spec=%s 装备 GS=%.0f 命中=%u/%u%s（该专精最好 GS=%.0f）",
+                        d.id, d.spec.c_str(), score, hit, hitTarget, hitOk ? "" : " 未达标", bestScore);
                     // [2026-10-29 站长口径] 猎人要有**合适的弹药**：没有弹药/弹药类型不对时
                     //   自动射击与稳固射击全部失败 ⇒ 整场站着不动（实测 40 秒只有 1 次施法）。
                     if (d.cls == CLASS_HUNTER)
@@ -3251,10 +3314,10 @@ uint32 stuckFightCleared = 0;
                         bot->StoreNewItemInBestSlots(22832, 20);   // 超级法力药水 x20
                         sLog.outError("[DUMMY] id=%u spec=%s 已发法力药水 x20", d.id, d.spec.c_str());
                     }
-                    sLog.outError("[DUMMY] id=%u spec=%s 换装完成：sp=%d ap=%d（下限 sp>=%d / ap>=%d）",
+                    sLog.outError("[DUMMY] id=%u spec=%s 换装完成：sp=%d ap=%d（GS %.0f）",
                         d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
-                        int(bot->GetTotalAttackPowerValue(BASE_ATTACK)), spFloor, apFloor);
+                        int(bot->GetTotalAttackPowerValue(BASE_ATTACK)), score);
                 }
             }
             // 近战要贴脸、远程要离 18 码（猎人有 8 码死角），否则状态机整场卡在 Approach
