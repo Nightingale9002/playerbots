@@ -3173,9 +3173,12 @@ uint32 stuckFightCleared = 0;
             // [2026-10-29 站长口径] "毕业装 bot 也只有 500 dps" 的根因之一：随机 bot 的天赋树是随机的、
             //   装备也是旧的（StaticBots=1 不会自己换）。这里按目标专精**重天赋 + 换最好装备**，
             //   否则测的既不是毕业装、也不是这个专精的循环上限。
-            if (d.respec && !d.respecced)
+            static std::set<std::string> s_prepared;   // "<guid>:<premade>" 已经准备过的组合
+            std::string const prepKey = std::to_string(d.guid) + ":" + d.premade;
+            if (d.respec && !d.respecced && !s_prepared.count(prepKey))
             {
                 d.respecced = true;
+                s_prepared.insert(prepKey);
                 if (bot->GetLevel() >= 70)
                 {
                     // [站长口径 2026-10-29] 天赋是**按专精固定一套**（AiPlayerbot.PremadeSpecName/Link），
