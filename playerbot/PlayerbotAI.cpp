@@ -5792,7 +5792,13 @@ bool PlayerbotAI::CastSpellBody(uint32 spellId, Unit* target, Item* itemTarget, 
 
     aiObjectContext->GetValue<ai::PositionMap&>("position")->Get()["random"].Reset();
 
-    if (oldSel)
+    // [2026-10-30 站长口径] **战斗中不要来回换目标**：每次施法都把选择对象改回旧的（常是 bot 自己）
+    //   会把 `UNIT_FIELD_TARGET` 指向不可攻击的单位，下一次 `Unit::_UpdateAutoRepeatSpell()` 就会
+    //   `InterruptSpell(CURRENT_AUTOREPEAT_SPELL)` ⇒ 自动射击被打断、再重挂（每挂最多一发）。
+    //   正确做法：战斗中保持对准当前 victim；只有**不在战斗**或没有 victim 时才恢复旧选择。
+    if (bot->IsInCombat() && bot->GetVictim())
+        bot->SetSelectionGuid(bot->GetVictim()->GetObjectGuid());
+    else if (oldSel)
         bot->SetSelectionGuid(oldSel);
 
     if (HasStrategy("debug spell", BotState::BOT_STATE_NON_COMBAT))
