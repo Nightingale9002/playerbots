@@ -3292,6 +3292,28 @@ uint32 stuckFightCleared = 0;
                                 d.bisPending.push_back(std::make_pair(f[0].GetUInt8(), f[1].GetUInt32()));
                             } while (bres->NextRow());
                         }
+                        // [2026-10-30 实测] 17 个 bot 一起排队"每 tick 穿一件"时，40 秒窗口内经常还没排到
+                        //   主手（slot 15）就开打了 ⇒ 空手 dps 10~20。主手必须**立刻**穿上，其余再流水。
+                        for (auto k = d.bisPending.begin(); k != d.bisPending.end(); ++k)
+                        {
+                            if (k->first != EQUIPMENT_SLOT_MAINHAND)
+                                continue;
+                            if (ItemPrototype const* pMain = sObjectMgr.GetItemPrototype(k->second))
+                            {
+                                if (Item* itMain = bot->StoreNewItemInInventorySlot(k->second, 1))
+                                    ai::EquipAction::EquipItem(bot->GetPlayerbotAI(), bot, itMain, true);
+                            }
+                            d.bisPending.erase(k);
+                            break;
+                        }
+                        if (d.meleeSpec && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+                        {
+                            // 兜底：直接给一把通用单手剑（所有近战都练过剑技能）
+                            if (Item* fb = bot->StoreNewItemInInventorySlot(22736, 1))
+                                ai::EquipAction::EquipItem(bot->GetPlayerbotAI(), bot, fb, true);
+                            sLog.outError("[DUMMY] id=%u spec=%s 主手穿不上 ⇒ 兜底 22736（wep 自检）",
+                                d.id, d.spec.c_str());
+                        }
                         d.gearReady = d.bisPending.empty();
                         sLog.outError("[DUMMY] id=%u spec=%s BIS 流水：待穿 %u 件",
                             d.id, d.spec.c_str(), (uint32)d.bisPending.size());
