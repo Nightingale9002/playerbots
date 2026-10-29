@@ -515,14 +515,41 @@ namespace
         return CastChecked(ai, m, s, name, nullptr, s.bot);
     }
 
+    // [2026-10-30 修] 地面目标技（暴风雪/烈焰风暴/飓风/箭雨/火雨）原来**不做任何校验**就直接
+    //   交给 `PlayerbotAI::CastSpell(id, x, y, z)`：那一层只看"能不能排队"，里面 `Spell::SpellStart`
+    //   的 CheckCast 失败时是**静默**的（不返回错误码）⇒ 状态机以为放出去了，整条优先级表
+    //   就卡死在这一个技能上，后面的兜底技能永远轮不到。
+    //   实测（5 个假人一堆）：平衡德进 Aoe 后 40 秒 **0 伤害**（全是"飓风"的幽灵施法：
+    //   FSM 记账 46 次、真实施法 1 次），把 balance:aoe_pack 调高绕开 Aoe 分支立刻回到 1040 dps；
+    //   兽王猎同理（Aoe 里箭雨幽灵化 ⇒ 0~216 dps，绕开 Aoe 反而 471）。
+    //   现在先跑一次完整的 CanCastSpell（射程/视线/资源/站姿/地形都算上，还带回结果码），
+    //   失败就按资源类/其它类退避，并且**返回 false 让表里的下一个技能兜底**。
     bool TryCastAt(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, float x, float y, float z)
     {
         uint32 id = SpellId(ai, s.bot, m, name);
         if (!Ready(s.bot, id))
             return false;
+
+        time_t const now = time(nullptr);
+        auto it = m->failUntil.find(id);
+        if (it != m->failUntil.end() && now < it->second)
+            return false;
+
+        SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+        if (!ai->CanCastSpell(id, x, y, z, 0, true, nullptr, false, false, false, &res))
+        {
+            bool const waitingResource = (res == SPELL_FAILED_NO_POWER
+                || res == SPELL_FAILED_OUT_OF_RANGE || res == SPELL_FAILED_LINE_OF_SIGHT
+                || res == SPELL_FAILED_NOT_READY);
+            m->failUntil[id] = now + (waitingResource ? 1 : 2);
+            return false;
+        }
         if (!ai->CastSpell(id, x, y, z))
             return false;
         ++m->castCount;
+        m->lastOk[id] = now;
+        m->castThisTick = true;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
         return true;
     }
 
@@ -1113,11 +1140,20 @@ namespace
         bool const mutilate = (m->spec == Spec::Assassination);
         GetBehind(ai, m, s);   // 绕背：只走位，不占这个 GCD   // 毁伤/背刺要背身
         bool const executeWindow = s.targetHp <= BurstHp(m);
+        // [2026-10-30 修] 盗贼原来**根本没有 Aoe 状态**（`aoe_pack` / `combat:aoe_pack` 对盗贼是死配置），
+        //   群战里跟单体一模一样。TBC 盗贼没有真正的群体技（刀扇 Fan of Knives 是 WLK 才有），
+        //   群战能做的只有：剑刃乱舞（额外打一个目标 + 20% 攻速）和冲动，其余照常攒星泄星。
+        //   所以这里补一个 Aoe 状态，把这两张 CD 技顶到最前面，后面的循环完全复用单体表。
+        bool const aoe = (s.pack10 >= AoEPack(m));
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
         if (!inRange)
             st = State::Approach;
         else if (st == State::Approach)
+            st = State::Burn;
+        if (st != State::Approach && aoe)
+            st = State::Aoe;
+        else if (st == State::Aoe)
             st = State::Burn;
         if (st == State::Burn && executeWindow)
             st = State::Burst;
@@ -1128,16 +1164,27 @@ namespace
         {
             case State::Approach:
                 break;
-            case State::Burst:
+            case State::Aoe:
+                // 群战：先把两张 CD 技挂上（剑刃乱舞 = 额外打一个目标 + 20% 攻速；冲动 = 回能量），
+                //   之后完全沿用下面的单体循环——TBC 盗贼的"群伤"就是这两张 CD 技，没有别的。
                 if (UseTrinket(ai, m, s)) break;
-                if (mutilate && CastFirst(ai, m, s, { "cold blood" })) break;
                 if (!mutilate && CastFirst(ai, m, s, { "adrenaline rush" })) break;
                 if (CastFirst(ai, m, s, { "blade flurry" })) break;
-                break;
+                [[fallthrough]];
+            case State::Burst:
+                if (st == State::Burst)
+                {
+                    if (UseTrinket(ai, m, s)) break;
+                    if (mutilate && CastFirst(ai, m, s, { "cold blood" })) break;
+                    if (!mutilate && CastFirst(ai, m, s, { "adrenaline rush" })) break;
+                    if (CastFirst(ai, m, s, { "blade flurry" })) break;
+                    break;
+                }
+                [[fallthrough]];
             case State::Burn:
             default:
             {
-                st = State::Burn;
+                if (st != State::Aoe) st = State::Burn;
                 // 切割常驻：有星就先补，再攒星；终结技走毒�?剔骨
                 if (UseTrinket(ai, m, s)) break;
                 if (!mutilate && CastFirst(ai, m, s, { "adrenaline rush" })) break;
@@ -1370,7 +1417,14 @@ namespace
                 CastFirst(ai, m, s, { "life tap" });
                 break;
             case State::Aoe:
-                if (CastFirst(ai, m, s, { "seed of corruption" })) break;
+                // [2026-10-30 修] 种子(Seed of Corruption) 对**同一个目标**重复种会把上一颗顶掉：
+                //   上一颗永远等不到"到期/受创引爆"，等于每 2 秒白读一次条。
+                //   实测群战 40 秒种了 16~18 颗，总伤害只有 4~17 千（对比参考专精的 4~7 万）。
+                //   现在：每个目标只种一颗；群体主输出改用地狱火雨(Rain of Fire，地面通道技)，
+                //   火雨也不满足条件（站位/蓝不够）时才回到暗影箭。
+                if (AuraStacks(ai, s.bot, m, "seed of corruption", s.target) == 0
+                    && CastFirst(ai, m, s, { "seed of corruption" })) break;
+                if (TryCastAt(ai, m, s, "rain of fire", s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ())) break;
                 if (CastFirst(ai, m, s, { "shadow bolt" })) break;
                 break;
             case State::Burst:
