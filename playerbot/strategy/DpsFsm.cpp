@@ -6,6 +6,7 @@
 #include "Grids/CellImpl.h"
 #include "Maps/Map.h"
 
+#include <cmath>
 #include <ctime>
 #include <fstream>
 #include <map>
@@ -103,6 +104,8 @@ namespace
         bool castThisTick = false;             // 本 tick 状态机是否真的放出了技能
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
         time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
+        time_t lastCloseTry = 0;               // 上一次"真够不着就贴上去"的时间
+        time_t lastConsLog = 0;                // "自身中心 AoE 放不出"日志节流
         time_t lastPotionTry = 0;              // 上一次尝试喝药水的时间
         time_t lastSummary = 0;
         uint32 castCount = 0;
@@ -840,6 +843,43 @@ namespace
         return true;
     }
 
+    // [2026-10-30 修] **近战要真的站进 MeleeReach 里**，不能只看"表面距离够近"。
+    //   背景（实测 40 秒 melee=0 / 十字军打击 0 次）：
+    //     · Snapshot.dist 是 bot->GetDistance(target)，默认 DIST_CALC_BOUNDING_RADIUS
+    //       ⇒ 是"减去双方体积半径之后的表面距离"，比核心的判定小 0.5~1 码；
+    //     · 核心 Unit::CanReachWithMeleeAttack 用**中心距离**比 GetCombinedCombatReach(...,true)
+    //       （其下限就是 ATTACK_DISTANCE=5.0，而且是严格 `<`）。
+    //   于是 bot 站在表面距离 4.5（中心 5.00）时：状态机以为"在近战范围"（<= 6.5），不出 Approach；
+    //   核心却认为够不着 ⇒ 一次平砍都不挥、Crusader Strike 一直被 CheckCast 判 OUT_OF_RANGE。
+    //   引擎的 "reach melee" 也救不了：ReachTargetAction 的 range=0 ⇒ ChaseTo(target, 0) 里
+    //   endPoint = botPoint + dir*min(0, dist) = 自己脚下，路径长度为 0 ⇒ 原地不动。
+    //   所以这里由状态机自己贴上去：走到"够得着"的内侧点（0.8 倍 MeleeReach）。
+    bool CloseToMelee(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!s.target || !s.bot->IsInWorld())
+            return false;
+
+        time_t const now = time(nullptr);
+        if (m->lastCloseTry && now - m->lastCloseTry <= 0)   // 1 秒一次，别每 tick 都改路径
+            return false;
+        m->lastCloseTry = now ? now : 1;
+
+        float const reach = s.bot->GetCombinedCombatReach(s.target, true);
+        float const want = (reach > 1.0f) ? reach * 0.8f : 2.0f;   // 站到"够得着"的内侧
+        float const dx = s.bot->GetPositionX() - s.target->GetPositionX();
+        float const dy = s.bot->GetPositionY() - s.target->GetPositionY();
+        float const len = sqrtf(dx * dx + dy * dy);
+        if (len < 0.05f)
+            return false;
+
+        float x = s.target->GetPositionX() + dx / len * want;
+        float y = s.target->GetPositionY() + dy / len * want;
+        float z = s.target->GetPositionZ();
+        s.bot->UpdateGroundPositionZ(x, y, z);
+        s.bot->GetMotionMaster()->MovePoint(0, x, y, z);
+        return true;
+    }
+
     // [2026-10-29 实测] 英勇打击/顺劈/重殴这类"下一次挥击附带"的技能没有冷却，
     //   每个 AI tick 都能重新施放 —— 实测 arms 40 秒刷了 1116 次、fury 934 次，
     //   既白烧怒气也把施法统计搞脏。它们排进 CURRENT_MELEE_SPELL 就说明已经挂上了，不用再放。
@@ -857,6 +897,45 @@ namespace
         if (s.bot->GetCurrentSpell(CURRENT_MELEE_SPELL))
             return false;
         return TryCast(ai, m, s, name, nullptr);
+    }
+
+    // [2026-10-30] **自身中心的"敌方"AoE（奉献）**：两条现成入口都进不去——
+    //   ① `TryCast`/`CanCastSpell(自己)`：IsPositiveSpell(奉献)=false（带伤害），于是
+    //      PlayerbotAI::CanCastSpell 里"负法术 + 友方目标"⇒ SPELL_FAILED_TARGET_FRIENDLY(110)；
+    //   ② `TryCastAt(x,y,z)`：PlayerbotAI::CastSpell(x,y,z) 要求 Targets 里有 DEST/SOURCE_LOCATION，
+    //      而奉献是 TARGET_UNIT_CASTER（Targets=0）⇒ 直接 return false。
+    //   这里照引擎 SPELL_ACTION 的做法走核心 `Unit::CastSpell`（单位目标是敌人，法术隐式目标是施法者），
+    //   自己守 GCD / 冷却，成功才算一次施法。
+    bool CastSelfCentered(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        uint32 const id = SpellId(ai, s.bot, m, name);
+        if (!Ready(s.bot, id))
+            return false;
+        SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+        if (entry && s.bot->HasGCD(entry))
+            return false;    // 别顶掉正在转的 GCD
+
+        // 目标是**自己**：奉献的 RangeIndex=1 是"自身 0 码"，拿敌人当单位目标会被核心判
+        //   SPELL_FAILED_OUT_OF_RANGE(0x5C=92)（实测）。核心不像 bot 的 CanCastSpell 那样做正负法术
+        //   启发式，所以"对自己放一个带伤害的自身 AoE"是合法的（客户端点奉献就是这个效果）。
+        Unit* const tgt = s.bot;
+        SpellCastResult const res = s.bot->CastSpell(tgt, id, uint32(TRIGGERED_NONE));
+        if (res != SPELL_CAST_OK)
+        {
+            time_t const now = time(nullptr);
+            if (!m->lastConsLog || now - m->lastConsLog >= 10)
+            {
+                m->lastConsLog = now;
+                sLog.outError("[DPSFSM] %s %s 放不出：id=%u result=%d（0=OK，其它见 SpellCastResult）",
+                    s.bot->GetName(), name, id, int(res));
+            }
+            return false;
+        }
+        ++m->castCount;
+        m->castThisTick = true;
+        m->lastOk[id] = time(nullptr);
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        return true;
     }
 
     // ============================ 战士 ============================
@@ -1446,7 +1525,12 @@ namespace
         if (m->spec != Spec::Retribution) return false;
 
         GetBehind(ai, m, s);   // 绕背：只走位，不占这个 GCD   // 找背（不被招架/躲闪）
-        bool const inRange = s.dist <= 6.5f;   // 近战够得着就行（5.0 太紧，卡在 5.2 会永远不进循环）
+        // [2026-10-30 修] 近战范围要用**核心的判定**，不能用表面距离：
+        //   s.dist <= 6.5 会把"中心距离 5.0 码、其实够不着"的情形也判成在范围内，
+        //   结果整场不挥刀、Crusader Strike 一直被拒（实测 melee=0 / 35395:0）。
+        bool const inRange = s.bot->CanReachWithMeleeAttack(s.target);
+        if (!inRange)
+            CloseToMelee(ai, m, s);   // 真够不着就自己贴上去（引擎 reach melee 的 range=0 是零长度路径）
         bool const executeWindow = s.targetHp <= BurstHp(m);
         // [2026-10-29 实测] 很多随机圣骑士没点"命令圣印"（它是天赋），直接按名字取会取不到 ⇒
         //   一路空判、40 秒 0 伤害。这里给一串候选，取第一个"这个 bot 真会"的。
@@ -1464,12 +1548,11 @@ namespace
                 break;
             }
         }
-        // 圣印：优先级表——剩余 < 2s 就续；候选按"本专精会什么"排（第一条满足就执行）
-        if (TryTable(ai, m, s, {
-                { seal, s.bot, nullptr, 2000 },
-                { "seal of righteousness", s.bot, nullptr, 2000 },
-                { "seal of command", s.bot, nullptr, 2000 },
-                { "seal of blood", s.bot, nullptr, 2000 } }))
+        // 圣印：**只续当前这一个**（剩余 < 2s 才续）。
+        //   ⚠️ 别把候选圣印做成同一张表：表是"第一条能放就放"，主圣印一次施法失败就会串到下一个，
+        //   几个圣印互相顶掉、还白吃 GCD（实测 40 秒：Command 12 次 + Righteousness 10 次 + Blood 1 次，
+        //   而十字军打击 0 次、审判 1 次）。
+        if (TryTable(ai, m, s, { { seal, s.bot, nullptr, 2000 } }))
             return true;
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
@@ -1488,7 +1571,10 @@ namespace
                 break;
             case State::Burst:
                 if (UseTrinket(ai, m, s)) break;
-                if (CastFirst(ai, m, s, { "avenging wrath" })) break;
+                // [2026-10-30 修] 复仇之怒/神圣之怒都是**自身增益**（spell_template.Targets = 0，
+                //   没有 DEST/SOURCE_LOCATION 标志），CastFirst 不传 target ⇒ 拿敌人当目标 ⇒
+                //   PlayerbotAI::CastSpell 里 CanCastSpell 判成"对敌放增益"失败，整场 0 次。
+                if (TryCastSelf(ai, m, s, "avenging wrath")) break;
                 if (CastFirst(ai, m, s, { "hammer of wrath" })) break;
                 if (CastFirst(ai, m, s, { "judgement" })) break;
                 CastFirst(ai, m, s, { "crusader strike" });
@@ -1498,7 +1584,7 @@ namespace
             {
                 st = State::Burn;
                 if (UseTrinket(ai, m, s)) break;
-                if (CastFirst(ai, m, s, { "avenging wrath" })) break;
+                if (TryCastSelf(ai, m, s, "avenging wrath")) break;
                 // [2026-10-29 实测] 审判的伤害全靠圣印；圣印没挂上就判 = 白扔 CD
                 //   （假人场景实测 40 秒 210 次审判、只有 105 伤害）。这里改成"没圣印只挂圣印"。
                 // [2026-10-29 诊断结论] 圣印的光环 id 就是施法 id，而且**必须打在自己身上**
@@ -1516,8 +1602,11 @@ namespace
                 }
                 if (CastFirst(ai, m, s, { "judgement" })) break;
                 if (CastFirst(ai, m, s, { "crusader strike" })) break;
-                if (s.power > 40.0f && TryCastAt(ai, m, s, "consecration",
-                        s.bot->GetPositionX(), s.bot->GetPositionY(), s.bot->GetPositionZ())) break;
+                // [2026-10-30 修] 奉献（27173）：自身中心的 AoE，两条常规入口都会失败（见 CastSelfCentered）。
+                //   它是惩戒唯一的填充技（审判 10s / 十字军 6s 都有空档），不吃这一手 40 秒就白丢 5~6 次。
+                //   蓝门限放到 15%：惩戒的审判/十字军在本库里 ManaCost=0，蓝只花在圣印(65)和奉献(660)上，
+                //   40% 会白等 GCD；留 15% 足够续一次圣印就行。
+                if (s.power > 15.0f && CastSelfCentered(ai, m, s, "consecration")) break;
                 break;
             }
         }

@@ -4073,7 +4073,13 @@ uint32 stuckFightCleared = 0;
                 //   standDist 码处（ApplyDummySetup 刚算好近战/远程的 standDist）。dummyall/arms 已自带堆心。
                 if (!d.pileSet && !d.pileOwner)
                 {
-                    d.pileX = d.x + d.standDist;
+                    // [2026-10-30 修] 假人不是摆在堆心，而是摆在**堆心正东 PILE_DUMMY_R 码**处
+                    //   （见下面 SummonCreature 的 px = cx + cos(ang)*r，第 0 个 ang=0）。
+                    //   所以堆心必须从 bot 站位往回退一个 PILE_DUMMY_R，bot 才真的离 0 号假人 standDist 码。
+                    //   原来写 d.x + standDist ⇒ 近战 bot 离假人 3+2 = **正好 5.00 码 = ATTACK_DISTANCE**，
+                    //   而 CanReachWithMeleeAttack() 是严格 `<`（Object.cpp GetCombinedCombatReach 的下限就是
+                    //   ATTACK_DISTANCE）⇒ 整场 0 次平砍、十字军打击永远"超出射程"、inreach=0。
+                    d.pileX = d.x + d.standDist - PILE_DUMMY_R;
                     d.pileY = d.y;
                     d.pileZ = d.z;
                     d.pileSet = true;
