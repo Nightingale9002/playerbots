@@ -237,6 +237,29 @@ namespace
 
     // 省蓝等级 > 1 时引擎会给最低 rank，所以这里一定要自己往上爬 spell_chain。
 
+    // [2026-10-30 修] 兜底：直接按名字扫 bot 自己的法术表，取**最高 rank**。
+    //   为什么需要它：引擎的 "spell id" 值（SpellIdValue）会过滤 `IsPassiveSpell`，而姿态(战斗/狂暴姿态)、
+    //   图腾这类"形态/召唤"法术正是被过滤掉的一类 ⇒ 值返回 0 ⇒ 状态机整条技能表静默失效
+    //   （实测：狂暴战整场 0 次旋风斩，日志只有一句"没有可用技能 'berserker stance'"）。
+    uint32 ScanSpellbookByName(Player* bot, char const* name)
+    {
+        uint32 best = 0;
+        for (PlayerSpellMap::const_iterator itr = bot->GetSpellMap().begin(); itr != bot->GetSpellMap().end(); ++itr)
+        {
+            uint32 const id = itr->first;
+            if (itr->second.state == PLAYERSPELL_REMOVED || itr->second.disabled)
+                continue;
+            SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+            if (!entry || !entry->SpellName[0])
+                continue;
+            if (strcasecmp(entry->SpellName[0], name) != 0)
+                continue;
+            if (!best || sSpellMgr.IsSpellHigherRankOfSpell(id, best))
+                best = id;
+        }
+        return best;
+    }
+
     uint32 SpellId(PlayerbotAI* ai, Player* bot, BotMem* m, char const* name, bool warn = true)
     {
         auto it = m->ids.find(name);
@@ -246,6 +269,9 @@ namespace
         uint32 id = 0;
         if (auto* value = ai->GetAiObjectContext()->GetValue<uint32>("spell id", name))
             id = value->Get();
+
+        if (!id)
+            id = ScanSpellbookByName(bot, name);
 
         if (id)
         {
@@ -385,7 +411,11 @@ namespace
                 s.power = float(s.energy);
         }
 
-        s.casting = bot->IsNonMeleeSpellCasted(false);
+        // [2026-10-30 修] IsNonMeleeSpellCasted 的第三参 skipAutorepeat 默认 false ⇒ 自动射击
+        //   （CURRENT_AUTOREPEAT_SPELL）也算"正在读条"。猎人自动射击一直挂着 ⇒ s.casting 恒 true
+        //   ⇒ TickHunter 在 `if (s.casting) return true` 就返回：稳固射击/猎人印记/毒蛇钉刺整场 0 次
+        //   （实测 marks 40 秒 casts=19、top 只有 75:18 = 自动射击的重复登记）。自动射击不是"读条"，跳过它。
+        s.casting = bot->IsNonMeleeSpellCasted(false, false, true);
         s.moving = bot->IsMoving();
         s.silenced = bot->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SILENCED);
 
@@ -435,6 +465,29 @@ namespace
         SpellCastResult res = SPELL_FAILED_DONT_REPORT;
         if (!ai->CanCastSpell(id, tgt, 0, false, nullptr, false, false, false, &res))
         {
+            // [2026-10-30 修] 自身增益/自身姿态这类"该打自己"的法术，走 ai->CanCastSpell(对敌目标) 会被判死。
+            //   实测两类结果码：
+            //     ① TARGET_ENEMY(108)：燃烧 11129 / 冰冷血脉 12472 / 奥强 12042 / 闪现 12051 /
+            //        剑刃乱舞 13877 / 冲动 13750 / 冷血 14177 / 元素掌握 16166 / 英雄 32182 / 唤水元素 31687…
+            //        （CanCastSpell 见"正法术 + 敌对目标"直接拒 ⇒ 这些技能整场 0 次）；
+            //     ② TARGET_FRIENDLY(110)：切割 6774 这类"效果正面但 IsPositiveSpell=false"的法术，
+            //        对着自己放又被判"负法术 + 友方目标" ⇒ 盗贼切割整场 0 次。
+            //   本质都是"这一手应该以自己为目标"，改用核心 Unit::CastSpell(self) 放（和奉献 CastSelfCentered 同一条路）。
+            bool const selfFix = (res == SPELL_FAILED_TARGET_FRIENDLY)
+                || (res == SPELL_FAILED_TARGET_ENEMY && tgt != s.bot);
+            if (selfFix)
+            {
+                SpellCastResult const res2 = s.bot->CastSpell(s.bot, id, uint32(TRIGGERED_NONE));
+                if (res2 == SPELL_CAST_OK)
+                {
+                    ++m->castCount;
+                    m->lastOk[id] = now;
+                    m->castThisTick = true;
+                    PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+                    return true;
+                }
+                res = res2;
+            }
             // [2026-10-29 实测] 一律退 2 秒会把怒气/能量职业的 DPS 砍半：
             //   "蓝/怒/能量不够"是**等一下就够**，只退 0.4 秒；射程/视线/其它条件才退 2 秒。
             bool const waitingResource = (res == SPELL_FAILED_NO_POWER
@@ -547,6 +600,9 @@ namespace
         return true;
     }
 
+    // 法力药水（实现见下方 UseManaPotion）：法师的 Recover 也要用，先声明
+    bool UseManaPotion(BotMem* m, Snapshot& s);
+
     // ============================ 法师 ============================
     bool TickMage(PlayerbotAI* ai, BotMem* m)
     {
@@ -607,10 +663,13 @@ namespace
         switch (st)
         {
             case State::Recover:
-                // 唤醒（8 分钟一次）优先，其次魔杖
+                // 唤醒（8 分钟一次）优先，其次法力药水，最后才是魔杖
 
-                if (!CastFirst(ai, m, s, { "evocation" }))
+                if (!TryCastSelf(ai, m, s, "evocation"))
+                {
+                    if (UseManaPotion(m, s)) break;
                     CastFirst(ai, m, s, { "shoot" });
+                }
                 break;
 
             case State::Aoe:
@@ -702,9 +761,13 @@ namespace
                     if (UseTrinket(ai, m, s)) break;
                     if (CastFirst(ai, m, s, { "arcane power" })) break;
                     // 奥：奥术冲击叠到 3 层就放奥术飞弹泄掉
-
-                    int const blastStacks = AuraStacks(ai, s.bot, m, "arcane blast", s.bot);
-                    if (blastStacks >= 3 && CastFirst(ai, m, s, { "arcane missiles" })) break;
+                    // [2026-10-30 修] 叠层 debuff 是**独立 id 36032**，不在 30451 的 spell_chain 里；
+                    //   原来按 "arcane blast" 查 aura 永远是 0 ⇒ 奥术飞弹整场 0 次。
+                    int const blastStacks = int(s.bot->GetAuraCount(36032));
+                    // 蓝够就继续奥冲（叠层既加伤害也加耗蓝）；蓝紧了再用飞弹把叠层泄掉、稳住续航
+                    if (blastStacks >= 3 && s.power < 45.0f && CastFirst(ai, m, s, { "arcane missiles" })) break;
+                    // 奥术弹幕：瞬发、CD 好了就打（没点这个天赋时 SpellId 取不到，自动跳过）
+                    if (CastFirst(ai, m, s, { "arcane barrage" })) break;
                 }
 
                 CastFirst(ai, m, s, { filler });
@@ -987,6 +1050,13 @@ namespace
                 st = State::Burn;
                 if (UseTrinket(ai, m, s)) break;
                 if (fury && CastFirst(ai, m, s, { "death wish" })) break;
+                // [2026-10-30 修] 狂暴战必须在**狂暴姿态**：旋风斩(1680) Stances=0x40000 只要狂暴姿态，
+                //   实测 bot 默认战斗姿态(17) ⇒ whirlwind 每次都被判 ONLY_SHAPESHIFT(89)、整场 0 次。
+                //   姿态切换只占一个 GCD，开场切一次就够（切完一直保持）。
+                if (fury && s.bot->GetShapeshiftForm() != FORM_BERSERKERSTANCE)
+                {
+                    if (TryCastSelf(ai, m, s, "berserker stance")) break;
+                }
 
                 // 怒气账本：先看"这一手放完，下一个 CD 到点的关键技能（嗜血/致死）还够不够怒"
                 char const* core = fury ? "bloodthirst" : "mortal strike";
@@ -999,7 +1069,10 @@ namespace
                 if (s.rage >= coreCost && CastFirst(ai, m, s, { core })) break;
                 if (s.rage >= wwCost && CastFirst(ai, m, s, { "whirlwind" })) break;
                 if (CastFirst(ai, m, s, { "overpower" })) break;          // 压制只花 5 怒，随时可打
-                if (!fury && s.rage >= slamCost && CastFirst(ai, m, s, { "slam" })) break;
+                // [2026-10-30 修] 猛击(15 怒) 会吃掉致死(30 怒) 的怒气：实测 arms 40 秒只出 12 次猛击、
+                //   致死 **0 次**（怒气在 150~299 之间被猛击一路吃光，永远攒不到 300）。
+                //   所以猛击必须给致死留够一发：rage >= 致死 + 猛击。
+                if (!fury && s.rage >= slamCost + coreCost && CastFirst(ai, m, s, { "slam" })) break;
                 // 英勇/顺劈是"下次挥击附带"，会顶掉普攻（换怒）⇒ 必须给下一个 core 留够怒
                 if (s.rage >= coreCost + hsCost && s.rage >= hsFloor
                     && TrySwing(ai, m, s, "heroic strike")) break;
@@ -1064,11 +1137,23 @@ namespace
                 int const evisEnergy = int(TP(m, "fin_energy", 45.0));  // 放终结技前至少留这么多能量
 
                 // 切割：优先级表里一条"剩余 < 2.5s 且连击点够就续"的自身 buff 条目
+                // [2026-10-30 修] 目标必须填**当前敌人**，不能填自己：核心 Spell::CheckCast 对连击点法术
+                //   要求 `unitTarget == GetComboTargetGuid()`，对自己放会判 NO_COMBO_POINTS(73)
+                //   （实测切割 40 秒 0 次，全是 res=73）。切割的隐式目标本来就是施法者，单位目标给敌人没关系。
                 if (TryTable(ai, m, s, {
-                        { "slice and dice", s.bot, nullptr, 2500, nullptr, sndCp, 0 } }))
+                        { "slice and dice", nullptr, nullptr, 2500, nullptr, sndCp, 0 } }))
                     break;
-                if (s.combo >= finCp && s.energy >= evisEnergy
-                    && CastFirst(ai, m, s, { finisher })) break;
+                if (s.combo >= finCp && s.energy >= evisEnergy)
+                {
+                    // [2026-10-30 修] 刺杀：毒伤(Envenom)要求目标身上有中毒状态（TargetAuraState=16，实测 res=106
+                    //   TARGET_AURASTATE），木桩/没上毒的怪身上永远没有 ⇒ 星级满了也放不出终结技，
+                    //   只能反复攒星。改成"毒伤放不出就剔骨兜底"。
+                    if (mutilate && CastFirst(ai, m, s, { "envenom", "eviscerate" })) break;
+                    if (!mutilate && CastFirst(ai, m, s, { "eviscerate" })) break;
+                }
+                // 星已经满、能量还不够放终结技时**别再攒星**（连击点上限 5，多打的全浪费）
+                if (s.combo >= finCp)
+                    break;
                 // 毁灭/毁伤要求匕首 + 背后；随机 bot 经常不满足 ⇒ 一定留个邪恶攻击兜底，
                 //   否则整场 0 施法（实测 assassination 40 秒 casts=0、只有 2 次平砍）。
                 if (CastFirst(ai, m, s, mutilate ? std::initializer_list<char const*>{ "mutilate", "sinister strike" }
@@ -1299,7 +1384,10 @@ namespace
                 }
                 if (destruction)
                 {
-                    if (AuraStacks(ai, s.bot, m, "immolate", s.target) == 0 && CastFirst(ai, m, s, { "immolate" })) break;
+                    bool const immo = AuraStacks(ai, s.bot, m, "immolate", s.target) > 0;
+                    if (!immo && CastFirst(ai, m, s, { "immolate" })) break;
+                    // [2026-10-30 修] 燃烧(Conflagrate) 要目标身上有献祭，原来的表里根本没有这个技能
+                    if (immo && CastFirst(ai, m, s, { "conflagrate" })) break;
                 }
                 if (affliction && CastFirst(ai, m, s, { "drain life" })) break;
                 CastFirst(ai, m, s, { "shadow bolt" });
@@ -1312,6 +1400,31 @@ namespace
     }
 
     // ============================ 萨满 ============================
+    // [2026-10-30 修] 增强萨的输出有一大块在图腾上（大地之力/优雅/灼热/法力之泉），
+    //   而原来的优先级表里**一个图腾都没有** ⇒ 实测 40 秒只有风暴打击 + 震击。
+    //   这里按"这个插槽空着就补一个"来做（图腾被拆/到期/没人插都会走到这里），
+    //   没学的图腾（低等级/别的元素图腾）直接跳过，不占 GCD。
+    bool TotemUpkeep(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        struct TotemSlotName { TotemSlot slot; char const* name; };
+        static TotemSlotName const kTotems[] = {
+            { TOTEM_SLOT_EARTH, "strength of earth totem" },
+            { TOTEM_SLOT_AIR,   "grace of air totem" },
+            { TOTEM_SLOT_FIRE,  "searing totem" },
+            { TOTEM_SLOT_WATER, "mana spring totem" },
+        };
+        for (TotemSlotName const& t : kTotems)
+        {
+            if (!s.bot->GetTotemGuid(t.slot).IsEmpty())
+                continue;
+            if (!SpellId(ai, s.bot, m, t.name, false))
+                continue;
+            if (TryCastSelf(ai, m, s, t.name))
+                return true;
+        }
+        return false;
+    }
+
     bool TickShaman(PlayerbotAI* ai, BotMem* m)
     {
         Snapshot s;
@@ -1359,9 +1472,10 @@ namespace
                 if (UseTrinket(ai, m, s)) break;
                 if (enhance)
                 {
-                    if (CastFirst(ai, m, s, { "bloodlust" })) break;
-                    if (CastFirst(ai, m, s, { "heroism" })) break;
-                    if (CastFirst(ai, m, s, { "shamanistic rage" })) break;
+                    if (TotemUpkeep(ai, m, s)) break;
+                    if (TryCastSelf(ai, m, s, "bloodlust")) break;
+                    if (TryCastSelf(ai, m, s, "heroism")) break;
+                    if (TryCastSelf(ai, m, s, "shamanistic rage")) break;
                     if (CastFirst(ai, m, s, { "stormstrike" })) break;
                 }
                 else
@@ -1378,14 +1492,17 @@ namespace
                 if (UseTrinket(ai, m, s)) break;
                 if (enhance)
                 {
-                    if (CastFirst(ai, m, s, { "bloodlust" })) break;
-                    if (CastFirst(ai, m, s, { "heroism" })) break;
+                    if (TotemUpkeep(ai, m, s)) break;
+                    // [2026-10-30] 萨满之怒/嗜血/英雄都是自身增益：原来走 CastFirst（对敌目标）
+                    //   被判 TARGET_ENEMY(108) ⇒ 整场 0 次。改 TryCastSelf。
+                    if (TryCastSelf(ai, m, s, "bloodlust")) break;
+                    if (TryCastSelf(ai, m, s, "heroism")) break;
+                    if (TryCastSelf(ai, m, s, "shamanistic rage")) break;
                     if (CastFirst(ai, m, s, { "stormstrike" })) break;
                     // 震击共用冷却：烈焰震击常驻，地球震击补位
                     if (AuraStacks(ai, s.bot, m, "flame shock", s.target) == 0 && CastFirst(ai, m, s, { "flame shock" })) break;
                     if (CastFirst(ai, m, s, { "earth shock" })) break;
                     break;   // 其余等普攻/风怒
-
                 }
                 if (CastFirst(ai, m, s, { "elemental mastery" })) break;
                 if (AuraStacks(ai, s.bot, m, "flame shock", s.target) == 0 && CastFirst(ai, m, s, { "flame shock" })) break;
@@ -1438,8 +1555,11 @@ namespace
                     break;
                 case State::Burst:
                     if (UseTrinket(ai, m, s)) break;
-                    if (CastFirst(ai, m, s, { "tiger's fury" })) break;
-                    if (s.combo >= 5 && CastFirst(ai, m, s, { "rip" })) break;
+                    if (s.energy >= 80 && CastFirst(ai, m, s, { "tiger's fury" })) break;
+                    if (s.combo >= 5 && AuraStacks(ai, s.bot, m, "rip", s.target) == 0
+                        && CastFirst(ai, m, s, { "rip" })) break;
+                    if (s.combo >= 5 && CastFirst(ai, m, s, { "ferocious bite" })) break;
+                    if (s.combo >= 5) break;
                     if (CastFirst(ai, m, s, { "mangle (cat)" })) break;
                     CastFirst(ai, m, s, { "shred" });
                     break;
@@ -1448,11 +1568,21 @@ namespace
                 {
                     st = State::Burn;
                     if (UseTrinket(ai, m, s)) break;
-                    if (CastFirst(ai, m, s, { "tiger's fury" })) break;
-                    // 裂伤(�? 的流血易伤先挂，再割裂/扫击
+                    // [2026-10-30 修] 凶猛之怒(Tiger's Fury) 没有冷却、只花 30 能量，原来排在第一位，
+                    //   自增益"打自己"修好以后它把能量全吃光（实测 40 秒 15 次 TF、裂伤只剩 2 次、dps 359）。
+                    //   改成"能量快满才放"（等效于把快溢出的能量换成攻强），不跟裂伤/终结技抢能量。
+                    if (s.energy >= 80 && CastFirst(ai, m, s, { "tiger's fury" })) break;
+                    // [2026-10-30 修] 终结技（割裂/凶猛撕咬）原来排在"攒星技"后面：
+                    //   mangle(cat) 没有冷却、能量一够就先被它吃掉，星满了也在继续打裂伤
+                    //   ⇒ 实测 40 秒 rip 只有 1 次、凶猛撕咬（Ferocious Bite）**表里根本没有**。
+                    //   现在：5 星先泄终结技；割裂没挂先挂割裂，挂上了就改用凶猛撕咬。
+                    bool const ripUp = AuraStacks(ai, s.bot, m, "rip", s.target) > 0;
+                    if (s.combo >= 5 && !ripUp && CastFirst(ai, m, s, { "rip" })) break;
+                    if (s.combo >= 5 && ripUp && CastFirst(ai, m, s, { "ferocious bite" })) break;
+                    if (s.combo >= 5) break;      // 星满了在等能量放终结技，别再攒星
+                    // 裂伤(�? 的流血易伤先挂，再补扫击/撕碎
                     if (CastFirst(ai, m, s, { "mangle (cat)" })) break;
                     if (AuraStacks(ai, s.bot, m, "rake", s.target) == 0 && CastFirst(ai, m, s, { "rake" })) break;
-                    if (s.combo >= 5 && CastFirst(ai, m, s, { "rip" })) break;
                     CastFirst(ai, m, s, { "shred" });
                     break;
                 }
@@ -2000,53 +2130,66 @@ namespace ai
 
             ++m->tickCount;
 
+            bool handled = false;
             switch (m->spec)
             {
                 case Spec::Fire:
                 case Spec::Frost:
                 case Spec::Arcane:
-                    return TickMage(ai, m);
+                    handled = TickMage(ai, m);
+                    break;
 
                 case Spec::Arms:
                 case Spec::Fury:
                 case Spec::Protection:
-                    return TickWarrior(ai, m);
+                    handled = TickWarrior(ai, m);
+                    break;
 
                 case Spec::Combat:
                 case Spec::Assassination:
                 case Spec::Subtlety:
-                    return TickRogue(ai, m);
+                    handled = TickRogue(ai, m);
+                    break;
 
                 case Spec::BeastMastery:
                 case Spec::Marksmanship:
                 case Spec::Survival:
-                    return TickHunter(ai, m);
+                    handled = TickHunter(ai, m);
+                    break;
 
                 case Spec::Affliction:
                 case Spec::Demonology:
                 case Spec::Destruction:
-                    return TickWarlock(ai, m);
+                    handled = TickWarlock(ai, m);
+                    break;
 
                 case Spec::Enhancement:
                 case Spec::Elemental:
                 case Spec::Restoration:
-                    return TickShaman(ai, m);
+                    handled = TickShaman(ai, m);
+                    break;
 
                 case Spec::Feral:
                 case Spec::Balance:
-                    return TickDruid(ai, m);
+                    handled = TickDruid(ai, m);
+                    break;
 
                 case Spec::Retribution:
                 case Spec::Holy:
-                    return TickPaladin(ai, m);
+                    handled = TickPaladin(ai, m);
+                    break;
 
                 case Spec::Shadow:
                 case Spec::Discipline:
-                    return TickPriest(ai, m);
+                    handled = TickPriest(ai, m);
+                    break;
 
                 default:
                     break;
             }
+
+            if (handled)
+                return true;
 
             if (m->flags.insert("unimplemented logged").second)
                 sLog.outError("[DPSFSM] %s 职业/专精 %s 状态机还没写，先回退原引擎",
