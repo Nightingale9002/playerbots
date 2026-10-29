@@ -109,6 +109,7 @@ namespace
     std::set<uint32> s_disabled;      // A/B 对照：这些 guid 这一轮不走状态机
     std::set<uint32> s_forceDps;      // 假人测试：强制按 DPS 打（忽略坦/奶角色门）
     std::map<uint32, std::set<ObjectGuid>> s_scenarioTargets;   // guid → 这一轮"自己的"假人
+    std::map<uint32, uint32> s_scenarioRun;                      // guid → 登记它的 runId
 
     std::mutex s_memMutex;
     std::unordered_map<uint32, std::unique_ptr<BotMem>> s_mem;
@@ -555,7 +556,9 @@ namespace
                         AuraStacks(ai, s.bot, m, "fire vulnerability", s.target));
                     if (scorchStacks > 0)
                         m->flags.insert("scorch seen");
-                    if (scorchStacks < 5 && m->flags.count("scorch seen") && TryCast(ai, m, s, "scorch", nullptr))
+                    int const scorchFull = int(TP(m, "scorch_stacks", 5.0));
+                    if (scorchStacks < scorchFull && m->flags.count("scorch seen")
+                        && TryCast(ai, m, s, "scorch", nullptr))
                         break;
                     // 火焰冲击 8 秒 CD、瞬发：不占读条，CD 好了就该打（原来只在移动/斩杀才放）
                     if (CastFirst(ai, m, s, { "fire blast" })) break;
@@ -639,6 +642,15 @@ namespace
     // [2026-10-29 实测] 英勇打击/顺劈/重殴这类"下一次挥击附带"的技能没有冷却，
     //   每个 AI tick 都能重新施放 —— 实测 arms 40 秒刷了 1116 次、fury 934 次，
     //   既白烧怒气也把施法统计搞脏。它们排进 CURRENT_MELEE_SPELL 就说明已经挂上了，不用再放。
+    // [2026-10-29 站长口径] 资源账本：怒气/能量/法力的真实消耗一律从 SpellEntry->manaCost 读，
+    //   不写死数字（不同等级/不同 rank 的消耗不同）。这样"放了这一手还能不能放下关键技能"才判得准。
+    int SpellCost(PlayerbotAI* ai, BotMem* m, char const* name)
+    {
+        uint32 const id = SpellId(ai, ai->GetBot(), m, name, false);
+        SpellEntry const* entry = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
+        return entry ? int(entry->manaCost) : 0;
+    }
+
     bool TrySwing(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
     {
         if (s.bot->GetCurrentSpell(CURRENT_MELEE_SPELL))
@@ -690,17 +702,28 @@ namespace
                 break;
             case State::Burn:
             default:
+            {
                 st = State::Burn;
                 if (UseTrinket(ai, m, s)) break;
                 if (fury && CastFirst(ai, m, s, { "death wish" })) break;
-                if (CastFirst(ai, m, s, { fury ? "bloodthirst" : "mortal strike" })) break;
-                if (CastFirst(ai, m, s, { "whirlwind" })) break;
-                if (CastFirst(ai, m, s, { "overpower" })) break;
-                if (!fury && CastFirst(ai, m, s, { "slam" })) break;
-                // 英勇打击顶掉一次普攻（换怒）：怒不够时等于自断怒气来源。
-                //   实测 ap1456 狂暴战 40 秒 15 次英勇 / 只有 8 次普攻 / 嗜血才 3 次 ⇒ 改成高怒才泄
-                if (s.rage >= int(TP(m, "hs_rage", 75.0)) && TrySwing(ai, m, s, "heroic strike")) break;
-                break;   // 怒气不够就等普攻，别硬放
+
+                // 怒气账本：先看"这一手放完，下一个 CD 到点的关键技能（嗜血/致死）还够不够怒"
+                char const* core = fury ? "bloodthirst" : "mortal strike";
+                int const coreCost = SpellCost(ai, m, core);
+                int const wwCost = SpellCost(ai, m, "whirlwind");
+                int const hsCost = SpellCost(ai, m, "heroic strike");
+                int const slamCost = SpellCost(ai, m, "slam");
+                int const hsFloor = int(TP(m, "hs_rage", 75.0));
+
+                if (s.rage >= coreCost && CastFirst(ai, m, s, { core })) break;
+                if (s.rage >= wwCost && CastFirst(ai, m, s, { "whirlwind" })) break;
+                if (CastFirst(ai, m, s, { "overpower" })) break;          // 压制只花 5 怒，随时可打
+                if (!fury && s.rage >= slamCost && CastFirst(ai, m, s, { "slam" })) break;
+                // 英勇/顺劈是"下次挥击附带"，会顶掉普攻（换怒）⇒ 必须给下一个 core 留够怒
+                if (s.rage >= coreCost + hsCost && s.rage >= hsFloor
+                    && TrySwing(ai, m, s, "heroic strike")) break;
+                break;   // 怒不够就等普攻，别硬放（硬放只会让核心技能永远没怒）
+            }
         }
 
         LogTransition(ai, m, s, st);
@@ -748,14 +771,21 @@ namespace
                 if (!mutilate && CastFirst(ai, m, s, { "adrenaline rush" })) break;
                 if (CastFirst(ai, m, s, { "blade flurry" })) break;
                 if (mutilate && CastFirst(ai, m, s, { "cold blood" })) break;
-                // 切割：原来 1 星就切（垃圾），改成 4 星以上才切；之后再用 5 星终结技
+
+                // 能量账本：终结技会清空连击点，放完还要留够一发攒星技的能量，否则出现"空星干等"
+                char const* builder = mutilate ? "mutilate" : "sinister strike";
+                char const* finisher = mutilate ? "envenom" : "eviscerate";
+                int const builderCost = SpellCost(ai, m, builder);
+                int const finisherCost = SpellCost(ai, m, finisher);
+                int const sndCp = int(TP(m, "snd_cp", 4.0));      // 切割要几星
+                int const finCp = int(TP(m, "fin_cp", 5.0));      // 终结技要几星
+                int const evisEnergy = int(TP(m, "fin_energy", 45.0));  // 放终结技前至少留这么多能量
+
                 bool const sndUp = AuraStacks(ai, s.bot, m, "slice and dice", s.bot) > 0;
-                if (!sndUp && s.combo >= 4 && CastFirst(ai, m, s, { "slice and dice" })) break;
-                if (sndUp && s.combo >= 5)
-                {
-                    if (mutilate && CastFirst(ai, m, s, { "envenom" })) break;
-                    if (!mutilate && CastFirst(ai, m, s, { "eviscerate" })) break;
-                }
+                if (!sndUp && s.combo >= sndCp && s.energy >= finisherCost + builderCost
+                    && CastFirst(ai, m, s, { "slice and dice" })) break;
+                if (sndUp && s.combo >= finCp && s.energy >= evisEnergy
+                    && CastFirst(ai, m, s, { finisher })) break;
                 // 毁灭/毁伤要求匕首 + 背后；随机 bot 经常不满足 ⇒ 一定留个邪恶攻击兜底，
                 //   否则整场 0 施法（实测 assassination 40 秒 casts=0、只有 2 次平砍）。
                 if (CastFirst(ai, m, s, mutilate ? std::initializer_list<char const*>{ "mutilate", "sinister strike" }
@@ -1328,6 +1358,7 @@ namespace ai
                 if (!sServerFacade.IsHostileTo(bot, u))
                     continue;
                 bool ok = bot->Attack(u, true);   // 假人场景里就是要它开打
+                bool const firstTry = ok;
                 if (!ok || !bot->GetVictim())
                 {
                     // Unit::Attack() 在本核心里有个不对称：bot 还挂在目标的 m_attackers 里、
@@ -1346,10 +1377,14 @@ namespace ai
                     if (now - mem->lastEngageLog >= 10)
                     {
                         mem->lastEngageLog = now;
-                        sLog.outError("[DPSFSM-ENGAGE] %s 咬不上去: attack=%d victim=%s mounted=%d dist=%.1f",
-                            bot->GetName(), ok ? 1 : 0,
+                        sLog.outError("[DPSFSM-ENGAGE] %s 咬不上去: attack=%d(retry=%d) victim=%s mounted=%d "
+                            "dist=%.1f alive=%d inworld=%d evade=%d dead=%d flying=%d",
+                            bot->GetName(), firstTry ? 1 : 0, ok ? 1 : 0,
                             bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
-                            bot->IsMounted() ? 1 : 0, bot->GetDistance(u));
+                            bot->IsMounted() ? 1 : 0, bot->GetDistance(u),
+                            u->IsAlive() ? 1 : 0, u->IsInWorld() ? 1 : 0,
+                            u->GetCombatManager().IsInEvadeMode() ? 1 : 0,
+                            bot->IsAlive() ? 0 : 1, bot->IsFlying() ? 1 : 0);
                     }
                     continue;
                 }
@@ -1358,13 +1393,31 @@ namespace ai
             return false;
         }
 
-        void SetScenarioTargets(uint32 guid, std::vector<ObjectGuid> const& targets)
+        void SetScenarioTargets(uint32 guid, std::vector<ObjectGuid> const& targets, uint32 runId)
         {
             std::lock_guard<std::mutex> lock(s_disabledMutex);
             if (targets.empty())
+            {
                 s_scenarioTargets.erase(guid);
+                s_scenarioRun.erase(guid);
+            }
             else
+            {
                 s_scenarioTargets[guid] = std::set<ObjectGuid>(targets.begin(), targets.end());
+                s_scenarioRun[guid] = runId;
+            }
+        }
+
+        void ClearScenarioTargets(uint32 guid, uint32 runId)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            auto it = s_scenarioRun.find(guid);
+            if (it == s_scenarioRun.end())
+                return;
+            if (runId && it->second != runId)
+                return;      // 这条是新一轮登记的，别动
+            s_scenarioTargets.erase(guid);
+            s_scenarioRun.erase(guid);
         }
 
         int PackCount(Player* bot, float range)

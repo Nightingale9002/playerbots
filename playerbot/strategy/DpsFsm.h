@@ -75,7 +75,10 @@ namespace ai
 
         // 假人场景专用：声明"这一轮只有这些目标是自己的" ⇒ pack 统计只数它们，
         //   避免多组同时跑时把邻居的假人算进 AoE 判断（1 目标场景被误判成群架）。
-        void SetScenarioTargets(uint32 guid, std::vector<ObjectGuid> const& targets);
+        void SetScenarioTargets(uint32 guid, std::vector<ObjectGuid> const& targets, uint32 runId = 0);
+
+        // 只清自己那一轮（同一只 bot 被复用时，上一轮的收尾不能把新一轮的目标集清掉）
+        void ClearScenarioTargets(uint32 guid, uint32 runId = 0);
 
         // 假人场景：没有 victim 时自己咬上去（只对"声明过的场景目标"生效，副本里不改变行为）
         bool EngageScenarioTarget(PlayerbotAI* ai);

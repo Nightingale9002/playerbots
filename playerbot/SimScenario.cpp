@@ -3392,6 +3392,10 @@ uint32 stuckFightCleared = 0;
                     return false;
                 }
                 c->setFaction(14);
+                // [2026-10-29 实测] SummonCreature 出来的假人没有 home 点，CombatManager 会标成 evade；
+                //   而 Unit::Attack() 对 evade 目标直接返回 false（"victim in evade mode"）⇒ 远程 bot 永远开不了打。
+                c->GetCombatManager().SetEvadeState(EVADE_NONE);
+                c->GetCombatManager().StopEvade();
                 c->Relocate(px, py, c->GetPositionZ());
                 if (c->GetPositionZ() < d.z - 5.0f || c->GetPositionZ() > d.z + 20.0f)
                     sLog.outError("[DUMMY] id=%u 假人落点异常 z=%.1f（bot z=%.1f）⇒ 可能掉进水里/地形下",
@@ -3401,7 +3405,7 @@ uint32 stuckFightCleared = 0;
                 c->SetHealth(c->GetMaxHealth());
                 d.dummies.push_back(c->GetObjectGuid());
             }
-            dpsfsm::SetScenarioTargets(d.guid, d.dummies);   // pack 只数自己的假人
+            dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);   // pack 只数自己的假人（带 runId 防串）
             return !d.dummies.empty();
         }
 
@@ -3461,7 +3465,7 @@ uint32 stuckFightCleared = 0;
                 sec > 0.0 ? total / sec : 0.0, (unsigned long long)casts, (unsigned long long)melee,
                 top.empty() ? "-" : top.c_str());
 
-            dpsfsm::SetScenarioTargets(d.guid, std::vector<ObjectGuid>());
+            dpsfsm::ClearScenarioTargets(d.guid, d.id);
             // 收尾：撤假人 + 停手
             if (bot)
             {
@@ -3571,6 +3575,11 @@ uint32 stuckFightCleared = 0;
                         //   先 CombatStop 把这个状态清干净，再咬一次。
                         if (!bot->GetVictim() && !bot->IsMounted() && first->IsAlive())
                         {
+                            if (first->GetCombatManager().IsInEvadeMode())
+                            {
+                                first->GetCombatManager().SetEvadeState(EVADE_NONE);
+                                first->GetCombatManager().StopEvade();
+                            }
                             bot->CombatStopWithPets(true);
                             bot->Attack(first, true);
                         }
