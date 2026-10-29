@@ -367,7 +367,12 @@ namespace
         SpellCastResult res = SPELL_FAILED_DONT_REPORT;
         if (!ai->CanCastSpell(id, tgt, 0, false, nullptr, false, false, false, &res))
         {
-            m->failUntil[id] = now + 2;   // 2 秒退避（≥ GCD），别每 tick 重试
+            // [2026-10-29 实测] 一律退 2 秒会把怒气/能量职业的 DPS 砍半：
+            //   "蓝/怒/能量不够"是**等一下就够**，只退 0.4 秒；射程/视线/其它条件才退 2 秒。
+            bool const waitingResource = (res == SPELL_FAILED_NO_POWER
+                || res == SPELL_FAILED_OUT_OF_RANGE || res == SPELL_FAILED_LINE_OF_SIGHT
+                || res == SPELL_FAILED_NOT_READY);
+            m->failUntil[id] = now + (waitingResource ? 1 : 2);
             return false;
         }
         if (!ai->CastSpell(id, tgt))
@@ -552,6 +557,7 @@ namespace
                         m->flags.insert("scorch seen");
                     if (scorchStacks < 5 && m->flags.count("scorch seen") && TryCast(ai, m, s, "scorch", nullptr))
                         break;
+                    // 火焰冲击 8 秒 CD、瞬发：不占读条，CD 好了就该打（原来只在移动/斩杀才放）
                     if (CastFirst(ai, m, s, { "fire blast" })) break;
                 }
                 else if (frost)
@@ -691,7 +697,9 @@ namespace
                 if (CastFirst(ai, m, s, { "whirlwind" })) break;
                 if (CastFirst(ai, m, s, { "overpower" })) break;
                 if (!fury && CastFirst(ai, m, s, { "slam" })) break;
-                if (s.rage >= 60 && TrySwing(ai, m, s, "heroic strike")) break;
+                // 英勇打击顶掉一次普攻（换怒）：怒不够时等于自断怒气来源。
+                //   实测 ap1456 狂暴战 40 秒 15 次英勇 / 只有 8 次普攻 / 嗜血才 3 次 ⇒ 改成高怒才泄
+                if (s.rage >= int(TP(m, "hs_rage", 75.0)) && TrySwing(ai, m, s, "heroic strike")) break;
                 break;   // 怒气不够就等普攻，别硬放
         }
 
@@ -743,7 +751,7 @@ namespace
                 // 切割：原来 1 星就切（垃圾），改成 4 星以上才切；之后再用 5 星终结技
                 bool const sndUp = AuraStacks(ai, s.bot, m, "slice and dice", s.bot) > 0;
                 if (!sndUp && s.combo >= 4 && CastFirst(ai, m, s, { "slice and dice" })) break;
-                if (sndUp && s.combo >= 4)
+                if (sndUp && s.combo >= 5)
                 {
                     if (mutilate && CastFirst(ai, m, s, { "envenom" })) break;
                     if (!mutilate && CastFirst(ai, m, s, { "eviscerate" })) break;

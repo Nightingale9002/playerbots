@@ -2,6 +2,7 @@
 #include "playerbot/SimScenario.h"
 #include "playerbot/AiFactory.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "playerbot/Talentspec.h"   // premade 天赋（按专精固定一套）
 #include "playerbot/DungeonRoute.h"
 #include "playerbot/DpsExempt.h"
 #include "playerbot/strategy/DpsFsm.h"   // [2026-10-29] 假人场景 A/B：单只 bot 开关 DPS 状态机
@@ -257,6 +258,7 @@ uint32 stuckFightCleared = 0;
             bool setupDone = false;
             uint32 pinnedGuid = 0;      // 调优时要"同一只 bot 复测"，不能每轮换人
             uint8 tab = 0;              // 目标天赋树
+            std::string premade;        // 目标 premade 天赋名（配置里那一套）
             bool respec = true;         // 开跑前按目标专精重天赋 + 换最好装备
             bool respecced = false;
             bool useFsm = true;         // false = 这一轮关掉 DPS 状态机（A/B 对照基线）
@@ -281,31 +283,32 @@ uint32 stuckFightCleared = 0;
             char const* disable1;
             char const* disable2;
             uint8 tab;          // 该职业的天赋树序号（talentTab.tabpage：0/1/2）
+            char const* premade; // 配置里 AiPlayerbot.PremadeSpecName.<cls>.<n> 的**精确名字**
         };
 
         SpecKey const s_specKeys[] =
         {
             // mage: 0=奥 1=火 2=冰 | warrior: 0=武器 1=狂暴 2=防护 | rogue: 0=刺杀 1=战斗 2=敏锐
-            { "fire",         CLASS_MAGE,    "fire",          "frost",         "arcane",       1 },
-            { "frost",        CLASS_MAGE,    "frost",         "fire",          "arcane",       2 },
-            { "arcane",       CLASS_MAGE,    "arcane",        "fire",          "frost",        0 },
-            { "arms",         CLASS_WARRIOR, "arms",          "fury",          "protection",   0 },
-            { "fury",         CLASS_WARRIOR, "fury",          "arms",          "protection",   1 },
-            { "combat",       CLASS_ROGUE,   "combat",        "assassination", "subtlety",     1 },
-            { "assassination",CLASS_ROGUE,   "assassination", "combat",        "subtlety",     0 },
+            { "fire",         CLASS_MAGE,    "fire",          "frost",         "arcane",       1, "pve dps fire" },
+            { "frost",        CLASS_MAGE,    "frost",         "fire",          "arcane",       2, "pve dps frost" },
+            { "arcane",       CLASS_MAGE,    "arcane",        "fire",          "frost",        0, "pve dps arcane" },
+            { "arms",         CLASS_WARRIOR, "arms",          "fury",          "protection",   0, "pve arms" },
+            { "fury",         CLASS_WARRIOR, "fury",          "arms",          "protection",   1, "pve fury" },
+            { "combat",       CLASS_ROGUE,   "combat",        "assassination", "subtlety",     1, "pve dps combat" },
+            { "assassination",CLASS_ROGUE,   "assassination", "combat",        "subtlety",     0, "pve assassination" },
             // hunter: 0=兽王 1=射击 2=生存 | warlock: 0=痛苦 1=恶魔 2=毁灭
-            { "bm",           CLASS_HUNTER,  "beast mastery", "marksmanship",  "survival",     0 },
-            { "marks",        CLASS_HUNTER,  "marksmanship",  "beast mastery", "survival",     1 },
-            { "affliction",   CLASS_WARLOCK, "affliction",    "demonology",    "destruction",  0 },
-            { "destro",       CLASS_WARLOCK, "destruction",   "affliction",    "demonology",   2 },
+            { "bm",           CLASS_HUNTER,  "beast mastery", "marksmanship",  "survival",     0, "pve dps bm" },
+            { "marks",        CLASS_HUNTER,  "marksmanship",  "beast mastery", "survival",     1, "pve dps mm" },
+            { "affliction",   CLASS_WARLOCK, "affliction",    "demonology",    "destruction",  0, "pve dps affli" },
+            { "destro",       CLASS_WARLOCK, "destruction",   "affliction",    "demonology",   2, "pve dps destro" },
             // shaman: 0=元素 1=增强 2=恢复 | druid: 0=平衡 1=野性 2=恢复
-            { "enhance",      CLASS_SHAMAN,  "enhancement",   "elemental",     "restoration",  1 },
-            { "elemental",    CLASS_SHAMAN,  "elemental",     "enhancement",   "restoration",  0 },
-            { "feral",        CLASS_DRUID,   "feral",         "balance",       "restoration",  1 },
-            { "balance",      CLASS_DRUID,   "balance",       "feral",         "restoration",  0 },
+            { "enhance",      CLASS_SHAMAN,  "enhancement",   "elemental",     "restoration",  1, "pve dps enh" },
+            { "elemental",    CLASS_SHAMAN,  "elemental",     "enhancement",   "restoration",  0, "pve dps elem" },
+            { "feral",        CLASS_DRUID,   "feral",         "balance",       "restoration",  1, "pve dps feral cat" },
+            { "balance",      CLASS_DRUID,   "balance",       "feral",         "restoration",  0, "pve dps balance" },
             // paladin: 0=神圣 1=防护 2=惩戒 | priest: 0=戒律 1=神圣 2=暗影
-            { "ret",          CLASS_PALADIN, "retribution",   "protection",    "holy",         2 },
-            { "shadow",       CLASS_PRIEST,  "shadow",        "discipline",    "holy",         2 },
+            { "ret",          CLASS_PALADIN, "retribution",   "protection",    "holy",         2, "pve dps ret" },
+            { "shadow",       CLASS_PRIEST,  "shadow",        "discipline",    "holy",         2, "pve dps shadow" },
         };
 
         SpecKey const* FindSpecKey(std::string const& key)
@@ -3175,12 +3178,32 @@ uint32 stuckFightCleared = 0;
                 d.respecced = true;
                 if (bot->GetLevel() >= 70)
                 {
-                    bot->resetTalents(true);
-                    sRandomPlayerbotMgr.SetValue(bot, "specNo", uint32(d.tab) + 1);
+                    // [站长口径 2026-10-29] 天赋是**按专精固定一套**（AiPlayerbot.PremadeSpecName/Link），
+                    //   不能用 PlayerbotFactory::Randomize 的随机填点 —— 那会把现成的 build 换成随机点，
+                    //   反而把 DPS 上限砸下来。这里按名字找 premade 那一套，直接 ApplyTalents。
+                    ClassSpecs& specs = sPlayerbotAIConfig.classSpecs[d.cls];
+                    bool applied = false;
+                    for (auto& path : specs.talentPath)
+                    {
+                        if (path.name != d.premade || path.talentSpec.empty())
+                            continue;
+                        TalentSpec& ts = path.talentSpec.back();     // 最高等级那一档
+                        std::ostringstream out;
+                        bot->resetTalents(true);
+                        ts.ApplyTalents(bot, &out);
+                        applied = true;
+                        sLog.outError("[DUMMY] id=%u spec=%s premade=[%s] 天赋已套用", d.id, d.spec.c_str(), d.premade.c_str());
+                        break;
+                    }
+                    if (!applied)
+                        sLog.outError("[DUMMY] id=%u spec=%s 没找到 premade 天赋 [%s]，保留原天赋",
+                            d.id, d.spec.c_str(), d.premade.c_str());
+
+                    // 装备：仍用"最好装备"那套（属性权重那部分之前已经调过）
                     PlayerbotFactory factory(bot, 70);
-                    factory.Randomize(false, false);
-                    sLog.outError("[DUMMY] id=%u spec=%s 已重天赋(tab=%u)+换装：sp=%d ap=%d",
-                        d.id, d.spec.c_str(), (uint32)d.tab,
+                    factory.EquipGearBest();
+                    sLog.outError("[DUMMY] id=%u spec=%s 换装完成：sp=%d ap=%d",
+                        d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
                         int(bot->GetTotalAttackPowerValue(BASE_ATTACK)));
                 }
@@ -3277,6 +3300,7 @@ uint32 stuckFightCleared = 0;
                 d0.disable1 = spec->disable1;
                 d0.disable2 = spec->disable2;
                 d0.tab = spec->tab;
+                d0.premade = spec->premade;
                 d0.respec = respec;
                 d0.targets = targets;
                 d0.durationMs = seconds * 1000;
@@ -3312,6 +3336,7 @@ uint32 stuckFightCleared = 0;
             d.disable1 = spec->disable1;
             d.disable2 = spec->disable2;
             d.tab = spec->tab;
+            d.premade = spec->premade;
             d.respec = respec;
             d.targets = targets;
             d.durationMs = seconds * 1000;
