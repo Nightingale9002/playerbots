@@ -87,6 +87,7 @@ namespace
 
     struct BotMem
     {
+        uint32 guid = 0;
         State state = State::Idle;
         Spec spec = Spec::Unknown;
         time_t specCheckedAt = 0;
@@ -110,6 +111,7 @@ namespace
     std::set<uint32> s_disabled;      // A/B 对照：这些 guid 这一轮不走状态机
     std::set<uint32> s_forceDps;      // 假人测试：强制按 DPS 打（忽略坦/奶角色门）
     std::map<uint32, std::set<ObjectGuid>> s_scenarioTargets;   // guid → 这一轮"自己的"假人
+    std::map<uint32, std::map<std::string, double>> s_overrides; // guid → 本轮参数覆盖（调优并发用）
     std::map<uint32, uint32> s_scenarioRun;                      // guid → 登记它的 runId
 
     std::mutex s_memMutex;
@@ -120,7 +122,10 @@ namespace
         std::lock_guard<std::mutex> lock(s_memMutex);
         std::unique_ptr<BotMem>& slot = s_mem[guid];
         if (!slot)
+        {
             slot.reset(new BotMem());
+            slot->guid = guid;
+        }
         return slot.get();
     }
 
@@ -184,6 +189,8 @@ namespace
         sLog.outError("[DPSFSM] 调优参数已加载 %u 项（%s）", (uint32)s_tune.vals.size(), path.c_str());
     }
 
+    double TuneForBot(BotMem* m, char const* key, double def);
+
     double Tune(char const* spec, char const* key, double def)
     {
         std::lock_guard<std::mutex> lock(s_tuneMutex);
@@ -196,9 +203,25 @@ namespace
         return def;
     }
 
+    double TuneForBot(BotMem* m, char const* key, double def)
+    {
+        // 先看"这只 bot 自己的覆盖"（同一轮里不同 bot 可以跑不同参数值）
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            auto it = s_overrides.find(m->guid);
+            if (it != s_overrides.end())
+            {
+                auto kv = it->second.find(key);
+                if (kv != it->second.end())
+                    return kv->second;
+            }
+        }
+        return Tune(ai::dpsfsm::SpecName(m->spec), key, def);
+    }
+
     double TP(BotMem* m, char const* key, double def)
     {
-        return Tune(ai::dpsfsm::SpecName(m->spec), key, def);
+        return TuneForBot(m, key, def);
     }
 
     int   AoEPack(BotMem* m)  { return int(TP(m, "aoe_pack", 3.0)); }
@@ -1355,6 +1378,18 @@ namespace ai
 {
     namespace dpsfsm
     {
+        void SetParamOverride(uint32 guid, char const* key, double value)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            s_overrides[guid][key] = value;
+        }
+
+        void ClearParamOverrides(uint32 guid)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            s_overrides.erase(guid);
+        }
+
         bool SkipEngine(uint32 guid)
         {
             std::lock_guard<std::mutex> lock(s_disabledMutex);

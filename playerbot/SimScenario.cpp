@@ -250,6 +250,12 @@ uint32 stuckFightCleared = 0;
             uint32 mapId = 1;
             float x = 0.0f, y = 0.0f, z = 0.0f;
             float standDist = 3.0f;   // bot 相对假人的站位距离
+            uint32 pileOwner = 0;     // !=0：这一轮不自己召假人，共用这个 id 的假人堆
+            float ringAngle = 0.0f;   // 共享堆时自己站的角度（一圈人围着打）
+            bool centerPile = false;  // true = 假人就摆在 (x,y)（共享堆的堆主）
+            bool sharedPile = false;  // true = 这一轮的木桩是全队共用的，收尾时谁都不许删
+            std::map<std::string, double> overrides;   // 本 bot 的参数覆盖（调优并发用）
+            std::string armLabel;                      // 例如 "burst_hp=10" 或 "baseline"
             std::vector<ObjectGuid> dummies;
             bool reported = false;
             uint32 lastPulseMs = 0;
@@ -3225,7 +3231,10 @@ uint32 stuckFightCleared = 0;
             if (bot->IsMounted())
                 bot->Unmount();
             // bot 站在网格点、朝东；假人在它东边 standDist 码处（GM 岛面积小，这样不会掉进海里）
-            bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
+            if (d.centerPile)
+                bot->TeleportTo(d.mapId, d.x - 3.0f, d.y, d.z, 0.0f);
+            else
+                bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
             sLog.outError("[DUMMY] id=%u 站位 %.1f 码（近战/远程区分）", d.id, d.standDist);
 
             if (PlayerbotAI* ai = bot->GetPlayerbotAI())
@@ -3237,8 +3246,12 @@ uint32 stuckFightCleared = 0;
                 ai->ChangeStrategy("-" + d.disable2, BotState::BOT_STATE_COMBAT);
                 ai->ChangeStrategy("-" + d.disable2, BotState::BOT_STATE_NON_COMBAT);
             }
+            for (auto const& kv : d.overrides)
+                dpsfsm::SetParamOverride(d.guid, kv.first.c_str(), kv.second);
             dpsfsm::SetBotEnabled(d.guid, d.useFsm);
             dpsfsm::SetBotForceDps(d.guid, true);   // 假人场景：坦/奶也按 DPS 打，测的是输出能力
+            if (!d.armLabel.empty())
+                sLog.outError("[DUMMY] id=%u spec=%s arm=%s", d.id, d.spec.c_str(), d.armLabel.c_str());
             sLog.outError("[DUMMY] id=%u spec=%s bot=%s 已就位（策略 +%s -%s -%s，fsm=%d）",
                 d.id, d.spec.c_str(), bot->GetName(), d.enable.c_str(), d.disable1.c_str(), d.disable2.c_str(),
                 d.useFsm ? 1 : 0);
@@ -3370,6 +3383,282 @@ uint32 stuckFightCleared = 0;
             return true;
         }
 
+        // [2026-10-29 站长口径] 所有专精在**同一轮**里一起打同一堆木桩：
+        //   堆主（第一个专精）负责召唤，其余人加入同一堆；每人仍只数"自己声明的目标"，
+        //   所以 1 目标/5 目标的口径不变，但一轮就能把 17 个专精全测完。
+        // [2026-10-29 站长口径] 一轮里同时跑多组不同参数（A/B 并发）：
+        //   每个 "spec:key=value" 是一臂，各用**不同 bot**、共用同一堆木桩（玩家之间没有碰撞体积，站一起没事）。
+        //   "spec:@" 表示该专精的基线（不覆盖任何参数）。
+        void StartArms(std::list<std::string>& messages, std::vector<std::string> const& arms,
+                       uint32 targets, uint32 seconds)
+        {
+            if (targets < 1) targets = 1;
+            if (targets > 5) targets = 5;
+            if (seconds < 20) seconds = 20;
+
+            struct Arm
+            {
+                SpecKey const* spec = nullptr;
+                std::string key;
+                double value = 0.0;
+                bool baseline = false;
+                std::string label;
+            };
+            std::vector<Arm> parsed;
+            for (auto const& a : arms)
+            {
+                size_t const colon = a.find(':');
+                if (colon == std::string::npos)
+                    continue;
+                std::string const specKey = a.substr(0, colon);
+                std::string const rest = a.substr(colon + 1);
+                SpecKey const* spec = FindSpecKey(specKey);
+                if (!spec)
+                {
+                    messages.push_back("arms: 不认识的专精 " + specKey);
+                    continue;
+                }
+                Arm arm;
+                arm.spec = spec;
+                if (rest == "@")
+                {
+                    arm.baseline = true;
+                    arm.label = "baseline";
+                }
+                else
+                {
+                    size_t const eq = rest.find('=');
+                    if (eq == std::string::npos)
+                        continue;
+                    arm.key = rest.substr(0, eq);
+                    arm.value = atof(rest.substr(eq + 1).c_str());
+                    arm.label = arm.key + "=" + rest.substr(eq + 1);
+                }
+                parsed.push_back(arm);
+            }
+            if (parsed.empty())
+            {
+                messages.push_back("arms: 没有可跑的臂（格式 spec:key=value 或 spec:@）");
+                return;
+            }
+
+            std::set<uint32> used;
+            for (auto const& d : s_dummies)
+                used.insert(d.guid);
+            for (auto const& r : s_runs)
+                for (uint32 g : r.guids)
+                    used.insert(g);
+
+            uint32 ownerId = 0;
+            uint32 started = 0;
+            std::string skipped;
+            for (auto const& arm : parsed)
+            {
+                Player* bot = FindOnlineBotOfClass(arm.spec->cls, used);
+                uint32 loginGuid = 0;
+                if (!bot)
+                {
+                    std::vector<Candidate> pool = LoadCandidates(60, {});
+                    for (auto const& c : pool)
+                    {
+                        if (c.cls != arm.spec->cls || used.count(c.guid))
+                            continue;
+                        loginGuid = c.guid;
+                        break;
+                    }
+                    if (!loginGuid)
+                    {
+                        skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
+                        continue;
+                    }
+                }
+
+                bool const melee = (arm.spec->cls == CLASS_WARRIOR || arm.spec->cls == CLASS_ROGUE
+                    || (arm.spec->cls == CLASS_PALADIN && std::string(arm.spec->key) != "holy")
+                    || (arm.spec->cls == CLASS_DRUID && std::string(arm.spec->key) == "feral")
+                    || (arm.spec->cls == CLASS_SHAMAN && std::string(arm.spec->key) == "enhance"));
+
+                DummyRun d;
+                d.id = ++s_dummySeq;
+                d.spec = arm.spec->key;
+                d.cls = arm.spec->cls;
+                d.enable = arm.spec->enable;
+                d.disable1 = arm.spec->disable1;
+                d.disable2 = arm.spec->disable2;
+                d.tab = arm.spec->tab;
+                d.premade = arm.spec->premade;
+                d.respec = true;
+                d.targets = targets;
+                d.durationMs = seconds * 1000;
+                d.startMs = Now();
+                d.guid = bot ? bot->GetGUIDLow() : loginGuid;
+                d.waitingLogin = (bot == nullptr);
+                d.mapId = 1;
+                d.standDist = melee ? 3.0f : 18.0f;
+                d.z = DUMMY_SPOT_Z;
+                d.sharedPile = true;
+                d.armLabel = arm.label;
+                if (!arm.baseline)
+                    d.overrides[arm.key] = arm.value;
+
+                // 所有臂共用同一堆木桩：第一个臂当堆主（召 1 个假人），其余加入
+                d.ringAngle = 6.2831853f * float(started) / float(parsed.size());
+                if (!ownerId)
+                {
+                    ownerId = d.id;
+                    d.centerPile = true;
+                    d.x = DUMMY_SPOT_X;
+                    d.y = DUMMY_SPOT_Y;
+                }
+                else
+                {
+                    d.pileOwner = ownerId;
+                    d.x = DUMMY_SPOT_X + cos(d.ringAngle) * d.standDist;
+                    d.y = DUMMY_SPOT_Y + sin(d.ringAngle) * d.standDist;
+                }
+
+                if (d.waitingLogin)
+                {
+                    uint32 const accountId = sObjectMgr.GetPlayerAccountIdByGUID(GuidOf(d.guid));
+                    if (!accountId)
+                    {
+                        skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
+                        continue;
+                    }
+                    sRandomPlayerbotMgr.AddPlayerBot(d.guid, accountId);
+                }
+
+                used.insert(d.guid);
+                s_dummies.push_back(d);
+                ++started;
+            }
+
+            sLog.outError("[DUMMY] arms 开跑：%u 臂、木桩 %u 个、%u 秒、堆主 id=%u、跳过=[%s]",
+                started, targets, seconds, ownerId, skipped.c_str());
+            messages.push_back("参数并发开跑：" + std::to_string(started) + " 臂 × "
+                + std::to_string(targets) + " 木桩 × " + std::to_string(seconds) + " 秒");
+        }
+
+        void StartDummyAll(std::list<std::string>& messages, uint32 targets, uint32 seconds)
+        {
+            if (targets < 1) targets = 1;
+            if (targets > 5) targets = 5;
+            if (seconds < 20) seconds = 20;
+
+            std::set<uint32> used;
+            for (auto const& d : s_dummies)
+                used.insert(d.guid);
+            for (auto const& r : s_runs)
+                for (uint32 g : r.guids)
+                    used.insert(g);
+
+            uint32 const n = uint32(sizeof(s_specKeys) / sizeof(s_specKeys[0]));
+            // [2026-10-29 实测] 17 个人围着**同一个**木桩，近战会互相顶出去（combat 45 / arms 11 dps）。
+            //   改成"一轮里 3 堆、每堆 5~6 人"，既是一轮跑完，又不会挤。
+            uint32 const PILES = 3;
+            float const pileX[PILES] = { DUMMY_SPOT_X - 22.0f, DUMMY_SPOT_X, DUMMY_SPOT_X + 22.0f };
+            float const pileY[PILES] = { DUMMY_SPOT_Y, DUMMY_SPOT_Y, DUMMY_SPOT_Y };
+            uint32 ownerIds[PILES] = { 0, 0, 0 };
+            uint32 perPile[PILES] = { 0, 0, 0 };
+            uint32 ownerId = 0;
+            uint32 started = 0;
+            std::string skipped;
+
+            // 先按"每堆几个人"预分配角度（第 i 个专精 → 第 i%PILES 堆）
+            for (uint32 i = 0; i < n; ++i)
+                ++perPile[i % PILES];
+
+            uint32 seenInPile[PILES] = { 0, 0, 0 };
+
+            for (uint32 i = 0; i < n; ++i)
+            {
+                uint32 const pile = i % PILES;
+                SpecKey const& spec = s_specKeys[i];
+                Player* bot = FindOnlineBotOfClass(spec.cls, used);
+                uint32 loginGuid = 0;
+                if (!bot)
+                {
+                    // 没有在线同职业 bot ⇒ 从候选池里挑一个拉上线（TickDummies 会等它登录）
+                    std::vector<Candidate> pool = LoadCandidates(60, {});
+                    for (auto const& c : pool)
+                    {
+                        if (c.cls != spec.cls || used.count(c.guid))
+                            continue;
+                        loginGuid = c.guid;
+                        break;
+                    }
+                    if (!loginGuid)
+                    {
+                        skipped += std::string(skipped.empty() ? "" : ",") + spec.key;
+                        continue;
+                    }
+                }
+
+                bool const melee = (spec.cls == CLASS_WARRIOR || spec.cls == CLASS_ROGUE
+                    || (spec.cls == CLASS_PALADIN && std::string(spec.key) != "holy")
+                    || (spec.cls == CLASS_DRUID && std::string(spec.key) == "feral")
+                    || (spec.cls == CLASS_SHAMAN && std::string(spec.key) == "enhance"));
+
+                DummyRun d;
+                d.id = ++s_dummySeq;
+                d.spec = spec.key;
+                d.cls = spec.cls;
+                d.enable = spec.enable;
+                d.disable1 = spec.disable1;
+                d.disable2 = spec.disable2;
+                d.tab = spec.tab;
+                d.premade = spec.premade;
+                d.respec = true;
+                d.targets = targets;
+                d.durationMs = seconds * 1000;
+                d.startMs = Now();
+                d.guid = bot ? bot->GetGUIDLow() : loginGuid;
+                d.waitingLogin = (bot == nullptr);
+                d.mapId = 1;
+                d.standDist = melee ? 3.0f : 18.0f;
+                d.z = DUMMY_SPOT_Z;
+                d.ringAngle = 6.2831853f * float(seenInPile[pile]) / float(perPile[pile] ? perPile[pile] : 1);
+                ++seenInPile[pile];
+                d.x = pileX[pile];
+                d.y = pileY[pile];
+
+                d.sharedPile = true;
+                if (!ownerIds[pile])
+                {
+                    ownerIds[pile] = d.id;
+                    ownerId = d.id;
+                    d.centerPile = true;    // 本堆的堆主：假人就摆在 (x,y)
+                }
+                else
+                {
+                    d.pileOwner = ownerIds[pile];
+                    d.x = pileX[pile] + cos(d.ringAngle) * d.standDist;
+                    d.y = pileY[pile] + sin(d.ringAngle) * d.standDist;
+                }
+
+                if (d.waitingLogin)
+                {
+                    uint32 const accountId = sObjectMgr.GetPlayerAccountIdByGUID(GuidOf(d.guid));
+                    if (!accountId)
+                    {
+                        skipped += std::string(skipped.empty() ? "" : ",") + spec.key;
+                        continue;
+                    }
+                    sRandomPlayerbotMgr.AddPlayerBot(d.guid, accountId);
+                }
+
+                used.insert(d.guid);
+                s_dummies.push_back(d);
+                ++started;
+            }
+
+            sLog.outError("[DUMMY] dummyall 开跑：%u 个专精、%u 堆、每堆 %u 个木桩、%u 秒、堆主 id=%u/%u/%u、跳过=[%s]",
+                started, PILES, targets, seconds, ownerIds[0], ownerIds[1], ownerIds[2], skipped.c_str());
+            messages.push_back("整队假人开跑：" + std::to_string(started) + " 个专精 × "
+                + std::to_string(targets) + " 个木桩 × " + std::to_string(seconds) + " 秒"
+                + (skipped.empty() ? "" : "；跳过（无在线 bot）：" + skipped));
+        }
+
         bool SpawnDummies(DummyRun& d, Player* bot)
         {
             if (bot->GetMapId() != d.mapId)
@@ -3379,7 +3668,7 @@ uint32 stuckFightCleared = 0;
                 return false;
 
             float const r = 2.0f;
-            float const cx = d.x + d.standDist;   // 假人圈中心在 bot 东边 standDist 码
+            float const cx = d.centerPile ? d.x : (d.x + d.standDist);   // 共享堆时 (x,y) 就是堆心
             float const cy = d.y;
             for (uint32 i = 0; i < d.targets; ++i)
             {
@@ -3404,7 +3693,8 @@ uint32 stuckFightCleared = 0;
                     sLog.outError("[DUMMY] id=%u 假人落点异常 z=%.1f（bot z=%.1f）⇒ 可能掉进水里/地形下",
                         d.id, c->GetPositionZ(), d.z);
                 // 模板血量可能没跟 SQL 对齐（实测只有几千）⇒ 强制拉到 100 万，2 分钟打不死
-                c->SetMaxHealth(1000000);
+                // 共享堆时一堆人围打：100 万撑不住（17 人 × 500 dps × 60s ≈ 51 万，留余量）
+                c->SetMaxHealth(5000000);
                 c->SetHealth(c->GetMaxHealth());
                 d.dummies.push_back(c->GetObjectGuid());
             }
@@ -3456,6 +3746,8 @@ uint32 stuckFightCleared = 0;
             }
 
             std::string extra = "";
+            if (!d.armLabel.empty())
+                extra += "arm=" + d.armLabel + " ";   // 参数并发调优靠这个字段归组
             if (bot)
             {
                 // 属性：用来判断这一轮到底是不是"毕业装"（法伤 / 攻强）
@@ -3488,13 +3780,19 @@ uint32 stuckFightCleared = 0;
                 top.empty() ? "-" : top.c_str());
 
             dpsfsm::ClearScenarioTargets(d.guid, d.id);
+            dpsfsm::ClearParamOverrides(d.guid);
             // 收尾：撤假人 + 停手
-            if (bot)
+            if (bot && bot->IsInWorld())
             {
-                if (Map* map = bot->GetMap())
-                    for (ObjectGuid const& g : d.dummies)
-                        if (Creature* c = map->GetCreature(g))
-                            c->ForcedDespawn();
+                // [2026-10-29 实测] 共享堆不能在这里删：堆主先收尾会把别人的木桩一起删掉
+                //   （其余 15 个专精全部 aborted(dummy-gone)）。共用的靠召唤时的定时消失。
+                if (!d.sharedPile)
+                {
+                    if (Map* map = bot->GetMap())
+                        for (ObjectGuid const& g : d.dummies)
+                            if (Creature* c = map->GetCreature(g))
+                                c->ForcedDespawn();
+                }
                 bot->CombatStopWithPets(true);
             }
         }
@@ -3518,8 +3816,61 @@ uint32 stuckFightCleared = 0;
                     continue;
                 }
 
+                // [2026-10-29 崩溃修] 刚登录的 bot 可能还没进世界（m_currMap 为空），
+                //   这时做 Unmount/TeleportTo/GetMap 会触发核心断言 "GetMap(): m_currMap" 直接关服。
+                if (!bot->IsInWorld() || !bot->IsAlive())
+                {
+                    ++it;
+                    continue;
+                }
+
                 if (!d.setupDone)
                     ApplyDummySetup(d, bot);
+
+                // [2026-10-29 站长口径] 一堆木桩、所有专精同一轮一起打：
+                //   pileOwner 的 run 自己不召假人，等堆主召好后"加入"同一堆（各自仍然只数自己声明的目标）。
+                if (d.pileOwner)
+                {
+                    DummyRun* owner = nullptr;
+                    for (auto& other : s_dummies)
+                        if (other.id == d.pileOwner && !other.dummies.empty())
+                        {
+                            owner = &other;
+                            break;
+                        }
+                    if (!owner)
+                    {
+                        if (now - d.startMs > 90000)
+                        {
+                            ReportDummy(d, bot, "aborted(no-pile)");
+                            it = s_dummies.erase(it);
+                            continue;
+                        }
+                        ++it;
+                        continue;
+                    }
+
+                    d.dummies = owner->dummies;
+                    // 站位坐标在 StartDummyAll 里就算好了（按自己那堆的堆心 + 角度），这里直接用 d.x/d.y。
+                    //   ⚠️ 曾经这里重新按 DUMMY_SPOT_X 算，导致外围两堆的近战被传到中间那堆，永远够不着自己的木桩。
+                    float const cx = d.x;
+                    float const cy = d.y;
+                    if (bot->IsMounted())
+                        bot->Unmount();
+                    bot->TeleportTo(d.mapId, cx, cy, d.z, 0.0f);
+                    d.x = cx;
+                    d.y = cy;
+                    dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);
+                    d.dmg0 = bot->botDamageDealt;
+                    d.pet0 = bot->botPetDamageDealt;
+                    d.melee0 = bot->botMeleeHits;
+                    d.casts0 = bot->botCasts;
+                    d.spells0 = bot->botSpellCounts;
+                    d.startMs = now;
+                    d.pileOwner = 0;      // 已加入
+                    sLog.outError("[DUMMY] id=%u spec=%s 加入共享木桩堆（%u 个），站位角度 %.2f",
+                        d.id, d.spec.c_str(), (uint32)d.dummies.size(), d.ringAngle);
+                }
 
                 // 传送落地后才召唤假人
                 if (d.dummies.empty())
@@ -3555,7 +3906,12 @@ uint32 stuckFightCleared = 0;
                 if (now - d.lastAttackMs > 1000)
                 {
                     d.lastAttackMs = now;
-                    Map* map = bot->GetMap();
+                    Map* map = bot->IsInWorld() ? bot->GetMap() : nullptr;
+                    if (!map)
+                    {
+                        ++it;
+                        continue;
+                    }
                     Creature* first = map ? map->GetCreature(d.dummies[0]) : nullptr;
                     if (!first || !first->IsAlive())
                     {
@@ -4006,6 +4362,28 @@ uint32 stuckFightCleared = 0;
             bool useFsm = !(args.size() > 5 && atoi(args[5].c_str()) == 0);
             bool respec = !(args.size() > 6 && atoi(args[6].c_str()) == 0);   // 第 7 个参数传 0 = 不重天赋
             StartDummy(messages, args[1], targets, seconds, pinBot, useFsm, respec);
+            return messages;
+        }
+
+        if (args[0] == "arms")
+        {
+            if (args.size() < 4)
+            {
+                messages.push_back("用法：.rndbot sim arms <targets> <seconds> <spec:key=value|spec:@> [...]");
+                return messages;
+            }
+            uint32 targets = uint32(atoi(args[1].c_str()));
+            uint32 seconds = uint32(atoi(args[2].c_str()));
+            std::vector<std::string> arms(args.begin() + 3, args.end());
+            StartArms(messages, arms, targets, seconds);
+            return messages;
+        }
+
+        if (args[0] == "dummyall")
+        {
+            uint32 targets = args.size() > 1 ? uint32(atoi(args[1].c_str())) : 1;
+            uint32 seconds = args.size() > 2 ? uint32(atoi(args[2].c_str())) : 60;
+            StartDummyAll(messages, targets, seconds);
             return messages;
         }
 

@@ -87,6 +87,10 @@ namespace ai
         //   副本里返回 false（引擎照常跑），保证走位/打断/救人不受影响。
         bool SkipEngine(uint32 guid);
 
+        // [2026-10-29] 调优并发：给**单只 bot** 覆盖某个参数，这样同一轮里可以用不同的参数值做 A/B。
+        void SetParamOverride(uint32 guid, char const* key, double value);
+        void ClearParamOverrides(uint32 guid);
+
         // [2026-10-29] 单只 bot 开关（A/B 对照：同一轮里一部分 bot 走状态机、一部分走原引擎）
         void SetBotEnabled(uint32 guid, bool on);
 
