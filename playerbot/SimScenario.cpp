@@ -265,6 +265,7 @@ uint32 stuckFightCleared = 0;
             std::string armLabel;                      // 例如 "burst_hp=10" 或 "baseline"
             std::vector<std::pair<uint8, uint32>> bisPending;   // 静态 BIS：还没穿上的 (slot,item)
             std::map<uint32, int> bisRetry;                     // 每个 itemId 已重试次数
+            bool probed3s = false;      // [2026-10-31] 开跑 3 秒的"是否已开打"探针只打一次
             bool lowHpDummy = false;                            // true = 低血木桩（用来验证斩杀这类"目标低血"技能）
             bool gearReady = true;                              // 装备流水是否已完成
             std::vector<ObjectGuid> dummies;
@@ -3680,6 +3681,18 @@ uint32 stuckFightCleared = 0;
             d.melee0 = bot->botMeleeHits;
             d.casts0 = bot->botCasts;
 
+            // [2026-10-31 诊断] 开跑瞬间的现场：之前约 1/3 轮次整轮 0 伤害且没有 [ENGAGE-STUCK]，
+            //   怀疑失败发生在"进世界/假人生成/能否攻击"这一层，先把它抄下来。
+            sLog.outError("[DUMMY-START] id=%u spec=%s inworld=%d mapid=%u dummies=%u victim=%s "
+                "canattack=%d dist=%.1f mounted=%d",
+                d.id, d.spec.c_str(), bot->IsInWorld() ? 1 : 0, bot->GetMapId(),
+                uint32(d.dummies.size()),
+                bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
+                (!d.dummies.empty() && d.dummies[0]) ? (bot->CanAttack(bot->GetMap() ? bot->GetMap()->GetCreature(d.dummies[0]) : nullptr) ? 1 : 0) : -1,
+                (!d.dummies.empty() && d.dummies[0] && bot->GetMap() && bot->GetMap()->GetCreature(d.dummies[0]))
+                    ? bot->GetDistance(bot->GetMap()->GetCreature(d.dummies[0])) : -1.0f,
+                bot->IsMounted() ? 1 : 0);
+
             sLog.outError("[DUMMY] start id=%u spec=%s bot=%s class=%u targets=%u seconds=%u at=(%.1f,%.1f,%.1f) map=%u",
                 d.id, d.spec.c_str(), bot->GetName(), spec->cls, targets, seconds, d.x, d.y, d.z, d.mapId);
             messages.push_back("假人场景已开 id=" + std::to_string(d.id) + " spec=" + d.spec + " bot=" + bot->GetName()
@@ -4381,6 +4394,30 @@ uint32 stuckFightCleared = 0;
                     d.spells0 = bot->botSpellCounts;
                     d.startMs = now;
                     sLog.outError("[DUMMY] id=%u spec=%s 假人已就位 %u 个，开始计时", d.id, d.spec.c_str(), (uint32)d.dummies.size());
+
+                    // [2026-10-31 修] **假人召唤完成后再声明一次场景目标**，并强制接战。
+                    //   之前 SetScenarioTargets 在 dummies 还空时也被调用过；空目标集会让
+                    //   EngageScenarioTarget 直接返回 ⇒ GetVictim() 一直为空 ⇒
+                    //   状态机在 "no-victim" 处整轮让路（实测约 1/3 轮次 0 伤害，旧路径同样复现）。
+                    dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);
+                    if (!d.dummies.empty())
+                    {
+                        if (Creature* d0 = bot->GetMap() ? bot->GetMap()->GetCreature(d.dummies[0]) : nullptr)
+                        {
+                            if (d0->IsAlive() && !bot->GetVictim())
+                            {
+                                if (d0->GetCombatManager().IsInEvadeMode())
+                                {
+                                    d0->GetCombatManager().SetEvadeState(EVADE_NONE);
+                                    d0->GetCombatManager().StopEvade();
+                                }
+                                bot->CombatStopWithPets(true);
+                                bot->Attack(d0, d.meleeSpec);
+                                sLog.outError("[DUMMY] id=%u 召唤完成后强制接战：victim=%s",
+                                    d.id, bot->GetVictim() ? bot->GetVictim()->GetName() : "-");
+                            }
+                        }
+                    }
                 }
 
                 // 每 2 秒把人拽回来 + 重新咬住假人（假人不还手，bot 自己容易脱战）
@@ -4402,6 +4439,24 @@ uint32 stuckFightCleared = 0;
                     }
                     if (!bot->IsWithinDist3d(d.x, d.y, d.z, 28.0f) || bot->GetMapId() != d.mapId)
                         bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
+                    // [2026-10-31] 开跑 3 秒：如果一点伤害都没有，把"为什么打不到"的现场抄下来
+                    if (!d.probed3s && now - d.startMs >= 3000)
+                    {
+                        d.probed3s = true;
+                        if (bot->botDamageDealt == d.dmg0)
+                            sLog.outError("[ENGAGE-3S] id=%u spec=%s victim=%s dummies=%u "
+                                "casting=%d gcd_ready=%d inrange=%d moving=%d stunned=%d dead=%d",
+                                d.id, d.spec.c_str(),
+                                bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
+                                uint32(d.dummies.size()),
+                                bot->IsNonMeleeSpellCasted(false) ? 1 : 0,
+                                1,
+                                first ? (bot->CanReachWithMeleeAttack(first) ? 1 : 0) : -1,
+                                bot->IsMoving() ? 1 : 0,
+                                bot->hasUnitState(UNIT_STAT_STUNNED) ? 1 : 0,
+                                bot->IsAlive() ? 1 : 0);
+                    }
+
                     if (now - d.lastPulseMs > 10000)
                     {
                         d.lastPulseMs = now;
