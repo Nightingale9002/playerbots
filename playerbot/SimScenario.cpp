@@ -4406,7 +4406,7 @@ uint32 stuckFightCleared = 0;
                     {
                         d.lastPulseMs = now;
                         sLog.outError("[DUMMY-PULSE] id=%u bot=%s incombat=%d victim=%s dummy=%s alive=%d dist=%.1f "
-                            "moving=%d gen=%u mounted=%d hostile=%d hostileBack=%d evade=%d faction=%u dummypos=(%.1f,%.1f)",
+                            "moving=%d gen=%u mounted=%d canattack=%d hostileBack=%d evade=%d faction=%u dummypos=(%.1f,%.1f)",
                             d.id, bot->GetName(), bot->IsInCombat() ? 1 : 0,
                             bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
                             first ? first->GetName() : "-", first ? (first->IsAlive() ? 1 : 0) : -1,
@@ -4473,6 +4473,30 @@ uint32 stuckFightCleared = 0;
                         //   MoveChase(bot, 0)），假人贴到 2~3 码后猎人落进 8 码死角、自动射击停摆。
                         //   只在近战场景保留这条"进入战斗"的兜底；远程场景不许假人动。
                             /* 假人只当木桩：不主动咬 bot（否则它会自己走到 bot 脸上，远程职业进 8 码死角） */
+                        // [2026-10-31 诊断] 开跑 5 秒还没造成任何伤害 ⇒ 打一行"为什么没接战"的现场快照。
+                        //   实测约 1/3 轮次整轮 0 伤害（incombat=0 casts=0），但报告里 victim 有值，
+                        //   说明"进战斗"这一步偶发失败。这里不猜，先把状态抄下来。
+                        if (bot->botDamageDealt == d.dmg0 && now - d.startMs > 5000)
+                        {
+                            sLog.outError("[ENGAGE-STUCK] id=%u bot=%s spec=%s victim=%s mounted=%d "
+                                "evade=%d pos=(%.1f,%.1f,%.1f) dummypos=(%.1f,%.1f,%.1f) dist=%.1f "
+                                "canattack=%d attacker=%d combat=%d casting=%d stunned=%d rooted=%d",
+                                d.id, bot->GetName(), d.spec.c_str(),
+                                bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
+                                bot->IsMounted() ? 1 : 0,
+                                first ? (first->GetCombatManager().IsInEvadeMode() ? 1 : 0) : -1,
+                                bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                first ? first->GetPositionX() : 0.0f, first ? first->GetPositionY() : 0.0f,
+                                first ? first->GetPositionZ() : 0.0f,
+                                first ? bot->GetDistance(first) : -1.0f,
+                                first ? (bot->CanAttack(first) ? 1 : 0) : -1,
+                                bot->getAttackerForHelper() ? 1 : 0,
+                                bot->IsInCombat() ? 1 : 0,
+                                bot->IsNonMeleeSpellCasted(false) ? 1 : 0,
+                                bot->hasUnitState(UNIT_STAT_STUNNED) ? 1 : 0,
+                                bot->hasUnitState(UNIT_STAT_ROOT) ? 1 : 0);
+                        }
+
                         sLog.outError("[DUMMY-PULSE] id=%u 出手: action=%d direct=%d victim=%s attacker=%d",
                             d.id, acted ? 1 : 0, direct ? 1 : 0,
                             bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
