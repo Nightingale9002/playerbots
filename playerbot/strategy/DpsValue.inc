@@ -43,6 +43,8 @@ namespace dpsvalue
         bool   isDebuff = false;   // true = 挂在目标身上（破甲/精灵之火）
         // [2026-10-30 站长口径] 形态是外层状态机的选择，不能交给伤害分数：
         //   变形会清空能量/怒气、耗 GCD 与法力 ⇒ 候选里只允许"当前形态可用"的技能。
+        uint32 schoolMask = 0;     // [2026-10-30 站长口径] 按角色实际属性估值：需要学派（法伤加成按学派算）
+        float  coeff = 0.0f;       // 法术强度系数（读条技能 ≈ 施法时间/3.5；DoT ≈ 时长/15）
         uint32 requiredForm = 0;    // 0 = 无形态要求；否则是 Stances 位掩码
     };
 
@@ -76,6 +78,15 @@ namespace dpsvalue
             c.durationMs = GetSpellDuration(sp) > 0 ? uint32(GetSpellDuration(sp)) : 0;
             c.powerType = uint8(sp->powerType);
             c.requiredForm = sp->Stances;
+            c.schoolMask = sp->SchoolMask;
+            // 系数用经典近似：直接伤害 = 施法时间/3.5；周期性 = 总时长/15；瞬发按 0.43
+            if (c.dot && c.durationMs)
+                c.coeff = float(c.durationMs) / 15000.0f;
+            else if (c.castMs > 0)
+                c.coeff = float(c.castMs) / 3500.0f;
+            else
+                c.coeff = 0.43f;
+            c.coeff = std::min(1.6f, std::max(0.15f, c.coeff));
             c.cost = int32(sp->manaCost);
 
             bool anyDamage = false;
@@ -561,5 +572,40 @@ namespace dpsvalue
             return (sp->Stances & mask) != 0;
         }
         return true;
+    }
+}
+
+namespace dpsvalue
+{
+    // [2026-10-30 站长口径] **按角色实际属性估值**，而不是只看技能基础伤害：
+    //   伤害 = 基础伤害 + 武器伤害×倍数 + 法伤×系数，再乘暴击期望。
+    //   法伤从 SpellBaseDamageBonusDone(学派) 取（这就是角色面板上的法伤）；
+    //   暴击用 CalculateSpellCritChance(victim, 学派, 法术)。
+    inline float EstDamage(Player* bot, Unit* target, Cand const& c, float weaponHit, uint8 combo, int pack)
+    {
+        float dmg = c.base + c.weaponMul * weaponHit;
+        if (c.schoolMask && c.coeff > 0.0f)
+        {
+            int32 const sp = bot->SpellBaseDamageBonusDone(SpellSchoolMask(c.schoolMask));
+            if (sp > 0)
+                dmg += float(sp) * c.coeff;
+        }
+        if (c.needsCombo)
+            dmg *= 0.35f + 0.13f * float(combo);
+        if (c.aoeTargets > 1)
+            dmg *= float(std::min(std::max(pack, 1), c.aoeTargets));
+
+        // 暴击期望（法术暴击；物理技能用同一接口的近似，误差可接受）
+        if (target)
+        {
+            SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
+            if (sp)
+            {
+                float const crit = bot->CalculateSpellCritChance(target, SpellSchoolMask(c.schoolMask ? c.schoolMask : SPELL_SCHOOL_MASK_NORMAL), sp);
+                if (crit > 0.0f)
+                    dmg *= 1.0f + crit / 100.0f;
+            }
+        }
+        return dmg;
     }
 }

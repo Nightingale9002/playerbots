@@ -158,7 +158,8 @@ namespace dpspolicy
 
     // 火法：灼烧叠 5 层 > 燃烧 > 火球 > 火焰冲击 > 烈焰风暴(群)
     static PStep const kFire[] = {
-        { "combustion",         PKind::Self },
+        { "combustion",         PKind::Prereq },
+        { "presence of mind",   PKind::Prereq },
         { "scorch",             PKind::Target, "fire vulnerability" },
         { "fireball",           PKind::Target },
         { "fire blast",         PKind::Target },
@@ -167,8 +168,9 @@ namespace dpspolicy
 
     // 冰法：冰冷血脉 > 水元素 > 寒冰箭 > 冰枪术 > 暴风雪(群)
     static PStep const kFrost[] = {
-        { "icy veins",          PKind::Self },
-        { "summon water elemental", PKind::Self },
+        // [2026-10-30] 前置：冰冷血脉 + 召唤水元素（宠物输出是冰法一大块，实测漏了会掉 ~30%）
+        { "icy veins",               PKind::Prereq },
+        { "summon water elemental",  PKind::Prereq },
         { "frostbolt",          PKind::Target },
         { "ice lance",          PKind::Target },
         { "blizzard",           PKind::Ground, nullptr, 0, 0, 0, nullptr, 2 },
@@ -176,7 +178,7 @@ namespace dpspolicy
 
     // 奥法：奥强 > 奥术冲击 > 奥术飞弹 > 魔爆(群)
     static PStep const kArcane[] = {
-        { "arcane power",       PKind::Self },
+        { "arcane power",       PKind::Prereq },
         { "arcane blast",       PKind::Target },
         { "arcane missiles",    PKind::Target },
         { "arcane explosion",   PKind::Target, nullptr, 0, 0, 0, nullptr, 2 },
@@ -713,6 +715,7 @@ namespace dpspolicy
                 float bestAutoScore = bestScore;
                 bool bestAutoUpkeep = false;
 
+                float const weaponHit = s.bot->CalculateDamage(BASE_ATTACK, false);
                 std::set<uint32> inTable;
                 for (int i = 0; i < pol->count; ++i)
                 {
@@ -764,10 +767,13 @@ namespace dpspolicy
                     }
                     else
                     {
-                        float base = 0.0f;
-                        if (!dpsvalue::ValueOfId(ai, m, s, c.id, base))
+                        // [2026-10-30 站长口径] 按角色实际属性估值（法伤/暴击），不再只看技能基础伤害
+                        float const dmg = dpsvalue::EstDamage(s.bot, s.target, c, weaponHit, s.combo, s.pack10);
+                        float const actSec = std::max(1.5f, float(c.castMs) / 1000.0f)
+                            + dpsvalue::ResourceSeconds(s.bot, c);
+                        if (dmg <= 0.0f)
                             continue;
-                        score = base * w;
+                        score = dmg / std::max(0.2f, actSec) * w;
                     }
                     if (score > bestAutoScore)
                     {
