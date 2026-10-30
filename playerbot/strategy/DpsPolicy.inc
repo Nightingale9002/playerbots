@@ -22,6 +22,7 @@ namespace dpspolicy
         Self,       // 对自己施放（圣印/姿态/形态/自身增益）
         Ground,     // 对目标脚下地面施放（暴风雪/烈焰风暴/火雨/飓风/箭雨）
         Swing,      // 下一次挥击附带（英勇打击/顺劈）
+        PowerShift, // [2026-10-30] 狼头之盔 power-shift：取消形态 → 下一 tick 变回猫，换 +20 能量
         Hold        // 有意"什么都不放、等资源"（能量职业的合法选择：等能量比硬塞更划算，还能留给打断）
     };
 
@@ -231,15 +232,14 @@ namespace dpspolicy
         { "hurricane",          PKind::Ground, nullptr, 0, 0, 0, nullptr, 2 },
     };
 
-    // 野德：猫形态 > 猛虎 > 扫击 > 割裂 > 撕碎 > 凶猛撕咬
+    // 野德（猫）：[站长口径] 形态在外层，形态内只放三招 —— 裂伤(维持) → 割裂(≥4星) → 撕碎(填充)，
+    //   能量见底后靠狼头之盔 power-shift 换能量（2~3 个技能变形一次）。
     static PStep const kFeral[] = {
-        { "cat form",           PKind::Self,  nullptr, 0, 0, 0, nullptr, 0, 100.0f, "form", "cat" },
-        { "tiger's fury",       PKind::Self,  nullptr, 0, 0, 0, nullptr, 0, 100.0f, "energy>=80" },
-        { "rake",               PKind::Target, "rake", 0, 0, 0, nullptr, 0, 100.0f, "dot", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
+        { "cat form",           PKind::Self,  nullptr, 0, 0, 0, nullptr, 0, 100.0f, "form", nullptr, "cat" },
+        { "mangle (cat)",       PKind::Target, "mangle (cat)", 0, 0, 0, nullptr, 0, 100.0f, "mangle-upkeep" },
         { "rip",                PKind::Target, "rip", 4 },
-        { "mangle (cat)",       PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder-cat", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "shred",              PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
-        { "ferocious bite",     PKind::Target, nullptr, 5 },
+        { "power-shift",        PKind::PowerShift, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "wolfhead" },
     };
 
     // 暗牧：痛 > 吸血鬼之触 > 心灵震爆 > 心灵尖刺 > 死亡(斩杀)
@@ -482,6 +482,21 @@ namespace dpspolicy
         }
         if (st.needForm && !HasFormOrShift(s.bot, st.needForm))
             return false;
+        if (st.kind == PKind::PowerShift)
+        {
+            // [2026-10-30 站长口径] 猫德靠狼头之盔"变形换能量"：2~3 个技能后变形一次。
+            //   条件是"能量见底 + 法力够变形成本"，否则不变（变形本身清能量、耗 GCD 与法力）。
+            if (TP(m, "power_shift", 1.0) < 0.5)
+                return false;
+            if (s.bot->GetShapeshiftForm() != FORM_CAT)
+                return false;
+            if (s.energy >= int(TP(m, "shift_energy", 25.0)))
+                return false;
+            if (s.bot->GetPower(POWER_MANA) < uint32(TP(m, "shift_mana", 300.0)))
+                return false;
+            return true;
+        }
+
         if (st.kind == PKind::Hold)
         {
             int const thr = st.holdParam ? int(TP(m, st.holdParam, st.holdDefault)) : st.holdBelowEnergy;
@@ -529,6 +544,27 @@ namespace dpspolicy
                     s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ());
             case PKind::Swing:
                 return TrySwing(ai, m, s, st.name);
+            case PKind::PowerShift:
+            {
+                // [2026-10-30 站长口径] **单 tick 原子动作**：取消形态 + 立即变回猫。
+                //   真实游戏里变形不在公共冷却上（只有 1 秒形态冷却）⇒ 代价只有法力，不占 GCD。
+                //   之前拆成两个 tick（先取消、下个 tick 再变）⇒ 等于 2 个 GCD，实测变形越多 dps 越低
+                //   （9 次变形 603 dps  vs  0 次变形 723 dps）。
+                s.bot->RemoveSpellsCausingAura(SPELL_AURA_MOD_SHAPESHIFT);
+                uint32 const catId = SpellId(ai, s.bot, m, "cat form", false);
+                if (catId && s.bot->HasSpell(catId))
+                {
+                    SpellCastResult const res = s.bot->CastSpell(s.bot, catId, uint32(TRIGGERED_NONE));
+                    if (res == SPELL_CAST_OK)
+                    {
+                        ++m->castCount;
+                        m->castThisTick = true;
+                        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), catId);
+                        return true;
+                    }
+                }
+                return true;        // 形态已取消，下一 tick 的 cat form 步骤会补回
+            }
             case PKind::Hold:
                 return true;        // 有意等待：不施法，但"本 tick 由状态机决定"（别让引擎插动作）
             case PKind::Target:
@@ -567,6 +603,22 @@ namespace dpspolicy
             //   第一遍：伤害类（直接/武器/DoT/AoE）→ 得到本 tick 的参考价值 Vmax
             //   第二遍：吞吐修正类（切割/破甲/精灵之火…）= Vmax × 幅度 × 覆盖权重
             //   ⇒ 没有伤害的技能也能跟伤害技能在同一把尺子上比较，不需要手写顺序。
+            // [2026-10-30 站长口径·补充] power-shift **不吃 GCD**：变形只耗法力。
+            //   所以做完变形后要在**同一个 tick 继续选技能**，否则一次变形就吞掉一个输出机会
+            //   （实测：6 次变形 635 dps vs 不变形 709 dps，等于每变形一次亏 ~12 dps）。
+            bool powerShifted = false;
+            for (int i = 0; i < pol->count; ++i)
+            {
+                dpspolicy::PStep const& st = pol->steps[i];
+                if (st.kind != dpspolicy::PKind::PowerShift)
+                    continue;
+                if (!dpspolicy::StepAllowed(ai, m, s, st))
+                    break;
+                if (dpspolicy::TryStep(ai, m, s, st))
+                    powerShifted = true;
+                break;
+            }
+
             float vmax = 0.0f;
             int bestIdx = -1;
             float bestScore = -1.0f;
@@ -738,6 +790,10 @@ namespace dpspolicy
                 //   有意等待（而不是塞一个低效技能），并把这个 tick 记为 Recover。
                 m->state = State::Recover;
                 return true;
+            }
+            else if (powerShifted)
+            {
+                return true;        // 只完成了变形（+20 能量），下一 tick 正常输出
             }
         }
 
