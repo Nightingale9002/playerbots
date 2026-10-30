@@ -41,6 +41,9 @@ namespace dpsvalue
         float  modValue = 0.0f;
         bool   upkeep = false;
         bool   isDebuff = false;   // true = 挂在目标身上（破甲/精灵之火）
+        // [2026-10-30 站长口径] 形态是外层状态机的选择，不能交给伤害分数：
+        //   变形会清空能量/怒气、耗 GCD 与法力 ⇒ 候选里只允许"当前形态可用"的技能。
+        uint32 requiredForm = 0;    // 0 = 无形态要求；否则是 Stances 位掩码
     };
 
     inline std::unordered_map<uint32, std::vector<Cand>>& Cache() { static std::unordered_map<uint32, std::vector<Cand>> c; return c; }
@@ -72,6 +75,7 @@ namespace dpsvalue
             c.castMs = GetSpellCastTime(sp, bot);
             c.durationMs = GetSpellDuration(sp) > 0 ? uint32(GetSpellDuration(sp)) : 0;
             c.powerType = uint8(sp->powerType);
+            c.requiredForm = sp->Stances;
             c.cost = int32(sp->manaCost);
 
             bool anyDamage = false;
@@ -531,5 +535,31 @@ namespace dpsvalue
         }
         float const gainSec = std::max(0.0f, durSec - remainSec);
         return vmax * magnitude * gainSec / 1.5f;
+    }
+}
+
+namespace dpsvalue
+{
+    // 当前形态是否满足技能要求（0 = 任意形态）。用核心的 SpellEntry::CanBeUsedInForm 判，
+    //   避免自己拼 Stances 位掩码（之前想用 GetShapeshiftFormMask，核心没有这个接口）。
+    inline bool FormAllowed(Player* bot, Cand const& c)
+    {
+        SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
+        if (!sp)
+            return true;
+        ShapeshiftForm const form = bot->GetShapeshiftForm();
+        uint32 const mask = (form == FORM_NONE) ? 0u : (1u << (uint32(form) - 1));
+
+        // ① 有 StancesNot 且命中当前形态 ⇒ 施放会打断形态（实测野德 40 秒变形 6 次就是这么来的）
+        if (mask && (sp->StancesNot & mask))
+            return false;
+        // ② 有形态要求 ⇒ 当前形态必须满足
+        if (sp->Stances)
+        {
+            if (!mask)
+                return false;                   // 人形放不了
+            return (sp->Stances & mask) != 0;
+        }
+        return true;
     }
 }

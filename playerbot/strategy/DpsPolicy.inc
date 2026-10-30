@@ -79,7 +79,7 @@ namespace dpspolicy
                                          "rain of fire", "shadow bolt", "incinerate", "drain life" };
             case CLASS_SHAMAN:  return { "stormstrike", "earth shock", "flame shock", "frost shock",
                                          "lightning bolt", "chain lightning", "searing totem", "fire nova" };
-            case CLASS_DRUID:   return { "cat form", "mangle", "shred", "rake", "rip", "ferocious bite", "tiger's fury",
+            case CLASS_DRUID:   return { "cat form", "mangle (cat)", "shred", "rake", "rip", "ferocious bite", "tiger's fury",
                                          "wrath", "starfire", "moonfire", "insect swarm", "hurricane" };
             case CLASS_PRIEST:  return { "shadow word: pain", "vampiric touch", "mind blast", "mind flay",
                                          "shadow word: death", "smite", "holy fire" };
@@ -237,7 +237,7 @@ namespace dpspolicy
         { "tiger's fury",       PKind::Self,  nullptr, 0, 0, 0, nullptr, 0, 100.0f, "energy>=80" },
         { "rake",               PKind::Target, "rake", 0, 0, 0, nullptr, 0, 100.0f, "dot", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "rip",                PKind::Target, "rip", 4 },
-        { "mangle",             PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
+        { "mangle (cat)",       PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder-cat", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "shred",              PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "ferocious bite",     PKind::Target, nullptr, 5 },
     };
@@ -652,6 +652,8 @@ namespace dpspolicy
                 {
                     if (inTable.count(c.id))
                         continue;                       // 表内条目已在上两遍算过
+                    if (!dpsvalue::FormAllowed(s.bot, c))
+                        continue;                       // 当前形态用不了（变形代价高，不参与打分）
                     if (!Ready(s.bot, c.id))
                         continue;
                     if (c.auraState == 2 && s.targetHp > 20.0f)
