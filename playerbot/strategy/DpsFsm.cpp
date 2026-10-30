@@ -101,7 +101,8 @@ namespace
         std::map<uint32, time_t> failUntil;   // 技能 id → 这个时间点之前别再试（施法被拒的退避）
         std::map<uint32, time_t> lastOk;       // 技能 id → 上次成功时间
         uint32 hbLast = 0;                     // 这只 bot 上次打心跳的时间
-        bool castThisTick = false;             // 本 tick 状态机是否真的放出了技能
+        bool castThisTick = false;
+        bool policyLogged = false;      // [2026-10-30] "策略里点名但没学会"的日志只打一次             // 本 tick 状态机是否真的放出了技能
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
         time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
         time_t lastCloseTry = 0;               // 上一次"真够不着就贴上去"的时间
@@ -2128,7 +2129,10 @@ namespace ai
             return Spec::Unknown;
         }
 
-        bool Tick(PlayerbotAI* ai)
+        // [2026-10-30 站长口径] 职业=技能空间、专精=策略；实现见 DpsPolicy.inc（纯文本包含，便于与旧处理器 A/B）
+#include "playerbot/strategy/DpsPolicy.inc"
+
+    bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
                 return false;
@@ -2200,6 +2204,10 @@ namespace ai
                 return false;
 
             ++m->tickCount;
+
+            // [2026-10-30] 职业技能空间 + 专精策略（policy=1 开启；默认 0 走原分专精处理器，便于同轮 A/B）
+            if (TP(m, "policy", 0.0) >= 1.0)
+                return TickPolicy(ai, m);
 
             bool handled = false;
             switch (m->spec)
