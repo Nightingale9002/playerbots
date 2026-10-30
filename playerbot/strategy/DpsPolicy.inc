@@ -566,8 +566,16 @@ namespace dpspolicy
                     continue;
                 if (!dpsvalue::ResourceOk(ai, m, s, sid))
                     continue;
-                float const wKey = st.kind == dpspolicy::PKind::Self ? 1.0f : 1.0f;
-                float const score = std::max(1.0f, vmax) * mag * dpspolicy::StepWeight(m, st) * wKey;
+                // [2026-10-30] 互斥分析（只做"可证明"的部分）：
+                //   目标身上已有同效果槽且幅度 >= 我的 ⇒ 打了也没收益，跳过并计数
+                //   队友已认领同一效果槽且未过期 ⇒ 不重复刷
+                if (dpsvalue::DebuffSuperseded(s.target, sid)
+                    || dpsvalue::ClaimedByOther(s.target, sid, s.bot->GetGUIDLow()))
+                {
+                    ++m->dupDebuff;
+                    continue;
+                }
+                float const score = std::max(1.0f, vmax) * mag * dpspolicy::StepWeight(m, st);
                 if (score > bestScore)
                 {
                     bestScore = score;
@@ -577,8 +585,17 @@ namespace dpspolicy
 
             if (bestIdx >= 0)
             {
-                if (dpspolicy::TryStep(ai, m, s, pol->steps[bestIdx]))
+                dpspolicy::PStep const& chosen = pol->steps[bestIdx];
+                if (dpspolicy::TryStep(ai, m, s, chosen))
                 {
+                    // 吞吐类 debuff 施放成功 ⇒ 登记认领（同队其它 bot 不再重复刷）
+                    uint32 const cid = SpellId(ai, s.bot, m, chosen.name, false);
+                    if (cid && s.target)
+                    {
+                        float dummyMag = 0.0f;
+                        if (dpsvalue::IsUpkeepId(ai, m, s, cid, dummyMag))
+                            dpsvalue::ClaimSlot(s.target, cid, s.bot->GetGUIDLow(), 15000);
+                    }
                     m->state = (s.pack10 >= AoEPack(m)) ? State::Aoe : State::Burn;
                     return true;
                 }

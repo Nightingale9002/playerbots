@@ -384,3 +384,105 @@ namespace dpsvalue
         return false;
     }
 }
+
+namespace dpsvalue
+{
+    // =====================================================================================
+    // [2026-10-30 站长口径] boss 身上 debuff 的互斥性分析：
+    //   ① 默认允许叠加（同类不一定互斥：破甲与精灵之火就叠）
+    //   ② 只在"能证明会被顶掉/无收益"时判 0：同 aura 类型 + 同 EffectMiscValue（同一效果槽）
+    //      且目标身上已有幅度 >= 我的
+    //   ③ 判不了的组合不猜，只计数（dup），交给实测数据决定后续规则
+    // =====================================================================================
+    inline bool DebuffSuperseded(Unit* target, uint32 myId)
+    {
+        if (!target)
+            return false;
+        SpellEntry const* mine = sSpellTemplate.LookupEntry<SpellEntry>(myId);
+        if (!mine)
+            return false;
+        for (auto const& kv : target->GetSpellAuraHolderMap())
+        {
+            SpellAuraHolder* h = kv.second;
+            if (!h || h->GetId() == myId)
+                continue;
+            SpellEntry const* other = h->GetSpellProto();
+            if (!other)
+                continue;
+            for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+            {
+                uint32 const a = mine->EffectApplyAuraName[i];
+                if (a != SPELL_AURA_MOD_RESISTANCE && a != SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN)
+                    continue;
+                int32 const mv = mine->CalculateSimpleValue(SpellEffectIndex(i));
+                int32 const mm = int32(mine->EffectMiscValue[i]);
+                if (!mv)
+                    continue;
+                for (int j = 0; j < MAX_EFFECT_INDEX; ++j)
+                {
+                    if (other->EffectApplyAuraName[j] != a)
+                        continue;
+                    if (int32(other->EffectMiscValue[j]) != mm)
+                        continue;                  // 不同效果槽 ⇒ 允许叠加
+                    int32 const ov = other->CalculateSimpleValue(SpellEffectIndex(j));
+                    if (ov && std::abs(ov) >= std::abs(mv))
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 队友重复：认领表（同一目标 + 同一效果槽，只让一个 bot 负责刷）
+    struct Claim
+    {
+        uint32 owner = 0;
+        time_t until = 0;
+    };
+
+    inline std::map<std::pair<uint32, uint32>, Claim>& ClaimMap()
+    {
+        static std::map<std::pair<uint32, uint32>, Claim> m;
+        return m;
+    }
+
+    inline uint32 SlotSignature(uint32 myId)
+    {
+        SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(myId);
+        if (!sp)
+            return 0;
+        for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            uint32 const a = sp->EffectApplyAuraName[i];
+            if (a != SPELL_AURA_MOD_RESISTANCE && a != SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN)
+                continue;
+            return a * 100000u + uint32(sp->EffectMiscValue[i] & 0xFFFF);
+        }
+        return 0;
+    }
+
+    inline bool ClaimedByOther(Unit* target, uint32 myId, uint32 meGuid)
+    {
+        if (!target)
+            return false;
+        uint32 const sig = SlotSignature(myId);
+        if (!sig)
+            return false;
+        auto const it = ClaimMap().find(std::make_pair(uint32(target->GetGUIDLow()), sig));
+        if (it == ClaimMap().end() || it->second.owner == meGuid)
+            return false;
+        return it->second.until > time(nullptr);
+    }
+
+    inline void ClaimSlot(Unit* target, uint32 myId, uint32 meGuid, uint32 durationMs)
+    {
+        if (!target)
+            return;
+        uint32 const sig = SlotSignature(myId);
+        if (!sig)
+            return;
+        Claim& c = ClaimMap()[std::make_pair(uint32(target->GetGUIDLow()), sig)];
+        c.owner = meGuid;
+        c.until = time(nullptr) + (time_t)std::max<uint32>(1000, durationMs) / 1000;
+    }
+}
