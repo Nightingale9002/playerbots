@@ -707,7 +707,7 @@ namespace dpspolicy
                     ++m->dupDebuff;
                     continue;
                 }
-                float const score = dpsvalue::UpkeepValue(s.bot, s.bot->GetGUIDLow(),
+                float const score = dpsvalue::UpkeepValue(s.bot, s.target, s.bot->GetGUIDLow(),
                     std::max(1.0f, vmax), mag, sid) * dpspolicy::StepWeight(m, st);
                 if (score > bestScore)
                 {
@@ -771,7 +771,7 @@ namespace dpspolicy
                             ++m->dupDebuff;
                             continue;
                         }
-                        score = dpsvalue::UpkeepValue(s.bot, s.bot->GetGUIDLow(),
+                        score = dpsvalue::UpkeepValue(s.bot, s.target, s.bot->GetGUIDLow(),
                             std::max(1.0f, vmax), mag, c.id) * w;
                         upkeep = true;
                     }

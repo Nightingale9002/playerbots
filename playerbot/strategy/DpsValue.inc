@@ -500,7 +500,8 @@ namespace dpsvalue
             return;
         Claim& c = ClaimMap()[std::make_pair(uint32(target->GetGUIDLow()), sig)];
         c.owner = meGuid;
-        c.until = time(nullptr) + (time_t)std::max<uint32>(1000, durationMs) / 1000;
+        // [2026-10-31 修 Bug D] 用实际 duration（之前调用方写死 15 秒），并按毫秒算
+        c.until = time(nullptr) + (time_t)(std::max<uint32>(1000, durationMs) / 1000);
     }
 }
 
@@ -521,7 +522,7 @@ namespace dpsvalue
     //   现在：value = Vmax × 幅度 × (新时长 − 已剩时长) / GCD
     //     · 切割 30% × 20s / 1.5s = 4.0 × Vmax ⇒ 该补
     //     · 5% × 10s / 1.5s = 0.33 × Vmax ⇒ 不该补
-    inline float UpkeepValue(Player* bot, uint32 guid, float vmax, float magnitude, uint32 id)
+    inline float UpkeepValue(Player* bot, Unit* target, uint32 guid, float vmax, float magnitude, uint32 id)
     {
         Cand const* c = FindCand(bot, guid, id);
         float durSec = 0.0f;
@@ -532,7 +533,9 @@ namespace dpsvalue
         float remainSec = 0.0f;
         if (c && c->upkeep)
         {
-            Unit* who = c->isDebuff ? nullptr : bot;
+            // [2026-10-31 修 Bug A] debuff 的剩余时间在**目标**身上；之前传 nullptr ⇒ 永远 0
+            //   ⇒ gainSec=整段时长 ⇒ 破甲/精灵之火/腐蚀被反复重放。
+            Unit* who = c->isDebuff ? target : bot;
             if (who)
             {
                 SpellAuraHolder* h = who->GetSpellAuraHolder(id);
@@ -584,7 +587,10 @@ namespace dpsvalue
     inline float EstDamage(Player* bot, Unit* target, Cand const& c, float weaponHit, uint8 combo, int pack)
     {
         float dmg = c.base + c.weaponMul * weaponHit;
-        if (c.schoolMask && c.coeff > 0.0f)
+        bool const physical = (c.weaponMul > 0.0f);
+        // [2026-10-31 修 Bug B] 法伤只加在**纯法术**上；物理技能（weaponMul>0）加武器伤害即可。
+        //   之前物理技能也被加法伤（瞬发 coeff=0.43），会把骑/萨/野德的物理技能估值抬高。
+        if (!physical && c.schoolMask && c.coeff > 0.0f)
         {
             int32 const sp = bot->SpellBaseDamageBonusDone(SpellSchoolMask(c.schoolMask));
             if (sp > 0)
@@ -601,7 +607,9 @@ namespace dpsvalue
             SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
             if (sp)
             {
-                float const crit = bot->CalculateSpellCritChance(target, SpellSchoolMask(c.schoolMask ? c.schoolMask : SPELL_SCHOOL_MASK_NORMAL), sp);
+                // 物理技能不吃法术暴击（用同一接口会算错，宁可先不乘）
+                float const crit = physical ? 0.0f
+                    : bot->CalculateSpellCritChance(target, SpellSchoolMask(c.schoolMask ? c.schoolMask : SPELL_SCHOOL_MASK_NORMAL), sp);
                 if (crit > 0.0f)
                     dmg *= 1.0f + crit / 100.0f;
             }
