@@ -280,6 +280,41 @@ namespace dpspolicy
         { "arcane shot",        PKind::Target },
     };
 
+
+    // ---- [2026-10-30 站长口径] 表内价值驱动 ----
+    // 表结构保留（人可读、可约束），但"选哪一步"不再取第一条能放的，而是**打分取最大**：
+    //   score = 期望伤害 / 行动成本 × 权重
+    // 权重按步骤类别从 tune 参数读（每专精可分别调）：
+    //   w_dot / w_finisher / w_strike / w_aoe / w_nuke / w_buff，默认 1.0
+    // 类别由步骤自身字段推导（不新增表字段，避免再"手写分类"）：
+    //   Self                → buff
+    //   Ground 或 minPack>0 → aoe
+    //   Swing               → strike
+    //   minCombo>0          → finisher
+    //   needAuraGone        → dot
+    //   其余 Target         → nuke
+    inline char const* StepWeightClass(PStep const& st)
+    {
+        if (st.kind == PKind::Self)
+            return "buff";
+        if (st.kind == PKind::Ground || st.minPack > 0)
+            return "aoe";
+        if (st.kind == PKind::Swing)
+            return "strike";
+        if (st.minCombo > 0)
+            return "finisher";
+        if (st.needAuraGone)
+            return "dot";
+        return "nuke";
+    }
+
+    inline float StepWeight(BotMem* m, PStep const& st)
+    {
+        char key[24];
+        snprintf(key, sizeof(key), "w_%s", StepWeightClass(st));
+        return float(TP(m, key, 1.0));
+    }
+
     inline PPolicy const* PolicyFor(uint8 cls, Spec spec)
     {
         static PPolicy const arms   { "arms",    kArms,    int(sizeof(kArms) / sizeof(kArms[0])) };
@@ -477,6 +512,85 @@ namespace dpspolicy
             return false;
 
         dpspolicy::LogMissingOnce(ai, m, s.bot, pol);
+
+        // [2026-10-30 站长口径] 表内价值驱动：pselect=1 时先给所有"当前可执行"的步骤打分，再放最高的那个。
+        //   pselect=0（默认）= 原来的"第一条能放就放"，两条路可同轮 A/B。
+        if (TP(m, "pselect", 0.0) >= 1.0)
+        {
+            // [2026-10-30 站长口径] 表内价值驱动，**两遍打分**：
+            //   第一遍：伤害类（直接/武器/DoT/AoE）→ 得到本 tick 的参考价值 Vmax
+            //   第二遍：吞吐修正类（切割/破甲/精灵之火…）= Vmax × 幅度 × 覆盖权重
+            //   ⇒ 没有伤害的技能也能跟伤害技能在同一把尺子上比较，不需要手写顺序。
+            float vmax = 0.0f;
+            int bestIdx = -1;
+            float bestScore = -1.0f;
+
+            for (int i = 0; i < pol->count; ++i)
+            {
+                dpspolicy::PStep const& st = pol->steps[i];
+                if (st.kind == dpspolicy::PKind::Hold)
+                    continue;
+                if (!dpspolicy::StepAllowed(ai, m, s, st))
+                    continue;
+                uint32 const sid = SpellId(ai, s.bot, m, st.name, false);
+                if (!sid || !s.bot->HasSpell(sid))
+                    continue;
+                float mag = 0.0f;
+                if (dpsvalue::IsUpkeepId(ai, m, s, sid, mag))
+                    continue;                      // 吞吐类第二遍再算
+                float base = 0.0f;
+                if (!dpsvalue::ValueOfId(ai, m, s, sid, base))
+                    continue;
+                float const score = base * dpspolicy::StepWeight(m, st);
+                if (score > vmax)
+                    vmax = score;
+                if (dpsvalue::ResourceOk(ai, m, s, sid) && score > bestScore)
+                {
+                    bestScore = score;
+                    bestIdx = i;
+                }
+            }
+
+            for (int i = 0; i < pol->count; ++i)
+            {
+                dpspolicy::PStep const& st = pol->steps[i];
+                if (st.kind == dpspolicy::PKind::Hold)
+                    continue;
+                if (!dpspolicy::StepAllowed(ai, m, s, st))
+                    continue;
+                uint32 const sid = SpellId(ai, s.bot, m, st.name, false);
+                if (!sid || !s.bot->HasSpell(sid))
+                    continue;
+                float mag = 0.0f;
+                if (!dpsvalue::IsUpkeepId(ai, m, s, sid, mag))
+                    continue;
+                if (!dpsvalue::ResourceOk(ai, m, s, sid))
+                    continue;
+                float const wKey = st.kind == dpspolicy::PKind::Self ? 1.0f : 1.0f;
+                float const score = std::max(1.0f, vmax) * mag * dpspolicy::StepWeight(m, st) * wKey;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx >= 0)
+            {
+                if (dpspolicy::TryStep(ai, m, s, pol->steps[bestIdx]))
+                {
+                    m->state = (s.pack10 >= AoEPack(m)) ? State::Aoe : State::Burn;
+                    return true;
+                }
+            }
+            else if (vmax > 0.0f)
+            {
+                // [2026-10-30 站长口径] **等资源也是一个状态**：有更好的伤害技能但资源不够时，
+                //   有意等待（而不是塞一个低效技能），并把这个 tick 记为 Recover。
+                m->state = State::Recover;
+                return true;
+            }
+        }
 
         for (int i = 0; i < pol->count; ++i)
         {

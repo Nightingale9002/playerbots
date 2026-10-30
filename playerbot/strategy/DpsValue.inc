@@ -1,0 +1,386 @@
+// =====================================================================================
+// [2026-10-30 站长口径] **价值驱动（value-driven）重写**：不再"按专精查优先级表"，
+//   而是每个决策点对 bot **法术书里所有输出技能**打分，取价值最高的一个。
+//
+//   value(skill) = 期望伤害 / 行动成本
+//     期望伤害 = 基础伤害(DB) + 武器伤害×倍数；DoT 用"整段总量"
+//     行动成本 = max(施法时间, 1.5s GCD) + 资源折算时间（怒气/能量/法力 ÷ 收入速度）
+//   过滤条件全部来自 DB 与局面，不来自"我猜的职业分类"：
+//     · 已学会 & 冷却好（Ready）
+//     · 斩杀类（SpellEntry.TargetAuraState == 2）只在目标 < 20% 血时可用
+//     · 连击点法术要求有星，伤害按星数放大
+//     · DoT 类：目标身上已在跳就跳过（避免刷爆）
+//     · 有半径的伤害法术按目标数放大（AoE）
+//   状态不再是输入：Burst/Aoe 只是结果（我们会把"当前行为"记成遥测标签）。
+//
+//   开关：`value=1`（`*:value=1` 或 `spec:value=1`）。默认 0，便于与旧实现同轮 A/B。
+//   分工：**伤害技能由价值引擎选**；自身 buff/圣印/图腾等维护交给原处理器（fallback），
+//         因为它们的"价值"是提升后续伤害，用一次性 DB 伤害估不出来。
+// =====================================================================================
+namespace dpsvalue
+{
+    struct Cand
+    {
+        uint32 id = 0;
+        float  base = 0.0f;        // 基础伤害（DoT 为整段总量）
+        float  weaponMul = 0.0f;   // 武器伤害倍数（物理技能）
+        bool   dot = false;        // 周期性伤害
+        bool   needsCombo = false; // 连击点法术
+        uint32 auraState = 0;      // 需要的目标 aura state（2 = 低血斩杀）
+        uint32 castMs = 0;
+        uint32 durationMs = 0;
+        int32  cost = 0;
+        uint8  powerType = 0;      // 0=none 1=mana 2=rage 3=energy
+        int    aoeTargets = 1;     // >1 表示可打多目标（按半径估算）
+        // [2026-10-30 站长口径] 不是所有有用的技能都带伤害：切割/破甲/精灵之火这类是"吞吐修正"。
+        //   识别靠 DB 的 aura 类型（机械映射），不靠手写清单：
+        //     modKind: 1=攻速/急速  2=攻强  3=削护甲（负抗性）  4=易伤(受伤百分比)
+        //   modValue 是该效果的幅度（正数），upkeep=true 表示"长期挂着、临近过期才续"。
+        uint8  modKind = 0;
+        float  modValue = 0.0f;
+        bool   upkeep = false;
+        bool   isDebuff = false;   // true = 挂在目标身上（破甲/精灵之火）
+    };
+
+    inline std::unordered_map<uint32, std::vector<Cand>>& Cache() { static std::unordered_map<uint32, std::vector<Cand>> c; return c; }
+    inline std::unordered_map<uint32, time_t>& BuiltAt() { static std::unordered_map<uint32, time_t> b; return b; }
+
+    // 法术书扫描：只留"能造成伤害"的法术（直接伤害/武器伤害/周期性伤害），且只留最高 rank。
+    inline void Rebuild(Player* bot, uint32 guid)
+    {
+        std::vector<Cand> out;
+        PlayerSpellMap const& spells = bot->GetSpellMap();
+        for (auto const& kv : spells)
+        {
+            PlayerSpell const& ps = kv.second;
+            if (!ps.active || ps.disabled)
+                continue;
+            uint32 const id = kv.first;
+            SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(id);
+            if (!sp)
+                continue;
+            // 只保留最高 rank（低 rank 只在没学高 rank 时才考虑）
+            uint32 const next = sSpellMgr.GetNextSpellInChain(id);
+            if (next && bot->HasSpell(next))
+                continue;
+
+            Cand c;
+            c.id = id;
+            c.auraState = sp->TargetAuraState;
+            c.castMs = GetSpellCastTime(sp, bot);
+            c.durationMs = GetSpellDuration(sp) > 0 ? uint32(GetSpellDuration(sp)) : 0;
+            c.powerType = uint8(sp->powerType);
+            c.cost = int32(sp->manaCost);
+
+            bool anyDamage = false;
+            for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+            {
+                uint32 const eff = sp->Effect[i];
+                int32 const simple = sp->CalculateSimpleValue(SpellEffectIndex(i));
+                if (eff == SPELL_EFFECT_SCHOOL_DAMAGE)
+                {
+                    c.base += float(simple > 0 ? simple : 0);
+                    anyDamage = true;
+                    if (sp->EffectRadiusIndex[i])
+                        c.aoeTargets = 5;         // 地面/范围伤害：按目标数放大
+                }
+                else if (eff == SPELL_EFFECT_WEAPON_DAMAGE || eff == SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL)
+                {
+                    c.weaponMul += 1.0f;
+                    c.base += float(simple > 0 ? simple : 0);
+                    anyDamage = true;
+                }
+                else if (eff == SPELL_EFFECT_WEAPON_PERCENT_DAMAGE)
+                {
+                    c.weaponMul += float(simple > 0 ? simple : 0) / 100.0f;
+                    anyDamage = true;
+                }
+                else if (eff == SPELL_EFFECT_APPLY_AURA && sp->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE)
+                {
+                    int32 const amp = int32(sp->EffectAmplitude[i]);
+                    int32 const dur = GetSpellDuration(sp);
+                    int ticks = (amp > 0 && dur > 0) ? (dur / amp) : 1;
+                    if (ticks < 1) ticks = 1;
+                    c.base += float(simple > 0 ? simple : 0) * float(ticks);
+                    c.dot = true;
+                    anyDamage = true;
+                }
+            }
+            // [2026-10-30] 没有直接伤害也没关系：识别"吞吐修正类"（只放开收益可估的三类）
+            if (!anyDamage || c.base <= 0.0f)
+            {
+                for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+                {
+                    if (sp->Effect[i] != SPELL_EFFECT_APPLY_AURA)
+                        continue;
+                    uint32 const aura = sp->EffectApplyAuraName[i];
+                    int32 const val = sp->CalculateSimpleValue(SpellEffectIndex(i));
+                    uint8 kind = 0;
+                    if (aura == SPELL_AURA_MOD_MELEE_HASTE)                       kind = 1;   // 切割类
+                    else if (aura == SPELL_AURA_MOD_ATTACK_POWER
+                        || aura == SPELL_AURA_MOD_RANGED_ATTACK_POWER)           kind = 2;   // 攻强 buff
+                    else if (aura == SPELL_AURA_MOD_RESISTANCE && val < 0)       kind = 3;   // 削护甲（破甲/精灵之火）
+                    else if (aura == SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN)        kind = 4;   // 易伤
+                    if (!kind)
+                        continue;
+                    c.modKind = kind;
+                    c.modValue = float(val < 0 ? -val : val) / (kind == 2 ? 1.0f : 100.0f);
+                    c.upkeep = (c.durationMs >= 8000);
+                    // 目标型 debuff：需要选中敌人（AuraState/范围判定交给 CheckCast）
+                    c.isDebuff = (kind == 3 || kind == 4);
+                    break;
+                }
+                if (!c.modKind)
+                    continue;
+            }
+            // 连击点法术：DB 的 AttributesEx 带 REQ_COMBO_POINTS(0x00040000) 位
+            if (sp->AttributesEx & 0x00040000)
+                c.needsCombo = true;
+
+            out.push_back(c);
+        }
+        Cache()[guid] = out;
+        BuiltAt()[guid] = time(nullptr);
+        sLog.outError("[DPSVALUE] %s 候选技能 %u 个（法术书 %u）",
+            bot->GetName(), uint32(out.size()), uint32(spells.size()));
+    }
+
+    inline std::vector<Cand>& Candidates(Player* bot, uint32 guid)
+    {
+        auto it = BuiltAt().find(guid);
+        if (it == BuiltAt().end() || time(nullptr) - it->second > 120)
+            Rebuild(bot, guid);
+        return Cache()[guid];
+    }
+
+    // 资源折算成"秒"（收入速度按经验常数；目的只是让不同技能的消耗可比）
+    inline float ResourceSeconds(Player* bot, Cand const& c)
+    {
+        if (c.cost <= 0)
+            return 0.0f;
+        switch (c.powerType)
+        {
+            case POWER_RAGE:   return float(c.cost) / 3.0f;      // 约 3 怒/秒
+            case POWER_ENERGY: return float(c.cost) / 10.0f;     // 10 能量/秒
+            case POWER_MANA:
+            {
+                float const maxMana = float(bot->GetMaxPower(POWER_MANA));
+                float const regen = std::max(30.0f, maxMana * 0.02f);
+                return float(c.cost) / regen;
+            }
+            default: return 0.0f;
+        }
+    }
+
+    inline bool HasResource(Player* bot, Cand const& c)
+    {
+        if (c.cost <= 0)
+            return true;
+        if (c.powerType == POWER_RAGE)
+            return bot->GetPower(POWER_RAGE) >= uint32(c.cost);
+        if (c.powerType == POWER_ENERGY)
+            return bot->GetPower(POWER_ENERGY) >= uint32(c.cost);
+        if (c.powerType == POWER_MANA)
+            return bot->GetPower(POWER_MANA) >= uint32(c.cost);
+        return true;
+    }
+}
+
+namespace dpsvalue
+{
+    // 按 id 施放（复制 CastChecked 的校验/退避逻辑，但不再走"名字→id"这一步）：
+    //   价值引擎手里已经是 id，而且必须用**已学会的最高 rank**。
+    inline bool CastId(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 id, Unit* target)
+    {
+        if (!id || !s.bot->HasSpell(id))
+            return false;
+        if (!Ready(s.bot, id))
+            return false;
+
+        time_t const now = time(nullptr);
+        auto it = m->failUntil.find(id);
+        if (it != m->failUntil.end() && now < it->second)
+            return false;
+
+        Unit* tgt = target ? target : s.target;
+        SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+        if (!ai->CanCastSpell(id, tgt, 0, false, nullptr, false, false, false, &res))
+        {
+            // 自身增益/形态类：对敌施放会被判 108/110，改走核心自放（同 CastChecked 的处理）
+            bool const selfFix = (res == SPELL_FAILED_TARGET_FRIENDLY)
+                || (res == SPELL_FAILED_TARGET_ENEMY && tgt != s.bot);
+            if (selfFix)
+            {
+                SpellCastResult const res2 = s.bot->CastSpell(s.bot, id, uint32(TRIGGERED_NONE));
+                if (res2 == SPELL_CAST_OK)
+                {
+                    ++m->castCount;
+                    m->lastOk[id] = now;
+                    m->castThisTick = true;
+                    PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+                    return true;
+                }
+                res = res2;
+            }
+            bool const waitingResource = (res == SPELL_FAILED_NO_POWER
+                || res == SPELL_FAILED_OUT_OF_RANGE || res == SPELL_FAILED_LINE_OF_SIGHT
+                || res == SPELL_FAILED_NOT_READY);
+            m->failUntil[id] = now + (waitingResource ? 1 : 2);
+            return false;
+        }
+        if (!ai->CastSpell(id, tgt))
+            return false;
+        ++m->castCount;
+        m->lastOk[id] = now;
+        m->castThisTick = true;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        return true;
+    }
+}
+
+    // [2026-10-30] 价值驱动主循环：对所有候选技能打分，放最高的那个。
+    //   返回 true = 本 tick 已决定（放了技能，或资源不够"有意等"）。
+    //   返回 false = 没有可用的伤害技能 ⇒ 交给原处理器做 buff/圣印/图腾等维护。
+    bool TickValue(PlayerbotAI* ai, BotMem* m)
+    {
+        Snapshot s;
+        BuildSnapshot(ai, m, s);
+        if (!s.target)
+            return false;
+        if (s.casting)
+            return true;
+
+        std::vector<dpsvalue::Cand>& cands = dpsvalue::Candidates(s.bot, s.bot->GetGUIDLow());
+        float const weaponHit = s.bot->CalculateDamage(BASE_ATTACK, false);
+        int const pack = std::max(s.pack10, 1);
+
+        int bestIdx = -1;
+        float bestVal = -1.0f;
+        bool bestHasResource = true;
+
+        for (size_t i = 0; i < cands.size(); ++i)
+        {
+            dpsvalue::Cand const& c = cands[i];
+            if (!Ready(s.bot, c.id))
+                continue;
+            if (c.auraState == 2 && s.targetHp > 20.0f)          // 斩杀类：目标血不够低
+                continue;
+            if (c.needsCombo && s.combo == 0)
+                continue;
+            if (c.dot && s.target->GetSpellAuraHolder(c.id))     // DoT 还在跳
+                continue;
+
+            float dmg = c.base + c.weaponMul * weaponHit;
+            if (c.needsCombo)
+                dmg *= 0.35f + 0.13f * float(s.combo);           // 星越多伤害越高（近似）
+            if (c.aoeTargets > 1)
+                dmg *= float(std::min(pack, c.aoeTargets));
+
+            float const actSec = std::max(1.5f, float(c.castMs) / 1000.0f)
+                + dpsvalue::ResourceSeconds(s.bot, c);
+            float const val = dmg / std::max(0.2f, actSec);
+            if (val > bestVal)
+            {
+                bestVal = val;
+                bestIdx = int(i);
+                bestHasResource = dpsvalue::HasResource(s.bot, c);
+            }
+        }
+
+        if (bestIdx < 0)
+            return false;
+
+        dpsvalue::Cand const& best = cands[size_t(bestIdx)];
+        if (!bestHasResource)
+        {
+            // 资源不够：有意等（能量/怒气职业等资源常常比硬塞低效技能更划算）
+            m->state = State::Recover;
+            return true;
+        }
+        if (dpsvalue::CastId(ai, m, s, best.id, s.target))
+        {
+            m->state = State::Burn;
+            return true;
+        }
+        return false;
+    }
+
+namespace dpsvalue
+{
+    // [2026-10-30 站长口径] 表内价值驱动：给策略表里的一步算"值多少"。
+    //   返回 false = 这一步没有伤害元数据（buff/圣印/姿态这类），调用方按顺序兜底。
+    inline bool ValueOfId(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 id, float& outValue)
+    {
+        if (!id)
+            return false;
+        std::vector<Cand>& cands = Candidates(s.bot, s.bot->GetGUIDLow());
+        for (Cand const& c : cands)
+        {
+            if (c.id != id)
+                continue;
+            if (c.modKind)
+            {
+                // [2026-10-30] 吞吐修正类：value = 参考DPS × 幅度 × 覆盖权重
+                //   参考DPS 由调用方（策略表打分）用"当前最高伤害价值"传入；这里用 Unity 占位 1.0，
+                //   实际乘在 TickPolicy 里完成（那里能拿到 Vmax）。
+                float cover = 1.0f;
+                if (c.upkeep && c.durationMs > 0)
+                {
+                    SpellAuraHolder* holder = (c.isDebuff ? s.target : s.bot)->GetSpellAuraHolder(c.id);
+                    if (holder)
+                    {
+                        int const remain = holder->GetAuraDuration();
+                        // 剩余 > 40% 时长 ⇒ 现在补是浪费 GCD（覆盖权重 0）
+                        cover = (remain < 0 || remain > int(c.durationMs) * 2 / 5) ? 0.0f
+                              : (1.0f - float(remain) / float(c.durationMs));
+                    }
+                }
+                if (cover <= 0.0f)
+                    return false;
+                outValue = c.modValue * cover;      // 归一化幅度（0~1 量级），调用方乘 Vmax
+                return true;
+            }
+
+            float dmg = c.base + c.weaponMul * s.bot->CalculateDamage(BASE_ATTACK, false);
+            if (c.needsCombo)
+                dmg *= 0.35f + 0.13f * float(s.combo);
+            if (c.aoeTargets > 1)
+                dmg *= float(std::min(std::max(s.pack10, 1), c.aoeTargets));
+            if (dmg <= 0.0f)
+                return false;
+            float const actSec = std::max(1.5f, float(c.castMs) / 1000.0f) + ResourceSeconds(s.bot, c);
+            outValue = dmg / std::max(0.2f, actSec);
+            return true;
+        }
+        return false;
+    }
+
+    inline bool ResourceOk(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 id)
+    {
+        std::vector<Cand>& cands = Candidates(s.bot, s.bot->GetGUIDLow());
+        for (Cand const& c : cands)
+            if (c.id == id)
+                return HasResource(s.bot, c);
+        return true;        // 没有元数据（buff 类）：交给 CastChecked 自己判
+    }
+}
+
+namespace dpsvalue
+{
+    // 这个 id 是不是"吞吐修正类"（切割/破甲/精灵之火这类没有伤害但有收益的）
+    inline bool IsUpkeepId(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 id, float& outMagnitude)
+    {
+        std::vector<Cand>& cands = Candidates(s.bot, s.bot->GetGUIDLow());
+        for (Cand const& c : cands)
+        {
+            if (c.id != id || !c.modKind)
+                continue;
+            float v = 0.0f;
+            if (!ValueOfId(ai, m, s, id, v))
+                return false;
+            outMagnitude = v;
+            return true;
+        }
+        return false;
+    }
+}

@@ -2134,7 +2134,12 @@ namespace ai
         }
 
         // [2026-10-30 站长口径] 职业=技能空间、专精=策略；实现见 DpsPolicy.inc（纯文本包含，便于与旧处理器 A/B）
+    // [2026-10-30] 顺序很重要：DpsValue 必须在 DpsPolicy 之前包含（表内打分调用 dpsvalue::ValueOfId）
+#include "playerbot/strategy/DpsValue.inc"
 #include "playerbot/strategy/DpsPolicy.inc"
+
+
+
 
     // [2026-10-30 站长口径] **所有物理近战输出都要找背**（找背是站位问题，跟具体技能无关）；
     //   但"找背"不等于一直调位置：站到背后之后就尽量不动（走动会打断挥击，实测平砍 78→54）。
@@ -2242,6 +2247,14 @@ namespace ai
             ++m->tickCount;
             if (bot->IsMoving())
                 ++m->movTicks;
+
+            // [2026-10-30] 价值驱动优先：value=1 时先由价值引擎选技能；
+            //   它没有伤害技能可用（或都放不出）时返回 false，落回下面做 buff/圣印/形态维护。
+            if (TP(m, "value", 0.0) >= 1.0)
+            {
+                if (TickValue(ai, m))
+                    return true;
+            }
 
             // [2026-10-30] 职业技能空间 + 专精策略（policy=1 开启；默认 0 走原分专精处理器，便于同轮 A/B）
             if (TP(m, "policy", 0.0) >= 1.0)
