@@ -21,7 +21,8 @@ namespace dpspolicy
         Target,     // 对当前目标施放
         Self,       // 对自己施放（圣印/姿态/形态/自身增益）
         Ground,     // 对目标脚下地面施放（暴风雪/烈焰风暴/火雨/飓风/箭雨）
-        Swing       // 下一次挥击附带（英勇打击/顺劈）
+        Swing,      // 下一次挥击附带（英勇打击/顺劈）
+        Hold        // 有意"什么都不放、等资源"（能量职业的合法选择：等能量比硬塞更划算，还能留给打断）
     };
 
     struct PStep
@@ -42,6 +43,14 @@ namespace dpspolicy
         double enableDefault = 1.0;
         char const* rageParam = nullptr;      // 非空时：minRage 取 TP(param, default)
         double rageDefault = 60.0;
+        // [2026-10-30] 连击点相关（盗贼/野德）：
+        bool auraSelf = false;                // needAuraGone 查自己（切割这类自身 buff）
+        int maxCombo = 0;                     // 攒星技：连击点 >= 这个值就别再攒（防溢出，0=不限）
+        int refreshMs = 0;                    // 自身 buff 剩余 < 这个毫秒才续（0 = 没了才补）
+        bool needBehind = false;              // 这一手要求站背后：不在背后就先自己找背（不换技能）
+        int holdBelowEnergy = 0;              // PKind::Hold：能量低于这个值时才"等"（0 = 一直等）
+        char const* holdParam = nullptr;      // 等待阈值也可扫（例如 hold_energy）
+        double holdDefault = 45.0;
     };
 
     struct PPolicy
@@ -107,22 +116,42 @@ namespace dpspolicy
         { "heroic strike",      PKind::Swing,  nullptr, 0, 0, 45 },
     };
 
-    // 战斗贼：切割 > 剑刃乱舞 > 冲动 > 邪恶攻击 > 剔骨
+    // 战斗贼：切割(续期) > 剑刃乱舞 > 冲动 > 邪恶攻击(星<5) > 剔骨(5 星)
+    //   [2026-10-30] 连击点三件套：① 切割作为连击点法术必须**打敌人**（打自己判 NO_COMBO_POINTS 73）
+    //   ② 攒星技 maxCombo=5，星满了不再攒（防溢出）③ 切割 remaining<2.5s 才续；4 星优先、1 星应急
     static PStep const kCombat[] = {
-        { "slice and dice",     PKind::Self,  "slice and dice", 1 },
+        { "slice and dice",     PKind::Target, "slice and dice", 4, 0, 0, nullptr, 0, 100.0f, "snd",
+          nullptr, nullptr, 1.0, nullptr, 60.0, true, 0, 2500 },
+        { "slice and dice",     PKind::Target, "slice and dice", 1, 0, 0, nullptr, 0, 100.0f, "snd-emergency",
+          nullptr, nullptr, 1.0, nullptr, 60.0, true, 0, 2500 },
         { "blade flurry",       PKind::Self },
         { "adrenaline rush",    PKind::Self },
-        { "sinister strike",    PKind::Target },
+        { "sinister strike",    PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder",
+          nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "eviscerate",         PKind::Target, nullptr, 5 },
+        { "eviscerate",         PKind::Target, nullptr, 3 },
+        { "hold",               PKind::Hold,   nullptr, 0, 0, 0, nullptr, 0, 100.0f, "wait-energy",
+          nullptr, nullptr, 1.0, nullptr, 60.0, false, 0, 0, false, 0, "hold_energy", 45.0 },
     };
 
-    // 刺杀贼：切割 > 冷血 > 毁伤 > 毒伤(不可用则剔骨)
+    // 刺杀贼：切割(续期) > 冷血 > 毁伤(星<5) > 毒伤(4 星) > 剔骨兜底
     static PStep const kAssa[] = {
-        { "slice and dice",     PKind::Self,  "slice and dice", 1 },
+        { "slice and dice",     PKind::Target, "slice and dice", 4, 0, 0, nullptr, 0, 100.0f, "snd",
+          nullptr, nullptr, 1.0, nullptr, 60.0, true, 0, 2500 },
+        { "slice and dice",     PKind::Target, "slice and dice", 1, 0, 0, nullptr, 0, 100.0f, "snd-emergency",
+          nullptr, nullptr, 1.0, nullptr, 60.0, true, 0, 2500 },
         { "cold blood",         PKind::Self },
-        { "mutilate",           PKind::Target },
+        // [2026-10-30 修] 毁伤要求"双匕首 + 背后"，随机 bot 经常不满足（旧处理器为此专门留了兜底，
+        //   否则整场 0 施法）。策略里必须紧跟一条邪恶攻击兜底，否则这个专精会突然掉到 0 伤害。
+        { "mutilate",           PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder/behind",
+          nullptr, nullptr, 1.0, nullptr, 60.0, false, 5, 0, true },
+        { "sinister strike",    PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder-fallback",
+          nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "envenom",            PKind::Target, nullptr, 4 },
         { "eviscerate",         PKind::Target, nullptr, 4 },
+        { "eviscerate",         PKind::Target, nullptr, 2 },
+        { "hold",               PKind::Hold,   nullptr, 0, 0, 0, nullptr, 0, 100.0f, "wait-energy",
+          nullptr, nullptr, 1.0, nullptr, 60.0, false, 0, 0, false, 0, "hold_energy", 45.0 },
     };
 
     // 火法：灼烧叠 5 层 > 燃烧 > 火球 > 火焰冲击 > 烈焰风暴(群)
@@ -206,10 +235,10 @@ namespace dpspolicy
     static PStep const kFeral[] = {
         { "cat form",           PKind::Self,  nullptr, 0, 0, 0, nullptr, 0, 100.0f, "form", "cat" },
         { "tiger's fury",       PKind::Self,  nullptr, 0, 0, 0, nullptr, 0, 100.0f, "energy>=80" },
-        { "rake",               PKind::Target, "rake" },
+        { "rake",               PKind::Target, "rake", 0, 0, 0, nullptr, 0, 100.0f, "dot", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "rip",                PKind::Target, "rip", 4 },
-        { "mangle",             PKind::Target },
-        { "shred",              PKind::Target },
+        { "mangle",             PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
+        { "shred",              PKind::Target, nullptr, 0, 0, 0, nullptr, 0, 100.0f, "builder", nullptr, nullptr, 1.0, nullptr, 60.0, false, 5 },
         { "ferocious bite",     PKind::Target, nullptr, 5 },
     };
 
@@ -372,14 +401,37 @@ namespace dpspolicy
         }
         if (st.needForm && !HasFormOrShift(s.bot, st.needForm))
             return false;
+        if (st.kind == PKind::Hold)
+        {
+            int const thr = st.holdParam ? int(TP(m, st.holdParam, st.holdDefault)) : st.holdBelowEnergy;
+            return thr <= 0 || s.energy < thr;
+        }
+
+        // [2026-10-30] 连击点上限：星已经够了就别再打攒星技（多打的星直接浪费）
+        if (st.maxCombo > 0 && s.combo >= st.maxCombo)
+            return false;
+
         if (st.needAuraGone)
         {
-            // [2026-10-30 实测] 自身增益（战斗怒吼/圣印）的"已有就跳过"必须查**自己**，
+            // [2026-10-30 实测] 自身增益（战斗怒吼/圣印/切割）的"已有就跳过"必须查**自己**，
             //   原来一律查目标 ⇒ 战斗怒吼 40 秒刷了 15 次、把 GCD 全占了（policy 223 dps vs 旧 510）。
-            Unit* auraUnit = (st.kind == PKind::Self) ? s.bot : s.target;
-            if (AuraStacks(ai, s.bot, m, st.needAuraGone, auraUnit) > 0)
+            bool const onSelf = st.auraSelf || st.kind == PKind::Self;
+            Unit* auraUnit = onSelf ? s.bot : s.target;
+            if (st.refreshMs > 0 && onSelf)
+            {
+                int const remain = AuraRemain(ai, m, s, st.needAuraGone);
+                if (remain > st.refreshMs)        // 还够久，先不续
+                    return false;
+            }
+            else if (AuraStacks(ai, s.bot, m, st.needAuraGone, auraUnit) > 0)
                 return false;
         }
+
+        // [2026-10-30] 连击点归属：星记在 GetComboTargetGuid() 上。换目标后旧星还在，
+        //   但对着新目标放终结技会被判 NO_COMBO_POINTS(73)。终结技要求"星属于当前目标"。
+        if (st.minCombo > 0 && s.target
+            && s.bot->GetComboTargetGuid() != s.target->GetObjectGuid())
+            return false;
         return true;
     }
 
@@ -396,6 +448,8 @@ namespace dpspolicy
                     s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ());
             case PKind::Swing:
                 return TrySwing(ai, m, s, st.name);
+            case PKind::Hold:
+                return true;        // 有意等待：不施法，但"本 tick 由状态机决定"（别让引擎插动作）
             case PKind::Target:
             default:
                 return TryCast(ai, m, s, st.name, nullptr);
@@ -427,8 +481,27 @@ namespace dpspolicy
         for (int i = 0; i < pol->count; ++i)
         {
             dpspolicy::PStep const& st = pol->steps[i];
+
+            // [2026-10-30 站长口径] **站位是移动层的职责**（引擎侧 PlayerbotAI::PositionMeleeDpsBehind），
+            //   技能层不自己 MovePoint；这里只把"需要背后但还没站好"记一次，便于排查
+            //   （例如毁伤要求双匕首+背后，背后的问号应该由移动层解决，而不是降级技能）。
+            if (st.needBehind && s.target && !s.bot->IsFacingTargetsBack(s.target) && !m->behindWarned)
+            {
+                m->behindWarned = true;
+                sLog.outError("[DPSFSM-POLICY] %s 需要背后但当前没站好（交给移动层摆位）", s.bot->GetName());
+            }
+
             if (!dpspolicy::StepAllowed(ai, m, s, st))
                 continue;
+
+            // [2026-10-30 站长口径] 能量职业"什么都不放、等资源"是合法且常常更优的选择
+            //   （硬塞一发低效技能既掉 dps 又把能量占掉，还挤掉打断/疾跑的余量）。
+            if (st.kind == dpspolicy::PKind::Hold)
+            {
+                m->state = State::Recover;
+                return true;
+            }
+
             if (dpspolicy::TryStep(ai, m, s, st))
             {
                 m->state = (s.pack10 >= AoEPack(m)) ? State::Aoe : State::Burn;

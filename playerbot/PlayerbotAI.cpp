@@ -1958,6 +1958,62 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     //   再走原引擎（其他动作/走位/打断保持不动）。默认关。
     // [2026-10-29] 假人场景里状态机全权负责技能：引擎这一步不再插施法（它原来会抢 GCD：
     //   补 buff / 魔杖平射 / 重复挂圣印，实测把 DPS 压掉一大半）。副本里仍照旧走引擎。
+    // [2026-10-30 站长口径] **站位是移动层的职责**：物理近战输出由引擎摆到目标背后，
+    //   技能层只声明"这一手需要背后"，不自己 MovePoint。
+    //   两个容差很关键，否则会陷入"一直微调位置"（走动打断挥击，实测平砍 78→54、dps 824→518）：
+    //     ① 角度容差：已经在目标后半球（dot < -0.3）就算站好了，不再调整；
+    //     ② 距离容差：离"理想落脚点" 2 码以内就不动。
+    if (sPlayerbotAIConfig.dpsFsm && bot->IsInCombat() && bot->GetVictim() && dpsfsm::NeedsBehind(bot))
+    {
+        Unit* v = bot->GetVictim();
+        float const dx = bot->GetPositionX() - v->GetPositionX();
+        float const dy = bot->GetPositionY() - v->GetPositionY();
+        float const len = sqrt(dx * dx + dy * dy);
+        float const fx = cos(v->GetOrientation());
+        float const fy = sin(v->GetOrientation());
+        float const behindDot = (len > 0.01f) ? (-(dx / len) * fx - (dy / len) * fy) : -1.0f;   // 1 = 正后方
+
+        // 理想落脚点（目标正后方，0.8 倍近战触及）
+        float const reach = bot->GetCombinedCombatReach(v, true) * 0.8f;
+        float const tx = v->GetPositionX() - fx * reach;
+        float const ty = v->GetPositionY() - fy * reach;
+        float const tz = v->GetPositionZ();
+
+        float const ddx = bot->GetPositionX() - tx;
+        float const ddy = bot->GetPositionY() - ty;
+        float const spotDist = sqrt(ddx * ddx + ddy * ddy);
+
+        bool const alreadyBehind = (behindDot > 0.3f);          // 后半球
+        bool const closeEnough = (spotDist < 2.0f);
+        bool const needMove = !alreadyBehind && !closeEnough
+            && bot->GetDistance(v) <= 15.0f
+            && !bot->IsMoving()
+            && !bot->hasUnitState(UNIT_STAT_ROOT | UNIT_STAT_STUNNED | UNIT_STAT_CONFUSED | UNIT_STAT_FLEEING);
+
+        if (needMove)
+        {
+            static std::mutex s_posMutex;
+            static std::unordered_map<uint32, uint32> s_posLastTry;
+            uint32 const nowMs = WorldTimer::getMSTime();
+            bool allow = false;
+            {
+                std::lock_guard<std::mutex> lock(s_posMutex);
+                uint32& last = s_posLastTry[bot->GetGUIDLow()];
+                if (!last || WorldTimer::getMSTimeDiff(last, nowMs) >= 1500)
+                {
+                    last = nowMs ? nowMs : 1;
+                    allow = true;
+                }
+            }
+            if (allow)
+            {
+                float z = tz;
+                bot->UpdateGroundPositionZ(tx, ty, z);
+                bot->GetMotionMaster()->MovePoint(0, tx, ty, z);
+            }
+        }
+    }
+
     bool const fsmHandled = sPlayerbotAIConfig.dpsFsm && dpsfsm::Tick(this);
     // [2026-10-29 实测] 只有"状态机这一 tick 真的放出了技能"才让引擎让位。
     //   否则连走位/追击一起关掉 ⇒ 近战打不到人（fury 40 秒只有 11 次普攻、arms 2 次）。

@@ -102,7 +102,8 @@ namespace
         std::map<uint32, time_t> lastOk;       // 技能 id → 上次成功时间
         uint32 hbLast = 0;                     // 这只 bot 上次打心跳的时间
         bool castThisTick = false;
-        bool policyLogged = false;      // [2026-10-30] "策略里点名但没学会"的日志只打一次             // 本 tick 状态机是否真的放出了技能
+        bool policyLogged = false;
+        bool behindWarned = false;      // "需要背后但没站好"只记一次      // [2026-10-30] "策略里点名但没学会"的日志只打一次             // 本 tick 状态机是否真的放出了技能
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
         time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
         time_t lastCloseTry = 0;               // 上一次"真够不着就贴上去"的时间
@@ -2131,6 +2132,25 @@ namespace ai
 
         // [2026-10-30 站长口径] 职业=技能空间、专精=策略；实现见 DpsPolicy.inc（纯文本包含，便于与旧处理器 A/B）
 #include "playerbot/strategy/DpsPolicy.inc"
+
+    // [2026-10-30 站长口径] **所有物理近战输出都要找背**（找背是站位问题，跟具体技能无关）；
+    //   但"找背"不等于一直调位置：站到背后之后就尽量不动（走动会打断挥击，实测平砍 78→54）。
+    bool NeedsBehind(Player* bot)
+    {
+        if (!bot)
+            return false;
+        switch (bot->getClass())
+        {
+            case CLASS_WARRIOR:
+            case CLASS_ROGUE:
+            case CLASS_PALADIN:
+            case CLASS_SHAMAN:
+            case CLASS_DRUID:
+                return true;
+            default:
+                return false;
+        }
+    }
 
     bool Tick(PlayerbotAI* ai)
         {

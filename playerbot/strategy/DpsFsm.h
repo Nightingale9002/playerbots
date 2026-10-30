@@ -102,6 +102,10 @@ namespace ai
         void SetBotForceDps(uint32 guid, bool on);
 
         // 返回 true 表示本 tick 已由状态机接管（无论是否成功施法）。
+        // [2026-10-30] 该 bot 当前专精的技能里是否有"必须站背后"的（只有这些才值得让移动层去摆位；
+        //   给所有近战都摆位会打断挥击：实测平砍 78 → 54，dps 824 → 518）。
+        bool NeedsBehind(Player* bot);
+
         bool Tick(PlayerbotAI* ai);
     }
 }
