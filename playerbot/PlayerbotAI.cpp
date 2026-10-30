@@ -2028,7 +2028,10 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     uint32 const guid = bot->GetGUIDLow();
     bool const skipEngine = fsmHandled && dpsfsm::SkipEngine(guid) && dpsfsm::DidCastThisTick(guid);
     if (!skipEngine)
+    {
+        dpsfsm::NoteEngineRun(guid);
         DoNextAction(minimal);
+    }
 
     // [2026-10-30 已删除] 这里曾有一条"远程职业绝不进近战"的不变量：
     //   实测无效（`DistanceYourself` 只在 CHASE 态生效，且会被引擎下一 tick 覆盖），

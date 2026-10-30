@@ -103,7 +103,10 @@ namespace
         uint32 hbLast = 0;                     // 这只 bot 上次打心跳的时间
         bool castThisTick = false;
         bool policyLogged = false;
-        bool behindWarned = false;      // "需要背后但没站好"只记一次      // [2026-10-30] "策略里点名但没学会"的日志只打一次             // 本 tick 状态机是否真的放出了技能
+        bool behindWarned = false;
+        uint32 engRuns = 0;         // 引擎真正跑过的 tick 数（诊断白字缺口用）
+        uint32 movTicks = 0;        // 在移动的 tick 数（移动会打断挥击）
+        uint32 skipTicks = 0;       // 因为状态机放了技能而让位给状态机的 tick 数      // "需要背后但没站好"只记一次      // [2026-10-30] "策略里点名但没学会"的日志只打一次             // 本 tick 状态机是否真的放出了技能
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
         time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
         time_t lastCloseTry = 0;               // 上一次"真够不着就贴上去"的时间
@@ -2152,6 +2155,15 @@ namespace ai
         }
     }
 
+    // [2026-10-30 诊断] 引擎这一 tick 真的跑了 ⇒ 计数（对比 policy=0/1 时引擎被让位的比例）
+    void NoteEngineRun(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(s_memMutex);
+        auto it = s_mem.find(guid);
+        if (it != s_mem.end())
+            ++it->second->engRuns;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -2173,10 +2185,14 @@ namespace ai
             if (!m->hbLast || WorldTimer::getMSTimeDiff(m->hbLast, hbNow ? hbNow : 1) >= 10000)
             {
                 m->hbLast = hbNow ? hbNow : 1;
-                sLog.outError("[DPSFSM-HB] %s spec=%s state=%s incombat=%d target=%s hp=%.0f res=%.0f ticks=%u casts=%u",
-                    bot->GetName(), SpecName(m->spec), StateName(m->state), bot->IsInCombat() ? 1 : 0,
+                // [2026-10-30] 加了 pol/eng/mov/melee 四个字段：
+                //   pol=1 走职业空间策略；eng=引擎真跑的 tick 数；mov=在移动的 tick 数；melee=白字命中数。
+                //   定位"policy 模式白字平砍变少"就看 eng/mov/melee 三者的关系。
+                sLog.outError("[DPSFSM-HB] %s spec=%s state=%s pol=%d incombat=%d target=%s hp=%.0f res=%.0f ticks=%u casts=%u eng=%u mov=%u melee=%u",
+                    bot->GetName(), SpecName(m->spec), StateName(m->state),
+                    TP(m, "policy", 0.0) >= 1.0 ? 1 : 0, bot->IsInCombat() ? 1 : 0,
                     bot->GetVictim() ? bot->GetVictim()->GetName() : "-", bot->GetHealthPercent(), bot->GetPowerPercent(),
-                    m->tickCount, m->castCount);
+                    m->tickCount, m->castCount, m->engRuns, m->movTicks, bot->botMeleeHits);
             }
 
             // [2026-10-29 诊断结论] 原来只认 IsInCombat()：本核心里"有目标但还没造成/受到伤害"不算战斗，
@@ -2224,6 +2240,8 @@ namespace ai
                 return false;
 
             ++m->tickCount;
+            if (bot->IsMoving())
+                ++m->movTicks;
 
             // [2026-10-30] 职业技能空间 + 专精策略（policy=1 开启；默认 0 走原分专精处理器，便于同轮 A/B）
             if (TP(m, "policy", 0.0) >= 1.0)

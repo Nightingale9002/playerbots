@@ -106,6 +106,10 @@ namespace ai
         //   给所有近战都摆位会打断挥击：实测平砍 78 → 54，dps 824 → 518）。
         bool NeedsBehind(Player* bot);
 
+        // [2026-10-30 诊断] 引擎这一 tick 是否真的跑了（用来定位"policy 模式白字平砍变少"）：
+        //   如果 policy 模式让引擎"少跑了"，白字/开怪这些由引擎负责的部分就会掉。
+        void NoteEngineRun(uint32 guid);
+
         bool Tick(PlayerbotAI* ai);
     }
 }
