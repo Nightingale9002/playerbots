@@ -116,6 +116,9 @@ namespace
         time_t lastPotionTry = 0;              // 上一次尝试喝药水的时间
         time_t lastSummary = 0;
         uint32 castCount = 0;
+        uint32 stuckSpellId = 0;      // [2026-10-31] 读条看门狗：当前卡住的法术
+        time_t stuckSince = 0;        //                       开始卡住的时间
+
         uint32 tickCount = 0;
     };
 
@@ -515,11 +518,28 @@ namespace
             m->failUntil[id] = now + (waitingResource ? 1 : 2);
             return false;
         }
-        if (!ai->CastSpell(id, tgt))
+        // [2026-10-31 根因修复] `PlayerbotAI::CastSpellBody()` 对 bot 恒有：
+        //     if (!IsInFront(...)) { SetFacingTo(...); if (!HasRealPlayerMaster()) failWithDelay = true; }
+        //     if (failWithDelay) return false;      // ← 只转向、不施法
+        //   而需要 FacingCasterFlags 的技能（寒冰箭/火球/暗影箭/奥术冲击…）都会撞上这个分支，
+        //   于是"自身法术能放、对敌技能全灭"（实测约 1/3 轮次 0 伤害、casts 只有冰冷血脉+水元素）。
+        //   ⇒ 对敌施法直接走核心 Unit::CastSpell，绕开这段 bot 专用逻辑。
+        if (tgt && tgt != s.bot)
+            s.bot->SetFacingToObject(tgt);
+        if (tgt && tgt != s.bot)
         {
-            // 不退避：本次多半是"刚转向/排队"的假失败，下一 tick 立刻重试才有输出
-            return false;
+            SpellCastResult const r2 = s.bot->CastSpell(tgt, id, uint32(TRIGGERED_NONE));
+            if (r2 != SPELL_CAST_OK)
+            {
+                m->failUntil[id] = now;      // 不退避，下一 tick 立刻重试
+                return false;
+            }
+            // [2026-10-31] 核心施法要自己记账，否则 botCasts / top= 统计不到
+            //   （之前出现 "dmg=20k 但 casts=0"，正是漏记）
+            PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
         }
+        else if (!ai->CastSpell(id, tgt))
+            return false;
         ++m->castCount;
         m->lastOk[id] = now;
         m->castThisTick = true;

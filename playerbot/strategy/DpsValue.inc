@@ -219,7 +219,43 @@ namespace dpsvalue
         if (it != m->failUntil.end() && now < it->second)
             return false;
 
+        // [2026-10-31 根因] 非伤害法术必须有**最小间隔**，否则会出现"同一法术每 tick 重放"：
+        //   - 9846 Tiger's Fury（瞬发加能量、**不产生光环**）⇒ 维持判定永远认为"没效果" ⇒ 25 秒放 230 次
+        //   - 30909 Curse of Weakness（减敌人攻强，不增加自己输出）⇒ 25 秒放 24 次、零伤害
+        // 直接在法术模板上判断"是否产生伤害"，不依赖 Cand（Cand 的扫表函数在本函数之后定义）
+        if (SpellEntry const* spx = sSpellTemplate.LookupEntry<SpellEntry>(id))
+        {
+            bool noDmg = true;
+            for (int32 e = 0; e < 3 && noDmg; ++e)
+            {
+                uint32 const eff = spx->Effect[e];
+                if (eff == SPELL_EFFECT_SCHOOL_DAMAGE || eff == SPELL_EFFECT_WEAPON_DAMAGE
+                    || eff == SPELL_EFFECT_WEAPON_PERCENT_DAMAGE || eff == SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL
+                    || eff == SPELL_EFFECT_HEAL || eff == SPELL_EFFECT_HEAL_MAX_HEALTH)
+                    noDmg = false;
+                else if (eff == SPELL_EFFECT_APPLY_AURA
+                    && (spx->EffectApplyAuraName[e] == SPELL_AURA_PERIODIC_DAMAGE
+                        || spx->EffectApplyAuraName[e] == SPELL_AURA_PERIODIC_LEECH))
+                    noDmg = false;
+            }
+            if (noDmg)
+            {
+                auto lo = m->lastOk.find(id);
+                if (lo != m->lastOk.end() && now - lo->second < 10)
+                    return false;
+            }
+        }
+
         Unit* tgt = target ? target : s.target;
+
+        // [2026-10-31 根因] `PlayerbotAI::CastSpellBody` 里：背对目标时只 `SetFacingTo` 然后
+        //   `if (!HasRealPlayerMaster()) failWithDelay = true; ... return false;`
+        //   ⇒ bot 没有真人主人时，**第一次调用不施法只转向、返回 false**。
+        //   CastChecked（旧路径/自身施法）早已修过，但 `CastId`（pauto/pselect 的伤害技能）漏了，
+        //   于是出现"自身法术能放（冰冷血脉/水元素）、伤害技能全灭"的现象。
+        if (tgt && tgt != s.bot)
+            s.bot->SetFacingToObject(tgt);
+
         SpellCastResult res = SPELL_FAILED_DONT_REPORT;
         if (!ai->CanCastSpell(id, tgt, 0, false, nullptr, false, false, false, &res))
         {
@@ -245,8 +281,17 @@ namespace dpsvalue
             m->failUntil[id] = now + (waitingResource ? 1 : 2);
             return false;
         }
-        if (!ai->CastSpell(id, tgt))
-            return false;
+        // [2026-10-31 根因修复] 同 CastChecked：绕开 CastSpellBody 的 "bot 无真人主人 ⇒ 只转向返回 false"
+        if (tgt && tgt != s.bot)
+        {
+            s.bot->SetFacingToObject(tgt);
+            SpellCastResult const r2 = s.bot->CastSpell(tgt, id, uint32(TRIGGERED_NONE));
+            if (r2 != SPELL_CAST_OK)
+                return false;
+            PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);   // 同 CastChecked：补记账
+        }
+        else if (!ai->CastSpell(id, tgt))
+            return false;      // 第三方目标仍走原路径
         ++m->castCount;
         m->lastOk[id] = now;
         m->castThisTick = true;

@@ -599,8 +599,39 @@ namespace dpspolicy
             m->state = State::Idle;
             return false;
         }
-        if (s.casting)              // 正在读条：不要打断自己
+        // [2026-10-31 根因] 卡住的读条会让状态机**永久让路**：
+        //   实测失败轮 top= 只有"冰冷血脉+召唤水元素"，且 pet=0（召唤没有结果），
+        //   之后的寒冰箭连 `Unit::CastSpell` 都没被调用（gdb 条件断点 `$esi==27072` 整轮未命中）。
+        //   因为这里 `if (s.casting) return true;` 每 tick 都直接返回 ⇒ 后面的打分完全不跑。
+        //   修法：同一个法术连续读条超过 5 秒 ⇒ 强行打断并黑名单 60 秒，让状态机恢复决策。
+        if (s.casting)
+        {
+            Spell* cur = s.bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            uint32 const curId = cur ? cur->m_spellInfo->Id : 0u;
+            time_t const nowC = time(nullptr);
+            if (curId && m->stuckSpellId == curId)
+            {
+                if (!m->stuckSince)
+                    m->stuckSince = nowC;
+                else if (nowC - m->stuckSince >= 5)
+                {
+                    s.bot->InterruptSpell(CURRENT_GENERIC_SPELL, false);
+                    m->failUntil[curId] = nowC + 60;
+                    m->stuckSpellId = 0;
+                    m->stuckSince = 0;
+                    sLog.outError("[DPSFSM] %s 读条卡住 %.0fs，打断并黑名单 spell=%u",
+                        s.bot->GetName(), 5.0, curId);
+                }
+            }
+            else
+            {
+                m->stuckSpellId = curId;
+                m->stuckSince = nowC;
+            }
             return true;
+        }
+        m->stuckSpellId = 0;
+        m->stuckSince = 0;
 
         dpspolicy::PPolicy const* pol = dpspolicy::PolicyFor(s.bot->getClass(), m->spec);
         if (!pol)

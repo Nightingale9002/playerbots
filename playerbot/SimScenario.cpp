@@ -3622,8 +3622,9 @@ uint32 stuckFightCleared = 0;
                 d0.guid = pinnedGuid ? pinnedGuid : pick->guid;
                 d0.pinnedGuid = pinnedGuid;
                 d0.mapId = 1;
-                d0.x = DUMMY_SPOT_X + 14.0f * float(int(d0.id % 3) - 1);
-                d0.y = DUMMY_SPOT_Y + 14.0f * float(int((d0.id / 3) % 2));
+                // [2026-10-31] 同上：单点，不铺网格（bot 无碰撞体积）
+                d0.x = DUMMY_SPOT_X;
+                d0.y = DUMMY_SPOT_Y;
                 d0.z = DUMMY_SPOT_Z;
                 d0.waitingLogin = true;
                 d0.useFsm = useFsm;
@@ -3662,8 +3663,13 @@ uint32 stuckFightCleared = 0;
             d.mapId = 1;
             // 每个场景错开 40 码（3x2 网格），这样才能同时跑很多组互不干扰
             // GM 岛不大：3 列 × 2 行（列距 14、行距 14），假人再往东 standDist ⇒ 全部留在岛上
-            d.x = DUMMY_SPOT_X + 14.0f * float(int(d.id % 3) - 1);
-            d.y = DUMMY_SPOT_Y + 14.0f * float(int((d.id / 3) % 2));
+            // [2026-10-31 站长口径] **bot 之间没有碰撞体积，不需要网格，一个位置就够**。
+            //   原来按 (id%3, (id/3)%2) 铺 3×2 网格，其中 `y = SPOT_Y + 14` 那一排与自己假人之间
+            //   被 vmap 地形挡住视线 ⇒ 核心对所有对敌法术返回 SPELL_FAILED_LINE_OF_SIGHT(44)
+            //   ⇒ 整轮 0 伤害（实测 22 轮：row0 11/11 成功、row1 11/11 全零，完全按行分布）。
+            //   改成单点后所有 bot 站在同一处（互不碰撞），站位差异只来自 standDist（近战 3 / 远程 18）。
+            d.x = DUMMY_SPOT_X;
+            d.y = DUMMY_SPOT_Y;
             d.z = DUMMY_SPOT_Z;
 
             bot->CombatStopWithPets(true);
@@ -3673,7 +3679,9 @@ uint32 stuckFightCleared = 0;
             //   在跨轮复用时还没好 ⇒ 同一配置不同轮次差 30%（实测 frost 1124 vs 821）。
             //   这里只影响测速场景，不影响副本里的真实行为。
             {
-                bot->RemoveAllCooldowns(true);
+                // [2026-10-31 修] 参数是 **sendOnly**，传 true 只给客户端发包、**不会清服务端冷却**！
+                //   必须传 false 才真正清掉（之前传 true ⇒ 2 分钟级大招跨轮仍是冷却中，实测同配置轮次差 30%）。
+                bot->RemoveAllCooldowns(false);
             }
 
             d.dmg0 = bot->botDamageDealt;
@@ -3969,13 +3977,14 @@ uint32 stuckFightCleared = 0;
                 d.standDist = melee ? 3.0f : 18.0f;
                 d.meleeSpec = melee;
                 // 一堆一个专精：自己就是这堆的堆主，假人摆在 pileX/pileY（不共用别人的堆）。
+                //   [2026-10-31 回退] 曾经试过"所有专精共用一堆"，实测 17 个专精抢同一个木桩，
+                //   数字被抢怪/AoE 重叠污染（assassination 169/264、ret 1764、enhance 97/207），
+                //   不可作为测量工具 ⇒ 恢复"一堆一专精"。测量请用**单专精串行跑**（那条路径已修好）。
                 d.pileX = spot.x;
                 d.pileY = spot.y;
                 d.pileZ = spot.z;
                 d.pileSet = true;
                 d.ringAngle = spot.standAngle;
-                // 站位量的是离 **0 号假人** 的距离（假人在堆心正东 PILE_DUMMY_R 处），
-                //   否则近战站在堆心西侧 3 码、离假人其实是 5 码，正好卡在 ATTACK_DISTANCE 边上。
                 d.x = spot.x + PILE_DUMMY_R + cos(spot.standAngle) * d.standDist;
                 d.y = spot.y + sin(spot.standAngle) * d.standDist;
                 d.z = spot.standZ;
@@ -4364,6 +4373,34 @@ uint32 stuckFightCleared = 0;
                     d.pileOwner = 0;      // 已加入
                     sLog.outError("[DUMMY] id=%u spec=%s 加入共享木桩堆（%u 个），站位角度 %.2f",
                         d.id, d.spec.c_str(), (uint32)d.dummies.size(), d.ringAngle);
+
+                    // [2026-10-31 根因修复·共享堆] 环形成员同样会被地形挡视线
+                    //   （实测 dummyall 里 affliction 0/0、shadow 113/0，而单专精路径修好后 6/6 有效）。
+                    //   这里补一次 LOS 自检：不通视就沿"朝堆心方向逐步靠拢"重试，取第一个通视的落点。
+                    if (Creature* d0 = (bot->GetMap() && !d.dummies.empty())
+                            ? bot->GetMap()->GetCreature(d.dummies[0]) : nullptr)
+                    {
+                        bool losOk = bot->IsWithinLOSInMap(d0, true);
+                        if (!losOk)
+                        {
+                            for (float r : { 12.0f, 8.0f, 5.0f, 3.0f })
+                            {
+                                float const nx = d.pileX + std::cos(d.ringAngle) * (r + PILE_DUMMY_R);
+                                float const ny = d.pileY + std::sin(d.ringAngle) * (r + PILE_DUMMY_R);
+                                float nz = d.z;
+                                bot->GetMap()->GetHeight(nx, ny, nz, false);
+                                bot->TeleportTo(d.mapId, nx, ny, nz, 0.0f);
+                                if (bot->IsWithinLOSInMap(d0, true))
+                                {
+                                    d.x = nx; d.y = ny; d.z = nz;
+                                    losOk = true;
+                                    break;
+                                }
+                            }
+                        }
+                        sLog.outError("[DUMMY] id=%u spec=%s 共享堆站位自检 los=%d pos=(%.1f,%.1f,%.1f)",
+                            d.id, d.spec.c_str(), losOk ? 1 : 0, d.x, d.y, d.z);
+                    }
                 }
 
                 // 传送落地后才召唤假人
@@ -4394,6 +4431,40 @@ uint32 stuckFightCleared = 0;
                     d.spells0 = bot->botSpellCounts;
                     d.startMs = now;
                     sLog.outError("[DUMMY] id=%u spec=%s 假人已就位 %u 个，开始计时", d.id, d.spec.c_str(), (uint32)d.dummies.size());
+
+                    // [2026-10-31 根因修复] 落点网格 `y = SPOT_Y + 14*((id/3)%2)` 的第二排（row1）
+                    //   与自己的假人之间被 **vmap 地形挡住视线** ⇒ 核心 `Spell::CheckCast` 对所有
+                    //   对敌法术返回 `SPELL_FAILED_LINE_OF_SIGHT(44)` ⇒ 整轮只有自身法术落地、
+                    //   dmg=0、永不进战斗（实测 22 轮：row0 11/11 成功、row1 11/11 全零，完全按行分布）。
+                    //
+                    //   源码里本来就有 LOS 自检，但它在 `ApplyDummySetup()` 里执行，那时 `d.dummies`
+                    //   还是空的（假人尚未召唤），被 `if (!d.dummies.empty())` 整块跳过 —— 死代码。
+                    //   这里在**召唤成功之后**再自检一次：不通视就沿候选偏移挪 bot（挪的是落点，
+                    //   每秒钉位用的正是 d.x/d.y/d.z，所以会一直生效）。
+                    if (Creature* d0 = (bot->GetMap() && !d.dummies.empty())
+                            ? bot->GetMap()->GetCreature(d.dummies[0]) : nullptr)
+                    {
+                        bool losOk = bot->IsWithinLOSInMap(d0, true);
+                        if (!losOk)
+                        {
+                            static float const losOffs[6][2] = { {0.0f, 0.0f}, {-6.0f, 0.0f}, {0.0f, -6.0f},
+                                                                 {-12.0f, 0.0f}, {0.0f, -12.0f}, {-6.0f, -6.0f} };
+                            for (auto const& o : losOffs)
+                            {
+                                float nx = d.x + o[0], ny = d.y + o[1], nz = d.z;
+                                bot->GetMap()->GetHeight(nx, ny, nz, false);
+                                bot->TeleportTo(d.mapId, nx, ny, nz, 0.0f);
+                                if (bot->IsWithinLOSInMap(d0, true))
+                                {
+                                    d.x = nx; d.y = ny; d.z = nz;
+                                    losOk = true;
+                                    break;
+                                }
+                            }
+                        }
+                        sLog.outError("[DUMMY] id=%u spec=%s 站位自检 los=%d pos=(%.1f,%.1f,%.1f)",
+                            d.id, d.spec.c_str(), losOk ? 1 : 0, d.x, d.y, d.z);
+                    }
 
                     // [2026-10-31 修] **假人召唤完成后再声明一次场景目标**，并强制接战。
                     //   之前 SetScenarioTargets 在 dummies 还空时也被调用过；空目标集会让
@@ -4439,6 +4510,27 @@ uint32 stuckFightCleared = 0;
                     }
                     if (!bot->IsWithinDist3d(d.x, d.y, d.z, 28.0f) || bot->GetMapId() != d.mapId)
                         bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
+                    // [2026-10-31 根因] 假人是 SummonCreature 出来的、没有 home 点，被打几次后
+                    //   CombatManager 会把它标成 **evade**；而核心对 evade 目标的施法/攻击一律非法
+                    //   ⇒ 那一轮所有伤害技能都被拒，只剩自身法术（实测失败轮 top= 只有冰冷血脉+水元素）。
+                    //   这里每秒无条件清一次（不只是没目标时清），保证整轮可打。
+                    {
+                        static uint32 s_lastClearMs = 0;
+                        if (!s_lastClearMs || WorldTimer::getMSTimeDiff(s_lastClearMs, now) >= 1000)
+                        {
+                            s_lastClearMs = now;
+                            for (ObjectGuid const& dg : d.dummies)
+                            {
+                                Creature* dc = bot->GetMap() ? bot->GetMap()->GetCreature(dg) : nullptr;
+                                if (dc && dc->GetCombatManager().IsInEvadeMode())
+                                {
+                                    dc->GetCombatManager().SetEvadeState(EVADE_NONE);
+                                    dc->GetCombatManager().StopEvade();
+                                }
+                            }
+                        }
+                    }
+
                     // [2026-10-31] 开跑 3 秒：如果一点伤害都没有，把"为什么打不到"的现场抄下来
                     if (!d.probed3s && now - d.startMs >= 3000)
                     {
