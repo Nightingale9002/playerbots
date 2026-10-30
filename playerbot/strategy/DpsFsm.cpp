@@ -2244,7 +2244,11 @@ namespace ai
 
             // [2026-10-29 站长口径] 之前做的仇恨门不能因为状态机被绕过：
             //   门禁与 AttackAction 完全同一份实现（WaitingForTankThreat），不复制判断。
-            if (AttackAction::WaitingForTankThreat(ai, bot, bot->GetVictim()))
+            // [2026-10-31 修] 假人场景**必须绕过**这道门：假人没有仇恨，`WaitingForTankThreat`
+            //   会一直为真 ⇒ 状态机 return false、引擎的 AttackAction 也在等 ⇒ **互相推诿的死锁**。
+            //   实测表现：bot 有目标、canattack=1、站 17.4 码，但 40 秒 0 施法 0 伤害（约 1/3 轮次）。
+            if (!dpsfsm::SkipEngine(bot->GetGUIDLow())
+                && AttackAction::WaitingForTankThreat(ai, bot, bot->GetVictim()))
                 return false;
 
             ++m->tickCount;
