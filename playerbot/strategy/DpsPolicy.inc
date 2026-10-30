@@ -22,6 +22,7 @@ namespace dpspolicy
         Self,       // 对自己施放（圣印/姿态/形态/自身增益）
         Ground,     // 对目标脚下地面施放（暴风雪/烈焰风暴/火雨/飓风/箭雨）
         Swing,      // 下一次挥击附带（英勇打击/顺劈）
+        Burst,      // [2026-10-31 站长口径] 爆发技能：冷却好了就用（冰冷血脉/奥强/燃烧/召唤水元素/萨满之怒）
         Prereq,     // [2026-10-30] 前置动作（图腾/萨满之怒等）：先做，不参与伤害打分，要占一次施法
         PowerShift, // [2026-10-30] 狼头之盔 power-shift：取消形态 → 下一 tick 变回猫，换 +20 能量
         Hold        // 有意"什么都不放、等资源"（能量职业的合法选择：等能量比硬塞更划算，还能留给打断）
@@ -158,8 +159,8 @@ namespace dpspolicy
 
     // 火法：灼烧叠 5 层 > 燃烧 > 火球 > 火焰冲击 > 烈焰风暴(群)
     static PStep const kFire[] = {
-        { "combustion",         PKind::Prereq },
-        { "presence of mind",   PKind::Prereq },
+        { "combustion",         PKind::Burst },
+        { "presence of mind",   PKind::Burst },
         { "scorch",             PKind::Target, "fire vulnerability" },
         { "fireball",           PKind::Target },
         { "fire blast",         PKind::Target },
@@ -169,8 +170,8 @@ namespace dpspolicy
     // 冰法：冰冷血脉 > 水元素 > 寒冰箭 > 冰枪术 > 暴风雪(群)
     static PStep const kFrost[] = {
         // [2026-10-30] 前置：冰冷血脉 + 召唤水元素（宠物输出是冰法一大块，实测漏了会掉 ~30%）
-        { "icy veins",               PKind::Prereq },
-        { "summon water elemental",  PKind::Prereq },
+        { "icy veins",               PKind::Burst },
+        { "summon water elemental",  PKind::Burst },
         { "frostbolt",          PKind::Target },
         { "ice lance",          PKind::Target },
         { "blizzard",           PKind::Ground, nullptr, 0, 0, 0, nullptr, 2 },
@@ -178,7 +179,7 @@ namespace dpspolicy
 
     // 奥法：奥强 > 奥术冲击 > 奥术飞弹 > 魔爆(群)
     static PStep const kArcane[] = {
-        { "arcane power",       PKind::Prereq },
+        { "arcane power",       PKind::Burst },
         { "arcane blast",       PKind::Target },
         { "arcane missiles",    PKind::Target },
         { "arcane explosion",   PKind::Target, nullptr, 0, 0, 0, nullptr, 2 },
@@ -224,7 +225,7 @@ namespace dpspolicy
         { "grace of air totem",      PKind::Prereq },
         { "searing totem",           PKind::Prereq },
         { "mana spring totem",       PKind::Prereq },
-        { "shamanistic rage",        PKind::Prereq },
+        { "shamanistic rage",        PKind::Burst },
         { "stormstrike",        PKind::Target },
         { "flame shock",        PKind::Target, "flame shock" },
         { "earth shock",        PKind::Target },
@@ -553,6 +554,7 @@ namespace dpspolicy
                     s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ());
             case PKind::Swing:
                 return TrySwing(ai, m, s, st.name);
+            case PKind::Burst:
             case PKind::Prereq:
                 return TryCastSelf(ai, m, s, st.name);
             case PKind::PowerShift:
@@ -623,7 +625,7 @@ namespace dpspolicy
             for (int i = 0; i < pol->count; ++i)
             {
                 dpspolicy::PStep const& st = pol->steps[i];
-                if (st.kind != dpspolicy::PKind::Prereq)
+                if (st.kind != dpspolicy::PKind::Prereq && st.kind != dpspolicy::PKind::Burst)
                     continue;
                 if (!dpspolicy::StepAllowed(ai, m, s, st))
                     continue;
