@@ -3668,6 +3668,13 @@ uint32 stuckFightCleared = 0;
             bot->CombatStopWithPets(true);
             ApplyDummySetup(d, bot);
 
+            // [2026-10-31 站长口径·测试台] 每轮开始**重置冷却**：否则 2 分钟级大招（召唤水元素/冰冷血脉）
+            //   在跨轮复用时还没好 ⇒ 同一配置不同轮次差 30%（实测 frost 1124 vs 821）。
+            //   这里只影响测速场景，不影响副本里的真实行为。
+            {
+                bot->RemoveAllCooldowns(true);
+            }
+
             d.dmg0 = bot->botDamageDealt;
             d.pet0 = bot->botPetDamageDealt;
             d.melee0 = bot->botMeleeHits;
