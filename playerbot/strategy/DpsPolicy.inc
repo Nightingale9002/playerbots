@@ -364,6 +364,52 @@ namespace dpspolicy
         }
     }
 
+
+    // =====================================================================================
+    // [2026-10-30 站长口径] **覆盖率断言**：把"自动候选里有、策略表里没有"的技能打成错误日志。
+    //   为什么必须做：之前的机制是"表决定候选、表内价值化" ⇒ 表外的技能永远选不到，而且是**静默**的。
+    //     实例：战斗贼表里漏了割裂（Rupture），Optuna 扫 w_dot 三个值毫无差异，我却误判成"该维度无效"。
+    //   这条日志的目的就是让漏配立刻暴露，再由人/脚本判断"该不该加进表"。
+    // =====================================================================================
+    inline void LogCoverage(PlayerbotAI* ai, BotMem* m, Player* bot, PPolicy const* pol)
+    {
+        if (!pol || m->coverageLogged)
+            return;
+        m->coverageLogged = true;
+
+        std::set<uint32> inTable;
+        for (int i = 0; i < pol->count; ++i)
+        {
+            uint32 const id = SpellId(ai, bot, m, pol->steps[i].name, false);
+            if (id)
+                inTable.insert(id);
+        }
+
+        std::vector<dpsvalue::Cand>& cands = dpsvalue::Candidates(bot, bot->GetGUIDLow());
+        std::string missing;
+        int missCount = 0;
+        for (dpsvalue::Cand const& c : cands)
+        {
+            if (inTable.count(c.id))
+                continue;
+            ++missCount;
+            if (missCount <= 12)
+            {
+                missing += c.name;
+                missing += '(';
+                missing += c.dot ? "dot" : (c.modKind ? "upkeep" : (c.aoeTargets > 1 ? "aoe" : "dmg"));
+                missing += ") ";
+            }
+        }
+        if (missCount > 0)
+            sLog.outError("[DPSCOVER] %s spec=%s 自动候选 %u 个，其中 %d 个**不在策略表**里: %s%s",
+                bot->GetName(), SpecName(m->spec), uint32(cands.size()), missCount, missing.c_str(),
+                missCount > 12 ? "…" : "");
+        else
+            sLog.outError("[DPSCOVER] %s spec=%s 自动候选 %u 个，全部已被策略表覆盖",
+                bot->GetName(), SpecName(m->spec), uint32(cands.size()));
+    }
+
     // 该专精策略里点了名、但 bot 法术书里没有的技能（只记一次，排查"为什么某个技能没放"用）
     inline void LogMissingOnce(PlayerbotAI* ai, BotMem* m, Player* bot, PPolicy const* pol)
     {
@@ -575,11 +621,95 @@ namespace dpspolicy
                     ++m->dupDebuff;
                     continue;
                 }
-                float const score = std::max(1.0f, vmax) * mag * dpspolicy::StepWeight(m, st);
+                float const score = dpsvalue::UpkeepValue(s.bot, s.bot->GetGUIDLow(),
+                    std::max(1.0f, vmax), mag, sid) * dpspolicy::StepWeight(m, st);
                 if (score > bestScore)
                 {
                     bestScore = score;
                     bestIdx = i;
+                }
+            }
+
+            // [2026-10-30 站长口径] **pauto=1：法术书里所有可用法术都进候选**（跨系混搭也允许）。
+            //   表只提供"约束 + 权重"；表外候选按 Cand 自身字段推导权重类别，走同一套价值公式。
+            //   用不用跨系技能由权重（Optuna 可调）和实测决定，而不是我手写排除。
+            if (TP(m, "pauto", 0.0) >= 1.0)
+            {
+                uint32 bestAutoId = 0;
+                float bestAutoScore = bestScore;
+                bool bestAutoUpkeep = false;
+
+                std::set<uint32> inTable;
+                for (int i = 0; i < pol->count; ++i)
+                {
+                    uint32 const tid = SpellId(ai, s.bot, m, pol->steps[i].name, false);
+                    if (tid)
+                        inTable.insert(tid);
+                }
+
+                std::vector<dpsvalue::Cand>& cands = dpsvalue::Candidates(s.bot, s.bot->GetGUIDLow());
+                for (dpsvalue::Cand const& c : cands)
+                {
+                    if (inTable.count(c.id))
+                        continue;                       // 表内条目已在上两遍算过
+                    if (!Ready(s.bot, c.id))
+                        continue;
+                    if (c.auraState == 2 && s.targetHp > 20.0f)
+                        continue;
+                    if (c.needsCombo && s.combo == 0)
+                        continue;
+                    if (c.dot && s.target->GetSpellAuraHolder(c.id))
+                        continue;
+                    if (!dpsvalue::ResourceOk(ai, m, s, c.id))
+                        continue;
+
+                    char const* wclass = c.modKind
+                        ? (c.isDebuff ? "debuff" : "buff")
+                        : (c.dot ? "dot" : (c.aoeTargets > 1 ? "aoe"
+                            : (c.weaponMul > 0.0f ? "strike" : (c.needsCombo ? "finisher" : "nuke"))));
+                    char wkey[24];
+                    snprintf(wkey, sizeof(wkey), "w_%s", wclass);
+                    float const w = float(TP(m, wkey, 1.0));
+
+                    float mag = 0.0f;
+                    float score = 0.0f;
+                    bool upkeep = false;
+                    if (dpsvalue::IsUpkeepId(ai, m, s, c.id, mag))
+                    {
+                        if (dpsvalue::DebuffSuperseded(s.target, c.id)
+                            || dpsvalue::ClaimedByOther(s.target, c.id, s.bot->GetGUIDLow()))
+                        {
+                            ++m->dupDebuff;
+                            continue;
+                        }
+                        score = dpsvalue::UpkeepValue(s.bot, s.bot->GetGUIDLow(),
+                            std::max(1.0f, vmax), mag, c.id) * w;
+                        upkeep = true;
+                    }
+                    else
+                    {
+                        float base = 0.0f;
+                        if (!dpsvalue::ValueOfId(ai, m, s, c.id, base))
+                            continue;
+                        score = base * w;
+                    }
+                    if (score > bestAutoScore)
+                    {
+                        bestAutoScore = score;
+                        bestAutoId = c.id;
+                        bestAutoUpkeep = upkeep;
+                    }
+                }
+
+                if (bestAutoId)
+                {
+                    if (dpsvalue::CastId(ai, m, s, bestAutoId, s.target))
+                    {
+                        if (bestAutoUpkeep && s.target)
+                            dpsvalue::ClaimSlot(s.target, bestAutoId, s.bot->GetGUIDLow(), 15000);
+                        m->state = (s.pack10 >= AoEPack(m)) ? State::Aoe : State::Burn;
+                        return true;
+                    }
                 }
             }
 

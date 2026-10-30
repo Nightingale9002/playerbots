@@ -22,6 +22,7 @@ namespace dpsvalue
     struct Cand
     {
         uint32 id = 0;
+        std::string name;          // 法术名（覆盖率日志用）
         float  base = 0.0f;        // 基础伤害（DoT 为整段总量）
         float  weaponMul = 0.0f;   // 武器伤害倍数（物理技能）
         bool   dot = false;        // 周期性伤害
@@ -66,6 +67,7 @@ namespace dpsvalue
 
             Cand c;
             c.id = id;
+            c.name = sp->SpellName[0] ? sp->SpellName[0] : "?";
             c.auraState = sp->TargetAuraState;
             c.castMs = GetSpellCastTime(sp, bot);
             c.durationMs = GetSpellDuration(sp) > 0 ? uint32(GetSpellDuration(sp)) : 0;
@@ -484,5 +486,50 @@ namespace dpsvalue
         Claim& c = ClaimMap()[std::make_pair(uint32(target->GetGUIDLow()), sig)];
         c.owner = meGuid;
         c.until = time(nullptr) + (time_t)std::max<uint32>(1000, durationMs) / 1000;
+    }
+}
+
+namespace dpsvalue
+{
+    inline Cand const* FindCand(Player* bot, uint32 guid, uint32 id)
+    {
+        std::vector<Cand>& cands = Candidates(bot, guid);
+        for (Cand const& c : cands)
+            if (c.id == id)
+                return &c;
+        return nullptr;
+    }
+
+    // [2026-10-30 修] 吞吐类技能的**正确量纲**：整段时长带来的等效伤害 ÷ 一个 GCD。
+    //   之前写成 "Vmax × 幅度" ⇒ 切割(30%) 只有 0.3×Vmax，永远抢不过攒星技，
+    //   结果 policy/pauto 模式下切割与剔骨全丢（实测只剩邪恶攻击 12 次、dps 428）。
+    //   现在：value = Vmax × 幅度 × (新时长 − 已剩时长) / GCD
+    //     · 切割 30% × 20s / 1.5s = 4.0 × Vmax ⇒ 该补
+    //     · 5% × 10s / 1.5s = 0.33 × Vmax ⇒ 不该补
+    inline float UpkeepValue(Player* bot, uint32 guid, float vmax, float magnitude, uint32 id)
+    {
+        Cand const* c = FindCand(bot, guid, id);
+        float durSec = 0.0f;
+        if (c && c->durationMs)
+            durSec = float(c->durationMs) / 1000.0f;
+        if (durSec <= 0.0f)
+            durSec = 10.0f;                      // 无时长信息（自身瞬发增益）：按 10 秒估
+        float remainSec = 0.0f;
+        if (c && c->upkeep)
+        {
+            Unit* who = c->isDebuff ? nullptr : bot;
+            if (who)
+            {
+                SpellAuraHolder* h = who->GetSpellAuraHolder(id);
+                if (h)
+                {
+                    int const rem = h->GetAuraDuration();
+                    if (rem > 0)
+                        remainSec = float(rem) / 1000.0f;
+                }
+            }
+        }
+        float const gainSec = std::max(0.0f, durSec - remainSec);
+        return vmax * magnitude * gainSec / 1.5f;
     }
 }

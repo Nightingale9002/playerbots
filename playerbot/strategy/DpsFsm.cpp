@@ -104,6 +104,7 @@ namespace
         bool castThisTick = false;
         bool policyLogged = false;
         bool behindWarned = false;
+        bool coverageLogged = false;    // 覆盖率断言只打一次
         uint32 engRuns = 0;
         uint32 dupDebuff = 0;       // [2026-10-30] 同类 debuff 已被更强/相等效果占住时仍施放的次数（互斥分析用）         // 引擎真正跑过的 tick 数（诊断白字缺口用）
         uint32 movTicks = 0;        // 在移动的 tick 数（移动会打断挥击）
@@ -2249,6 +2250,10 @@ namespace ai
             ++m->tickCount;
             if (bot->IsMoving())
                 ++m->movTicks;
+
+            // [2026-10-30] 覆盖率断言：一次运行里每只 bot 打一条"表外候选"日志（漏配立刻可见）
+            if (dpspolicy::PPolicy const* covPol = dpspolicy::PolicyFor(bot->getClass(), m->spec))
+                dpspolicy::LogCoverage(ai, m, bot, covPol);
 
             // [2026-10-30] 价值驱动优先：value=1 时先由价值引擎选技能；
             //   它没有伤害技能可用（或都放不出）时返回 false，落回下面做 buff/圣印/形态维护。

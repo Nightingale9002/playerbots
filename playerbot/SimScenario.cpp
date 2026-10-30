@@ -3376,9 +3376,31 @@ uint32 stuckFightCleared = 0;
                             17364,  // Stormstrike
                             25454,  // Earth Shock
                         };
+                        // [2026-10-30 站长口径] **法术书是唯一来源**：只允许教"本职业法术族 + 通用"的技能。
+                        //   之前这段不分类别地给每只 bot 塞了 22 个技能，导致：
+                        //   战士的候选里出现 Mangle/Arcane Blast、术士的候选里出现 Slice and Dice…
+                        //   （覆盖率日志 [DPSCOVER] 实测暴露）。现在按 SpellFamilyName 过滤。
+                        uint32 const myFamily =
+                            (bot->getClass() == CLASS_MAGE)    ? 3  :
+                            (bot->getClass() == CLASS_WARRIOR) ? 4  :
+                            (bot->getClass() == CLASS_WARLOCK) ? 5  :
+                            (bot->getClass() == CLASS_PRIEST)  ? 6  :
+                            (bot->getClass() == CLASS_DRUID)   ? 7  :
+                            (bot->getClass() == CLASS_ROGUE)   ? 8  :
+                            (bot->getClass() == CLASS_HUNTER)  ? 9  :
+                            (bot->getClass() == CLASS_PALADIN) ? 10 :
+                            (bot->getClass() == CLASS_SHAMAN)  ? 11 : 0;
                         for (uint32 sp : keySpells)
-                            if (!bot->HasSpell(sp))
-                                bot->learnSpell(sp, false);
+                        {
+                            if (bot->HasSpell(sp))
+                                continue;
+                            SpellEntry const* kse = sSpellTemplate.LookupEntry<SpellEntry>(sp);
+                            if (!kse)
+                                continue;
+                            if (kse->SpellFamilyName != 0 && kse->SpellFamilyName != myFamily)
+                                continue;      // 不是本职业技能，绝不补学
+                            bot->learnSpell(sp, false);
+                        }
                     }
                     double bestScore = s_bestGearScore.count(gearKey) ? s_bestGearScore[gearKey] : 0.0;
                     double score = 0.0;
