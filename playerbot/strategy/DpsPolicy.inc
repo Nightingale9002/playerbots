@@ -619,6 +619,7 @@ namespace dpspolicy
             //   （实测：6 次变形 635 dps vs 不变形 709 dps，等于每变形一次亏 ~12 dps）。
             // [2026-10-30 站长口径] **前置动作优先**：图腾/萨满之怒这类不参与伤害打分，
             //   先做（占一次施法），否则会被"当前分更高的技能"永久挤掉（实测 enhance 585 → 400）。
+            bool prereqCast = false;
             for (int i = 0; i < pol->count; ++i)
             {
                 dpspolicy::PStep const& st = pol->steps[i];
@@ -627,7 +628,14 @@ namespace dpspolicy
                 if (!dpspolicy::StepAllowed(ai, m, s, st))
                     continue;
                 if (dpspolicy::TryStep(ai, m, s, st))
-                    return true;
+                {
+                    // [2026-10-31 修] 前置动作**不要让出整个 tick**：它不造成伤害，
+                    //   若就此 return，就没伤害 ⇒ 不进战斗 ⇒ 引擎也没机会开怪，
+                    //   实测冰法 3 轮里 2 轮 "incombat=0 casts=3"（只放了前置 buff）。
+                    //   现在放完前置继续在同一 tick 选伤害技能。
+                    prereqCast = true;
+                    break;
+                }
             }
 
             bool powerShifted = false;
@@ -819,9 +827,9 @@ namespace dpspolicy
                 m->state = State::Recover;
                 return true;
             }
-            else if (powerShifted)
+            else if (powerShifted || prereqCast)
             {
-                return true;        // 只完成了变形（+20 能量），下一 tick 正常输出
+                return true;        // 只完成了前置/变形，下一 tick 正常输出
             }
         }
 
