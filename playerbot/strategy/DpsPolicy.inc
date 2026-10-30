@@ -22,6 +22,7 @@ namespace dpspolicy
         Self,       // 对自己施放（圣印/姿态/形态/自身增益）
         Ground,     // 对目标脚下地面施放（暴风雪/烈焰风暴/火雨/飓风/箭雨）
         Swing,      // 下一次挥击附带（英勇打击/顺劈）
+        Prereq,     // [2026-10-30] 前置动作（图腾/萨满之怒等）：先做，不参与伤害打分，要占一次施法
         PowerShift, // [2026-10-30] 狼头之盔 power-shift：取消形态 → 下一 tick 变回猫，换 +20 能量
         Hold        // 有意"什么都不放、等资源"（能量职业的合法选择：等能量比硬塞更划算，还能留给打断）
     };
@@ -215,12 +216,18 @@ namespace dpspolicy
         { "earth shock",        PKind::Target },
     };
 
-    // 增强萨：风暴打击 > 火震 > 地震 > 冰震
+    // 增强萨：[站长口径] 图腾/萨满之怒是**前置动作**（不吃价值打分），之后才是输出循环。
     static PStep const kEnh[] = {
+        { "strength of earth totem", PKind::Prereq },
+        { "grace of air totem",      PKind::Prereq },
+        { "searing totem",           PKind::Prereq },
+        { "mana spring totem",       PKind::Prereq },
+        { "shamanistic rage",        PKind::Prereq },
         { "stormstrike",        PKind::Target },
         { "flame shock",        PKind::Target, "flame shock" },
         { "earth shock",        PKind::Target },
-        { "frost shock",        PKind::Target },
+        { "hold",               PKind::Hold,   nullptr, 0, 0, 0, nullptr, 0, 100.0f, "wait",
+          nullptr, nullptr, 1.0, nullptr, 60.0, false, 0, 0, false, 0, "hold_energy", 25.0 },
     };
 
     // 平衡德：虫群 > 月火 > 星火 > 愤怒 > 飓风(群)
@@ -544,6 +551,8 @@ namespace dpspolicy
                     s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ());
             case PKind::Swing:
                 return TrySwing(ai, m, s, st.name);
+            case PKind::Prereq:
+                return TryCastSelf(ai, m, s, st.name);
             case PKind::PowerShift:
             {
                 // [2026-10-30 站长口径] **单 tick 原子动作**：取消形态 + 立即变回猫。
@@ -606,6 +615,19 @@ namespace dpspolicy
             // [2026-10-30 站长口径·补充] power-shift **不吃 GCD**：变形只耗法力。
             //   所以做完变形后要在**同一个 tick 继续选技能**，否则一次变形就吞掉一个输出机会
             //   （实测：6 次变形 635 dps vs 不变形 709 dps，等于每变形一次亏 ~12 dps）。
+            // [2026-10-30 站长口径] **前置动作优先**：图腾/萨满之怒这类不参与伤害打分，
+            //   先做（占一次施法），否则会被"当前分更高的技能"永久挤掉（实测 enhance 585 → 400）。
+            for (int i = 0; i < pol->count; ++i)
+            {
+                dpspolicy::PStep const& st = pol->steps[i];
+                if (st.kind != dpspolicy::PKind::Prereq)
+                    continue;
+                if (!dpspolicy::StepAllowed(ai, m, s, st))
+                    continue;
+                if (dpspolicy::TryStep(ai, m, s, st))
+                    return true;
+            }
+
             bool powerShifted = false;
             for (int i = 0; i < pol->count; ++i)
             {
