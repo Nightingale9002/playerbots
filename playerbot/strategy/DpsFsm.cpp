@@ -469,6 +469,18 @@ namespace
             return false;
 
         Unit* tgt = selfTarget ? selfTarget : (target ? target : s.target);
+
+        // [2026-10-31 根因] `PlayerbotAI::CastSpellBody` 里有一段：
+        //     if (!IsInFront(bot, faceTo, ...)) { SetFacingTo(bot, faceTo);
+        //         if (!HasRealPlayerMaster()) failWithDelay = true; }
+        //     if (failWithDelay) { ... return false; }
+        //   ⇒ bot 没有真人主人时，**背对目标的第一次调用只转向、不施法、返回 false**。
+        //   而我们把这次 false 当成"施法失败"，写 2 秒退避；几个候选一起被写退避 ⇒ 整轮空转
+        //   （实测 1/3 轮次 victim 正常、不 casting、不移动，却 0 施法 0 伤害）。
+        //   修法：在调 CastSpell 之前自己先转向，让 IsInFront 成立，一次调用就真施法。
+        if (tgt && tgt != s.bot)
+            s.bot->SetFacingToObject(tgt);
+
         SpellCastResult res = SPELL_FAILED_DONT_REPORT;
         if (!ai->CanCastSpell(id, tgt, 0, false, nullptr, false, false, false, &res))
         {
@@ -504,7 +516,10 @@ namespace
             return false;
         }
         if (!ai->CastSpell(id, tgt))
+        {
+            // 不退避：本次多半是"刚转向/排队"的假失败，下一 tick 立刻重试才有输出
             return false;
+        }
         ++m->castCount;
         m->lastOk[id] = now;
         m->castThisTick = true;
@@ -1926,6 +1941,23 @@ namespace ai
             }
         }
 
+    // [2026-10-31 诊断] 记录"状态机为什么没干活"。定义在 EngageScenarioTarget 之前，
+    //   这样各处早退点都能直接调用（上次放到文件末尾导致编译失败）。
+    static void NoteBail(Player* bot, char const* why)
+    {
+        static std::map<uint32, std::pair<std::string, time_t>> s_lastBail;
+        if (!bot)
+            return;
+        time_t const now = time(nullptr);
+        uint32 const g = bot->GetGUIDLow();
+        auto& e = s_lastBail[g];
+        if (e.first == why && e.second && now - e.second < 5)
+            return;
+        e.first = why;
+        e.second = now;
+        sLog.outError("[FSM-BAIL] bot=%s why=%s", bot->GetName(), why);
+    }
+
         bool EngageScenarioTarget(PlayerbotAI* ai)
         {
             Player* bot = ai ? ai->GetBot() : nullptr;
@@ -2178,11 +2210,17 @@ namespace ai
 
             Player* bot = ai->GetBot();
             if (!bot->IsInWorld() || !bot->IsAlive())
+            {
+                NoteBail(bot, !bot->IsInWorld() ? "not-in-world" : "dead");
                 return false;
+            }
             {
                 std::lock_guard<std::mutex> lock(s_disabledMutex);
                 if (s_disabled.count(bot->GetGUIDLow()))
+                {
+                    NoteBail(bot, "disabled");
                     return false;
+                }
             }
             BotMem* m = Mem(bot->GetGUIDLow());
             m->castThisTick = false;
@@ -2214,12 +2252,16 @@ namespace ai
             {
                 if (m->state != State::Idle)
                     m->state = State::Idle;
+                NoteBail(bot, "no-victim");
                 return false;
             }
 
             // 被控�?被打断到不能自己行动时，交回引擎（解控、逃跑、驱散都更重要）
             if (bot->hasUnitState(UNIT_STAT_STUNNED | UNIT_STAT_FLEEING | UNIT_STAT_CONFUSED | UNIT_STAT_ROOT))
+            {
+                NoteBail(bot, "stunned/rooted");
                 return false;
+            }
 
             // [2026-10-29] 坦/奶不归 DPS 状态机管（副本里奶和坦另有职责，这里只做输出）
             {
@@ -2265,6 +2307,7 @@ namespace ai
             {
                 if (TickValue(ai, m))
                     return true;
+                NoteBail(bot, "value-engine-declined");
             }
 
             // [2026-10-30] 职业技能空间 + 专精策略（policy=1 开启；默认 0 走原分专精处理器，便于同轮 A/B）
