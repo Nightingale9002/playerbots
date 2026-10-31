@@ -47,6 +47,10 @@ namespace ai
                 case State::Recover:  return "Recover";
                 case State::Maintain: return "Maintain";
                 case State::Execute:  return "Execute";
+                // [2026-11-01 站长口径] 这两个状态早已在枚举里活着，但名字一直落在 "?" 上
+                //   （术士 Prep 的日志就成了 `state=?`，验收脚本没法按状态切）；只补名字，不动行为。
+                case State::Prep:     return "Prep";
+                case State::Flee:     return "Flee";
             }
             return "?";
         }
@@ -207,6 +211,23 @@ namespace
         // [2026-11-01 站长口径] `fill_dbg=1` 时候选读条日志的节流（1 秒一条，默认关）：
         //   验收要看的是"寒冰箭 cast≈2500"（旧口径 3000，丢了 SPELLMOD_CASTING_TIME）。
         uint32 lastFillDbg = 0;
+        // [2026-11-01 站长口径] 术士·毁灭（mode=5）专用：
+        //   lastWarlockLog —— [DPSFSM-WARLOCK] 的 10 秒节流（WorldTimer 毫秒）。
+        //   lastCastId     —— 上一次**成功**施放的法术 id（日志里的 last=；CastChecked 成功路径统一记，
+        //                      对所有职业只是多写一个字段，不改变任何决策）。
+        //   engagedAt      —— 本次交战开始的毫秒时刻：灵魂碎裂的 shatter_min_engage_ms 用它判断战斗时长
+        //                      （没有目标就清零 ⇒ 下一场重新计，碎裂每场只能交一次）。
+        //   shatterUsed    —— 本场战斗已经交过灵魂碎裂（长 CD：开局就交等于把牌打空）。
+        //   dot*           —— "目标预期存活"的采样（同一目标的血量斜率，见 WarlockDotLifetimeSec）。
+        uint32 lastWarlockLog = 0;
+        uint32 lastCastId = 0;
+        uint32 engagedAt = 0;
+        bool shatterUsed = false;
+        ObjectGuid dotTarget;
+        float dotPrevHp = 100.0f;
+        uint32 dotPrevAt = 0;
+        int dotLastLifeSec = -1;
+        float wlManaGap = 0.0f;   // 本 tick 的原始法力缺口（max - cur），[DPSFSM-WARLOCK] 与 life tap 共用
     };
 
     std::mutex s_disabledMutex;
@@ -977,6 +998,7 @@ namespace
                 {
                     ++m->castCount;
                     m->lastOk[id] = now;
+                    m->lastCastId = id;      // [2026-11-01] [DPSFSM-WARLOCK] 的 last=
                     m->castThisTick = true;
                     PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
                     return true;
@@ -1015,6 +1037,7 @@ namespace
             return false;
         ++m->castCount;
         m->lastOk[id] = now;
+        m->lastCastId = id;              // [2026-11-01] [DPSFSM-WARLOCK] 的 last=
         m->castThisTick = true;
         return true;
     }
@@ -3246,6 +3269,14 @@ namespace ai
             m->arcHolds = 0;
             m->arcCasts = 0;
             m->arcBranch = '?';
+            // [2026-11-01 站长口径] 术士·毁灭：交战计时与碎裂"每场一次"必须跨轮清零，
+            //   否则上一轮的 engagedAt 会让 shatter_min_engage_ms 在开局就立刻满足（等于开局就交碎裂）。
+            m->engagedAt = 0;
+            m->shatterUsed = false;
+            m->lastWarlockLog = 0;
+            m->dotTarget = ObjectGuid();
+            m->dotPrevAt = 0;
+            m->dotLastLifeSec = -1;
 
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
@@ -4976,6 +5007,338 @@ namespace ai
         return result;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] 术士 · 毁灭（Destruction）—— mode=5 的第五张职业图
+    //   毁灭是三系里最简单的一系：**主输出只有暗影箭**（shadow bolt），DoT / 燃烧只是
+    //   "这一手比暗影箭更值"时的补充。Affliction / Demonology **不接**：
+    //   它们继续走 legacy `TickWarlock`（`Tick()` 里不进这张图 ⇒ 行为一个字节都不动）。
+    //
+    //   口径（2026-11-01 站长，逐条对应）：
+    //     ① 诅咒位：目标身上没有任何诅咒 ⇒ 元素诅咒（法系团体收益，比痛苦诅咒更值）；
+    //     ② DoT 只在"每 GCD 预期收益 > 暗影箭"时才上 —— 先用**简化判据**：
+    //        目标预期存活 > dot_min_lifetime（默认 8 秒）才值得补腐蚀/献祭；
+    //     ③ 生命分流（life tap）= **资源填充**：血 > lifetap_hp(55) 且蓝缺口 > lifetap_deficit(2000)
+    //        时，用一个 GCD 换蓝；这一手只在"蓝真的不够继续读暗影箭"时抢，不提前换
+    //        （提前换 = 白丢一个 GCD，实测直接把 dps 打下来）；
+    //     ④ 仇恨**贴着上限跑**（不是压低）：threat_target_ratio(0.95) 以内照打，
+    //        越线才收高威胁牌（Throttle 效果）；进爆发前先**预判**：
+    //        myThreat + 预计爆发仇恨 > 坦克 ⇒ 先交灵魂碎裂（soul shatter）再爆发；
+    //     ⑤ 灵魂碎裂每场战斗只能交一次（长 CD），且战斗时长必须 ≥ shatter_min_engage_ms(20s)：
+    //        开局就交等于把牌打空，真正需要的时候反而不在手上。
+    //
+    //   可复用的现成口径（不重新发明）：`EvalThreat` 的三档、`CastFirst`/`TryCastSelf`/`Ready`、
+    //   `AffordSpell`（SpellEntry->manaCost 与当前法力绝对值比）、`SummonPetIfNeeded`/`CommandPetAttack`、
+    //   `AuraStacks`（任意 rank 的 debuff 叠层）、`UseTrinket`/`UseManaPotion`。
+    //   `FillCand`/`PickFill` 是**按 GCD 窗口排程**的填充筛选器（奥法 3+3 专用，窗口 = 叠层 debuff 剩余）；
+    //   毁灭是按固定优先级出手，没有"窗口放得下什么"的问题 ⇒ 不复用，避免把两套语义缝在一起。
+    // ==========================================================================
+
+    // [2026-11-01 站长口径] 仇恨线：术士是"贴着上限跑"，不是"离坦克远一点"。
+    //   EvalThreat 的通用 Throttle 档（threat_throttle 默认 0.80）是法师的"高威胁牌"线，
+    //   对术士过保守（0.80 就收手 = 白让出 15% 的仇恨空间）⇒ 术士真正要收手的位置单独由
+    //   threat_target_ratio（默认 0.95）决定。
+    //   假人 / 单人 / 状态机独占（SkipEngine）⇒ 没有坦克就没有"上限"可贴，恒放开。
+    bool WarlockThreatOk(BotMem* m, Snapshot& s)
+    {
+        if (dpsfsm::SkipEngine(s.bot->GetGUIDLow()) || !s.tankAlive || s.tankThreat <= 0.0f)
+            return true;
+        return s.myThreat <= s.tankThreat * float(TP(m, "threat_target_ratio", 0.95));
+    }
+
+    // [2026-11-01 站长口径] "目标预期存活"的简化估计（DoT 判据的输入）：
+    //   用**同一目标**最近一次观测的血量斜率推"还要几秒打完"。
+    //   为什么要它：DoT 的收益 = 还能跳几下；目标马上要死时补腐蚀等于白丢一个 GCD
+    //   （直接暗影箭就打死了）。返回值：<0 = 还没有斜率（开局第一 tick，按"还很久"处理）；
+    //   9999 = 血量没在掉（假人/坦克在扛），视为长命目标。
+    int WarlockDotLifetimeSec(BotMem* m, Snapshot& s)
+    {
+        if (!s.target)
+            return 0;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        ObjectGuid const guid = s.target->GetObjectGuid();
+        if (m->dotTarget != guid || !m->dotPrevAt)
+        {
+            m->dotTarget = guid;
+            m->dotPrevHp = s.targetHp;
+            m->dotPrevAt = safeNow;
+            m->dotLastLifeSec = -1;
+            return -1;
+        }
+        uint32 const dt = WorldTimer::getMSTimeDiff(m->dotPrevAt, safeNow);
+        if (dt < 1000)
+            return m->dotLastLifeSec;             // 1 秒采一次，别每 tick 都算斜率
+        float const dropped = m->dotPrevHp - s.targetHp;
+        m->dotPrevHp = s.targetHp;
+        m->dotPrevAt = safeNow;
+        if (dropped <= 0.01f)
+        {
+            m->dotLastLifeSec = 9999;             // 血没掉（被扛着/刚上手）⇒ 长命
+            return m->dotLastLifeSec;
+        }
+        float const perSec = dropped * 1000.0f / float(dt);      // 每秒掉多少 %
+        float const life = s.targetHp / std::max(0.01f, perSec);
+        m->dotLastLifeSec = int(std::min(9999.0f, life));
+        return m->dotLastLifeSec;
+    }
+
+    // [2026-11-01 站长口径] 状态转移只看 Snapshot + TP，不读世界、不打日志：
+    //   Idle → Recover(蓝见底/该换蓝) → Aoe(群架) → Burst(仇恨有量 && 间隔到) → Approach(射程) → Maintain
+    //   两处与口述顺序一致但**有意**保留的细节：
+    //     · Prep（护甲/宠物）放在最前：这是"开打前"的准备，缺了它整场都少一块输出；
+    //     · Approach 放在 Burst 之前：出射程时先走位，否则爆发牌全打在 OUT_OF_RANGE 上，白丢 GCD。
+    State EvalWarlock(PlayerbotAI* ai, BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        // ⓪ 开打前准备：恶魔护甲（fel armor，没学会就不算"缺"）或宠物不在场
+        bool const needArmor = SpellId(ai, s.bot, m, "fel armor", false)
+            && AuraRemain(ai, m, s, "fel armor") == 0;
+        bool const needPet = !PetPresent(s);
+        if (needArmor || needPet)
+            return State::Prep;
+
+        // ① 资源：蓝见底 ⇒ Recover（life tap 是资源填充，见 Tick 的动作表）
+        if (s.power < float(TP(m, "recover_power", 12.0)))
+            return State::Recover;
+
+        // ② 群架
+        if (s.pack30 >= AoEPack(m))
+            return State::Aoe;
+
+        // ③ 射程：先到位再谈爆发
+        if (s.dist > float(TP(m, "range_caster", 30.0)))
+            return State::Approach;
+
+        // ④ 爆发：仇恨还有余量（贴着 0.95 上限跑）+ burst_interval 到
+        //    EvalThreat 的 Wait（≥95% 坦克）是硬线；Throttle 档不拦爆发 —— 术士的收手线由
+        //    threat_target_ratio 决定（这就是"贴着上限跑"的含义）。
+        time_t const now = time(nullptr);
+        if (now < m->burstUntil)
+            return State::Burst;
+        if (threat != ThreatLevel::Wait && WarlockThreatOk(m, s)
+            && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+            return State::Burst;
+
+        return State::Maintain;
+    }
+
+    // 单体输出表（全部施法前都过 Ready()/射程，由 CastChecked 统一判）。
+    ai::dpsfsm::TickResult TickWarlockMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 宠物：掉队/换目标就重新下令（宠物仇恨不算在 bot 头上，Wait 档也让它继续咬）
+        CommandPetAttack(s);
+
+        bool const threatOk = WarlockThreatOk(m, s);
+
+        // ① 诅咒位：目标身上没有任何诅咒才补（元素/暗影/痛苦/末日任一在场就不动）
+        if (AuraStacks(ai, s.bot, m, "curse of the elements", s.target) == 0
+            && AuraStacks(ai, s.bot, m, "curse of shadows", s.target) == 0
+            && AuraStacks(ai, s.bot, m, "curse of agony", s.target) == 0
+            && AuraStacks(ai, s.bot, m, "curse of doom", s.target) == 0
+            && TryCast(ai, m, s, "curse of the elements", nullptr))
+            return TickResult::Acted;
+
+        // ② DoT：只在"目标预期存活 > dot_min_lifetime"时才上（每 GCD 预期收益 > 暗影箭）
+        int const lifeSec = WarlockDotLifetimeSec(m, s);
+        bool const dotWorth = (lifeSec < 0) || (float(lifeSec) > float(TP(m, "dot_min_lifetime", 8.0)));
+        if (dotWorth && AuraStacks(ai, s.bot, m, "corruption", s.target) == 0
+            && TryCast(ai, m, s, "corruption", nullptr))
+            return TickResult::Acted;
+        // 献祭：学会了才放（没点天赋时 SpellId 为 0，静默跳过，不打"没有可用技能"的错日志）
+        if (dotWorth && SpellId(ai, s.bot, m, "immolate", false)
+            && AuraStacks(ai, s.bot, m, "immolate", s.target) == 0
+            && TryCast(ai, m, s, "immolate", nullptr))
+            return TickResult::Acted;
+
+        // ③ 燃烧（conflagrate）：目标身上有献祭才值得，且是"高威胁牌"⇒ 仇恨越线时收起来
+        if (threatOk && SpellId(ai, s.bot, m, "conflagrate", false)
+            && AuraStacks(ai, s.bot, m, "immolate", s.target) > 0
+            && TryCast(ai, m, s, "conflagrate", nullptr))
+            return TickResult::Acted;
+
+        // ④ 资源填充：暗影箭都放不起时，用一个 GCD 换蓝（血够 + 蓝缺口 > 阈值）
+        if (!AffordSpell(ai, m, s, "shadow bolt")
+            && m->wlManaGap > float(TP(m, "lifetap_deficit", 2000.0))
+            && s.selfHp > float(TP(m, "lifetap_hp", 55.0))
+            && TryCastSelf(ai, m, s, "life tap"))
+            return TickResult::Acted;
+
+        // ⑤ 主输出：暗影箭（唯一的常规填充）
+        return FsmResult(CastFirst(ai, m, s, { "shadow bolt" }));
+    }
+
+    ai::dpsfsm::TickResult TickWarlockFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 读条/引导中一律不插技能（与 legacy `TickWarlock` 同口径：返回"我占着 GCD"）
+        if (s.casting)
+            return TickResult::Acted;
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+
+        // 本 tick 的原始法力缺口（life tap 与日志共用同一份数）
+        uint32 const maxMana = s.bot->GetMaxPower(POWER_MANA);
+        m->wlManaGap = maxMana ? float(maxMana) - float(s.bot->GetPower(POWER_MANA)) : 0.0f;
+
+        // 交战计时：有目标就开始计（换目标不重计，这是"这一场战斗"）；没目标 ⇒ 清场
+        if (s.target)
+        {
+            if (!m->engagedAt)
+                m->engagedAt = safeNow;
+        }
+        else
+        {
+            m->engagedAt = 0;
+            m->shatterUsed = false;
+        }
+
+        ThreatLevel const threat = EvalThreat(m, s);
+        State const st = EvalWarlock(ai, m, s, threat);
+
+        // 进入 Burst 的那一刻打点（不是每 tick 重置）：窗口才能跨 tick 放完"碎裂 → 饰品 → 暗影灼烧"
+        if (st == State::Burst && m->state != State::Burst)
+        {
+            m->lastBurst = time(nullptr);
+            m->burstUntil = m->lastBurst + time_t(TP(m, "burst_window", 6.0));
+        }
+        m->state = st;
+
+        TickResult result = TickResult::Decline;
+        switch (st)
+        {
+            case State::Prep:
+            {
+                // [2026-11-01 站长口径] 开打前：恶魔护甲（无该光环时）+ 没有宠物就召。
+                //   两样都做不了（没学会/CD 中）⇒ 不能卡在 Prep 空转，直接落回单体表继续打。
+                bool acted = false;
+                if (AuraRemain(ai, m, s, "fel armor") == 0 && TryCastSelf(ai, m, s, "fel armor"))
+                    acted = true;
+                // 召唤走统一入口：没有宠物才召，失败只留一条可区分的 [DPSFSM-PET] 诊断。
+                // 主召恶魔守卫（毁灭天赋通常点不到 ⇒ 取不到 id），落回小鬼：末日守卫/地狱犬/魅魔
+                // 都不是"点一下就常驻"的输出宠物，而小鬼是术士唯一"永远学会"的远程输出宠。
+                if (!acted && !PetPresent(s))
+                {
+                    if (SummonPetIfNeeded(ai, m, s, "summon felguard"))
+                        acted = true;
+                    else if (SummonPetIfNeeded(ai, m, s, "summon imp"))
+                        acted = true;
+                }
+                result = acted ? TickResult::Acted : TickWarlockMaintain(ai, m, s);
+                break;
+            }
+
+            case State::Recover:
+                // [2026-11-01 站长口径] 生命分流 = 资源填充：血 > lifetap_hp 且蓝缺口 > lifetap_deficit
+                //   ⇒ 用一个 GCD 换蓝；血不够时先喝法力药水（有就喝），都没有才 Hold 等回蓝。
+                if (s.selfHp > float(TP(m, "lifetap_hp", 55.0))
+                    && m->wlManaGap > float(TP(m, "lifetap_deficit", 2000.0))
+                    && TryCastSelf(ai, m, s, "life tap"))
+                    result = TickResult::Acted;
+                else if (UseManaPotion(m, s))
+                    result = TickResult::Acted;
+                else if (s.power >= float(TP(m, "recover_power", 12.0)))
+                    result = TickWarlockMaintain(ai, m, s);   // 蓝还够打：别把 GCD 空成 0 DPS
+                else
+                    result = TickResult::Hold;                // 蓝血都见底：等回蓝（不吃药就别动这一手）
+                break;
+
+            case State::Aoe:
+            {
+                // [2026-11-01 站长口径] 群伤先做**单体版**：种子（每个目标只种一颗，重复种会顶掉
+                //   上一颗 ⇒ 白读一个 GCD）+ 暗影箭兜底。
+                CommandPetAttack(s);
+                if (SpellId(ai, s.bot, m, "seed of corruption", false)
+                    && AuraStacks(ai, s.bot, m, "seed of corruption", s.target) == 0
+                    && TryCast(ai, m, s, "seed of corruption", nullptr))
+                    result = TickResult::Acted;
+                else
+                    result = FsmResult(CastFirst(ai, m, s, { "shadow bolt" }));
+                break;
+            }
+
+            case State::Burst:
+            {
+                CommandPetAttack(s);
+                bool const threatOk = WarlockThreatOk(m, s);
+
+                // [2026-11-01 站长口径] **爆发前预判**：myThreat + 预计爆发仇恨 > 坦克 ⇒
+                //   先交灵魂碎裂再爆发（不然爆发一落地就 OT，坦克要把怪追回来）。
+                //   两个硬门：① 每场只交一次（长 CD，开局就交等于把牌打空）；
+                //            ② 战斗时长 ≥ shatter_min_engage_ms（默认 20 秒）：短战斗不值这张牌。
+                uint32 const engageMs = m->engagedAt
+                    ? WorldTimer::getMSTimeDiff(m->engagedAt, safeNow) : 0;
+                int const shatterMinMs = int(TP(m, "shatter_min_engage_ms", 20000.0));
+                float const burstThreatEst = float(TP(m, "burst_threat_est", 3000.0));
+                bool const tankUp = s.tankAlive && s.tankThreat > 0.0f;
+                // ① 真判据：预判会顶到坦克（>100%）
+                bool const predictOver = tankUp
+                    && (s.myThreat + burstThreatEst) > s.tankThreat * 1.0f;
+                // ② 验收钩子（默认 0）：假人场景没有坦克 ⇒ predictOver 恒为假，这条分支永远摸不到。
+                //    打开 `destro:shatter_force=1` 就把"越线"当成成立，用来在假人里**真实走一遍**
+                //    "20 秒后交一次、每场只交一次"这条路（不是假日志：仍然要真的放出来才算数）。
+                bool const forceShatter = TP(m, "shatter_force", 0.0) >= 1.0;
+                if (!m->shatterUsed && engageMs >= uint32(shatterMinMs)
+                    && (predictOver || forceShatter))
+                {
+                    if (TryCastSelf(ai, m, s, "soul shatter"))
+                    {
+                        m->shatterUsed = true;
+                        // [2026-11-01 站长口径] 单独一条，便于脚本直接验收
+                        sLog.outError("[DPSFSM-SHATTER] %s my=%.0f tank=%.0f",
+                            s.bot->GetName(), s.myThreat, s.tankThreat);
+                        result = TickResult::Acted;
+                        break;
+                    }
+                }
+
+                // 饰品 → 暗影灼烧（学会了才放，且仇恨越线时收起）→ 暗影箭
+                if (TP(m, "burst_trinket", 1.0) >= 1.0 && UseTrinket(ai, m, s))
+                    result = TickResult::Acted;
+                else if (threatOk && SpellId(ai, s.bot, m, "shadowburn", false)
+                    && TryCast(ai, m, s, "shadowburn", nullptr))
+                    result = TickResult::Acted;
+                else
+                    result = FsmResult(CastFirst(ai, m, s, { "shadow bolt" }));
+                break;
+            }
+
+            case State::Approach:
+                result = TickResult::Decline;      // 走位归引擎
+                break;
+
+            case State::Maintain:
+                result = TickWarlockMaintain(ai, m, s);
+                break;
+
+            case State::Idle:
+            default:
+                result = TickResult::Decline;
+                break;
+        }
+
+        // [2026-11-01 站长口径] 每 10 秒一条状态日志（WorldTimer 节流）：
+        //   state / threat=自己/坦克 / mana / hp / shatter(0/1) / last=上一手成功施放的法术
+        if (!m->lastWarlockLog || WorldTimer::getMSTimeDiff(m->lastWarlockLog, safeNow) >= 10000)
+        {
+            m->lastWarlockLog = safeNow;
+            char const* last = "-";
+            if (m->lastCastId)
+                if (SpellEntry const* e = sServerFacade.LookupSpellInfo(m->lastCastId))
+                    last = e->SpellName[0];
+            sLog.outError("[DPSFSM-WARLOCK] %s state=%s threat=%.0f/%.0f mana=%.0f hp=%.0f shatter=%d last=%s",
+                s.bot->GetName(), ai::dpsfsm::StateName(st), s.myThreat, s.tankThreat,
+                s.power, s.selfHp, m->shatterUsed ? 1 : 0, last);
+        }
+
+        return result;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -5130,9 +5493,12 @@ namespace ai
             bool const warriorFsm = (m->spec == Spec::Arms || m->spec == Spec::Fury);
             bool const rogueFsm = (m->spec == Spec::Combat || m->spec == Spec::Assassination
                 || m->spec == Spec::Subtlety);
+            // [2026-11-01 站长口径] 术士只接**毁灭**（三系里最简单：主输出只有暗影箭）；
+            //   Affliction / Demonology 继续走 legacy `TickWarlock`（保持 Decline ⇒ 不改变任何行为）。
+            bool const warlockFsm = (m->spec == Spec::Destruction);
             if (dmode == DecisionMode::Fsm
                 && (m->spec == Spec::Frost || m->spec == Spec::Arcane || IsHunterSpec(m->spec)
-                    || warriorFsm || rogueFsm))
+                    || warriorFsm || rogueFsm || warlockFsm))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
@@ -5142,7 +5508,8 @@ namespace ai
                     ? TickFrostFsm(ai, m, s)
                     : (m->spec == Spec::Arcane ? TickArcaneFsm(ai, m, s)
                     : (IsHunterSpec(m->spec) ? TickHunterFsm(ai, m, s)
-                    : (warriorFsm ? TickWarriorFsm(ai, m, s) : TickRogueFsm(ai, m, s))));
+                    : (warriorFsm ? TickWarriorFsm(ai, m, s)
+                    : (rogueFsm ? TickRogueFsm(ai, m, s) : TickWarlockFsm(ai, m, s)))));
                 // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）
                 ManaLogTick(m, bot);
                 switch (fsmResult)
