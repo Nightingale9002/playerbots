@@ -166,6 +166,7 @@ namespace ai
         // [2026-11-01 站长口径] mode=5（显式状态图）当前覆盖的专精：
         //   法师 冰/奥/火 · 猎人 兽王/射击/生存 · 战士 武器/狂暴 · 盗贼 战斗/刺杀/敏锐
         //   · 术士 毁灭/**痛苦/恶魔** · 圣骑士 惩戒 · 萨满 元素/增强 · **牧师 暗影**
+        //   · **德鲁伊 野性/平衡**（恢复德在 mode=5 里 Decline：治疗以后单独做）
         //   （术士三系共用 `DpsFsm.cpp → TickWarlockFsmCore()`：毁灭走 `TickWarlockFsm()`，
         //     痛苦/恶魔走 `TickWarlockDotsFsm()`，只换单体表与群架档；
         //     痛苦 DoT 续期用 `TargetAuraRemain() < refresh_dot`，多目标铺前 `multidot_max` 个腐蚀）。
@@ -186,6 +187,16 @@ namespace ai
         //     维护 swp/vt/mb 三个时间点，并做**两拍前视**避让（两个 DoT 不许同拍到期，
         //     也不许卡在心爆的拍上）。戒律/神圣继续 Decline（不是 DPS 循环问题）。
         //   见 DpsFsm.cpp → TickShadowFsm() / ShadowPlanBeat() / TickShadowBeat()。
+        //   德鲁伊状态表（细节见 DpsFsm.cpp 的"德鲁伊"一节）：
+        //     野性（猫）：Idle / Prep(猫形态) / Recover(蓝低且不能变身) / Approach(近战够不着)
+        //       / Aoe(横扫) / Maintain(能量轮)。**这不是优先级表，是能量 tick 相位的排程机**：
+        //       核心状态是"距下一跳回能还有多久"（2 秒一跳、20 点），按"一跳够不够"决定
+        //       等一跳还是直接变身（Power Shift，有激怒时 +40 能量）。相位靠观测能量跳变得到
+        //       ——核心的 `m_regenTimer` 是 protected，模块侧读不到。
+        //     平衡（鸟）：Idle / Prep(枭兽形态) / Approach(>range_caster) / Recover(蓝<recover_power)
+        //       / Aoe(hurricane) / Burst(目标<burst_hp：饰品→force of nature) / Maintain
+        //       （moonfire → insect swarm 按 refresh_dot 续，starfire 填充；移动/蓝紧改 wrath）。
+        //   见 DpsFsm.cpp → TickDruidFsm() / TickFeralFsm() / TickBalanceFsm()。
         bool Tick(PlayerbotAI* ai);
     }
 }

@@ -343,6 +343,29 @@ namespace
         int    wfLastProcAt = 0;
         uint32 wfProcs = 0;
         bool   wfReadyPrev = true;
+        // [2026-11-01 站长口径] 德鲁伊 · 野性（猫，mode=5）—— **能量跳相位的排程机**专用记忆。
+        //   状态的核心不是"现在有多少能量"，而是"距离下一跳回能还有多久"（能量 2 秒一跳、20 点）。
+        //   核心**没有** `m_regenTimer` 的公开接口（Unit.h 里是 protected）⇒ 相位只能观测：
+        //   本 tick 的能量比上一 tick 多、且增量是"一跳的量"（5~50）⇒ 记一次回能跳。
+        //     drTickAt     —— 最近一次观测到回能跳的毫秒时刻；
+        //     drTickPeriod —— 观测到的跳间隔（默认 2000ms；假人服 Rate.Energy 不是 1 时以观测为准）；
+        //     drEnergyPrev —— 上一 tick 的能量读数（跳的检测用）；
+        //     drShifts     —— 本场成功变身次数（[DPSFSM-DRUID] 的 powershifts=，验收"真的变了"）；
+        //     drFuror      —— 有没有"激怒"（Furor）天赋：**没有就不变身**（变身会把能量清零、却不给 40）；
+        //                     判据与核心同一条：被动 dummy aura 的 SpellIconID == 238；
+        //     drShiftAt    —— 上一次变身的毫秒时刻（形态 1 秒冷却/日志用）。
+        uint32 drTickAt = 0;
+        int    drTickPeriod = 2000;
+        int    drEnergyPrev = -1;
+        uint32 drShifts = 0;
+        uint32 drLastLog = 0;
+        bool   drFuror = false;
+        bool   drFurorChecked = false;
+        uint32 drShiftAt = 0;
+        ObjectGuid drTarget;
+        uint32 drEngagedAt = 0;
+        int    drFurorLoggedPeriod = 0;   // 首次确定 furor/period 的诊断只打一次
+        uint32 drDiagAt = 0;              // `dr_diag=1` 时"等一跳/变身"判据的取证节流（2 秒一条）
     };
 
     std::mutex s_disabledMutex;
@@ -3499,6 +3522,18 @@ namespace ai
             m->spBeatAct = "-";
             m->spIdsCheckedAt = 0;
             m->spDiagAt = 0;
+            // [2026-11-01 站长口径] 德鲁伊：**能量跳相位必须跨轮清零** ——
+            //   上一轮的 drTickAt 停在哪里都是旧的相位，新一轮如果接着算，第一手就会按错误的
+            //   "距下一跳"去等/去变身（实测会让开局 1~2 秒空转）。能量读数也要重置，否则
+            //   第一 tick 的增量会被当成一次假跳。`drFuror` 是静态天赋事实，保留（与 ids/flags 同类）。
+            m->drTickAt = 0;
+            m->drTickPeriod = 2000;
+            m->drEnergyPrev = -1;
+            m->drShifts = 0;
+            m->drLastLog = 0;
+            m->drShiftAt = 0;
+            m->drTarget = ObjectGuid();
+            m->drEngagedAt = 0;
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
                 name = "guid=" + std::to_string(guid);
@@ -8073,6 +8108,725 @@ namespace ai
         return result;
     }
 
+    // =====================================================================================
+    // [2026-11-01 站长口径] 德鲁伊接进 mode=5（第十张职业图）：野性（Feral，猫）+ 平衡（Balance）。
+    //   恢复（Restoration）**不做 DPS**：派发处把它也选进这张图、`TickDruidFsm` 里第一行就 Decline，
+    //   这样 mode=5 的恢复德不会被 legacy `TickDruid` 的平衡循环误接管；
+    //   mode=0/1/2/3/4 与 legacy `TickDruid` 一个字节都不动。
+    //
+    //   一、野性（猫）—— **能量 tick 相位的排程机**，不是优先级表：
+    //     状态的核心不是"现在有多少能量"，而是"距离下一跳回能还有多久"（能量 2 秒一跳、20 点，
+    //     见核心 `Player::Regenerate(POWER_ENERGY)`；`m_regenTimer` 是 protected，模块侧只能观测）。
+    //     循环 = 变身（Power Shift：取消形态 + 立即变回猫，**单 tick 原子**；有激怒 Furor 时给 40 能量）
+    //            → 在回能第一秒把技能打出去 → 下一跳回能前完成下一次变身。
+    //     判据表（逐条对应站长口径）：
+    //       · 撕碎 shred：**一跳不够就不等**（差 2 点要等两跳 ⇒ 直接变身，变身立刻给 40）；
+    //         ⚠️ 口径写的是 42 能量，但**本服 TBC DBC 里 Shred = 60**（Mangle 45 / Rip 30 /
+    //         Ferocious Bite 35）；代码一律读 `spell_template.ManaCost`（DrPowerCost），
+    //         所以"等一跳 / 变身"的实际判据按 60 算（见文件末尾的判定式）。
+    //       · 割裂 rip(30)：一跳够就走"等一跳"（比变身省一次蓝）；
+    //       · 清晰预兆 clearcasting（免费技能）：**第二秒里不抢**，多等一跳对齐相位再打（不是白赚）；
+    //       · 裂伤 mangle：队里有熊形态德鲁伊 ⇒ 熊坦的裂伤 debuff 已经在，自己不补；
+    //         读不到就按"没有"处理；`mangle_self=1` 强制自己补、`=0` 强制不补；
+    //       · 变身蓝耗：只要"还够一次变身"就继续变；不够就走 Recover 喝法力药水
+    //         （`powershift_min_mana` 只作额外百分比下限，默认 0 = 只按"够一次变身"判）；
+    //       · 都不行 ⇒ Hold 等 tick，并且每个 tick 都 `SetFacingToObject`（否则白字全 BAD_FACING）。
+    //     星/终结技：割裂 5 星（`rip_refresh` 到期才补）；凶猛撕咬只在目标 ≤ `fb_hp`(25%) 用；
+    //       rip 还在、血又不低时攒着（能量 ≥ `fb_dump_energy`(80) 才泄一手，避免回能溢出）。
+    //     状态：Idle / Prep(猫形态) / Recover(蓝低且不能变身) / Approach(近战够不着) / Aoe(横扫)
+    //           / Maintain(能量轮)。
+    //     找背：`GetBehind()`（撕碎需要背面）；正面时不硬放 shred（会 BAD_FACING + 白进退避）。
+    //
+    //   二、平衡（鸟德）：
+    //     形态 moonkin form（Prep 补）；单体 moonfire / insect swarm 按剩余时间续（`refresh_dot`）
+    //     → starfire 填充（读条长，急速由核心算）；wrath 只在移动或蓝紧时用。
+    //     force of nature 在爆发（目标 ≤ `burst_hp`）开；barkskin 不进循环（保命交给上层）。
+    //     AOE：hurricane（引导，pack ≥ `aoe_pack`，走 `TryCastAt` —— 位置技必须有完整校验，
+    //       见 TryCastAt 上面"平衡德 40 秒 0 伤害 = 飓风幽灵施法"的实测注释）
+    //       + 目标身上 moonfire/insect swarm 铺。
+    //     蓝量：`recover_power`(10) 以下喝药；鸟德不缺蓝（月火回蓝天赋），不做复杂回蓝逻辑。
+    //
+    //   可复用（不重新发明）：`BuildSnapshot`、`CastFirst/TryCast/TryCastSelf/TryCastAt`、
+    //   `SpellIdAtRank`、`TargetAuraRemain`、`AuraStacks`、`TickResult{Acted,Hold,Decline}`、
+    //   `EvalThreat`、`UseManaPotion`、`UseTrinket`、`TP`。
+    // =====================================================================================
+
+    // 自己身上有没有**某个名字**的 aura（按 spell_template 的名字逐条比，rank 无关）。
+    //   为什么不用 AuraStacks/AuraRemain：`clearcasting`（清晰预兆的 proc）根本不在法术书里，
+    //   `SpellId(..., "clearcasting")` 会解析成 0 ⇒ 那两个入口永远返回 0。
+    bool DrHasAuraByName(Player* bot, char const* name)
+    {
+        if (!bot || !name)
+            return false;
+        for (auto const& itr : bot->GetSpellAuraHolderMap())
+        {
+            SpellAuraHolder* holder = itr.second;
+            SpellEntry const* proto = holder ? holder->GetSpellProto() : nullptr;
+            if (proto && proto->SpellName[0] && strcasecmp(proto->SpellName[0], name) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    // 有没有"激怒"（Furor）天赋：核心 `Aura::HandleAuraModShapeshift` 用的正是这条判据
+    //   （被动 dummy aura 的 SpellIconID == 238）。没有这个天赋，变身会把能量清零却不给 40
+    //   ⇒ **绝不为回能去变身**（那是负收益）。
+    bool DrHasFuror(Player* bot)
+    {
+        if (!bot)
+            return false;
+        for (Aura* aura : bot->GetAurasByType(SPELL_AURA_DUMMY))
+            if (aura && aura->GetSpellProto() && aura->GetSpellProto()->SpellIconID == 238)
+                return true;
+        return false;
+    }
+
+    // 法术的**真实**资源消耗：`manaCost` 对能量/怒气/法力是同一个字段（`Spell::CalculatePowerCost`），
+    //   形态类还有 `ManaCostPercentage`（猫形态就是按基础法力百分比收）⇒ 只读 manaCost 会低估。
+    int DrPowerCost(PlayerbotAI* ai, BotMem* m, char const* name, int def)
+    {
+        Player* bot = ai->GetBot();
+        uint32 const id = SpellId(ai, bot, m, name, false);
+        SpellEntry const* entry = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
+        if (!entry)
+            return def;
+        int cost = int(entry->manaCost);
+        if (entry->powerType == POWER_MANA && entry->ManaCostPercentage)
+            cost += int(uint32(entry->ManaCostPercentage) * bot->GetCreateMana() / 100);
+        return cost > 0 ? cost : def;
+    }
+
+    // 能量跳相位（观测值）。核心没有 m_regenTimer 的公开接口，只能看"能量跳变"：
+    //   本 tick 能量比上一 tick 多、且增量是一跳的量（5~50）⇒ 记一次回能跳。
+    struct DrEnergyPhase
+    {
+        int  energy = 0;      // 当前能量
+        int  remainMs = 0;    // 距**下一跳**回能的毫秒（0 = 相位未知/现在就够）
+        int  periodMs = 2000; // 观测到的跳间隔
+        bool known = false;   // 相位是否可信（长时间没观测到跳就置 false，别拿旧相位骗自己）
+    };
+
+    void DrObserveEnergy(BotMem* m, Snapshot& s, uint32 safeNow, DrEnergyPhase& out)
+    {
+        int const e = s.energy;
+        if (m->drEnergyPrev >= 0 && e > m->drEnergyPrev)
+        {
+            int const delta = e - m->drEnergyPrev;
+            // [2026-11-01 实测修] 只把"**一跳**的量"当回能跳：5~25（默认 20）。
+            //   ① 猛虎之怒(+60)/药水这类大增量不算；
+            //   ② **激怒变身给的 +40 也不算**（第一版把 40 当成了一跳，相位直接错位，
+            //      实测观测到 2999ms/3420ms 的"假周期"）。
+            //   ③ 变身前后 500ms 内的增量一律不认（消形态→回形态期间读数会跳）。
+            bool const afterShift = m->drShiftAt
+                && WorldTimer::getMSTimeDiff(m->drShiftAt, safeNow) < 500;
+            if (delta >= 5 && delta <= 25 && !afterShift)
+            {
+                // [2026-11-01 实测修] **跳间隔不学观测值**：核心 `Player::Update` 是
+                //   `m_regenTimer += diff; if (>= REGEN_TIME_FULL) RegenerateAll(...)` ⇒
+                //   回能周期**恒为 2000ms**（Rate.Energy 只改每跳的量，不改间隔）。
+                //   第一版用"两次观测的间隔"去学周期，结果把"变身清零 → 下一次真跳"的
+                //   半截间隔（1554/2999ms）当成了周期 ⇒ 相位越算越偏。固定 2000。
+                //   另外：距上次记跳不足 1200ms 的增量不认（那是同一跳被看见两次 / 零散回能），
+                //   否则每 tick 都把 drTickAt 刷成"刚刚"，remain 永远是 2000。
+                bool const fresh = !m->drTickAt
+                    || WorldTimer::getMSTimeDiff(m->drTickAt, safeNow) >= 1200;
+                if (fresh)
+                    m->drTickAt = safeNow;
+            }
+        }
+        m->drEnergyPrev = e;
+
+        out.energy = e;
+        out.periodMs = m->drTickPeriod > 0 ? m->drTickPeriod : 2000;
+        out.known = false;
+        out.remainMs = 0;
+        if (!m->drTickAt)
+            return;
+        uint32 const since = WorldTimer::getMSTimeDiff(m->drTickAt, safeNow);
+        // 3 个周期都没看到跳（能量满了 / 长时间没出手）⇒ 相位不可信，按"现在"处理
+        if (since > uint32(out.periodMs) * 3)
+            return;
+        int const phase = int(since) % out.periodMs;
+        out.remainMs = out.periodMs - phase;
+        if (out.remainMs <= 0 || out.remainMs > out.periodMs)
+            out.remainMs = out.periodMs;
+        out.known = true;
+    }
+
+    // 队里有熊形态德鲁伊（熊坦）⇒ 熊坦的裂伤 debuff 与猫的裂伤是同一个减益效果，自己不补。
+    //   `mangle_self=1` 强制自己补；`=0` 强制不补；不配（-1）= 自动。
+    bool DrMangleSelf(PlayerbotAI* ai, BotMem* m)
+    {
+        double const forced = TP(m, "mangle_self", -1.0);
+        if (forced >= 0.0)
+            return forced >= 0.5;
+        Player* bot = ai->GetBot();
+        Group* group = bot->GetGroup();
+        if (!group)
+            return true;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (!member || member == bot || !sServerFacade.IsAlive(member))
+                continue;
+            if (member->getClass() != CLASS_DRUID)
+                continue;
+            uint8 const form = member->GetShapeshiftForm();
+            if (form == FORM_BEAR || form == FORM_DIREBEAR)
+                return false;
+        }
+        return true;
+    }
+
+    // 变身（Power Shift）：单 tick 原子动作 —— 取消形态 + 立即变回猫，**不拆成两个 tick**。
+    //   与 DpsPolicy.inc 的 PKind::PowerShift 同一条实现（那边实测过："先取消、下个 tick 再变"
+    //   等于 2 个 GCD，9 次变形 603 dps vs 0 次 723 dps）。代价只有法力 + 形态 1 秒冷却。
+    bool DrPowerShift(PlayerbotAI* ai, BotMem* m, Snapshot& s, DrEnergyPhase const& p)
+    {
+        uint32 const catId = SpellId(ai, s.bot, m, "cat form", false);
+        if (!catId || !s.bot->HasSpell(catId))
+            return false;
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        // 形态有 1 秒冷却：刚变过就别再空放（假人里每 tick 都试会白吃施法失败退避）
+        if (m->drShiftAt && WorldTimer::getMSTimeDiff(m->drShiftAt, safeNow) < 1000)
+            return false;
+
+        // [2026-11-01 实测结论] 猫形态的"原地重放"会被核心拒绝：**res=64 = SPELL_FAILED_NOT_SHAPESHIFT**
+        //   （已在该形态里，`CheckCast` 只认"不在这个形态"时才允许施放）⇒ 必须先摘形态再放。
+        //   但**两件事必须同时成立**才允许摘：
+        //     ① `Ready()`：技能自身冷却 / 变形类 1 秒恢复已过；
+        //     ② `!GcdActive()`：核心 `Spell::CheckCast` 的 strict GCD 判据（`HasGCD(entry)`，
+        //        按 StartRecoveryCategory 查，和 `Ready()` 的全局 GCD 不是同一张表）。
+        //   第一版只查 ① ⇒ 摘掉形态后 CastSpell 返回 **res=63 = SPELL_FAILED_NOT_READY**，
+        //   形态没了、能量也没拿到，下一 tick 只能再花 590 蓝补形态（实测每轮 Cat Form 10 次、
+        //   powershifts=0、DPS 掉到 554）。两道闸一起过了，摘→放 才是原子的。
+        bool const ready = Ready(s.bot, catId) && !GcdActive(s.bot, catId);
+        if (!ready)
+        {
+            // `dr_diag=1` 才打（2 秒一条）：取证"为什么没变身"——是 GCD/冷却挡的
+            if (TP(m, "dr_diag", 0.0) >= 1.0
+                && (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt, safeNow) >= 2000))
+            {
+                m->drDiagAt = safeNow;
+                sLog.outError("[DPSFSM-DRUID-DIAG] %s powershift blocked ready=0 energy=%d tick=%dms mana=%.0f",
+                    s.bot->GetName(), p.energy, p.remainMs, s.power);
+            }
+            return false;
+        }
+
+        s.bot->RemoveSpellsCausingAura(SPELL_AURA_MOD_SHAPESHIFT);
+        SpellCastResult const res = s.bot->CastSpell(s.bot, catId, uint32(TRIGGERED_NONE));
+        if (res != SPELL_CAST_OK)
+        {
+            // `dr_diag=1`：取证"摘了形态却变不回来"的结果码（不该再出现，出现就是回归）
+            if (TP(m, "dr_diag", 0.0) >= 1.0
+                && (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt, safeNow) >= 2000))
+            {
+                m->drDiagAt = safeNow;
+                sLog.outError("[DPSFSM-DRUID-DIAG] %s powershift cast-fail res=%d energy=%d mana=%.0f form=%u",
+                    s.bot->GetName(), int(res), p.energy, s.power, uint32(s.bot->GetShapeshiftForm()));
+            }
+            return false;
+        }
+
+        time_t const now = time(nullptr);
+        m->drShiftAt = safeNow;
+        ++m->drShifts;
+        ++m->castCount;
+        m->castThisTick = true;
+        m->lastOk[catId] = now;
+        m->lastCastId = catId;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), catId);
+        sLog.outError("[DPSFSM-DRUID] %s powershift #%u energy=%d tick=%dms combo=%u mana=%.0f",
+            s.bot->GetName(), m->drShifts, p.energy, p.remainMs, uint32(s.combo), s.power);
+        return true;
+    }
+
+    // [DPSFSM-DRUID] 每 10 秒一条：
+    //   猫：`spec=feral state= energy=<n> tick=<距下一跳ms> combo=<n> powershifts=<n> mana=<%>`
+    //   鸟：`spec=balance state= dots=<n> mana=<%>`
+    void DrLogTick(PlayerbotAI* ai, BotMem* m, Snapshot& s, State st, DrEnergyPhase const& p)
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (m->drLastLog && WorldTimer::getMSTimeDiff(m->drLastLog, safeNow) < 10000)
+            return;
+        m->drLastLog = safeNow;
+
+        if (m->spec == Spec::Feral)
+        {
+            sLog.outError("[DPSFSM-DRUID] %s spec=feral state=%s energy=%d tick=%d combo=%u powershifts=%u mana=%.0f",
+                s.bot->GetName(), StateName(st), s.energy, p.remainMs, uint32(s.combo), m->drShifts, s.power);
+        }
+        else
+        {
+            int dots = 0;
+            if (s.target)
+            {
+                if (TargetAuraRemain(ai, s.bot, m, "moonfire", s.target) > 0)     ++dots;
+                if (TargetAuraRemain(ai, s.bot, m, "insect swarm", s.target) > 0) ++dots;
+            }
+            sLog.outError("[DPSFSM-DRUID] %s spec=balance state=%s dots=%d mana=%.0f",
+                s.bot->GetName(), StateName(st), dots, s.power);
+        }
+    }
+
+    ai::dpsfsm::TickResult TickFeralFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        if (!s.target)
+            return TickResult::Decline;
+
+        Player* bot = s.bot;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+
+        // [2026-11-01 实测修] **坐着（喝水/休息）时必须先站起来**。
+        //   假人连跑时上一轮结束后 bot 会坐下回蓝，而 SimScenario 只重置血/蓝/能量、不管站姿；
+        //   核心 `Spell::CheckCast` 第一条就会判 SPELL_FAILED_NOT_STANDING(65) ⇒ 整轮 45 秒
+        //   0 施法 0 伤害（实测 balance 每批第 2 轮必现；诊断行里 `res=65` 就是它）。
+        //   站起来不是施法、不占 GCD，所以放在最前面、无条件做。
+        if (!bot->IsStandState())
+            bot->SetStandState(UNIT_STAND_STATE_STAND);
+
+        // 先转向：Acted/Hold 时引擎整 tick 不跑（与惩戒骑同一口径）。
+        //   猫的每一手都要判朝向，不转就是 BAD_FACING 白字全丢。
+        if (s.target && s.target != bot)
+            bot->SetFacingToObject(s.target);
+
+        // 换目标 = 换一场战斗：只重置交战计时；累计 powershifts 保留（那是验收"真的变了"的数）
+        if (s.target->GetObjectGuid() != m->drTarget)
+        {
+            m->drTarget = s.target->GetObjectGuid();
+            m->drEngagedAt = safeNow;
+        }
+        if (!m->drEngagedAt)
+            m->drEngagedAt = safeNow;
+
+        DrEnergyPhase p;
+        DrObserveEnergy(m, s, safeNow, p);
+
+        // [2026-11-01 实测修] **激怒（Furor）检测必须在"已经在猫形态"时也做一次**：
+        //   第一版只在 Prep 里查，而假人第二/第三轮开局 bot 往往还保持着上一轮的猫形态
+        //   （SimScenario 只重置血/蓝/能量，不消形态）⇒ 永远进不到 Prep ⇒ `drFuror` 一直是 false
+        //   ⇒ **整轮一次变身都没有**（实测 20 秒 powershifts=0，日志里 furor=0）。
+        //   天赋是静态事实，查一次就够（`drFurorChecked`，跨轮保留）。
+        if (!m->drFurorChecked)
+        {
+            m->drFuror = DrHasFuror(bot);
+            m->drFurorChecked = true;
+        }
+
+        // ---- Prep：猫形态 ----
+        if (bot->GetShapeshiftForm() != FORM_CAT)
+        {
+            if (TP(m, "dr_diag", 0.0) >= 1.0
+                && (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt, safeNow) >= 2000))
+            {
+                m->drDiagAt = safeNow;
+                sLog.outError("[DPSFSM-DRUID-DIAG] %s form-loss form=%u aura=%d lastCast=%u energy=%d mana=%.0f auras=%u",
+                    bot->GetName(), uint32(bot->GetShapeshiftForm()),
+                    DrHasAuraByName(bot, "cat form") ? 1 : 0, m->lastCastId, s.energy, s.power,
+                    uint32(bot->GetSpellAuraHolderMap().size()));
+            }
+            if (DrHasAuraByName(bot, "cat form"))
+            {
+                // 光环在、形态字段却没同步（核心形态切换的中间态）⇒ 别每 tick 重放
+                //   （legacy 实测 40 秒刷了 140 次 Cat Form）
+                if (TP(m, "dr_diag", 0.0) >= 1.0
+                    && (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt, safeNow) >= 2000))
+                {
+                    m->drDiagAt = safeNow;
+                    sLog.outError("[DPSFSM-DRUID-DIAG] %s prep desync form=%u aura=1 energy=%d mana=%.0f auras=%u",
+                        bot->GetName(), uint32(bot->GetShapeshiftForm()), s.energy, s.power,
+                        uint32(bot->GetSpellAuraHolderMap().size()));
+                }
+                LogTransition(ai, m, s, State::Prep);
+                DrLogTick(ai, m, s, State::Prep, p);
+                return TickResult::Decline;
+            }
+            bool const ok = TryCastSelf(ai, m, s, "cat form");
+            if (!ok && TP(m, "dr_diag", 0.0) >= 1.0
+                && (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt, safeNow) >= 2000))
+            {
+                m->drDiagAt = safeNow;
+                sLog.outError("[DPSFSM-DRUID-DIAG] %s prep cast-fail form=%u aura=0 energy=%d mana=%.0f gdc=%d",
+                    bot->GetName(), uint32(bot->GetShapeshiftForm()), s.energy, s.power,
+                    Ready(bot, SpellId(ai, bot, m, "cat form", false)) ? 0 : 1);
+            }
+            LogTransition(ai, m, s, State::Prep);
+            DrLogTick(ai, m, s, State::Prep, p);
+            return ok ? TickResult::Acted : TickResult::Decline;
+        }
+
+        // 第一次确定 furor / 观测到的跳间隔：只打一条诊断（验收要知道"为什么不变身"）
+        if (m->drFurorChecked && m->drTickAt && m->drFurorLoggedPeriod != m->drTickPeriod)
+        {
+            m->drFurorLoggedPeriod = m->drTickPeriod;
+            sLog.outError("[DPSFSM-DRUID] %s furor=%d tickPeriod=%dms energy=%d tick=%dms mana=%.0f",
+                bot->GetName(), m->drFuror ? 1 : 0, m->drTickPeriod, p.energy, p.remainMs, s.power);
+        }
+
+        // ---- 资源/距离 ----
+        int const regen       = int(TP(m, "energy_tick", 20.0));
+        int const shredCost   = DrPowerCost(ai, m, "shred", 42);
+        int const ripCost     = DrPowerCost(ai, m, "rip", 30);
+        int const fbCost      = DrPowerCost(ai, m, "ferocious bite", 35);
+        int const mangleCost  = DrPowerCost(ai, m, "mangle (cat)", 40);
+        int const swipeCost   = DrPowerCost(ai, m, "swipe (cat)", 45);
+        int const shiftCost   = DrPowerCost(ai, m, "cat form", 400);
+        bool const manaShiftOk = int(bot->GetPower(POWER_MANA)) >= shiftCost;
+
+        bool const reach = bot->CanReachWithMeleeAttack(s.target);
+
+        State st = State::Maintain;
+        if (!reach)
+            st = State::Approach;
+        else if (m->drFuror && !manaShiftOk && s.energy < shredCost)
+            st = State::Recover;          // 蓝低到连一次变身都不够，且能量打不出下一手
+        else if (s.pack10 >= AoEPack(m))
+            st = State::Aoe;
+
+        TickResult result = TickResult::Decline;
+        char const* want = nullptr;
+        int wantCost = 0;
+        bool needBehind = false;
+        bool waitingForRip = false;
+
+        if (st == State::Approach)
+        {
+            CloseToMelee(ai, m, s);       // 引擎的 reach melee 是零长度路径（见 CloseToMelee 注释）
+            result = TickResult::Decline;
+        }
+        else if (st == State::Recover)
+        {
+            result = TickResult::Hold;
+            if (UseManaPotion(m, s))
+                result = TickResult::Acted;
+        }
+        else if (st == State::Aoe)
+        {
+            want = "swipe (cat)";
+            wantCost = swipeCost;
+        }
+        else
+        {
+            int const refresh = int(TP(m, "rip_refresh", 1500.0));
+            bool const ripUp = TargetAuraRemain(ai, bot, m, "rip", s.target) > refresh;
+            if (s.combo >= 5)
+            {
+                if (!ripUp)
+                {
+                    want = "rip";
+                    wantCost = ripCost;
+                }
+                else if (s.targetHp <= float(TP(m, "fb_hp", 25.0)))
+                {
+                    want = "ferocious bite";
+                    wantCost = fbCost;
+                }
+                else if (s.energy >= int(TP(m, "fb_dump_energy", 80.0)))
+                {
+                    // 5 星 + rip 还在 + 血不低：默认攒着等 rip 到期；只有能量快溢出才泄一手
+                    want = "ferocious bite";
+                    wantCost = fbCost;
+                }
+                else
+                    waitingForRip = true;
+            }
+            else
+            {
+                uint32 const mangleId = SpellId(ai, bot, m, "mangle (cat)", false);
+                int const mangleRefresh = int(TP(m, "mangle_refresh", 3000.0));
+                bool const mangleNeed = mangleId && DrMangleSelf(ai, m)
+                    && TargetAuraRemain(ai, bot, m, "mangle (cat)", s.target) < mangleRefresh;
+                if (mangleNeed)
+                {
+                    want = "mangle (cat)";
+                    wantCost = mangleCost;
+                }
+                else
+                {
+                    want = "shred";
+                    wantCost = shredCost;
+                    needBehind = true;
+                }
+            }
+        }
+
+        if (st == State::Aoe || st == State::Maintain)
+        {
+            bool const cc = DrHasAuraByName(bot, "clearcasting");
+            int const period = p.periodMs > 0 ? p.periodMs : 2000;
+            bool const firstSecond = !p.known || p.remainMs > period / 2;
+            bool const afford = want && (s.energy >= wantCost || cc);
+
+            if (want && needBehind && !bot->IsFacingTargetsBack(s.target))
+            {
+                GetBehind(ai, m, s);   // 只走位，不占 GCD；正面硬放 shred 会 BAD_FACING
+                result = TickResult::Hold;
+            }
+            else if (afford)
+            {
+                if (cc && !firstSecond)
+                {
+                    // [2026-11-01 站长口径] 清晰预兆这一发免费技**不在第二秒抢**：
+                    //   多等一跳把它对齐到回能相位（否则后面每一手的 GCD 都会与跳相位错开）。
+                    result = TickResult::Hold;
+                }
+                else if (TryCast(ai, m, s, want, nullptr))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Hold;
+            }
+            else if (waitingForRip)
+            {
+                // 5 星但 rip 还没到期、血也不低：攒星攒能量，等 rip 掉了再补（硬放 bite 会白扔星）
+                result = TickResult::Hold;
+            }
+            else if (want)
+            {
+                // [2026-11-01 站长口径] "等一跳还是变身"的判定（实测按本服 DBC 的能量消耗）：
+                //   · 一跳就够（energy + 20 >= cost）⇒ **等一跳**（比变身省一次蓝；
+                //     裂伤 rip(30) 的"能量接近 30 可以多等一跳"就是这一条）；
+                //   · 一跳不够 ⇒ 只有"变身能让自己更快凑够这一手"才变：
+                //     变身净增 = max(0, 激怒 40 − 当前能量)，且 当前 + 净增 + 20 >= cost；
+                //   · 变身也凑不够 ⇒ 老实等（绝不空放变身，那只会白花法力）。
+                //   ⚠️ 本服 TBC 的 Shred 是 **60 能量**（spell_template.ManaCost，不是口径里的 42），
+                //      Mangle 45、Rip 30、Ferocious Bite 35；所以"差 2 点等两跳"的典型场景
+                //      在本服不会出现，规则按上面的通用式落地（见回报里的说明）。
+                bool const oneTickEnough = (s.energy + regen >= wantCost);
+                int const furorEnergy = int(TP(m, "furor_energy", 40.0));
+                int const gain = furorEnergy > s.energy ? furorEnergy - s.energy : 0;
+                bool const shiftHelps = gain > 0 && (s.energy + gain + regen >= wantCost);
+
+                if (oneTickEnough)
+                    result = TickResult::Hold;      // 下一跳就够：等
+                else if (m->drFuror && manaShiftOk && shiftHelps
+                    && DrPowerShift(ai, m, s, p))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Hold;      // 没有激怒 / 蓝不够 / 变了也不够：等自然回能
+
+                // `dr_diag=1`：取证"等一跳还是变身"这一判据（2 秒一条，默认关）
+                if (TP(m, "dr_diag", 0.0) >= 1.0
+                    && (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt, safeNow) >= 2000))
+                {
+                    m->drDiagAt = safeNow;
+                    sLog.outError("[DPSFSM-DRUID-DIAG] %s wheel want=%s cost=%d energy=%d tick=%dms "
+                        "oneTick=%d furor=%d gain=%d shiftHelps=%d manaOk=%d shifts=%u behind=%d",
+                        bot->GetName(), want ? want : "-", wantCost, s.energy, p.remainMs,
+                        oneTickEnough ? 1 : 0, m->drFuror ? 1 : 0, gain, shiftHelps ? 1 : 0,
+                        manaShiftOk ? 1 : 0, m->drShifts,
+                        (s.target && bot->IsFacingTargetsBack(s.target)) ? 1 : 0);
+                }
+            }
+            else
+                result = TickResult::Hold;
+        }
+
+        LogTransition(ai, m, s, st);
+        DrLogTick(ai, m, s, st, p);
+        return result;
+    }
+
+    ai::dpsfsm::TickResult TickBalanceFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        if (!s.target)
+            return TickResult::Decline;
+
+        Player* bot = s.bot;
+        DrEnergyPhase p;   // 鸟德不用能量相位，只为共用 DrLogTick 的接口
+        p.energy = s.energy;
+
+        // [2026-11-01 实测修] 同野性：坐着的时候核心一律判 SPELL_FAILED_NOT_STANDING(65)。
+        //   假人连跑的第 2 轮整轮 0 施法就是这个（诊断行 `res=65`），先站起来再说。
+        if (!bot->IsStandState())
+            bot->SetStandState(UNIT_STAND_STATE_STAND);
+
+        // [2026-11-01 实测修] **换目标 = 换一场战斗：上一轮残留的读条/引导必须清掉**。
+        //   假人连跑时同一只 bot 会被复用，上一轮收尾时若正处在引导（飓风 10 秒）里，
+        //   旧 Spell 对象可能还挂在 `CURRENT_CHANNELED_SPELL` 上 ⇒ 本函数会一直早退。
+        //   只在"换了目标"时动手（正常战斗里换目标也应当放弃旧目标上的读条）。
+        if (s.target->GetObjectGuid() != m->drTarget)
+        {
+            m->drTarget = s.target->GetObjectGuid();
+            m->drEngagedAt = WorldTimer::getMSTime();
+            if (s.casting)
+                bot->InterruptNonMeleeSpells(false);
+        }
+
+        if (s.casting)
+        {
+            // 新目标刚清过读条还残留（或者这一轮确实在读条）：本 tick 不插技能。
+            // `dr_diag=1` 时留痕，便于区分"正常读条"和"卡死的读条"。
+            if (TP(m, "dr_diag", 0.0) >= 1.0
+                && (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt,
+                    WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1) >= 2000))
+            {
+                m->drDiagAt = WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1;
+                Spell* gen = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+                Spell* chn = bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+                sLog.outError("[DPSFSM-DRUID-DIAG] %s balance casting=1 generic=%u channel=%u mana=%.0f casts=%u",
+                    bot->GetName(), gen && gen->m_spellInfo ? gen->m_spellInfo->Id : 0,
+                    chn && chn->m_spellInfo ? chn->m_spellInfo->Id : 0, s.power, m->castCount);
+            }
+            return TickResult::Acted;
+        }
+
+        // ---- Prep：枭兽形态（没这个天赋的 bot 就在法师形态打，循环照旧） ----
+        if (SpellId(ai, bot, m, "moonkin form", false) && bot->GetShapeshiftForm() != FORM_MOONKIN)
+        {
+            if (DrHasAuraByName(bot, "moonkin form"))
+            {
+                LogTransition(ai, m, s, State::Prep);
+                DrLogTick(ai, m, s, State::Prep, p);
+                return TickResult::Decline;
+            }
+            bool const ok = TryCastSelf(ai, m, s, "moonkin form");
+            LogTransition(ai, m, s, State::Prep);
+            DrLogTick(ai, m, s, State::Prep, p);
+            return ok ? TickResult::Acted : TickResult::Decline;
+        }
+
+        ThreatLevel const threat = EvalThreat(m, s);
+        int const refresh = int(TP(m, "refresh_dot", 1500.0));
+        bool const reach = s.dist <= float(TP(m, "range_caster", 30.0));
+        bool const burstWindow = (s.targetHp <= float(TP(m, "burst_hp", 20.0)));
+
+        State st = State::Maintain;
+        if (!reach)
+            st = State::Approach;
+        else if (s.power < float(TP(m, "recover_power", 10.0)))
+            st = State::Recover;
+        else if (s.pack30 >= AoEPack(m))
+            st = State::Aoe;
+        else if (burstWindow && threat != ThreatLevel::Wait)
+            st = State::Burst;
+
+        TickResult result = TickResult::Decline;
+        switch (st)
+        {
+            case State::Approach:
+                result = TickResult::Decline;   // 走位归引擎
+                break;
+
+            case State::Recover:
+                if (UseManaPotion(m, s))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "shoot" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Hold;
+                break;
+
+            case State::Aoe:
+                // 先铺两个瞬发 DoT（目标身上），再引导飓风 —— 位置技必须走 TryCastAt 的完整校验
+                if (TargetAuraRemain(ai, bot, m, "moonfire", s.target) < refresh
+                    && TryCast(ai, m, s, "moonfire", nullptr))
+                    result = TickResult::Acted;
+                else if (TargetAuraRemain(ai, bot, m, "insect swarm", s.target) < refresh
+                    && TryCast(ai, m, s, "insect swarm", nullptr))
+                    result = TickResult::Acted;
+                else if (TryCastAt(ai, m, s, "hurricane",
+                    s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ()))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "starfire" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Hold;
+                break;
+
+            case State::Burst:
+                if (UseTrinket(ai, m, s))
+                {
+                    result = TickResult::Acted;
+                    break;
+                }
+                if (CastFirst(ai, m, s, { "force of nature" }))
+                {
+                    result = TickResult::Acted;
+                    break;
+                }
+                // 落回单体循环（不 break 出 switch 的写法：与上面两段同构）
+                if (TargetAuraRemain(ai, bot, m, "moonfire", s.target) < refresh
+                    && TryCast(ai, m, s, "moonfire", nullptr))
+                    result = TickResult::Acted;
+                else if (TargetAuraRemain(ai, bot, m, "insect swarm", s.target) < refresh
+                    && TryCast(ai, m, s, "insect swarm", nullptr))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "starfire" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Hold;
+                break;
+
+            case State::Maintain:
+            case State::Idle:
+            default:
+                // 月火 → 虫群 → 填充：starfire 读条长；移动中 / 蓝紧时改 wrath（读条短）
+                if (TargetAuraRemain(ai, bot, m, "moonfire", s.target) < refresh
+                    && TryCast(ai, m, s, "moonfire", nullptr))
+                    result = TickResult::Acted;
+                else if (TargetAuraRemain(ai, bot, m, "insect swarm", s.target) < refresh
+                    && TryCast(ai, m, s, "insect swarm", nullptr))
+                    result = TickResult::Acted;
+                else if (s.moving && CastFirst(ai, m, s, { "wrath" }))
+                    result = TickResult::Acted;
+                else if (s.power < float(TP(m, "wrath_mana", 30.0))
+                    && CastFirst(ai, m, s, { "wrath" }))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "starfire" }))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "wrath" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Hold;
+                break;
+        }
+
+        LogTransition(ai, m, s, st);
+        DrLogTick(ai, m, s, st, p);
+
+        // [2026-11-01 实测取证] `dr_diag=1`：当这一 tick **什么都没放出去**时，把"为什么"留痕。
+        //   背景：假人连跑时出现过整轮 45 秒 casts=0/dps=0（victim、距离、蓝量、存活全部正常），
+        //   而 `TryCast` 内部不暴露结果码 ⇒ 这里用 `CanCastSpell` 再问一次，只为日志、不改行为。
+        if (result != TickResult::Acted && TP(m, "dr_diag", 0.0) >= 1.0)
+        {
+            uint32 const nowMsD = WorldTimer::getMSTime();
+            uint32 const safeNowD = nowMsD ? nowMsD : 1;
+            if (!m->drDiagAt || WorldTimer::getMSTimeDiff(m->drDiagAt, safeNowD) >= 2000)
+            {
+                m->drDiagAt = safeNowD;
+                uint32 const sf = SpellId(ai, bot, m, "starfire", false);
+                uint32 const mf = SpellId(ai, bot, m, "moonfire", false);
+                SpellCastResult cr = SPELL_FAILED_DONT_REPORT;
+                bool const can = ai->CanCastSpell(sf, s.target, 0, true, nullptr, false, false, false, &cr);
+                sLog.outError("[DPSFSM-DRUID-DIAG] %s balance no-cast state=%s sf=%u has=%d ready=%d gcd=%d "
+                    "can=%d res=%d mf=%u mfReady=%d mana=%.0f casting=%d dist=%.1f",
+                    bot->GetName(), StateName(st), sf, (sf && bot->HasSpell(sf)) ? 1 : 0,
+                    (sf && Ready(bot, sf)) ? 1 : 0, (sf && GcdActive(bot, sf)) ? 1 : 0,
+                    can ? 1 : 0, int(cr), mf, (mf && Ready(bot, mf)) ? 1 : 0,
+                    s.power, s.casting ? 1 : 0, s.dist);
+            }
+        }
+        return result;
+    }
+    ai::dpsfsm::TickResult TickDruidFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+        if (m->spec == Spec::Feral)
+            return TickFeralFsm(ai, m, s);
+        if (m->spec == Spec::Balance)
+            return TickBalanceFsm(ai, m, s);
+        return TickResult::Decline;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -8249,9 +9003,15 @@ namespace ai
             //   它们不是 DPS 循环问题）⇒ 行为与 mode=0/1/2/3/4 完全一致。
             //   这张图不是优先级表，是 GCD 时间轮（详见 TickShadowFsm 上面的注释）。
             bool const priestFsm = (m->spec == Spec::Shadow);
+            // [2026-11-01 站长口径] 德鲁伊接进 mode=5（第十张职业图）：野性 + 平衡。
+            //   恢复（Restoration）**也选进来**，但 `TickDruidFsm` 第一行就 Decline ——
+            //   这样 mode=5 的恢复德不会被 legacy `TickDruid` 的平衡循环误接管；
+            //   mode=0/1/2/3/4 的德鲁伊照旧走 legacy，一个字节不动。
+            bool const druidFsm = (m->spec == Spec::Feral || m->spec == Spec::Balance
+                || m->spec == Spec::Restoration);
             if (dmode == DecisionMode::Fsm
                 && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm || retFsm
-                    || shamanFsm || priestFsm))
+                    || shamanFsm || priestFsm || druidFsm))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
@@ -8278,6 +9038,8 @@ namespace ai
                     fsmResult = TickShamanFsm(ai, m, s);
                 else if (priestFsm)
                     fsmResult = TickShadowFsm(ai, m, s);
+                else if (druidFsm)
+                    fsmResult = TickDruidFsm(ai, m, s);
                 else
                     fsmResult = (m->spec == Spec::Destruction)
                         ? TickWarlockFsm(ai, m, s) : TickWarlockDotsFsm(ai, m, s);
