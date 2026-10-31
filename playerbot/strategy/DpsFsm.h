@@ -165,7 +165,7 @@ namespace ai
 
         // [2026-11-01 站长口径] mode=5（显式状态图）当前覆盖的专精：
         //   法师 冰/奥/火 · 猎人 兽王/射击/生存 · 战士 武器/狂暴 · 盗贼 战斗/刺杀/敏锐
-        //   · 术士 毁灭/**痛苦/恶魔** · 圣骑士 惩戒 · 萨满 元素/增强
+        //   · 术士 毁灭/**痛苦/恶魔** · 圣骑士 惩戒 · 萨满 元素/增强 · **牧师 暗影**
         //   （术士三系共用 `DpsFsm.cpp → TickWarlockFsmCore()`：毁灭走 `TickWarlockFsm()`，
         //     痛苦/恶魔走 `TickWarlockDotsFsm()`，只换单体表与群架档；
         //     痛苦 DoT 续期用 `TargetAuraRemain() < refresh_dot`，多目标铺前 `multidot_max` 个腐蚀）。
@@ -179,6 +179,13 @@ namespace ai
         //     施放图腾后 `GetTotemGuid(slot)` **仍为空**（召唤走 SPELL_EFFECT_SUMMON，不登记槽位，
         //     见 KNOWN_ISSUES §10.53）⇒ 状态机自己记账（BotMem 的 totemCastAt/totemEntry/totemPos），
         //     判据见 DpsFsm.cpp → ShTotemNeed()。**不要**改回"查槽位判空"，那会把 GCD 全吃在图腾上。
+        //   牧师状态表（细节见 DpsFsm.cpp 的"牧师·暗影"一节）：
+        //     Idle / Prep(暗影形态缺失) / Approach(>range_caster) / Recover(蓝<recover_power：药水→魔杖)
+        //       / Aoe(多目标铺 DoT) / Burst(目标<burst_hp：饰品→灭→轮) / Maintain
+        //   ⚠️ 暗影是**唯一走 GCD 时间轮**的专精，不是优先级表：一拍 = 一个 GCD，
+        //     维护 swp/vt/mb 三个时间点，并做**两拍前视**避让（两个 DoT 不许同拍到期，
+        //     也不许卡在心爆的拍上）。戒律/神圣继续 Decline（不是 DPS 循环问题）。
+        //   见 DpsFsm.cpp → TickShadowFsm() / ShadowPlanBeat() / TickShadowBeat()。
         bool Tick(PlayerbotAI* ai);
     }
 }

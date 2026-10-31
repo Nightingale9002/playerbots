@@ -241,6 +241,27 @@ namespace
         //   连续 2 次仍读不到就退避 30 秒（实测一轮 18 次诅咒空转、dps 205、dots 恒 0）。
         int wlCurseTries = 0;
         uint32 wlCurseSkipUntil = 0;
+        // [2026-11-01 站长口径] 牧师·暗影（mode=5，**GCD 时间轮**）专用：
+        //   spBeat / spBeatAt —— 拍钟：`spBeat` 是"现在是第几拍"，`spBeatAt` 是**下一拍开始**的毫秒时刻。
+        //                        一拍 = 一个 GCD(1.5s)；引导技（精神鞭笞 3s）额外再吃一拍。
+        //   spMbReadyAt       —— 心爆"记账"的可再用时刻：核心没有"还剩多少毫秒"的公开接口
+        //                        （`IsSpellReady` 只给 bool），轮上要算"距心爆还有几拍"就只能自己记；
+        //                        CD 长度取自模板 `CategoryRecoveryTime` 经 `SPELLMOD_COOLDOWN`
+        //                        （强化心爆天赋）修正，与核心 `Player::AddCooldown` 同一条判据。
+        //                        **能不能放仍由 `Ready()` 决定**，记账只用于排拍。
+        //   spWheelBeat       —— 上一次打 `[DPSFSM-WHEEL]` 的拍号（同一次撞车只报一行）。
+        //   spDots / spBeatAct —— `[DPSFSM-PRIEST]` 的 dots=（当前目标挂了几个 DoT）与 beats=（本拍动作）。
+        uint32 lastPriestLog = 0;
+        int    spBeat = 0;
+        uint32 spBeatAt = 0;
+        uint32 spMbReadyAt = 0;
+        int    spWheelBeat = -1;
+        int    spDots = 0;
+        char const* spBeatAct = "-";
+        //   spIdsCheckedAt —— "法术缓存体检"的时刻（5 秒一次，见 TickShadowFsm 的说明）。
+        //   spDiagAt       —— [DPSFSM-PRIEST-DIAG] 的 10 秒节流（`sp_diag=1` 才打）。
+        uint32 spIdsCheckedAt = 0;
+        uint32 spDiagAt = 0;
         // [2026-11-01 站长口径] 法师·火法（mode=5）专用（详见 DpsFsm.cpp 的“法师·火法”一节）：
         //   fireFbSinceScorch —— 自上次补灼烧以来**放出的火球数**：维护节奏的**主**判据
         //                        （叠满后每 scorch_refresh_fireballs(8) 发火球补一次 ≈ 24 秒）；
@@ -3465,7 +3486,19 @@ namespace ai
             m->wfLastProcAt = 0;
             m->wfProcs = 0;
             m->wfReadyPrev = true;
-
+            // [2026-11-01 站长口径] 牧师·暗影：**时间轮的拍钟必须跨轮清零** ——
+            //   否则上一轮的 spBeatAt 停在几十秒前，新一轮第一次进 ShadowAdvanceBeat 会看到
+            //   "已经过了很多拍"（虽然那里做了不补拍的对齐，但拍号/撞车间隔仍然带着旧相位）；
+            //   spMbReadyAt 更直接：会让新一轮开局就"心爆已就绪"，前视窗口整体错位。
+            m->lastPriestLog = 0;
+            m->spBeat = 0;
+            m->spBeatAt = 0;
+            m->spMbReadyAt = 0;
+            m->spWheelBeat = -1;
+            m->spDots = 0;
+            m->spBeatAct = "-";
+            m->spIdsCheckedAt = 0;
+            m->spDiagAt = 0;
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
                 name = "guid=" + std::to_string(guid);
@@ -7474,6 +7507,572 @@ namespace ai
         return result;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] 牧师 · 暗影（Shadow）—— mode=5 的第九张职业图
+    //   （口径来源：dev/DESIGN_dps_fsm_graphs.md §6.9 + §10.7，站长 2026-11-01 定稿）
+    //
+    //   **这张图与前面八张有本质区别：暗牧不是优先级表，是 GCD 时间轮。**
+    //   legacy 的 `TickPriest`（mode=0/1/2/3/4 的暗牧路径）一个字节都不动：
+    //   这里只在 `mode=5` 且 `Spec::Shadow` 时接管（见 `Tick()` 的派发）。
+    //
+    //   为什么必须按拍排：心爆 6 秒 CD 正好 4 个 GCD（GCD 1.5s），触/痛是十几秒量级，
+    //   三者的"到期拍"会周期性相撞。优先级表只能看"这一拍挑一个"，看不见"下一拍撞车"
+    //   ⇒ 实测表现就是周期性丢心爆、或者两个 DoT 在同一拍一起到期（一次挤掉两个 GCD）。
+    //
+    //   时间轮本体（**一拍 = 一个 GCD**）：
+    //     · 拍钟：`BotMem::spBeat` / `spBeatAt`（下一拍开始的毫秒时刻）。挂钟过一拍 +1；
+    //       引导技（精神鞭笞 3 秒）额外再吃一拍（`spBeatAt += gcd`）。
+    //       停过太久（> 4 拍，例如换场景/假人重开）**不补拍**、直接对齐到现在。
+    //     · 三个时间点，全部换算成"还有几拍"（见 ShadowWheel）：
+    //         swp —— 目标身上**痛**的剩余毫秒：**严格等到到期之后**才续，不提前覆盖；
+    //         vt  —— 目标身上**触**的剩余毫秒 **减去一个读条**（实际 1.5s，按急速算）：
+    //                提前一个 GCD 起手，让新触正好落在旧触到期的瞬间；
+    //         mb  —— 心爆"记账"的剩余（CD 取自模板 categoryRecoveryTime 经 SPELLMOD_COOLDOWN 修正）。
+    //     · **两拍前视**：把三个"还有几拍"摊在 [0, 2] 窗口里，若两件事落在**同一拍**
+    //       ⇒ 低优先者**延后一拍**，并打 `[DPSFSM-WHEEL] <bot> defer=<swp|vt> reason=collision`。
+    //       优先级：**心爆 > 触 > 痛**（心爆是 4 拍一次的锚点；触有读条前置、拖一发就断 1.5 秒；
+    //       痛是瞬发，晚一拍只少一跳 —— "宁可少一跳也不撞车"正是站长口径）。
+    //     · 拍里没排到东西 ⇒ 填充：先 **灭**（带反伤守卫），再 **精神鞭笞**（引导 3s，占 2 拍）。
+    //     · 仇恨到 Throttle/Wait ⇒ **渐隐（fade）**占这一拍：暗牧是仇恨大户，用一个空 GCD
+    //       换后面能多打的 GCD，比硬打一下更值（`fade_throttle=1` 可关）。
+    //     · 多目标：上限 `multidot_max`(5)、**优先血量最多的**；铺不铺看"每 GCD 收益"
+    //       （见 ShadowMultiDot 的判据与它记录的取舍）。
+    // ==========================================================================
+
+    // 一拍里"该发生什么"的判定结果（纯数据：不碰世界、不改状态）。
+    struct ShadowWheel
+    {
+        int  gcdMs = 1500;          // 一拍多长（TP: gcd_ms）
+        int  vtCastMs = 1500;       // 触的**实际**读条（按当前急速算）
+        int  swpRemain = 0;         // 目标身上"痛"的剩余毫秒（0 = 没挂/已到期）
+        int  vtRemain = 0;          // 目标身上"触"的剩余毫秒
+        int  mbRemain = 0;          // 心爆还差多少毫秒可用（我方记账）
+        int  swpBeats = 0;          // 距"痛到期"还有几拍
+        int  vtBeats = 0;           // 距"该起手触"还有几拍
+        int  mbBeats = 0;           // 距心爆可用还有几拍
+        bool swpDue = false;        // 本拍该续痛
+        bool vtDue = false;         // 本拍该起手触
+        bool mbDue = false;         // 本拍该打心爆
+        bool deferSwp = false;      // 前视判定：本拍让给别的动作（撞车）
+        bool deferVt = false;
+    };
+
+    // 拍钟推进。`spBeatAt` = "下一拍开始的毫秒时刻"。
+    //   注：`WorldTimer::getMSTimeDiff` 是 uint32，异常跳变（回绕/时钟源切换）时按"对齐"处理，
+    //   绝不让 `spBeat` 一次跳几十拍 —— 那样前视窗口就失去意义了。
+    void ShadowAdvanceBeat(BotMem* m, uint32 safeNow, int gcdMs)
+    {
+        if (!m->spBeatAt || gcdMs <= 0)
+        {
+            m->spBeatAt = safeNow;
+            m->spBeat = 0;
+            return;
+        }
+        int32 const elapsed = int32(WorldTimer::getMSTimeDiff(m->spBeatAt, safeNow));
+        if (elapsed < 0 || elapsed > gcdMs * 4)
+        {
+            m->spBeatAt = safeNow;      // 停过/换场景：对齐，**不补拍**
+            return;
+        }
+        while (int32(WorldTimer::getMSTimeDiff(m->spBeatAt, safeNow)) >= gcdMs)
+        {
+            m->spBeatAt += uint32(gcdMs);
+            ++m->spBeat;
+        }
+    }
+
+    // 心爆的真实 CD（毫秒）：模板 `CategoryRecoveryTime` 经 `SPELLMOD_COOLDOWN`（强化心爆）修正，
+    //   与核心 `Player::AddCooldown` 走的是同一条判据（见 Player.cpp → AddCooldown 的
+    //   "blizzlike code for choosing which is recTime > categoryRecTime"）。
+    //   `mb_cd_ms` > 0 时直接用它（调参/对照用）；读不到模板才退回 6000。
+    int ShadowMindBlastCdMs(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        double const forced = TP(m, "mb_cd_ms", 0.0);
+        if (forced > 0.0)
+            return int(forced);
+        uint32 const id = SpellId(ai, s.bot, m, "mind blast", false);
+        SpellEntry const* e = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
+        if (!e)
+            return 6000;
+        int32 cd = 6000;
+        if (e->CategoryRecoveryTime)
+        {
+            cd = int32(e->CategoryRecoveryTime);
+            if (s.bot)
+                s.bot->ApplySpellMod(id, SPELLMOD_COOLDOWN, cd, false);
+        }
+        if (cd < 1000 || cd > 60000)
+            cd = 6000;
+        return int(cd);
+    }
+
+    // 把三个时间点摊成"还有几拍"，再做两拍前视（结果只写进 ShadowWheel，不改 BotMem 的决策状态）。
+    void ShadowPlanBeat(PlayerbotAI* ai, BotMem* m, Snapshot& s, ShadowWheel& w)
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+
+        w.gcdMs = int(TP(m, "gcd_ms", 1500.0));
+        if (w.gcdMs < 500)
+            w.gcdMs = 500;
+
+        w.vtCastMs = CastMsWithMod(ai, m, s, "vampiric touch", w.gcdMs);
+        if (w.vtCastMs <= 0)
+            w.vtCastMs = w.gcdMs;
+
+        ShadowAdvanceBeat(m, safeNow, w.gcdMs);
+
+        uint32 const swpId = SpellId(ai, s.bot, m, "shadow word: pain", false);
+        uint32 const vtId = SpellId(ai, s.bot, m, "vampiric touch", false);
+        uint32 const mbId = SpellId(ai, s.bot, m, "mind blast", false);
+
+        // ① 两个 DoT：读**目标身上**的实测剩余（任意 rank，见 TargetAuraRemain）
+        w.swpRemain = swpId ? TargetAuraRemain(ai, s.bot, m, "shadow word: pain", s.target) : 0;
+        w.vtRemain = vtId ? TargetAuraRemain(ai, s.bot, m, "vampiric touch", s.target) : 0;
+
+        // ② 心爆：我方记账。记账说"该好了"但核心说不行（真实 CD 更长 / 天赋没点）⇒
+        //    至少再等一拍，避免每 tick 都白试一次。
+        w.mbRemain = 0;
+        if (m->spMbReadyAt)
+        {
+            int32 const d = int32(m->spMbReadyAt) - int32(safeNow);
+            w.mbRemain = d > 0 ? d : 0;
+        }
+        bool const mbReady = mbId && Ready(s.bot, mbId);
+        if (mbId && w.mbRemain <= 0 && !mbReady)
+        {
+            m->spMbReadyAt = safeNow + uint32(w.gcdMs);
+            w.mbRemain = w.gcdMs;
+        }
+
+        auto beatsTo = [&w](int remainMs) -> int
+        {
+            if (remainMs <= 0)
+                return 0;
+            return (remainMs + w.gcdMs - 1) / w.gcdMs;
+        };
+
+        // 触的起手拍 = 到期 − 读条 − (dot_lead_gcd − 1) 个 GCD。
+        //   `dot_lead_gcd=1`（默认）就是"把读条本身当成唯一的提前量"：正好落在旧触到期的瞬间。
+        int const leadGcd = int(TP(m, "dot_lead_gcd", 1.0));
+        int const vtLeadMs = w.vtCastMs + (leadGcd > 1 ? (leadGcd - 1) * w.gcdMs : 0);
+
+        w.swpBeats = beatsTo(w.swpRemain);
+        w.vtBeats = beatsTo(w.vtRemain - vtLeadMs);
+        w.mbBeats = beatsTo(w.mbRemain);
+
+        w.swpDue = (swpId != 0) && (w.swpRemain <= 0);      // 严格等到期之后
+        w.vtDue = (vtId != 0) && (w.vtRemain <= vtLeadMs);  // 提前一个读条起手
+        w.mbDue = (mbId != 0) && (w.mbRemain <= 0) && mbReady;
+
+        // ③ **两拍前视**：只修 [0, 2] 窗口里的"同一拍撞车"。
+        //    优先级 心爆 > 触 > 痛 —— 低优先者延后一拍（下一拍立刻补，只少一跳）。
+        int const mbBeat = w.mbDue ? 0 : w.mbBeats;
+        int const vtBeat = w.vtDue ? 0 : w.vtBeats;
+        int const swpBeat = w.swpDue ? 0 : w.swpBeats;
+        bool const mbFirst = TP(m, "mb_first", 1.0) >= 1.0;
+        int const look = 2;
+
+        auto sameBeat = [look](int a, int b)
+        {
+            return a <= look && b <= look && a == b;
+        };
+
+        // 心爆的那一拍不能被 DoT 占掉（站长口径："不许卡在心爆的拍上"）
+        if (mbFirst && mbId && sameBeat(mbBeat, swpBeat))
+            w.deferSwp = true;
+        if (mbFirst && mbId && sameBeat(mbBeat, vtBeat))
+            w.deferVt = true;
+        // 两个 DoT 自己撞车：触先（有读条前置，拖一发就断档），痛让一拍（瞬发，晚一拍只少一跳）
+        if (sameBeat(vtBeat, swpBeat))
+            w.deferSwp = true;
+    }
+
+    // 目标身上"暗牧这一套"DoT 已挂几个（只给 `[DPSFSM-PRIEST]` 的 dots= 用，不参与决策）。
+    int ShadowDotCount(PlayerbotAI* ai, Player* bot, BotMem* m, Unit* u)
+    {
+        if (!u)
+            return 0;
+        static char const* kDots[] = { "shadow word: pain", "vampiric touch", "devouring plague" };
+        int n = 0;
+        for (char const* d : kDots)
+            if (SpellId(ai, bot, m, d, false) && AuraStacks(ai, bot, m, d, u) > 0)
+                ++n;
+        return n;
+    }
+
+    // 一个 DoT 在目标身上"还能跳几下"：有 aura 用**实测剩余 / 实测跳间隔**，
+    //   没 aura 按"满时长 / TP(dot_tick_ms)"（默认 3000ms 一跳，读不到就按这个）。
+    int ShadowDotTicksLeft(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, Unit* u)
+    {
+        int const fallbackTick = int(TP(m, "dot_tick_ms", 3000.0));
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
+        int period = fallbackTick ? fallbackTick : 3000;
+        if (id && u)
+        {
+            uint32 const first = sSpellMgr.GetFirstSpellInChain(id);
+            for (uint32 cur = first ? first : id; cur; cur = sSpellMgr.GetNextSpellInChain(cur))
+            {
+                SpellAuraHolder* holder = u->GetSpellAuraHolder(cur);
+                if (!holder)
+                    continue;
+                for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+                {
+                    Aura* aura = holder->GetAuraByEffectIndex(SpellEffectIndex(i));
+                    if (!aura || !aura->GetModifier() || !aura->GetModifier()->periodictime)
+                        continue;
+                    period = int(aura->GetModifier()->periodictime);
+                    break;
+                }
+                break;
+            }
+        }
+        int remain = TargetAuraRemain(ai, s.bot, m, name, u);
+        if (remain <= 0)
+        {
+            SpellEntry const* e = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
+            int const full = e ? int(GetSpellDuration(e)) : 0;
+            remain = full > 0 ? full : 15000;
+        }
+        if (period <= 0)
+            period = 3000;
+        return remain / period;
+    }
+
+    // [2026-11-01 站长口径] 暗牧·多目标：`possible targets` 里**血量最多的前 multidot_max(5) 个**，
+    //   超过 5 个不再扩（回头集火血量最高的）。排序用**绝对血量降序**：血最多的死得最慢 ⇒ DoT 跳得最多。
+    //   铺不铺走**每 GCD 收益**判据（站长原话：剩余跳数 × 单跳 ÷ 占用 GCD > 填充技收益）。
+    //   ⚠️ 记录这里的取舍（不编数字）：DoT 的单跳伤害能从目标身上的 aura 读到（`Modifier::m_amount`，
+    //      含法伤），但**填充技**（心爆/鞭/灭）的"每 GCD 实际伤害"本模块读不到 ——
+    //      没有伤害事件接口，只有施法次数（`botCasts`）。拿模板基础值去比含法伤的 DoT 每跳会
+    //      系统性低估填充 ⇒ 反而错误地多铺。所以把"填充技一个 GCD"折算成 **DoT 跳数**：
+    //      `multidot_fill_ticks`(默认 4)：**剩余跳数 > 它才铺**。这是这条判据唯一的自由参数，
+    //      conf 里可调（`shadow:multidot_fill_ticks=N`），不是从真实伤害模型推出来的。
+    bool ShadowMultiDot(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        int const cap = int(TP(m, "multidot_max", 5.0));
+        float const fillTicks = float(TP(m, "multidot_fill_ticks", 4.0));
+        if (cap <= 1 || !s.target)
+            return false;
+        if (s.pack30 < 2)               // 单目标不谈多目标：那条路归时间轮
+            return false;
+
+        std::vector<Unit*> list;
+        CountHostilesNear(ai, s.bot, float(TP(m, "range_caster", 30.0)), &list);
+        if (list.size() < 2)
+            return false;
+        std::sort(list.begin(), list.end(), [](Unit* a, Unit* b)
+        {
+            if (a->GetHealth() != b->GetHealth())
+                return a->GetHealth() > b->GetHealth();
+            return a->GetObjectGuid() < b->GetObjectGuid();
+        });
+        if (int(list.size()) > cap)
+            list.resize(size_t(cap));
+
+        for (Unit* u : list)
+        {
+            if (!u || u == s.target || !u->IsAlive())
+                continue;               // 当前目标交给轮（那里有撞车/到期判据），这里只照顾别人
+            for (int kind = 0; kind < 2; ++kind)
+            {
+                char const* name = kind ? "vampiric touch" : "shadow word: pain";
+                if (!SpellId(ai, s.bot, m, name, false))
+                    continue;           // 没学会（天赋没点）：跳过，不刷"没有可用技能"
+                if (TargetAuraRemain(ai, s.bot, m, name, u) > 0)
+                    continue;           // 已经挂着 ⇒ 不重铺（重复铺会顶掉，白读一个 GCD）
+                int const ticks = ShadowDotTicksLeft(ai, m, s, name, u);
+                if (float(ticks) <= fillTicks)
+                    continue;           // 跳不满 ⇒ 这个 GCD 不如拿去打填充
+                if (TryCast(ai, m, s, name, u))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // 灭的反伤守卫（站长口径）：灭对**没死**的目标会反弹伤害给自己 ⇒
+    //   只在"自身血量 > `swd_min_self_hp`(50%)"或"目标血量低于灭的单发伤害（能打死）"时才放。
+    //   单发伤害取模板基础值（**不含法伤** ⇒ 保守：宁可晚一点进斩杀，也不把自己反死）。
+    bool ShadowDeathOk(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!s.target)
+            return false;
+        uint32 const id = SpellId(ai, s.bot, m, "shadow word: death", false);
+        if (!id)
+            return false;
+        if (s.selfHp > float(TP(m, "swd_min_self_hp", 50.0)))
+            return true;
+        SpellEntry const* e = sServerFacade.LookupSpellInfo(id);
+        if (!e)
+            return false;
+        int32 const dmg = e->EffectBasePoints[EFFECT_INDEX_0] + 1;
+        if (dmg <= 0)
+            return false;
+        return int32(s.target->GetHealth()) <= dmg;
+    }
+
+    // 一个 GCD 的动作（Maintain / Aoe / Burst 共用的"拍"）。
+    ai::dpsfsm::TickResult TickShadowBeat(PlayerbotAI* ai, BotMem* m, Snapshot& s,
+        ThreatLevel threat, ShadowWheel& w)
+    {
+        using ai::dpsfsm::TickResult;
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        bool const mbFirst = TP(m, "mb_first", 1.0) >= 1.0;
+
+        // ⓪ 本拍确实"因撞车而延后"⇒ 打一条 [DPSFSM-WHEEL]（同一拍只报一行，便于脚本验收轮在转）
+        if (((w.deferSwp && w.swpDue) || (w.deferVt && w.vtDue)) && m->spWheelBeat != m->spBeat)
+        {
+            m->spWheelBeat = m->spBeat;
+            sLog.outError("[DPSFSM-WHEEL] %s defer=%s reason=collision",
+                s.bot->GetName(), w.deferSwp ? "swp" : "vt");
+        }
+
+        // ① 仇恨：Throttle/Wait ⇒ 渐隐占这一拍（暗牧是仇恨大户；省下的仇恨 = 后面能多打的 GCD）
+        if (TP(m, "fade_throttle", 1.0) >= 1.0 && threat != ThreatLevel::Open
+            && SpellId(ai, s.bot, m, "fade", false) && TryCastSelf(ai, m, s, "fade"))
+        {
+            m->spBeatAct = "fade";
+            return TickResult::Acted;
+        }
+
+        // ② 心爆优先（mb_first=1）：这一拍排给心爆，同拍的 DoT 已在前视里让开
+        if (mbFirst && w.mbDue && TryCast(ai, m, s, "mind blast", nullptr))
+        {
+            m->spMbReadyAt = safeNow + uint32(ShadowMindBlastCdMs(ai, m, s));
+            m->spBeatAct = "mb";
+            return TickResult::Acted;
+        }
+
+        // ③ 触：提前一个读条起手，让新触正好落在旧触到期的瞬间
+        if (w.vtDue && !w.deferVt && TryCast(ai, m, s, "vampiric touch", nullptr))
+        {
+            m->spBeatAct = "vt";
+            return TickResult::Acted;
+        }
+
+        // ④ 痛：严格等到期之后再续（瞬发；被前视判让路时晚一拍，只少一跳）
+        if (w.swpDue && !w.deferSwp && TryCast(ai, m, s, "shadow word: pain", nullptr))
+        {
+            m->spBeatAct = "swp";
+            return TickResult::Acted;
+        }
+
+        // ⑤ mb_first=0（A/B 用）：DoT 续满之后才排心爆
+        if (!mbFirst && w.mbDue && TryCast(ai, m, s, "mind blast", nullptr))
+        {
+            m->spMbReadyAt = safeNow + uint32(ShadowMindBlastCdMs(ai, m, s));
+            m->spBeatAct = "mb";
+            return TickResult::Acted;
+        }
+
+        // ⑥ 多目标铺 DoT（每 GCD 收益判据；见 ShadowMultiDot 的取舍说明）
+        if (ShadowMultiDot(ai, m, s))
+        {
+            m->spBeatAct = "multi";
+            return TickResult::Acted;
+        }
+
+        // ⑦ 填充：先灭（带反伤守卫），守卫/CD 不过再精神鞭笞（引导 3 秒 = 占 2 拍）
+        if (ShadowDeathOk(ai, m, s) && TryCast(ai, m, s, "shadow word: death", nullptr))
+        {
+            m->spBeatAct = "swd";
+            return TickResult::Acted;
+        }
+        if (SpellId(ai, s.bot, m, "mind flay", false) && TryCast(ai, m, s, "mind flay", nullptr))
+        {
+            // 引导 3 秒 = 占 2 拍：把下一拍推后一个 GCD（否则轮会把引导中间当成空拍）
+            m->spBeatAt += uint32(w.gcdMs);
+            m->spBeatAct = "flay";
+            return TickResult::Acted;
+        }
+
+        // ⑧ 这一拍什么都没放出去。**只有"GCD 还没转好"才算有意空着**（此时引擎也不该插）；
+        //    其它原因（射程/目标非法/技能解析失败/被拒）一律交回引擎 —— Hold 会把引擎**完全挡住**，
+        //    实测出现过"victim 正常、dist 17.5、45 秒 0 施法 0 伤害、eng 计数也不涨"的一轮，
+        //    根因就是这里把结构性失败当成了"有意空着"。
+        m->spBeatAct = "hold";
+        if (TP(m, "sp_diag", 0.0) >= 1.0
+            && (!m->spDiagAt || WorldTimer::getMSTimeDiff(m->spDiagAt, safeNow) >= 10000))
+        {
+            m->spDiagAt = safeNow;
+            uint32 const swpId = SpellId(ai, s.bot, m, "shadow word: pain", false);
+            uint32 const mbId = SpellId(ai, s.bot, m, "mind blast", false);
+            SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+            bool can = false;
+            if (swpId && s.target)
+                can = ai->CanCastSpell(swpId, s.target, 0, false, nullptr, false, false, false, &res);
+            sLog.outError("[DPSFSM-PRIEST-DIAG] %s tick=%u beat=%d dist=%.1f casting=%d "
+                "ids(swp=%u mb=%u vt=%u flay=%u swd=%u) has(swp=%d) ready(mb=%d) cancast(swp)=%d res=%d "
+                "tgt=%s tgtAlive=%d",
+                s.bot->GetName(), m->tickCount, m->spBeat, s.dist, s.casting ? 1 : 0,
+                swpId, mbId,
+                SpellId(ai, s.bot, m, "vampiric touch", false),
+                SpellId(ai, s.bot, m, "mind flay", false),
+                SpellId(ai, s.bot, m, "shadow word: death", false),
+                swpId ? (s.bot->HasSpell(swpId) ? 1 : 0) : 0,
+                mbId ? (Ready(s.bot, mbId) ? 1 : 0) : 0,
+                can ? 1 : 0, int(res),
+                s.target ? s.target->GetName() : "-",
+                (s.target && s.target->IsAlive()) ? 1 : 0);
+        }
+        // GCD 没转好 ⇒ 有意空着（Hold）；否则交回引擎（Decline），别把它挡在外面。
+        return GcdActive(s.bot, SpellId(ai, s.bot, m, "mind blast", false))
+            ? TickResult::Hold : TickResult::Decline;
+    }
+
+    // 状态转移：只看 Snapshot + TP（Prep 的形态门是唯一"读自己身上 aura"的地方）。
+    State ShadowEval(PlayerbotAI* ai, BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+        // Prep：暗影形态是整张图的前提（不在形态里既没有 15% 暗影加成，技能表也不对）
+        if (SpellId(ai, s.bot, m, "shadowform", false)
+            && AuraStacks(ai, s.bot, m, "shadowform", s.bot) == 0)
+            return State::Prep;
+        if (s.power < float(TP(m, "recover_power", 10.0)))
+            return State::Recover;
+        if (s.dist > float(TP(m, "range_caster", 30.0)))
+            return State::Approach;
+        if (s.pack30 >= AoEPack(m))
+            return State::Aoe;
+        if (s.targetHp <= BurstHp(m) && threat != ThreatLevel::Wait)
+            return State::Burst;
+        return State::Maintain;
+    }
+
+    // [DPSFSM-PRIEST] 每 10 秒一条（WorldTimer 节流）：
+    //   swp/vt/mb = 轮上的三个时间点（毫秒；0 = 已到期/可用），beats = 本拍动作，
+    //   dots = 当前目标已挂的 DoT 数，mana/threat 便于切日志。
+    void ShadowLogTick(PlayerbotAI* ai, BotMem* m, Snapshot& s, State st,
+        ShadowWheel const& w, ThreatLevel threat, uint32 safeNow)
+    {
+        if (m->lastPriestLog && WorldTimer::getMSTimeDiff(m->lastPriestLog, safeNow) < 10000)
+            return;
+        m->lastPriestLog = safeNow;
+        m->spDots = ShadowDotCount(ai, s.bot, m, s.target);
+        sLog.outError("[DPSFSM-PRIEST] %s state=%s swp=%d vt=%d mb=%d beats=%s dots=%d mana=%.0f threat=%s",
+            s.bot->GetName(), ai::dpsfsm::StateName(st), w.swpRemain, w.vtRemain, w.mbRemain,
+            m->spBeatAct ? m->spBeatAct : "-", m->spDots, s.power, ThreatLevelName(threat));
+    }
+
+    ai::dpsfsm::TickResult TickShadowFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+
+        // 读条/引导中一律不插技能（与 TickArcaneFsm 同一口径；CastChecked 也会因 GCD 拒绝）
+        if (s.casting)
+            return TickResult::Acted;
+
+        // [2026-11-01 实测自愈] **法术缓存体检**（5 秒一次，成本可忽略）：
+        //   `BotMem::ids` 是"名字 → id"的**永久缓存**（含负结果 0），而假人场景每轮都会 respec
+        //   （`arms`/`dummy` 的 respec=1）。如果某次解析正好落在"天赋正在重排、法术书是空的"那一瞬，
+        //   就会把 0 永久记下来 ⇒ 这一轮所有暗牧技能都解析成 0：轮上什么都不 due、
+        //   填充也拿不到 id、于是每拍都走 Hold，**引擎同时被挡住**（实测一轮 45 秒 0 施法 0 伤害，
+        //   而 victim/距离/存活全部正常）。这里把"解析成 0"或"已不在法术书里"的条目丢掉重解析。
+        static char const* kSpellNames[] = {
+            "shadow word: pain", "vampiric touch", "mind blast",
+            "shadow word: death", "mind flay", "fade", "shadowform"
+        };
+        if (!m->spIdsCheckedAt || WorldTimer::getMSTimeDiff(m->spIdsCheckedAt, safeNow) >= 5000)
+        {
+            m->spIdsCheckedAt = safeNow;
+            for (char const* n : kSpellNames)
+            {
+                auto it = m->ids.find(n);
+                if (it == m->ids.end())
+                    continue;
+                if (it->second == 0 || !s.bot->HasSpell(it->second))
+                    m->ids.erase(it);
+            }
+        }
+
+        ThreatLevel const threat = EvalThreat(m, s);
+        State st = ShadowEval(ai, m, s, threat);
+
+        // 轮每 tick 都算一次：即使这一拍什么都不放，日志里的三个时间点也要是当前的。
+        ShadowWheel w;
+        ShadowPlanBeat(ai, m, s, w);
+
+        TickResult result = TickResult::Decline;
+        switch (st)
+        {
+            case State::Prep:
+                if (TryCastSelf(ai, m, s, "shadowform"))
+                {
+                    m->spBeatAct = "form";
+                    result = TickResult::Acted;
+                }
+                break;
+
+            case State::Approach:
+                result = TickResult::Decline;      // 走位归引擎
+                break;
+
+            case State::Recover:
+                // 有蓝职业通用：蓝缺口 > potion_mana_deficit 先喝药水（瞬发、不打断），
+                // 剩下的（喝水/魔杖）交回引擎 —— 与冰法/奥法同一口径。
+                if (UseManaPotion(m, s))
+                {
+                    m->spBeatAct = "potion";
+                    result = TickResult::Acted;
+                }
+                else if (CastFirst(ai, m, s, { "shoot" }))
+                {
+                    m->spBeatAct = "wand";
+                    result = TickResult::Acted;
+                }
+                break;
+
+            case State::Aoe:
+                // 群架：先把**血量最多的前 multidot_max 个**铺上 DoT（每 GCD 收益达标才铺），
+                //   铺完的拍回到与单体完全相同的轮（心爆/触/痛/灭/鞭）。
+                if (ShadowMultiDot(ai, m, s))
+                {
+                    m->spBeatAct = "multi";
+                    result = TickResult::Acted;
+                }
+                else
+                    result = TickShadowBeat(ai, m, s, threat, w);
+                break;
+
+            case State::Burst:
+                // 斩杀段：饰品 → 灭（守卫此时基本放行：目标血低）→ 轮
+                if (UseTrinket(ai, m, s))
+                {
+                    m->spBeatAct = "trinket";
+                    result = TickResult::Acted;
+                }
+                else if (ShadowDeathOk(ai, m, s) && TryCast(ai, m, s, "shadow word: death", nullptr))
+                {
+                    m->spBeatAct = "swd";
+                    result = TickResult::Acted;
+                }
+                else
+                    result = TickShadowBeat(ai, m, s, threat, w);
+                break;
+
+            case State::Idle:
+            case State::Maintain:
+            default:
+                st = (st == State::Idle) ? State::Idle : State::Maintain;
+                if (st == State::Idle)
+                    result = TickResult::Decline;
+                else
+                    result = TickShadowBeat(ai, m, s, threat, w);
+                break;
+        }
+
+        LogTransition(ai, m, s, st);
+        ShadowLogTick(ai, m, s, st, w, threat, safeNow);
+        return result;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -7645,9 +8244,14 @@ namespace ai
             //   **元素 / 增强**进图；**恢复（Restoration）不做 DPS**（治疗以后单独做）⇒ 不进图，
             //   继续走 legacy `TickShaman`（在那里保持原有行为）。mode=0/1/2/3/4 的萨满也不变。
             bool const shamanFsm = (m->spec == Spec::Elemental || m->spec == Spec::Enhancement);
+            // [2026-11-01 站长口径] 暗牧接进 mode=5（第九张职业图）：`TickShadowFsm`。
+            //   **只接 Shadow**：戒律/神圣继续走 legacy `TickPriest`（在那里 Decline，
+            //   它们不是 DPS 循环问题）⇒ 行为与 mode=0/1/2/3/4 完全一致。
+            //   这张图不是优先级表，是 GCD 时间轮（详见 TickShadowFsm 上面的注释）。
+            bool const priestFsm = (m->spec == Spec::Shadow);
             if (dmode == DecisionMode::Fsm
                 && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm || retFsm
-                    || shamanFsm))
+                    || shamanFsm || priestFsm))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
@@ -7672,6 +8276,8 @@ namespace ai
                     fsmResult = TickRetFsm(ai, m, s);
                 else if (shamanFsm)
                     fsmResult = TickShamanFsm(ai, m, s);
+                else if (priestFsm)
+                    fsmResult = TickShadowFsm(ai, m, s);
                 else
                     fsmResult = (m->spec == Spec::Destruction)
                         ? TickWarlockFsm(ai, m, s) : TickWarlockDotsFsm(ai, m, s);
