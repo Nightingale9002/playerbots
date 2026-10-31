@@ -21,6 +21,7 @@ namespace ai
             Burst,      // 爆发窗口（仇恨稳定 + CD 好即开，早用早 CD）
             Aoe,        // 群伤
             Weave,      // 等自动射击窗口（猎人：读条会顶掉自动射击）
+            Maintain,   // [2026-10-31] 猎人平射计时器窗口：按平射剩余时间决定这一手放什么/空着
             Recover     // 资源/血量不足，回蓝回血
         };
 
@@ -86,6 +87,19 @@ namespace ai
             float myThreat = 0.0f;
             float tankThreat = 0.0f;
             bool tankAlive = false;
+            // [2026-10-31 站长口径] 猎人平射/读条时间轴：**只在 spec 是猎人时计算**
+            //   （其它职业保持默认值，不增加任何开销）。
+            //   autoRemainMs —— 距下一发自动射击还剩多少毫秒。
+            //      ⚠️ 本核心的 `Unit::getAttackTimer(RANGED_ATTACK)` **不随时间递减**
+            //      （Unit::Update 只递减 BASE/OFF），所以该字段由状态机侧"自动射击计数 + 观测周期"反推，
+            //      不是直接读那个死计时器（详见 DpsFsm.cpp 的 BotMem::autoShotAt 注释）。
+            //   steadyCastMs —— 当前急速下稳固射击的**实际**读条（SpellMgr::GetSpellCastTime × 远程攻速倍率）
+            //   multiReady / arcaneReady / killCommandReady —— 本 tick 是否可用（含 GCD/冷却）
+            int autoRemainMs = 0;
+            int steadyCastMs = 1500;
+            bool multiReady = false;
+            bool arcaneReady = false;
+            bool killCommandReady = false;
         };
 
         Spec DetectSpec(PlayerbotAI* ai);

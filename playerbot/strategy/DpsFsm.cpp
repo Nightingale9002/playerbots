@@ -35,6 +35,7 @@ namespace ai
                 case State::Aoe:      return "Aoe";
                 case State::Weave:    return "Weave";
                 case State::Recover:  return "Recover";
+                case State::Maintain: return "Maintain";
             }
             return "?";
         }
@@ -124,6 +125,21 @@ namespace
         //   召唤失败只打一条诊断（别每 tick 刷屏），换了 bot 对象（重登）才允许再打一条。
         bool petLogDone = false;        // 宠物召唤失败的诊断只打一次
         Player* petLogBot = nullptr;    // 上次打诊断时的 bot 对象（重登后指针会变 ⇒ 重置一次）
+        // [2026-10-31] 猎人时间轴诊断只打一次：把 core 算出来的稳固读条/急速倍率留痕，
+        //   方便判断"这一轮用的是 1500 回落值还是真实急速值"。
+        bool steadyCastLogged = false;
+        // [2026-10-31] 猎人计时器窗口诊断（`hunter_diag=1` 才开，2 秒一条）：取证"为什么没读稳固"
+        uint32 hunterDiagAt = 0;
+        // [2026-10-31 实测结论] 本核心 **不递减** `m_attackTimer[RANGED_ATTACK]`
+        //   （Unit::Update 只递减 BASE_ATTACK/OFF_ATTACK）⇒ getAttackTimer(RANGED_ATTACK)
+        //   不会随时间下降，不能当"下一发平射还剩多久"。真实节奏由两个核心事实决定：
+        //     ① 自动射击的冷却 = Player::AddCooldown 里 `RecoveryTime(0) + UNIT_FIELD_RANGEDATTACKTIME(2000)`；
+        //     ② 每次施法/移动打断自动射击后重挂，核心 `_UpdateAutoRepeatSpell` 先走 0.5s 起手。
+        //   所以这里用 `botSpellCounts[75]`（核心每发自动射击都会自增）反推"上一发时刻/观测周期"。
+        uint32 autoShotCount = 0;
+        uint32 autoShotAt = 0;
+        uint32 autoShotInterval = 2000;
+        bool autoRepeatWasPresent = false;
         uint32 engRuns = 0;
         uint32 dupDebuff = 0;       // [2026-10-30] 同类 debuff 已被更强/相等效果占住时仍施放的次数（互斥分析用）         // 引擎真正跑过的 tick 数（诊断白字缺口用）
         uint32 movTicks = 0;        // 在移动的 tick 数（移动会打断挥击）
@@ -583,6 +599,62 @@ namespace
         return n;
     }
 
+    // ==========================================================================
+    // [2026-10-31 站长口径] 猎人时间轴（平射计时器模型）的**取数**：
+    //   平射隐藏施法 0.5s（受急速）｜平射独立冷却 (武器速度−0.5)s（受急速）
+    //   ｜GCD 1.5s（不受急速）｜稳固读条 1.5s 基础、**受急速**。
+    //   不写急速挡位表：每 tick 现算 steady_window = 实际稳固读条 + autoshot_land。
+    // ==========================================================================
+    bool IsHunterSpec(Spec sp)
+    {
+        return sp == Spec::BeastMastery || sp == Spec::Marksmanship || sp == Spec::Survival;
+    }
+
+    // 远程攻速倍率（<1 = 有急速/箭袋加速）。
+    //   核心在 `Spell::prepare → GetSpellCastTime(spell != nullptr)` 里对
+    //   `USES_RANGED_SLOT` 技能（稳固/瞄准都是）用 `m_modAttackSpeedPct[RANGED_ATTACK]` 缩放，
+    //   而那个成员是 protected，模块侧拿不到 ⇒ 用同一份数据的等价关系反推：
+    //     · ApplyAttackTimePercentMod 对 `UNIT_FIELD_BASEATTACKTIME` 与 m_modAttackSpeedPct **同步**缩放；
+    //     · Unit::GetAttackTime() = 字段 / m_modAttackSpeedPct ⇒ 比值恒为未急速的武器速度；
+    //     · 所以 倍率 = 字段 / GetAttackTime()。
+    float HunterRangedSpeedMod(Player* bot)
+    {
+        if (!bot || !bot->IsInWorld())
+            return 1.0f;
+        uint32 const base = bot->GetAttackTime(RANGED_ATTACK);
+        float const field = bot->GetFloatValue(
+            static_cast<uint16>(UNIT_FIELD_BASEATTACKTIME) + static_cast<uint16>(RANGED_ATTACK));
+        if (!base || field <= 0.0f)
+            return 1.0f;
+        float const mod = field / float(base);
+        if (mod <= 0.05f || mod > 1.5f)     // 异常值 ⇒ 当没有急速，别把窗口算翻
+            return 1.0f;
+        return mod;
+    }
+
+    // 当前急速下某个远程读条技的**实际**读条毫秒。取不到返回 0（调用方回落到 TP 默认值）。
+    //   注意 `GetSpellCastTime(entry, bot)`（无 Spell 对象）本身**不加急速**，但会把核心对猎人远程
+    //   技能的 +500ms 工具条口径算进去（稳固的 CastingTimeIndex 是 1000 ⇒ 这里返回 1500）；
+    //   急速那一层由上面的远程攻速倍率补上，与 Spell 对象路径一致（稳固是 IS_ABILITY + RANGED_SLOT）。
+    int HunterRangedCastMs(PlayerbotAI* ai, BotMem* m, char const* name)
+    {
+        if (!ai || !ai->GetBot())
+            return 0;
+        uint32 const id = SpellId(ai, ai->GetBot(), m, name, false);
+        if (!id)
+            return 0;
+        SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+        if (!entry)
+            return 0;
+        uint32 const base = GetSpellCastTime(entry, ai->GetBot());
+        if (!base)
+            return 0;
+        int const ms = int(float(base) * HunterRangedSpeedMod(ai->GetBot()) + 0.5f);
+        if (ms < 300 || ms > 6000)
+            return 0;
+        return ms;
+    }
+
     void BuildSnapshot(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         Player* bot = ai->GetBot();
@@ -655,6 +727,74 @@ namespace
                     s.tankAlive = true;
                     s.tankThreat = tank->getThreatManager().getThreat(s.target);
                 }
+            }
+        }
+
+        // [2026-10-31] 猎人时间轴字段：只在猎人 spec 计算（别的职业不碰这几个成员，
+        //   保持默认值 0/1500/false，避免每 tick 多做几次法术/光环查询）。
+        if (IsHunterSpec(m->spec))
+        {
+            // 到下一发自动射击的剩余毫秒。
+            //   ⚠️ `getAttackTimer(RANGED_ATTACK)` 在本核心是**死值**（见 BotMem 里的取证注释），
+            //   只保留原始值进诊断；真正可用的剩余时间由"自动射击计数 + 观测周期"反推。
+            uint32 const rawTimer = bot->getAttackTimer(RANGED_ATTACK);
+            bool const repeatPresent = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32 const safeNow = nowMs ? nowMs : 1;
+
+            // 核心每发自动射击都会在 `_UpdateAutoRepeatSpell` 里 ++botSpellCounts[75]
+            uint32 const shotCount = uint32(bot->botSpellCounts[75]);
+            if (shotCount != m->autoShotCount)
+            {
+                // 观测周期：只有 ≥1000ms 的间隔才算"平射冷却"（核心 2s，打断后约 2.5s）；
+                //   重挂后第一发的 ~500ms 起手不算周期，观测完把间隔恢复成核心默认 2000。
+                if (m->autoShotCount && m->autoShotAt)
+                {
+                    uint32 const delta = WorldTimer::getMSTimeDiff(m->autoShotAt, safeNow);
+                    if (delta >= 1000 && delta <= 6000)
+                        m->autoShotInterval = delta;
+                    else if (delta < 1000)
+                        m->autoShotInterval = 2000;
+                }
+                m->autoShotCount = shotCount;
+                m->autoShotAt = safeNow;
+            }
+            else if (repeatPresent && !m->autoRepeatWasPresent)
+            {
+                // 刚重挂上：核心先走 0.5s 起手（m_AutoRepeatFirstCast），第一发约 500ms 后
+                m->autoShotAt = safeNow;
+                m->autoShotInterval = 500;
+            }
+            m->autoRepeatWasPresent = repeatPresent;
+
+            if (!repeatPresent || !m->autoShotAt)
+                s.autoRemainMs = 0;
+            else
+            {
+                uint32 const interval = m->autoShotInterval ? m->autoShotInterval : 2000;
+                int const elapsed = int(WorldTimer::getMSTimeDiff(m->autoShotAt, safeNow));
+                int remain = int(interval) - elapsed;
+                s.autoRemainMs = remain > 0 ? (remain < int(interval) ? remain : int(interval)) : 0;
+            }
+
+            int const steady = HunterRangedCastMs(ai, m, "steady shot");
+            s.steadyCastMs = steady ? steady : int(TP(m, "steady_cast_ms", 1500.0));
+
+            s.multiReady = Ready(bot, SpellId(ai, bot, m, "multi-shot", false));
+            s.arcaneReady = Ready(bot, SpellId(ai, bot, m, "arcane shot", false));
+            s.killCommandReady = Ready(bot, SpellId(ai, bot, m, "kill command", false));
+
+            if (!m->steadyCastLogged)
+            {
+                m->steadyCastLogged = true;
+                sLog.outError("[DPSFSM-HUNTER] %s spec=%s autoRemain=%dms(observed interval=%ums rawTimer=%ums) "
+                    "steadyCast=%dms(%s) rangedMod=%.3f weapon=%ums hasted=%.0f multi=%d arcane=%d kc=%d dist=%.1f",
+                    bot->GetName(), ai::dpsfsm::SpecName(m->spec), s.autoRemainMs, m->autoShotInterval,
+                    rawTimer, s.steadyCastMs, steady ? "core" : "fallback", HunterRangedSpeedMod(bot),
+                    bot->GetAttackTime(RANGED_ATTACK),
+                    double(bot->GetFloatValue(static_cast<uint16>(UNIT_FIELD_BASEATTACKTIME)
+                        + static_cast<uint16>(RANGED_ATTACK))),
+                    s.multiReady ? 1 : 0, s.arcaneReady ? 1 : 0, s.killCommandReady ? 1 : 0, s.dist);
             }
         }
     }
@@ -2931,6 +3071,209 @@ namespace ai
         return FsmResult(CastFirst(ai, m, s, { "frostbolt" }));
     }
 
+    // ==========================================================================
+    // [2026-10-31 站长口径] 猎人状态图（兽王/射击/生存，mode=5；legacy TickHunter 不动）
+    //   四计时器：平射隐藏施法 0.5s（受急速）｜平射独立冷却（武器速度−0.5s，受急速）
+    //            ｜GCD 1.5s（不受急速）｜稳固读条 1.5s 基础（受急速）。
+    //   Maintain 的动作表只读 Snapshot 里的 autoRemainMs / steadyCastMs / *Ready，
+    //   窗口不够就返回 Hold（有意空着，引擎也不许插），而不是"随便放一个"把平射顶掉。
+    // ==========================================================================
+    State EvalHunter(BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        // 资源：蓝 < recover_enter 进 Recover，回到 recover_exit 才出（滞回，避免抖动）
+        float const recoverEnter = float(TP(m, "recover_enter", 10.0));
+        float const recoverExit = float(TP(m, "recover_exit", 30.0));
+        bool const alreadyRecover = (m->state == State::Recover);
+        if (alreadyRecover ? (s.power < recoverExit) : (s.power < recoverEnter))
+            return State::Recover;
+
+        if (s.pack30 >= AoEPack(m))
+            return State::Aoe;
+
+        // 爆发：仇恨 Open 且间隔到了就开；进入后 burst_window 秒内保持 Burst，
+        //   让"急速射击 → 狂野怒火 → 杀戮命令 → 饰品"能跨几个 tick 依次放完。
+        time_t const now = time(nullptr);
+        if (now < m->burstUntil)
+            return State::Burst;
+        if (threat == ThreatLevel::Open
+            && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+            return State::Burst;
+
+        if (s.dist > float(TP(m, "hunter_range", 35.0)))
+            return State::Approach;
+
+        return State::Maintain;
+    }
+
+    // Maintain 动作表（顺序，命中即停）：
+    //   1 杀戮命令（兽王）→ 2 auto_remain <= autoshot_land → 奥射/否则 Hold
+    //   3 autoshot_land < auto_remain < steady_window → 多重 → 奥射 → 否则 Hold
+    //   4 auto_remain >= steady_window → 稳固 → 5 兜底 Hold
+    ai::dpsfsm::TickResult TickHunterMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 宠物掉队/换目标就重新下令（宠物仇恨不算在 bot 头上，Wait 档也让它继续咬）
+        CommandPetAttack(s);
+
+        // 1) 杀戮命令：GCD 外、最高优先（只有兽王点得出来，且必须有宠物在打）
+        if (m->spec == Spec::BeastMastery && s.killCommandReady && PetPresent(s)
+            && TryCast(ai, m, s, "kill command", s.target))
+            return TickResult::Acted;
+
+        int const land = int(float(TP(m, "autoshot_land_ms", 500.0)) * HunterRangedSpeedMod(s.bot) + 0.5f);
+        int const steadyWindow = s.steadyCastMs + land;
+
+        // [站长口径] 瞄准射击只有 boss 策略点名（use_aimed=1）才允许出现；
+        //   默认 0 ⇒ 本分支恒不进，瞄准射击不会出现在任何常规循环里。
+        if (TP(m, "use_aimed", 0.0) >= 1.0 && !s.moving)
+        {
+            int const aimedCast = int(TP(m, "aimed_cast_ms", 3000.0));
+            if (s.autoRemainMs >= aimedCast + land && CastFirst(ai, m, s, { "aimed shot" }))
+                return TickResult::Acted;
+        }
+
+        // 2) 平射马上落地：只能打瞬发；奥射没好就**空着等这一发**（读稳固等于白送平射）
+        if (s.autoRemainMs <= land)
+        {
+            if (s.arcaneReady && TryCast(ai, m, s, "arcane shot", s.target))
+                return TickResult::Acted;
+            return TickResult::Hold;
+        }
+
+        // 3) 窗口放不下稳固、但够一发瞬发：多重 → 奥射 → 否则空着
+        if (s.autoRemainMs < steadyWindow)
+        {
+            if (s.multiReady && TryCast(ai, m, s, "multi-shot", s.target))
+                return TickResult::Acted;
+            if (s.arcaneReady && TryCast(ai, m, s, "arcane shot", s.target))
+                return TickResult::Acted;
+            return TickResult::Hold;
+        }
+
+        // 4) 窗口够：稳固填充（移动中读条会被取消 ⇒ 空着走位）
+        if (!s.moving && TryCast(ai, m, s, "steady shot", s.target))
+            return TickResult::Acted;
+
+        // 5) 兜底：窗口不明/技能都没好 ⇒ 有意空着，别让引擎插一手把平射顶掉
+        return TickResult::Hold;
+    }
+
+    ai::dpsfsm::TickResult TickHunterFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 仇恨档位本 tick 只算一次（诊断日志在 EvalThreat 内部按 10 秒节流）
+        ThreatLevel const threat = EvalThreat(m, s);
+        State const st = EvalHunter(m, s, threat);
+
+        // 进入 Burst 的那一刻打点（不是每 tick 重置）：窗口才能跨 tick 放完整套爆发
+        if (st == State::Burst && m->state != State::Burst)
+        {
+            m->lastBurst = time(nullptr);
+            m->burstUntil = m->lastBurst + time_t(TP(m, "burst_window", 6.0));
+        }
+        m->state = st;
+
+        TickResult result = TickResult::Decline;
+        switch (st)
+        {
+            case State::Recover:
+                // 蝰蛇守护回蓝（没有该光环才挂）；否则用普通攻击，放不出就空着
+                if (AuraStacks(ai, s.bot, m, "aspect of the viper", s.bot) == 0
+                    && TryCastSelf(ai, m, s, "aspect of the viper"))
+                    result = TickResult::Acted;
+                else if (TryCast(ai, m, s, "shoot", s.target))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Hold;
+                break;
+
+            case State::Aoe:
+                CommandPetAttack(s);
+                // 箭雨（地面）→ 多重 → 回落到 Maintain 计时器表
+                if (!s.moving && TryCastAt(ai, m, s, "volley",
+                        s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ()))
+                    result = TickResult::Acted;
+                else if (s.multiReady && TryCast(ai, m, s, "multi-shot", s.target))
+                    result = TickResult::Acted;
+                else
+                    result = TickHunterMaintain(ai, m, s);
+                break;
+
+            case State::Burst:
+                CommandPetAttack(s);
+                // 顺序：急速射击 → 狂野怒火 → 杀戮命令 → 饰品；都放完就回 Maintain 继续输出
+                if (CastFirst(ai, m, s, { "rapid fire" }))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "bestial wrath" }))
+                    result = TickResult::Acted;
+                else if (s.killCommandReady && PetPresent(s)
+                    && TryCast(ai, m, s, "kill command", s.target))
+                    result = TickResult::Acted;
+                else if (UseTrinket(ai, m, s))
+                    result = TickResult::Acted;
+                else
+                    result = TickHunterMaintain(ai, m, s);
+                break;
+
+            case State::Approach:
+                result = TickResult::Decline;   // 走位归引擎
+                break;
+
+            case State::Maintain:
+                result = TickHunterMaintain(ai, m, s);
+                break;
+
+            case State::Idle:
+            default:
+                result = TickResult::Decline;
+                break;
+        }
+
+        // ------------------------------------------------------------------
+        // L6 不变量：核心 `Player::CastSpell()` 每次施法前都会
+        //   `InterruptSpell(CURRENT_AUTOREPEAT_SPELL)` —— 所以**任何施法之后**自动射击
+        //   都会被顶掉。只要没挂着就立刻重挂（自动射击不吃 GCD），这一步必须在 Tick 末尾，
+        //   否则中间那 0.5 秒起手会把自动射击饿死。
+        // ------------------------------------------------------------------
+        if (s.target && !s.moving && s.dist >= 8.0f
+            && !s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        {
+            if (!TryCast(ai, m, s, "auto shot", s.target))
+                ai->DoSpecificAction("auto shot", Event(), true);
+        }
+
+        // [2026-10-31] `hunter_diag=1` 时的窗口取证（默认关，2 秒一条）：
+        //   平射剩余 / 平射落地 / 稳固窗口 / 自动射击是否挂着 / 本 tick 放出了什么。
+        if (TP(m, "hunter_diag", 0.0) >= 1.0)
+        {
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32 const safeNow = nowMs ? nowMs : 1;
+            if (!m->hunterDiagAt || WorldTimer::getMSTimeDiff(m->hunterDiagAt, safeNow) >= 2000)
+            {
+                m->hunterDiagAt = safeNow;
+                char const* res = (result == TickResult::Acted) ? "acted"
+                    : (result == TickResult::Hold ? "hold" : "decline");
+                int const land = int(float(TP(m, "autoshot_land_ms", 500.0))
+                    * HunterRangedSpeedMod(s.bot) + 0.5f);
+                sLog.outError("[DPSFSM-HUNTER-DIAG] %s state=%s auto=%dms land=%d win=%d steady=%d "
+                    "rawTimer=%ums interval=%ums autoRepeat=%d moving=%d mult=%d arc=%d kc=%d res=%s",
+                    s.bot->GetName(), ai::dpsfsm::StateName(m->state), s.autoRemainMs, land,
+                    s.steadyCastMs + land, s.steadyCastMs,
+                    s.bot->getAttackTimer(RANGED_ATTACK), m->autoShotInterval,
+                    s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) ? 1 : 0,
+                    s.moving ? 1 : 0, s.multiReady ? 1 : 0, s.arcaneReady ? 1 : 0,
+                    s.killCommandReady ? 1 : 0, res);
+            }
+        }
+
+        return result;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -3070,15 +3413,19 @@ namespace ai
             if (ModeIsTable(dmode))
                 return TickPolicy(ai, m);
 
-            // [2026-10-31 S2] mode=5：显式状态图。目前只有冰法有图（试点），
+            // [2026-10-31 S2] mode=5：显式状态图。冰法（试点）+ 猎人三系（兽王/射击/生存）。
             //   其它专精还没有图 ⇒ 继续往下走手写处理器，行为与 legacy 相同。
-            if (dmode == DecisionMode::Fsm && m->spec == Spec::Frost)
+            if (dmode == DecisionMode::Fsm
+                && (m->spec == Spec::Frost || IsHunterSpec(m->spec)))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
                 // [2026-10-31 站长口径] 三态返回：Acted=我出手了；Hold=我有意空着（引擎也别插）；
                 //   Decline=我不处理，交回引擎（走位/追击/开怪/喝水）。
-                switch (TickFrostFsm(ai, m, s))
+                ai::dpsfsm::TickResult const fsmResult = (m->spec == Spec::Frost)
+                    ? TickFrostFsm(ai, m, s)
+                    : TickHunterFsm(ai, m, s);
+                switch (fsmResult)
                 {
                     case ai::dpsfsm::TickResult::Acted:
                         return true;
