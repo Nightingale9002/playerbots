@@ -6,6 +6,8 @@
 #include "NamedObjectContext.h"
 #include "Strategy.h"
 #include <set>
+#include <map>
+#include <atomic>
 
 namespace ai
 {
@@ -15,6 +17,42 @@ namespace ai
 
 namespace ai
 {
+    // -------------------------------------------------------------------------------------------
+    // [registry-audit 2026-11-01] 带"注册表自省"的 context 容器。
+    //
+    // 原来的 NamedObjectContextList 只有一个 contexts 链表，外面问不出"某个名字被几个 context
+    // 注册过"。这里在 Add() 时多记一份指针，用来**只读**地数重复定义（D1）；GetObject() 的
+    // 遍历顺序/返回值一行没动，所以"谁先注册谁生效"的老行为保持不变。
+    template <class T>
+    class AuditedObjectContextList : public NamedObjectContextList<T>
+    {
+    public:
+        void Add(NamedObjectContext<T>* context)
+        {
+            NamedObjectContextList<T>::Add(context);
+
+            if (context)
+                auditedContexts.push_back(context);
+        }
+
+        // 每个名字在多少个 context 的 creator 表里出现（= 有几个同名 creator）。
+        // 纯查询：只读各 factory 的 creators map，不 Create、不产生任何对象。
+        void CountCreators(std::map<std::string, int>& counts) const
+        {
+            for (typename std::list<NamedObjectContext<T>*>::const_iterator i = auditedContexts.begin(); i != auditedContexts.end(); ++i)
+            {
+                std::set<std::string> keys;
+                (*i)->GetSupportedKeys(keys);
+
+                for (std::set<std::string>::const_iterator k = keys.begin(); k != keys.end(); ++k)
+                    ++counts[*k];
+            }
+        }
+
+    private:
+        std::list<NamedObjectContext<T>*> auditedContexts;
+    };
+
     class AiObjectContext : public PlayerbotAIAware
     {
     public:
@@ -24,8 +62,15 @@ namespace ai
     public:
         virtual Strategy* GetStrategy(const std::string& name) { return strategyContexts.GetObject(name, ai); }
         virtual std::set<std::string> GetSiblingStrategy(const std::string& name) { return strategyContexts.GetSiblings(name); }
-        virtual Trigger* GetTrigger(const std::string& name) { return triggerContexts.GetObject(name, ai); }
-        virtual Action* GetAction(const std::string& name) { return actionContexts.GetObject(name, ai); }
+        // [registry-audit 2026-11-01] 这两个改用 out-of-line 定义（AiObjectContext.cpp），
+        // 因为第一次解析时要做一次"重复定义"自省；之后只剩一次原子读，热路径开销可忽略。
+        virtual Trigger* GetTrigger(const std::string& name);
+        virtual Action* GetAction(const std::string& name);
+
+        // [registry-audit 2026-11-01] 只读探针：注册表里有没有这个 creator。不 Create 对象，
+        // 因此可以在 Engine::Init() 里安全地问"策略引用的名字在不在"，不会改变任何解析时机。
+        bool HasActionCreator(const std::string& name);
+        bool HasTriggerCreator(const std::string& name);
         virtual UntypedValue* GetUntypedValue(const std::string& name)
         {
             if (name.empty())
@@ -150,10 +195,19 @@ namespace ai
         void BuildTriggerContexts();
         void BuildValueContexts();
 
-        NamedObjectContextList<Strategy> strategyContexts;
-        NamedObjectContextList<Action> actionContexts;
-        NamedObjectContextList<Trigger> triggerContexts;
-        NamedObjectContextList<UntypedValue> valueContexts;
+        // [registry-audit 2026-11-01] D1：进程内首次解析时整体扫一遍注册表，之后不再重复扫。
+        void EnsureActionRegistryAudit();
+        void EnsureTriggerRegistryAudit();
+
+        // [registry-audit 2026-11-01] 指向"本类注册表"的只读名字索引（桶按 typeid 分，见 .cpp）。
+        // 空指针 = 还没扫过；扫描失败/被跳过的极端情况保持空，调用方按"未知"而不是"MISSING"处理。
+        std::atomic<const std::map<std::string, int>*> actionCreatorIndex{ nullptr };
+        std::atomic<const std::map<std::string, int>*> triggerCreatorIndex{ nullptr };
+
+        AuditedObjectContextList<Strategy> strategyContexts;
+        AuditedObjectContextList<Action> actionContexts;
+        AuditedObjectContextList<Trigger> triggerContexts;
+        AuditedObjectContextList<UntypedValue> valueContexts;
     };
 
     // -------------------------------------------------------------------------------------------

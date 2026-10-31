@@ -2,6 +2,7 @@
 
 #include <map>
 #include <mutex>
+#include <cstddef>
 
 #include "Action.h"
 #include "Queue.h"
@@ -115,6 +116,11 @@ namespace ai
         // Drops armed entries whose TriggerNode is gone, so they cannot suppress later packets of the
         // same opcode forever. Called from Init() once the trigger list has been rebuilt.
         void PruneUnhandledExternalEvents();
+        // [registry-audit 2026-11-01] D2：策略注册期校验。只读注册表 + 只写日志，不改解析结果。
+        //   ValidateStrategyTriggers(): 只校验 InitTriggers() 新追加的那一段 TriggerNode
+        //   ValidateNextActionNames(): 校验一份 NextAction[] 里的每个动作名是否有 creator
+        void ValidateStrategyTriggers(Strategy* strategy, std::size_t triggerFromIndex);
+        void ValidateNextActionNames(Strategy* strategy, NextAction** actions, const char* origin);
 
     private:
         void LogAction(const char* format, ...);

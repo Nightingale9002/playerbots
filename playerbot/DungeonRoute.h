@@ -533,6 +533,26 @@ namespace dungeonroute
         return st;
     }
 
+    // ---- 诊断日志的"最小键"（dtelemetry::Event 的 key 参数）------------------------
+    // [2026-11-01 站长口径] 节流是**按 (tag,key)** 的，所以 key 必须能区分"谁在哪"，
+    //   否则一个 bot 的噪声会把整张图别的 bot 的诊断压掉。用最小、最稳定的键：
+    //     · "谁的决策"（PULLWHY/PULLSAFE/PULLCOST）⇒ bot guid low；
+    //     · "在哪一波"（MOVETGT/PULLDIAG）        ⇒ (map<<20)|ord（ord 是 16 位、map 只有几千，不会溢出）。
+    //   key=0 表示"全局键"，同一 tag 下所有 key=0 的调用共用一个窗口。
+    //   这两个函数是**纯函数**，不读也不写任何状态；只影响日志口径，不影响行为。
+    inline uint32 TeleKeyBot(Player const* bot)
+    {
+        return bot ? uint32(bot->GetGUIDLow()) : 0;
+    }
+
+    // ord=0（boss 阶段 / 还没定波）时退化成 bot 维度：否则所有 boss 阶段会共用一个 key
+    inline uint32 TeleKeyWave(uint32 mapId, uint16 ord, Player const* bot)
+    {
+        if (!ord)
+            return TeleKeyBot(bot);
+        return (mapId << 20) | uint32(ord);
+    }
+
     // ---- 数据加载（线程安全，每图只加载一次）--------------------------------------
     inline std::mutex& RouteMutex() { static std::mutex m; return m; }
     inline std::map<uint32, MapRoute>& RouteCache() { static std::map<uint32, MapRoute> c; return c; }

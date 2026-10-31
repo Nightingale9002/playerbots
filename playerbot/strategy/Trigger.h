@@ -89,6 +89,12 @@ namespace ai
         void setTrigger(Trigger* trigger) { this->trigger = trigger; }
         std::string getName() { return name; }
 
+        // [2026-11-01 registry-audit] 只读窥视已挂在节点上的 NextAction 数组：
+        //   getHandlers() 会 clone+merge 且要求 trigger 非空（会把 Trigger 实例化时机提前到
+        //   Engine::Init），而注册表自检只要"名字"，所以给一个不创建对象、不分配内存的入口。
+        //   没有显式数组的节点返回 NULL（其默认动作由 Strategy::getDefaultActions() 那条覆盖）。
+        NextAction** peekHandlers() { return handlers; }
+
     public:
         NextAction** getHandlers();
         float getFirstRelevance();

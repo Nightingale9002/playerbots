@@ -3,6 +3,7 @@
 #include "playerbot/DungeonRoute.h"
 #include "playerbot/CoverSpot.h"   // 离线预筛的卡视野点库
 #include "DungeonRouteActions.h"
+#include "DungeonTelemetry.h"           // [2026-11-01] 诊断日志节流 + 结构化（PULLWHY/PULLSAFE/PULLCOST/MOVETGT/PULLDIAG）
 #include "MotionGenerators/MoveMap.h"   // [2026-10-25] 卡视野改用**导航网格**判墙面
 #include "MotionGenerators/WaypointManager.h"        // [2026-10-26] 巡逻怪按路径推演
 #include "MotionGenerators/WaypointMovementGenerator.h"
@@ -275,7 +276,8 @@ bool DungeonRouteMoveAction::Execute(Event& event)
         if (!st2.moveTgtLogAt || WorldTimer::getMSTimeDiff(st2.moveTgtLogAt, n2 ? n2 : 1) >= 5000)
         {
             st2.moveTgtLogAt = n2 ? n2 : 1;
-            sLog.outError("[MOVETGT] %s ord=%u guid=%u boss=%d dist=%.1f lockOrd=%u curOrd=%u",
+            dtelemetry::Event("MOVETGT", dungeonroute::TeleKeyWave(map->GetId(), target.ord, bot),
+                "%s ord=%u guid=%u boss=%d dist=%.1f lockOrd=%u curOrd=%u",
                 bot->GetName(), uint32(target.ord), target.guid, target.boss ? 1 : 0,
                 bot->GetDistance(target.px, target.py, target.pz), uint32(st2.lockOrd),
                 uint32(dungeonroute::CurrentOrd(bot, *route)));
@@ -415,7 +417,8 @@ bool DungeonRoutePullAction::Execute(Event& event)
         if (!dbgOk)
             return;
         dbgSt.pullDbgAt = dbgNow ? dbgNow : 1;
-        sLog.outError("[PULLWHY] bot=%s reason=%s dist=%.1f ord=%u combat=%d",
+        dtelemetry::Event("PULLWHY", dungeonroute::TeleKeyBot(bot),
+            "bot=%s reason=%s dist=%.1f ord=%u combat=%d",
             bot->GetName(), why, d, ord, bot->IsInCombat() ? 1 : 0);
     };
 
@@ -566,14 +569,16 @@ bool DungeonRoutePullAction::Execute(Event& event)
                 bot->GetMotionMaster()->MovePoint(0, bestX, bestY, bot->GetPositionZ());
                 if (Unit* v = bot->GetVictim())
                     bot->SetFacingToObject(v);
-                sLog.outError("[PULLSAFE] %s 拉怪位会引到 %s(entry=%u) => 挪到最近的安全点 (%.0f,%.0f) dist=%.0f",
+                dtelemetry::Event("PULLSAFE", dungeonroute::TeleKeyBot(bot),
+                    "%s 拉怪位会引到 %s(entry=%u) => 挪到最近的安全点 (%.0f,%.0f) dist=%.0f",
                     bot->GetName(), bad->GetName(), bad->GetEntry(), bestX, bestY, bestD);
                 return true;
             }
             if (!found)
             {
                 dungeonroute::StateOf(bot).pullBackPending = 1;
-                sLog.outError("[PULLSAFE] %s 附近没有安全拉怪点（%s entry=%u）=> 先拉，之后 pullback",
+                dtelemetry::Event("PULLSAFE", dungeonroute::TeleKeyBot(bot),
+                    "%s 附近没有安全拉怪点（%s entry=%u）=> 先拉，之后 pullback",
                     bot->GetName(), bad->GetName(), bad->GetEntry());
             }
         }
@@ -671,7 +676,8 @@ bool DungeonRoutePullAction::Execute(Event& event)
         st.pullCostPatrol = cost.patrolAdds;
         if (changed)
         {
-            sLog.outError("[PULLCOST] %s 目标 %s entry=%u 当前代价=%u（巡逻 %u）%s", bot->GetName(),
+            dtelemetry::Event("PULLCOST", dungeonroute::TeleKeyBot(bot),
+                "%s 目标 %s entry=%u 当前代价=%u（巡逻 %u）%s", bot->GetName(),
                 creature->GetName(), creature->GetEntry(), cost.adds, cost.patrolAdds,
                 waitMs ? "⇒ 等更便宜的时刻" : "⇒ 现在开");
         }
@@ -686,7 +692,8 @@ bool DungeonRoutePullAction::Execute(Event& event)
                 dbgReason("wait_best_window", bot->GetDistance(creature), uint32(target.ord));
                 return true;
             }
-            sLog.outError("[PULLCOST] %s 等窗口已 %us（上限 10s）⇒ 现在开（当前代价=%u）",
+            dtelemetry::Event("PULLCOST", dungeonroute::TeleKeyBot(bot),
+                "%s 等窗口已 %us（上限 10s）⇒ 现在开（当前代价=%u）",
                 bot->GetName(), waited / 1000, cost.adds);
             st.pullCostWaitSince = 0;
             st.pullWaitUntil = 0;
@@ -891,7 +898,8 @@ bool DungeonRoutePullAction::Execute(Event& event)
         uint8 mtype = 0;
         if (creature->GetMotionMaster())
             mtype = creature->GetMotionMaster()->GetCurrentMovementGeneratorType();
-        sLog.outError("[PULLDIAG] bot=%s target=%s(entry=%u guid=%u) ord=%u boss=%d dist=%.1f dz=%.1f los=%d canattack=%d imm_player=%d imm_npc=%d untargetable=%d not_attackable1=%d path_ok=%d path_type=%d end_dist=%.1f pts=%u motion=%u",
+        dtelemetry::Event("PULLDIAG", dungeonroute::TeleKeyWave(map->GetId(), target.ord, bot),
+            "bot=%s target=%s(entry=%u guid=%u) ord=%u boss=%d dist=%.1f dz=%.1f los=%d canattack=%d imm_player=%d imm_npc=%d untargetable=%d not_attackable1=%d path_ok=%d path_type=%d end_dist=%.1f pts=%u motion=%u",
             bot->GetName(), creature->GetName(), creature->GetEntry(), target.guid,
             uint32(target.ord), target.boss ? 1 : 0, distNow,
             creature->GetPositionZ() - bot->GetPositionZ(), los ? 1 : 0,

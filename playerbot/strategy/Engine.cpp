@@ -8,11 +8,109 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PerformanceMonitor.h"
 
+#include <set>
+#include <cstdlib>
+
 #ifdef BUILD_ELUNA
 #include "LuaEngine/LuaEngine.h"
 #endif
 
 using namespace ai;
+
+// -----------------------------------------------------------------------------------------------
+// [registry-audit 2026-11-01] D2：策略注册期校验（"动作无出处 / 触发器漏注册"的静默失败）。
+//
+// 背景：Strategy::InitTriggers() 里的 TriggerNode("xxx", ...) 和 NextAction[] 里的名字，如果注册表
+// 里没有对应 creator，ProcessTriggers() 只是 continue（或 DoNextAction 打一行 UNKNOWN）—— 一个
+// 触发器可能从上线以来就没生效过，没人发现。
+//
+// 这里在 Engine::Init() 里，围绕每个策略的 InitTriggers() 记下 triggers 容器的下标区间，只校验这
+// 一段**新加入**的节点：
+//   1. 触发器名没有 creator          -> [REGISTRY] strategy=<策略> trigger=<名> MISSING
+//   2. TriggerNode 的 NextAction 名没有 creator -> [REGISTRY] strategy=<策略> action=<名> MISSING
+//
+// 硬约束（零行为变化）：
+//   * 只读注册表（AiObjectContext::Has*Creator 不 Create 对象）与只写日志；选择顺序、relevance、
+//     注册顺序一律不动。
+//   * 需要 TriggerNode 的 handler 名字时，先按原有方式把 Trigger 解析出来并挂回节点（这正是
+//     ProcessTriggers() 第一个 tick 会做的事），再 getHandlers()；拿到的数组是 clone，用完销毁。
+//   * Engine::Init() 每个 bot（以及每次增删策略）都会跑 -> 全局去重 + 每类最多 N 条，之后只累计。
+// -----------------------------------------------------------------------------------------------
+namespace
+{
+    const size_t kRegistryAuditGapLogCap = 200;
+
+    struct StrategyRegistryAudit
+    {
+        std::mutex mutex;
+        std::set<std::string> seen;      // 去重键："策略|trigger|名字" / "策略|action|名字"
+        size_t triggerLogged = 0;
+        size_t actionLogged = 0;
+        size_t triggerMissing = 0;
+        size_t actionMissing = 0;
+        size_t triggerSuppressed = 0;
+        size_t actionSuppressed = 0;
+        bool summaryReported = false;
+    };
+
+    StrategyRegistryAudit& StrategyAudit()
+    {
+        static StrategyRegistryAudit audit;
+        return audit;
+    }
+
+    // 需要临时关掉整套注册表自省（例如怀疑它影响启动时序/耗时）时：环境变量 BOT_REGISTRY_AUDIT=0。
+    // 关掉后 Validate* 直接返回，也就不会在 Init 里提前解析 Trigger（回到改动前的惰性解析）。
+    bool RegistryAuditEnabled()
+    {
+        static const bool enabled = []() -> bool
+        {
+            const char* value = std::getenv("BOT_REGISTRY_AUDIT");
+            return !(value && std::string(value) == "0");
+        }();
+
+        return enabled;
+    }
+
+    // 返回 true = "这条是新告警，且还没到上限"，调用方照常 sLog.outError；否则只累计计数。
+    bool ClaimRegistryGap(const std::string& key, bool isTrigger)
+    {
+        StrategyRegistryAudit& audit = StrategyAudit();
+        std::lock_guard<std::mutex> lock(audit.mutex);
+
+        if (!audit.seen.insert(key).second)
+            return false;
+
+        size_t& missing = isTrigger ? audit.triggerMissing : audit.actionMissing;
+        size_t& logged = isTrigger ? audit.triggerLogged : audit.actionLogged;
+        size_t& suppressed = isTrigger ? audit.triggerSuppressed : audit.actionSuppressed;
+
+        ++missing;
+
+        if (logged >= kRegistryAuditGapLogCap)
+        {
+            ++suppressed;
+            return false;
+        }
+
+        ++logged;
+        return true;
+    }
+
+    void ReportRegistryGapSummary()
+    {
+        StrategyRegistryAudit& audit = StrategyAudit();
+        std::lock_guard<std::mutex> lock(audit.mutex);
+
+        if (audit.summaryReported || (!audit.triggerSuppressed && !audit.actionSuppressed))
+            return;
+
+        audit.summaryReported = true;
+        sLog.outError("[REGISTRY] MISSING summary: trigger=%u (suppressed %u), action=%u (suppressed %u), cap=%u",
+            (uint32)audit.triggerMissing, (uint32)audit.triggerSuppressed,
+            (uint32)audit.actionMissing, (uint32)audit.actionSuppressed, (uint32)kRegistryAuditGapLogCap);
+    }
+}
 
 Engine::Engine(PlayerbotAI* ai, AiObjectContext *factory, BotState state) : PlayerbotAIAware(ai), aiObjectContext(factory), state(state)
 {
@@ -110,9 +208,20 @@ void Engine::Init()
     {
         Strategy* strategy = i->second;
         strategy->InitMultipliers(multipliers, state);
+
+        // [registry-audit 2026-11-01] D2：只校验 InitTriggers() 新追加的这一段。
+        const std::size_t triggerFromIndex = triggers.size();
         strategy->InitTriggers(triggers, state);
-        MultiplyAndPush(strategy->getDefaultActions(state), 0.0f, false, Event(), "default");
+        ValidateStrategyTriggers(strategy, triggerFromIndex);
+
+        // 默认动作列表只取一次，校验用的就是即将交给 MultiplyAndPush() 的同一份指针。
+        NextAction** defaultActions = strategy->getDefaultActions(state);
+        ValidateNextActionNames(strategy, defaultActions, "default");
+
+        MultiplyAndPush(defaultActions, 0.0f, false, Event(), "default");
     }
+
+    ReportRegistryGapSummary();
 
     PruneUnhandledExternalEvents();
 
@@ -122,6 +231,69 @@ void Engine::Init()
         fprintf(file, "\n");
         fclose(file);
 	}
+}
+
+void Engine::ValidateStrategyTriggers(Strategy* strategy, std::size_t triggerFromIndex)
+{
+    if (!strategy || !aiObjectContext || !RegistryAuditEnabled())
+        return;
+
+    const std::string strategyName = strategy->getName();
+
+    // std::list 没有随机访问：从头部走 triggerFromIndex 步，只校验这之后新加入的节点。
+    std::size_t index = 0;
+    std::list<TriggerNode*>::iterator i = triggers.begin();
+    while (i != triggers.end() && index < triggerFromIndex)
+    {
+        ++i;
+        ++index;
+    }
+
+    for (; i != triggers.end(); ++i)
+    {
+        TriggerNode* node = *i;
+        if (!node)
+            continue;
+
+        const std::string triggerName = node->getName();
+
+        if (!aiObjectContext->HasTriggerCreator(triggerName))
+        {
+            if (ClaimRegistryGap(strategyName + "|trigger|" + triggerName, true))
+                sLog.outError("[REGISTRY] strategy=%s trigger=%s MISSING", strategyName.c_str(), triggerName.c_str());
+            continue;
+        }
+
+        // [2026-11-01 修] 只窥视节点上已挂的数组，**不实例化 Trigger**：
+        //   TriggerNode::getHandlers() 会 clone+merge 并且要求 trigger 非空 —— 那会把 Trigger 的
+        //   实例化时机从"第一次 ProcessTriggers"提前到每个 bot 的 Engine::Init，属于行为变化
+        //   （dead/reaction 引擎的部分 Trigger 原本可能永远不实例化）。自检只需要"名字"，
+        //   所以用 peekHandlers()：有显式数组的节点校验动作名，没有的交给 getDefaultActions() 那条。
+        NextAction** handlers = node->peekHandlers();
+        if (!handlers)
+            continue;
+
+        ValidateNextActionNames(strategy, handlers, "trigger");
+    }
+}
+
+void Engine::ValidateNextActionNames(Strategy* strategy, NextAction** actions, const char* origin)
+{
+    if (!strategy || !aiObjectContext || !actions || !RegistryAuditEnabled())
+        return;
+
+    const std::string strategyName = strategy->getName();
+
+    for (int j = 0; actions[j]; j++)
+    {
+        const std::string actionName = actions[j]->getName();
+        if (aiObjectContext->HasActionCreator(actionName))
+            continue;
+
+        if (ClaimRegistryGap(strategyName + "|action|" + actionName, false))
+            sLog.outError("[REGISTRY] strategy=%s action=%s MISSING (%s)",
+                strategyName.c_str(), actionName.c_str(), origin);
+    }
 }
 
 bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
