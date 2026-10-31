@@ -111,6 +111,10 @@ namespace
         int  mode = 0;                  // [2026-10-31 S1] 本 tick 解析出的 DecisionMode（存 int：
                                         //   枚举声明在 BotMem 之后；TickPolicy 直接读它，不再二次读 conf）
         time_t lastBurst = 0;           // [2026-10-31 S2] 上次进入爆发的时间（"早用早 CD"的门）
+        int  burstRounds = 0;           // [2026-10-31 站长口径] 冰法进入 Burst 的轮数：
+                                        //   急冷(cold snap) 只在第 2 轮及以后放（第一轮先叠 buff/召水元素）
+        time_t burstUntil = 0;          // [2026-10-31 站长口径] 本轮爆发的结束时刻：窗口内保持 Burst，
+                                        //   让"冰冷血脉 → 饰品 → 水元素 → 急冷"能分几个 tick 依次放完
         // [2026-10-31 站长口径] 宠物（水元素/地狱火/猎人宠物/暗影魔…）是 17 个专精共用的输出单元：
         //   召唤失败只打一条诊断（别每 tick 刷屏），换了 bot 对象（重登）才允许再打一条。
         bool petLogDone = false;        // 宠物召唤失败的诊断只打一次
@@ -2638,6 +2642,31 @@ namespace ai
     //         ② 转移条件只读 Snapshot + TP 参数，不读世界、不打日志；
     //         ③ 没放出去就 return false，把走位/追击交回引擎（共同作用，不是抢活）。
     // ==========================================================================
+    // [2026-10-31 站长口径] "仇恨领先"的保守近似：没有落后于坦克即视为领先。
+    //   与 AttackAction 同一份实现（不复制判断）；假人场景 SkipEngine 恒真 ⇒ 恒领先。
+    bool ThreatLead(PlayerbotAI* ai, Snapshot& s)
+    {
+        return dpsfsm::SkipEngine(s.bot->GetGUIDLow())
+            || !AttackAction::WaitingForTankThreat(ai, s.bot, s.target);
+    }
+
+    // [2026-10-31 站长口径] 冰法 Aoe 里**暴风雪已降级为可选**：只有
+    //   ① 怪不在近身 aoe_melee_range 内（远程场景），或
+    //   ② 被目标追着咬、且它身上还没有减速（chilled）—— 才值得用暴风雪（1 级，减速效果一样、蓝耗低）。
+    //   `aoe_blizzard=0` 可整体关掉。
+    bool AoeWantBlizzard(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (TP(m, "aoe_blizzard", 1.0) < 1.0)
+            return false;
+        if (s.dist > float(TP(m, "aoe_melee_range", 10.0)))
+            return true;
+        if (!s.target || s.target->GetVictim() != s.bot)
+            return false;
+        if (s.dist > float(TP(m, "aoe_slow_range", 15.0)))
+            return false;
+        return AuraStacks(ai, s.bot, m, "chilled", s.target) == 0;
+    }
+
     State EvalFrost(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         if (!s.target)                                     return State::Idle;
@@ -2652,9 +2681,13 @@ namespace ai
         // [2026-10-31 站长口径] 爆发 = 仇恨稳定后**立刻开**、早用早 CD（不再等目标血量低）。
         //   单 bot 用时间间隔当"CD 门"，`burst_interval` 可调（越小越激进）。
         //   假人场景没有仇恨（SkipEngine 为真），视为仇恨稳定。
-        bool const threatOk = dpsfsm::SkipEngine(s.bot->GetGUIDLow())
-            || !AttackAction::WaitingForTankThreat(ai, s.bot, s.target);
-        if (threatOk && time(nullptr) - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+        //   爆发窗口内（burst_window 秒）一直留在 Burst：一个 GCD 只放一个技能，
+        //   "冰冷血脉 → 饰品 → 水元素 → 急冷"必须跨几个 tick 才放得完（否则只放得出第一手）。
+        time_t const now = time(nullptr);
+        if (now < m->burstUntil)
+            return State::Burst;
+        if (ThreatLead(ai, s)
+            && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
             return State::Burst;
 
         if (s.dist > float(TP(m, "range_caster", 30.0)))   return State::Approach;
@@ -2664,6 +2697,14 @@ namespace ai
     bool TickFrostFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         State const st = EvalFrost(ai, m, s);
+        // [2026-10-31 站长口径] 急冷只在"第二轮及以后"：每进入一次 Burst 计一轮（不是每 tick）。
+        //   进入时同时打点 lastBurst / 开 burstUntil 窗口，本轮爆发才能分几个 tick 依次放完。
+        if (st == State::Burst && m->state != State::Burst)
+        {
+            ++m->burstRounds;
+            m->lastBurst = time(nullptr);
+            m->burstUntil = m->lastBurst + time_t(TP(m, "burst_window", 6.0));
+        }
         m->state = st;
 
         switch (st)
@@ -2690,50 +2731,70 @@ namespace ai
                 return false;               // 走位归引擎
 
             case State::Aoe:
+            {
                 // [2026-10-31 站长口径] 群伤也不能让宠物闲着：掉队/换目标就重新下令（每 tick 检查，
                 //   10 秒一条 [DPSFSM-PET] 状态日志）
                 CommandPetAttack(s);
-                // [2026-10-31 站长口径] 暴风雪是**范围减速**，一次覆盖一片，不需要逐个目标检查；
-                //   中心点直接用当前目标的坐标（pack30>1 就是这个怪堆，不做聚类）。
-                //   默认放 **1 级暴风雪**（aoe_slow_rank=1）：减速效果一样、蓝耗低得多；
-                //   放不出来再回落 ice lance → frostbolt（保持原顺序）。
+                // 动作表：**魔爆术（近身、仇恨安全）→ 冰锥（近身且仇恨领先）→ 暴风雪（可选）→ 冰枪/寒冰箭**。
+                //   暴风雪已降级：只在"不在近身 10 码"或"需要减速"时用（aoe_slow_rank 默认 1 级，
+                //   减速效果一样、蓝耗低得多；中心点直接用当前目标坐标，pack30>1 就是这个怪堆）。
+                bool const threatOk = ThreatLead(ai, s);
+                bool const inMelee = s.dist <= float(TP(m, "aoe_melee_range", 10.0));
+                bool const wantBlizzard = AoeWantBlizzard(ai, m, s);
+                uint32 const slowRank = uint32(TP(m, "aoe_slow_rank", 1.0) + 0.5);
+                uint32 const blizzardId = SpellIdAtRank(ai, m, "blizzard", slowRank ? slowRank : 1);
+                if (!m->aoeLogDone)
                 {
-                    uint32 const slowRank = uint32(TP(m, "aoe_slow_rank", 1.0) + 0.5);
-                    uint32 const blizzardId = SpellIdAtRank(ai, m, "blizzard", slowRank ? slowRank : 1);
-                    if (!m->aoeLogDone)
-                    {
-                        m->aoeLogDone = true;
-                        sLog.outError("[DPSFSM-AOE] %s blizzard rank=%u id=%u pack30=%d",
-                            s.bot->GetName(), slowRank ? slowRank : 1, blizzardId, s.pack30);
-                    }
-                    if (blizzardId
-                        && CastIdAt(ai, m, s, blizzardId, s.target->GetPositionX(),
-                            s.target->GetPositionY(), s.target->GetPositionZ()))
-                        return true;
+                    m->aoeLogDone = true;
+                    sLog.outError("[DPSFSM-AOE] %s inmelee=%d threatOk=%d blizzard rank=%u id=%u use=%d pack30=%d dist=%.1f",
+                        s.bot->GetName(), inMelee ? 1 : 0, threatOk ? 1 : 0,
+                        slowRank ? slowRank : 1, blizzardId, wantBlizzard ? 1 : 0, s.pack30, s.dist);
                 }
+                // 主力：魔爆术（近身群伤，仇恨安全）
+                if (inMelee && TryCast(ai, m, s, "arcane explosion", nullptr))
+                    return true;
+                // 冰锥：只在近身且仇恨领先时用（否则容易抢坦的仇恨）
+                if (inMelee && threatOk && CastFirst(ai, m, s, { "cone of cold" }))
+                    return true;
+                // 暴风雪（可选）：不在近身 / 需要减速才用
+                if (wantBlizzard && blizzardId
+                    && CastIdAt(ai, m, s, blizzardId, s.target->GetPositionX(),
+                        s.target->GetPositionY(), s.target->GetPositionZ()))
+                    return true;
                 if (CastFirst(ai, m, s, { "ice lance" }))
                     return true;
                 return CastFirst(ai, m, s, { "frostbolt" });
+            }
 
             case State::Burst:
-                m->lastBurst = time(nullptr);      // 早用早 CD：进来就打点，别每 tick 重判
+                // 早用早 CD：lastBurst/burstUntil 已在"进入 Burst"那一刻打点，这里不再每 tick 重置
                 // [2026-10-31 站长口径] 无蓝职业（战/贼）的爆发消耗品 = 加速药水；有蓝的这里自动跳过
                 if (UseHastePotion(m, s))
                     return true;
-                // [2026-10-31 站长口径] 水元素走统一入口：没有宠物才召，失败留一条可区分的
-                //   [DPSFSM-PET] 诊断（原来裸 CastFirst 失败是静默的 ⇒ 实测 pet=0 查不出原因）
-                if (SummonPetIfNeeded(ai, m, s, "summon water elemental"))
-                    return true;
+                // [2026-10-31 站长口径] 爆发顺序：冰冷血脉 → 饰品 → 水元素 → 急冷（第 2 轮起）→ 寒冰箭填充
                 if (CastFirst(ai, m, s, { "icy veins" }))
                     return true;
-                if (CastFirst(ai, m, s, { "cold snap" }))
+                if (TP(m, "burst_trinket", 1.0) >= 1.0 && UseTrinket(ai, m, s))
                     return true;
+                // 水元素走统一入口：没有宠物才召，失败留一条可区分的 [DPSFSM-PET] 诊断
+                if (SummonPetIfNeeded(ai, m, s, "summon water elemental"))
+                    return true;
+                {
+                    int const snapRound = int(TP(m, "burst_cold_snap_round", 2.0));
+                    if (m->burstRounds >= snapRound && CastFirst(ai, m, s, { "cold snap" }))
+                        return true;
+                }
                 return CastFirst(ai, m, s, { "frostbolt" });
 
             case State::Burn:
                 // [2026-10-31 站长口径] 单体常规输出每 tick 先确认宠物在咬当前目标
-                //   （宠物掉队/换目标时要重新指令），再照原样放寒冰箭
+                //   （宠物掉队/换目标时要重新指令）。
+                //   平稳核心：寒冰箭是**唯一填充**（节能施法时也照打寒冰箭，不插别的）；
+                //   移动中读条会被取消 ⇒ 先试瞬发冰枪。
                 CommandPetAttack(s);
+                if (TP(m, "burn_lance_moving", 1.0) >= 1.0 && s.moving
+                    && CastFirst(ai, m, s, { "ice lance" }))
+                    return true;
                 return CastFirst(ai, m, s, { "frostbolt" });
 
             case State::Idle:
