@@ -2708,14 +2708,35 @@ namespace ai
     ThreatLevel EvalThreat(BotMem* m, Snapshot& s)
     {
         ThreatLevel level;
-        if (!s.tankAlive || dpsfsm::SkipEngine(s.bot->GetGUIDLow()))
-            level = ThreatLevel::Open;          // 假人 / 状态机独占：绝不卡住
-        else if (s.myThreat >= s.tankThreat * float(TP(m, "threat_open", 0.9)))
-            level = ThreatLevel::Open;          // 快追平坦克：再压就是白亏 DPS，放开打
-        else if (s.myThreat >= s.tankThreat * float(TP(m, "threat_floor", 0.7)))
+
+        // [2026-10-31 修正] 方向搞反过一次：**威胁越高越该收手**，不是越低。
+        //   旧写法是 myThreat < 0.7*tank ⇒ Wait（越安全越不打），组队里会永久空转 —— 已改。
+        //   新语义：danger（≥95% 坦克威胁）⇒ 等坦克拉开；throttle（≥80%）⇒ 收高威胁牌；否则放开打。
+        //   进入 Wait 后因为自己不再产生威胁、坦克继续涨，比值必然回落 ⇒ 会自己退出，不会死锁。
+        bool const inDungeon = s.bot->GetMap()
+            && (s.bot->GetMap()->IsDungeon() || s.bot->GetMap()->IsRaid());
+
+        if (!s.tankAlive || !inDungeon || dpsfsm::SkipEngine(s.bot->GetGUIDLow()))
+        {
+            // 假人 / 单人 / 野外：保持旧的"恒放开"行为，绝不因为威胁把 DPS 卡死
+            level = ThreatLevel::Open;
+        }
+        else if (s.tankThreat <= 0.0f)
+        {
+            level = ThreatLevel::Open;          // 坦克还没建立仇恨，无法判断 ⇒ 先放开
+        }
+        else if (s.myThreat >= s.tankThreat * float(TP(m, "threat_danger", 0.95)))
+        {
+            level = ThreatLevel::Wait;          // 快 OT：停手等坦克拉开（会自己退出）
+        }
+        else if (s.myThreat >= s.tankThreat * float(TP(m, "threat_throttle", 0.80)))
+        {
             level = ThreatLevel::Throttle;      // 中间态：打，但把高威胁牌收起来
+        }
         else
-            level = ThreatLevel::Wait;          // 离坦克还远：等一下比抢一手划算
+        {
+            level = ThreatLevel::Open;          // 离坦克还远：放开打
+        }
 
         // [2026-10-31 站长口径] 诊断：每 10 秒一条（WorldTimer 节流，别每 tick 刷屏）。
         //   字段固定为 my / tank / tankAlive / level，方便脚本直接切。
