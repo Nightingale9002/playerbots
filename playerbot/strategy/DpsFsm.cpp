@@ -175,8 +175,12 @@ namespace
         uint32 tickCount = 0;
         // [2026-10-31 站长口径] 组动作（macro）的执行状态：价值引擎选中"整组"之后，
         //   这里只负责把选中的那组一步步走完。选择仍然只有价值引擎一处。
-        int planId = 0;          // 0=无；1=奥法 3+3（3 奥冲 + 寒冰箭填窗 + 卡秒那发）
+        int planId = 0;          // 0=无；1=奥法 3+3（legacy，DpsPolicy.inc）；2=奥法 3+3（mode=5，本文件）
         int planStep = 0;
+        // [2026-10-31 站长口径] mode=5 的奥法 3+3：这一轮计划**打的是谁**（换目标/目标死 ⇒ 整组重来）。
+        ObjectGuid planTarget;
+        uint32 lastArcLog = 0;   // [DPSFSM-ARC] 诊断节流（WorldTimer 毫秒，10 秒一条）
+        uint32 lastGemTry = 0;   // 吃法力宝石的节流（没有宝石/还在 CD 时别每 tick 走一遍引擎）
     };
 
     std::mutex s_disabledMutex;
@@ -3530,6 +3534,286 @@ namespace ai
     }
 
     // ==========================================================================
+    // [2026-10-31 站长口径] 奥法状态图（mode=5 专用；legacy 的 `TickMage` 与 `DpsPolicy.inc`
+    //   里的 3+3（`ExecuteArcane33` / planId=1）**一个字节都不动**）。
+    //
+    //   平稳核心 = **蓝量驱动**：
+    //     蓝够（≥ `burn_mana`，默认 60%）= 无脑奥冲（叠层既加伤害也加耗蓝，这是"烧蓝换 DPS"）；
+    //     蓝见底（< `burn_mana`）= 切 3+3：3 发奥冲把 8 秒 debuff 叠满 3 层 → 在窗口里塞寒冰箭
+    //       （寒冰箭不吃奥冲的耗蓝加成）→ 卡 debuff 最后 `weave_margin`（默认 500ms）读下一发奥冲
+    //       （这一发起手时还吃到 3 层的加速，落地时叠层已回落 ⇒ 高速低费，同时是下一轮的第一发）。
+    //   爆发 = 奥强 → 冰脉（学会了才放）→ 全程奥冲连发；恢复 = 宝石 → 大蓝 → 唤醒。
+    //
+    //   复用 legacy 的现成口径（不重新发明）：
+    //     · 叠层 debuff 是**独立 id 36032**，不在 30451 的 spell_chain 里（见 TickMage 的注释）；
+    //     · 卡秒判据用 `GetSpellAuraHolder(36032)->GetAuraDuration()`（同 `ExecuteArcane33`）；
+    //     · 读条时长用 `GetSpellCastTime(entry, bot)`（同 `Arcane33GroupScore` / `ExecuteArcane33`）。
+    // ==========================================================================
+    uint32 const kArcaneBlastDebuff = 36032;    // 奥术冲击的叠层 debuff（TBC 独立 id）
+
+    // [2026-10-31 站长口径] 法力宝石：法师 Recover 的第一顺位（瞬发、应急回蓝）。
+    //   复用引擎现成的 "mana gem" 动作（`UseManaGemAction` 自己按等级挑宝石；`BOT_CHEATS=item`
+    //   时免物品），不自己扫背包——`UseManaPotion` 那条扫包路已经证明了"物品识别"容易走偏。
+    //   `DoSpecificAction` 的返回值分不出"没宝石"和"宝石在 CD"，所以 2 秒节流，别每 tick 走引擎。
+    bool UseManaGem(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (m->lastGemTry && WorldTimer::getMSTimeDiff(m->lastGemTry, safeNow) < 2000)
+            return false;
+        m->lastGemTry = safeNow;
+        if (!ai->DoSpecificAction("mana gem", Event(), true))
+            return false;
+        sLog.outError("[DPSFSM] %s 吃法力宝石（res=%.0f%%）", s.bot->GetName(), s.power);
+        return true;
+    }
+
+    // 状态转移（顺序 = 站长口径）：Idle → Recover（蓝见底）→ Aoe（群架）→ Burst（仇恨稳定 + CD 到）
+    //   → Approach（够不着）→ Maintain（平稳输出，里面跑 3+3）。
+    State EvalArcane(BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        // 蓝见底先回蓝：`recover_enter`（默认 6%）进、`recover_exit`（默认 20%）出。
+        //   滞回是必须的：没滞回时只有 6%~7% 这一条缝会留在 Recover，唤醒一落地就被打回 Maintain，
+        //   而唤醒是**引导**（8 秒）——引导期间本函数不决策，落地即出，正好回到 3+3 的起点。
+        float const recoverEnter = float(TP(m, "recover_enter", 6.0));
+        float const recoverExit = float(TP(m, "recover_exit", 20.0));
+        bool const alreadyRecover = (m->state == State::Recover);
+        if (alreadyRecover ? (s.power < recoverExit) : (s.power < recoverEnter))
+            return State::Recover;
+
+        if (s.pack30 >= AoEPack(m))
+            return State::Aoe;
+
+        // 爆发：仇恨 Open 且间隔到了就开；进入后 `burst_window` 秒内保持 Burst，
+        //   让"奥强 → 冰脉 → 奥冲"能跨几个 tick 依次放完（早用早 CD）。
+        time_t const now = time(nullptr);
+        if (now < m->burstUntil)
+            return State::Burst;
+        if (threat == ThreatLevel::Open
+            && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+            return State::Burst;
+
+        if (s.dist > float(TP(m, "range_caster", 30.0)))
+            return State::Approach;
+
+        return State::Maintain;
+    }
+
+    // --------------------------------------------------------------------------
+    // Maintain = 蓝量驱动 + 3+3 计划
+    //   planId=2 / planStep 记进度（和 legacy 的 planId=1 分开，两边不共用状态）：
+    //     step 0..2 —— 这一轮已经放出去几发奥冲（叠层中，索引用当前 debuff 层数）
+    //     step 3..5 —— 叠满 3 层后已经放出去几发寒冰箭（最多 3 发）
+    //     step 6    —— 填窗满了，等"卡秒"那一发奥冲
+    //   打断条件：目标没了/换了、进 Burst 或 Recover（由 TickArcaneFsm 清计划）、
+    //             蓝回到 `burn_mana` 以上（回到无脑奥冲）。
+    // --------------------------------------------------------------------------
+    ai::dpsfsm::TickResult TickArcaneMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 读条/引导中一律不插技能（与 legacy TickMage 一致；CastChecked 也会因为 GCD 拒绝）
+        if (s.casting)
+            return TickResult::Acted;
+
+        // 别的决策模式（mode=3 的 legacy 3+3）可能留下 planId=1，这里不认它，清成"无计划"
+        if (m->planId != 0 && m->planId != 2)
+        {
+            m->planId = 0;
+            m->planStep = 0;
+        }
+
+        // 目标死亡/切换 ⇒ 计划失效（BuildSnapshot 已经把死目标置空）
+        if (m->planId == 2 && (!s.target || m->planTarget != s.target->GetObjectGuid()))
+        {
+            m->planId = 0;
+            m->planStep = 0;
+        }
+
+        float const burnMana = float(TP(m, "burn_mana", 60.0));
+
+        // 蓝回到 burn_mana 以上 ⇒ 退出计划，回到无脑奥冲
+        if (m->planId == 2 && s.power >= burnMana)
+        {
+            m->planId = 0;
+            m->planStep = 0;
+        }
+
+        // 还没进计划：蓝够就无脑奥冲；蓝见底才开 3+3
+        if (m->planId != 2)
+        {
+            if (s.power >= burnMana || !s.target)
+                return FsmResult(CastFirst(ai, m, s, { "arcane blast" }));
+
+            m->planId = 2;
+            m->planStep = 0;
+            m->planTarget = s.target->GetObjectGuid();
+        }
+
+        // ---- 计划执行（每一步都走标准施法入口：记账/退避/朝向都在 CastChecked 里）----
+        if (!SpellId(ai, s.bot, m, "arcane blast", false))
+            return TickResult::Decline;     // 没学会奥冲 ⇒ 这个专精走不了 3+3，交回引擎
+        uint32 const fbId = SpellId(ai, s.bot, m, "frostbolt", false);
+
+        int const stacks = std::min(3, int(s.bot->GetAuraCount(kArcaneBlastDebuff)));
+        int remain = -1;
+        if (SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(kArcaneBlastDebuff))
+            remain = holder->GetAuraDuration();
+
+        // ① 叠层：没满 3 层就继续奥冲（debuff 掉光也从 0 开始）
+        if (stacks < 3)
+        {
+            if (m->planStep >= 3)       // 窗口断了（掉光/被驱散）⇒ 整组从叠层重来
+                m->planStep = 0;
+            if (!CastFirst(ai, m, s, { "arcane blast" }))
+                return TickResult::Decline;
+            if (m->planStep <= stacks)
+                m->planStep = stacks + 1;   // 已经放出去几发 = 当前层数 + 这一发
+            return TickResult::Acted;
+        }
+
+        // ② 叠满了 ⇒ 进入填窗相位（进入 Maintain 时本来就带着 3 层也走这条）
+        if (m->planStep < 3)
+            m->planStep = 3;
+
+        int const weave = int(TP(m, "arc_weave_margin", 500.0));   // 与猎人的 weave_margin(150ms) 分开，两者含义不同
+
+        // ③ 卡秒：debuff 只剩 weave 毫秒 ⇒ 现在起手，落地时叠层已经回落（高速低费）
+        if (remain >= 0 && remain <= weave)
+        {
+            if (!CastFirst(ai, m, s, { "arcane blast" }))
+                return TickResult::Decline;
+            m->planStep = 1;            // 这一发就是下一轮的第 1 发奥冲
+            return TickResult::Acted;
+        }
+
+        // ④ 填窗：寒冰箭塞得进剩余窗口才放（塞不进就等卡秒，别让读条被窗口截断）
+        int const fbCast = (fbId && sServerFacade.LookupSpellInfo(fbId))
+            ? int(GetSpellCastTime(sServerFacade.LookupSpellInfo(fbId), s.bot)) : 0;
+        if (m->planStep < 6 && fbId && remain >= fbCast
+            && CastFirst(ai, m, s, { "frostbolt" }))
+        {
+            ++m->planStep;
+            return TickResult::Acted;
+        }
+
+        // ⑤ 窗口里塞不下、又还没到卡秒点 ⇒ **有意空着**（让引擎插一手会把 8 秒窗口打乱）
+        return TickResult::Hold;
+    }
+
+    ai::dpsfsm::TickResult TickArcaneFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 仇恨档位本 tick 只算一次（诊断由 EvalThreat 内部按 10 秒节流）
+        ThreatLevel const threat = EvalThreat(m, s);
+        State const st = EvalArcane(m, s, threat);
+
+        // 进入 Burst 的那一刻打点（不是每 tick 重置）：窗口才能跨 tick 放完"奥强 → 冰脉"
+        if (st == State::Burst && m->state != State::Burst)
+        {
+            ++m->burstRounds;
+            m->lastBurst = time(nullptr);
+            m->burstUntil = m->lastBurst + time_t(TP(m, "burst_window", 6.0));
+        }
+        m->state = st;
+
+        // 计划只在 Maintain 里活着：进 Burst / Recover / Aoe / 目标没了 ⇒ 整个 3+3 重来
+        if (st != State::Maintain && m->planId == 2)
+        {
+            m->planId = 0;
+            m->planStep = 0;
+        }
+
+        TickResult result = TickResult::Decline;
+        switch (st)
+        {
+            case State::Recover:
+                // [站长口径] 恢复顺序：宝石 → 大蓝（缺口 > potion_mana_deficit，默认 3000）→ 唤醒。
+                //   唤醒落地 = 切回 3+3 的节点（`EvalArcane` 下一 tick 就会给回 Maintain）。
+                //   三样都不行 ⇒ 交回引擎（喝水/魔杖）。
+                // [2026-10-31 站长口径] **唤醒要卡在冰脉的尾巴上**：冰脉还在、且剩余 > `iv_tail_window`
+                //   （默认 2500ms）时先不放，继续奥冲吃冰脉；进入尾巴再唤醒，让引导落在冰脉窗口里。
+                //   冰脉没开时不等，蓝到阈值就放。
+                if (UseManaGem(ai, m, s))
+                    result = TickResult::Acted;
+                else if (UseManaPotion(m, s))
+                    result = TickResult::Acted;
+                else
+                {
+                    int const ivRemain = AuraRemain(ai, m, s, "icy veins");
+                    int const ivTail = int(TP(m, "iv_tail_window", 2500.0));
+                    bool const waitForIvTail = (ivRemain > ivTail);
+                    if (!waitForIvTail && TryCastSelf(ai, m, s, "evocation"))
+                        result = TickResult::Acted;
+                    else if (waitForIvTail)
+                        result = TickResult::Hold;    // 冰脉还没到尾巴：本 tick 有意空着（也不让引擎插手）
+                    else
+                        result = TickResult::Decline;
+                }
+                break;
+
+            case State::Aoe:
+                // 奥法没有专门的群伤循环：近身魔爆术 → 远处暴风雪（学会了才放）→ 兜底奥冲。
+                if (s.dist <= float(TP(m, "aoe_melee_range", 10.0))
+                    && TryCast(ai, m, s, "arcane explosion", nullptr))
+                    result = TickResult::Acted;
+                else if (SpellId(ai, s.bot, m, "blizzard", false)
+                    && TryCastAt(ai, m, s, "blizzard", s.target->GetPositionX(),
+                        s.target->GetPositionY(), s.target->GetPositionZ()))
+                    result = TickResult::Acted;
+                else
+                    result = FsmResult(CastFirst(ai, m, s, { "arcane blast" }));
+                break;
+
+            case State::Burst:
+                // [站长口径] 奥强 → 冰脉（学会了才放）→ 全程奥冲连发。
+                //   冰脉先用 `SpellId(..., false)` 探一次：没点天赋时不打"[DPSFSM] 没有可用技能"的错日志。
+                if (CastFirst(ai, m, s, { "arcane power" }))
+                    result = TickResult::Acted;
+                else if (SpellId(ai, s.bot, m, "icy veins", false)
+                    && CastFirst(ai, m, s, { "icy veins" }))
+                    result = TickResult::Acted;
+                else
+                    result = FsmResult(CastFirst(ai, m, s, { "arcane blast" }));
+                break;
+
+            case State::Approach:
+                result = TickResult::Decline;   // 走位归引擎
+                break;
+
+            case State::Maintain:
+                result = TickArcaneMaintain(ai, m, s);
+                break;
+
+            case State::Idle:
+            default:
+                result = TickResult::Decline;
+                break;
+        }
+
+        // [2026-10-31 站长口径] 奥法诊断：10 秒一条，字段固定 plan/step/stacks/mana/abaRemain，
+        //   便于脚本直接切（abaRemain = 奥冲叠层 debuff 剩余毫秒，没有该 debuff 时为 -1）。
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (!m->lastArcLog || WorldTimer::getMSTimeDiff(m->lastArcLog, safeNow) >= 10000)
+        {
+            m->lastArcLog = safeNow;
+            int const diagStacks = std::min(3, int(s.bot->GetAuraCount(kArcaneBlastDebuff)));
+            int diagRemain = -1;
+            if (SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(kArcaneBlastDebuff))
+                diagRemain = holder->GetAuraDuration();
+            sLog.outError("[DPSFSM-ARC] %s plan=%d step=%d stacks=%d mana=%.0f abaRemain=%d",
+                s.bot->GetName(), m->planId, m->planStep, diagStacks, s.power, diagRemain);
+        }
+
+        return result;
+    }
+
+    // ==========================================================================
     // [2026-10-31 站长口径] 猎人状态图（兽王/射击/生存，mode=5；legacy TickHunter 不动）
     //   四计时器：平射隐藏施法 0.5s（受急速）｜平射独立冷却（武器速度−0.5s，受急速）
     //            ｜GCD 1.5s（不受急速）｜稳固读条 1.5s 基础（受急速）。
@@ -3878,10 +4162,11 @@ namespace ai
             if (ModeIsTable(dmode))
                 return TickPolicy(ai, m);
 
-            // [2026-10-31 S2] mode=5：显式状态图。冰法（试点）+ 猎人三系（兽王/射击/生存）。
+            // [2026-10-31 S2] mode=5：显式状态图。冰法（试点）+ 猎人三系（兽王/射击/生存）
+            //   + [2026-10-31 站长口径] 奥法（蓝量驱动 + 3+3）。
             //   其它专精还没有图 ⇒ 继续往下走手写处理器，行为与 legacy 相同。
             if (dmode == DecisionMode::Fsm
-                && (m->spec == Spec::Frost || IsHunterSpec(m->spec)))
+                && (m->spec == Spec::Frost || m->spec == Spec::Arcane || IsHunterSpec(m->spec)))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
@@ -3889,7 +4174,7 @@ namespace ai
                 //   Decline=我不处理，交回引擎（走位/追击/开怪/喝水）。
                 ai::dpsfsm::TickResult const fsmResult = (m->spec == Spec::Frost)
                     ? TickFrostFsm(ai, m, s)
-                    : TickHunterFsm(ai, m, s);
+                    : (m->spec == Spec::Arcane ? TickArcaneFsm(ai, m, s) : TickHunterFsm(ai, m, s));
                 switch (fsmResult)
                 {
                     case ai::dpsfsm::TickResult::Acted:
