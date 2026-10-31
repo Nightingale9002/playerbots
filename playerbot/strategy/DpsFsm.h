@@ -22,6 +22,9 @@ namespace ai
             Aoe,        // 群伤
             Weave,      // 等自动射击窗口（猎人：读条会顶掉自动射击）
             Maintain,   // [2026-10-31] 猎人平射计时器窗口：按平射剩余时间决定这一手放什么/空着
+                        //   [2026-10-31 站长口径] 奥法也走这个状态，口径同一份：**预判排程 + 空档填充**
+                        //   （先算窗口放得下什么：寒冰箭 → 瞬发 → 卡秒奥冲 → 确实放不进才 Hold），
+                        //   绝不"等 debuff 掉到 500ms"。规则表见 DpsFsm.cpp → TickArcaneMaintain()。
             Recover,    // 资源/血量不足，回蓝回血
             Execute     // [2026-10-31 站长口径] 战士斩杀窗口：目标血 <= execute_hp（默认 20%）
                         //   单列一个状态，是为了让"低血段只打斩杀"这件事在状态表上看得见，
@@ -116,6 +119,16 @@ namespace ai
 
         // 只清自己那一轮（同一只 bot 被复用时，上一轮的收尾不能把新一轮的目标集清掉）
         void ClearScenarioTargets(uint32 guid, uint32 runId = 0);
+
+        // [2026-11-01 站长口径] 新一轮假人场景开始 ⇒ 把上一轮残留的 FSM 记忆清干净。
+        //   根因：`s_mem` 是 per-guid 常驻的（SimScenario 只重置 HP/蓝），状态机自己的记忆没人管 ——
+        //   上一轮可能停在 planStep=5（寒冰箭相位）或刚打完爆发的 lastBurst/burstUntil，
+        //   下一轮开局就带着它，行为与"干净开局"完全不同 ⇒ 实测 `arcane:mode=5` 三轮
+        //   dps 819.8 / 581.3 / 544.7（波动接近 50%，远超以往）。
+        //   只清"跨轮会改变决策"的字段；`failUntil`（技能退避）与宠物相关字段**保留**
+        //   （那是核心/宠物侧的短期状态，清掉只会让退避失效、多刷无用的施法失败）。
+        //   由 SetScenarioTargets() 在 **runId 变化时**调用一次（同一 runId 的重复登记不重置）。
+        void ResetScenarioState(uint32 guid);
 
         // 假人场景：没有 victim 时自己咬上去（只对"声明过的场景目标"生效，副本里不改变行为）
         bool EngageScenarioTarget(PlayerbotAI* ai);

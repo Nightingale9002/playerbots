@@ -183,6 +183,15 @@ namespace
         // [2026-10-31 站长口径] mode=5 的奥法 3+3：这一轮计划**打的是谁**（换目标/目标死 ⇒ 整组重来）。
         ObjectGuid planTarget;
         uint32 lastArcLog = 0;   // [DPSFSM-ARC] 诊断节流（WorldTimer 毫秒，10 秒一条）
+        // [2026-10-31 站长口径] [DPSFSM-ARC] 的本轮窗口计数（打一条清一次）：
+        //   arcHolds = 本窗口"有意空着"的 tick 数，arcCasts = 本窗口成功施法数。
+        //   空转 GCD 是奥法 dps 的命门（60 秒 27 次 vs 39 次），没有这两个数就只能靠猜。
+        uint32 arcHolds = 0;
+        uint32 arcCasts = 0;
+        // [2026-10-31 站长口径] `arc_diag=1` 时的分支取证（默认关）：本 tick 走了规则表里的哪一条。
+        //   'S'=叠层 'F'=寒冰箭 'I'=瞬发 'B'=卡秒奥冲 'M'=蓝不足交回 'H'=Hold 'G'=读条中 '?'=其它状态
+        char arcBranch = '?';
+        uint32 arcDiagAt = 0;    // 取证日志节流（1 秒一条）
         uint32 lastGemTry = 0;   // 吃法力宝石的节流（没有宝石/还在 CD 时别每 tick 走一遍引擎）
         // [2026-10-31 站长口径] 有蓝职业（奥法/冰法）的耗蓝账本：每次**施法成功**累加 SpellEntry->manaCost。
         //   只写统计、不参与任何决策（改不了施法选择 ⇒ mode=1/2/3/4 的行为不变，只是多一条 [DPSFSM-MANA]）。
@@ -198,6 +207,10 @@ namespace
     std::map<uint32, std::set<ObjectGuid>> s_scenarioTargets;   // guid → 这一轮"自己的"假人
     std::map<uint32, std::map<std::string, double>> s_overrides; // guid → 本轮参数覆盖（调优并发用）
     std::map<uint32, uint32> s_scenarioRun;                      // guid → 登记它的 runId
+    // [2026-11-01 站长口径] guid → 已经做过"轮间重置"的 runId。单独一张表而不是复用 s_scenarioRun：
+    //   s_scenarioRun 在 ClearScenarioTargets / 空目标集时会被抹掉，抹掉后再登记同一个 runId 会
+    //   被误判成"新一轮"而二次重置（多打一条 [DPSFSM-RESET]）。runId 单调递增，这张表只增不减。
+    std::map<uint32, uint32> s_resetRun;
     std::map<uint32, uint32> s_petLogAt;                         // [2026-10-31] guid → 上次打 [DPSFSM-PET] 周期日志的毫秒时刻
     std::map<uint32, uint32> s_petStuckAt;                       // [2026-10-31] guid → "在追但贴不上且没在动"的起始毫秒时刻
 
@@ -2151,6 +2164,17 @@ namespace
         return TryCast(ai, m, s, name, nullptr);
     }
 
+    // [2026-10-31 站长口径] 这一手蓝够不够放：按 `SpellEntry->manaCost`（与 [DPSFSM-MANA] 的账本同一口径）
+    //   跟**当前法力绝对值**比，而不是拿百分比拍脑袋（不同 rank 的消耗差一倍以上）。
+    //   cost<=0（拿不到模板 / 无消耗技能）⇒ 不拦。
+    bool AffordSpell(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        int const cost = SpellCost(ai, m, name);
+        if (cost <= 0)
+            return true;
+        return int(s.bot->GetPower(POWER_MANA)) >= cost;
+    }
+
     // [2026-10-30] **自身中心的"敌方"AoE（奉献）**：两条现成入口都进不去——
     //   ① `TryCast`/`CanCastSpell(自己)`：IsPositiveSpell(奉献)=false（带伤害），于是
     //      PlayerbotAI::CanCastSpell 里"负法术 + 友方目标"⇒ SPELL_FAILED_TARGET_FRIENDLY(110)；
@@ -3174,19 +3198,78 @@ namespace ai
             return false;
         }
 
+        // [2026-11-01 站长口径] 轮间重置：见 DpsFsm.h → ResetScenarioState() 的说明。
+        //   `BotMem` 是 per-guid 常驻的（`s_mem`），所以 planId/planStep/planTarget、
+        //   lastBurst/burstRounds/burstUntil、manaSpent/manaCounts/lastManaSpent、
+        //   lastArcLog/lastThreatLog、state/holdThisTick 全部会跨轮残留 —— 上一轮停在哪个相位，
+        //   下一轮就从哪个相位开局，行为完全不同（实测 arcane:mode=5 dps 波动接近 50%）。
+        //   **保留**：failUntil（技能退避，核心侧拒绝的短期记忆）、宠物字段（pet*）、
+        //   ids/unresolved/flags（技能表缓存）、lastOk/prereqLast（buff 节奏），
+        //   这些要么是"学会没学会"的静态缓存、要么是跨轮不该被清掉的短期状态。
+        void ResetScenarioState(uint32 guid)
+        {
+            // runId 只用于日志：SetScenarioTargets 先把新 runId 写进 s_resetRun 再调这里
+            uint32 runId = 0;
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                auto it = s_resetRun.find(guid);
+                if (it != s_resetRun.end())
+                    runId = it->second;
+            }
+
+            BotMem* m = Mem(guid);
+
+            m->planId = 0;
+            m->planStep = 0;
+            m->planTarget = ObjectGuid();
+            m->burstRounds = 0;
+            m->burstUntil = 0;
+            m->lastBurst = 0;
+            m->manaSpent = 0;
+            m->manaCounts.clear();
+            m->lastManaSpent = 0;
+            m->lastArcLog = 0;
+            m->lastThreatLog = 0;
+            m->state = State::Idle;
+            m->holdThisTick = false;
+            // 诊断窗口计数一并归零：这样每一轮的 [DPSFSM-ARC] 只报**本轮**的 holds/casts
+            //   （只影响日志，不影响任何决策；上一轮的窗口计数留着反而会把验收数字算串）。
+            m->arcHolds = 0;
+            m->arcCasts = 0;
+            m->arcBranch = '?';
+
+            std::string name;
+            if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
+                name = "guid=" + std::to_string(guid);
+            sLog.outError("[DPSFSM-RESET] %s runId=%u", name.c_str(), runId);
+        }
+
         void SetScenarioTargets(uint32 guid, std::vector<ObjectGuid> const& targets, uint32 runId)
         {
-            std::lock_guard<std::mutex> lock(s_disabledMutex);
-            if (targets.empty())
+            // [2026-11-01 站长口径] runId 变化 = 新一轮 ⇒ 清掉上一轮残留的 FSM 记忆。
+            //   同一 runId 的重复登记（SpawnDummies / TickDummies 都会调）**不重置**：
+            //   tick 内被反复清空的话 planStep/burstUntil 永远长不出来。
+            bool newRun = false;
             {
-                s_scenarioTargets.erase(guid);
-                s_scenarioRun.erase(guid);
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                auto it = s_resetRun.find(guid);
+                newRun = (it == s_resetRun.end() || it->second != runId);
+                if (newRun)
+                    s_resetRun[guid] = runId;
+
+                if (targets.empty())
+                {
+                    s_scenarioTargets.erase(guid);
+                    s_scenarioRun.erase(guid);
+                }
+                else
+                {
+                    s_scenarioTargets[guid] = std::set<ObjectGuid>(targets.begin(), targets.end());
+                    s_scenarioRun[guid] = runId;
+                }
             }
-            else
-            {
-                s_scenarioTargets[guid] = std::set<ObjectGuid>(targets.begin(), targets.end());
-                s_scenarioRun[guid] = runId;
-            }
+            if (newRun)
+                ResetScenarioState(guid);
         }
 
         void ClearScenarioTargets(uint32 guid, uint32 runId)
@@ -3622,36 +3705,48 @@ namespace ai
     // ==========================================================================
     uint32 const kArcaneBlastDebuff = 36032;    // 奥术冲击的叠层 debuff（TBC 独立 id）
 
-    // [2026-10-31 站长口径] **冰脉尾巴窗口按"还能不能放下下一发奥冲"动态算**：
-    //   tail = 当前急速下奥术冲击的实际读条 + `iv_tail_margin`（默认 0）；
-    //   冰脉剩余 `ivRemain > tail` ⇒ 还塞得下一发奥冲 ⇒ 先不放唤醒（继续吃冰脉）；
-    //   `ivRemain <= tail` ⇒ 已经放不完一发奥冲 ⇒ 就是开唤醒（拉满引导落在冰脉尾巴里）的时机。
-    //   固定的 `iv_tail_window`（2500ms）不再是主判据，只留作"查不到奥冲读条"时的兜底
-    //   （例如 bot 没学会奥冲 / SpellEntry 缺失）；正常路径一律用 `iv_tail_margin`。
+    // [2026-10-31 站长口径] 某个法术在**当前急速下**的实际读条毫秒数（奥法预算排程要用的那个数）。
     //   ⚠️ `GetSpellCastTime(entry, bot)` 不传 Spell 对象时**不套** UNIT_MOD_CAST_SPEED，
-    //      而冰脉/饰品/英雄正是通过这个字段加速；奥冲是普通法术（非 IS_ABILITY），
+    //      而冰脉/饰品/英雄正是通过这个字段加速；奥冲/寒冰箭都是普通法术（非 IS_ABILITY），
     //      真实路径会乘它 —— 这里按核心同一条件补上，否则"当前急速"这一层就丢了。
-    //      （装备的法术急速走 SPELLMOD_CASTING_TIME，需要 Spell 对象才拿得到；缺口由 `iv_tail_margin` 覆盖。）
-    int IvTailMs(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    //      （装备的法术急速走 SPELLMOD_CASTING_TIME，需要 Spell 对象才拿得到；缺口由
+    //       `fill_margin` / `iv_tail_margin` 覆盖。）
+    //   fallback：拿不到模板、或读条异常（瞬发 / 数据缺失）时的回落值。
+    int CastMsWithMod(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, int fallback)
     {
-        uint32 const id = SpellId(ai, s.bot, m, "arcane blast", false);
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
         SpellEntry const* entry = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
         if (!entry)
-            return int(TP(m, "iv_tail_window", 2500.0));     // 兜底：沿用旧的固定尾巴窗口
+            return fallback;
 
-        int abCast = int(GetSpellCastTime(entry, s.bot));
-        if (abCast > 0
+        int castMs = int(GetSpellCastTime(entry, s.bot));
+        if (castMs > 0
             && !entry->HasAttribute(SPELL_ATTR_IS_ABILITY)
             && !entry->HasAttribute(SPELL_ATTR_IS_TRADESKILL)
             && !entry->HasAttribute(SPELL_ATTR_EX3_IGNORE_CASTER_MODIFIERS))
         {
             float const mod = s.bot->GetFloatValue(UNIT_MOD_CAST_SPEED);
             if (mod > 0.2f && mod < 2.0f)
-                abCast = int(float(abCast) * mod + 0.5f);
+                castMs = int(float(castMs) * mod + 0.5f);
         }
-        if (abCast < 300 || abCast > 6000)                  // 异常值 ⇒ 当没有急速，别把窗口算翻
-            abCast = 2500;
-        return abCast + int(TP(m, "iv_tail_margin", 0.0));
+        if (castMs < 300 || castMs > 6000)                  // 异常值 ⇒ 当没有急速，别把窗口算翻
+            return fallback;
+        return castMs;
+    }
+
+    // [2026-10-31 站长口径] **冰脉尾巴窗口按"还能不能放下下一发奥冲"动态算**：
+    //   tail = 当前急速下奥术冲击的实际读条 + `iv_tail_margin`（默认 0）；
+    //   冰脉剩余 `ivRemain > tail` ⇒ 还塞得下一发奥冲 ⇒ 先不放唤醒（继续吃冰脉）；
+    //   `ivRemain <= tail` ⇒ 已经放不完一发奥冲 ⇒ 就是开唤醒（拉满引导落在冰脉尾巴里）的时机。
+    //   固定的 `iv_tail_window`（2500ms）不再是主判据，只留作"查不到奥冲读条"时的兜底
+    //   （例如 bot 没学会奥冲 / SpellEntry 缺失）；正常路径一律用 `iv_tail_margin`。
+    //   [2026-10-31 站长口径] 读条本身走 `CastMsWithMod`（与 Maintain 的寒冰箭预算同一份实现），
+    //   两种异常（模板缺失 / 读条异常）统一回落到 `iv_tail_window`。
+    int IvTailMs(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        int const fallback = int(TP(m, "iv_tail_window", 2500.0));
+        return CastMsWithMod(ai, m, s, "arcane blast", fallback)
+            + int(TP(m, "iv_tail_margin", 0.0));
     }
 
     // [2026-10-31 站长口径] 法力宝石：法师 Recover 的第一顺位（瞬发、应急回蓝）。
@@ -3706,11 +3801,28 @@ namespace ai
     }
 
     // --------------------------------------------------------------------------
-    // Maintain = 蓝量驱动 + 3+3 计划
-    //   planId=2 / planStep 记进度（和 legacy 的 planId=1 分开，两边不共用状态）：
-    //     step 0..2 —— 这一轮已经放出去几发奥冲（叠层中，索引用当前 debuff 层数）
-    //     step 3..5 —— 叠满 3 层后已经放出去几发寒冰箭（最多 3 发）
-    //     step 6    —— 填窗满了，等"卡秒"那一发奥冲
+    // Maintain = 蓝量驱动 + **预判排程 + 空档填充**（[2026-10-31 站长口径]）
+    //
+    //   旧口径（3+3 硬上限）的实测病：寒冰箭塞满 3 发后**一律 Hold 到 debuff 掉到
+    //   `arc_weave_margin`(500ms)**，日志实况是 `abaRemain=2873` 就已经开始空等 ⇒
+    //   60 秒木桩 `mode=5` 只有 27 次施法（2.22 秒/发），而 `mode=3` 有 39 次（1.54 秒/发）。
+    //   差的那 12 个 GCD 全是白丢的伤害 —— 不是不会打，是在空等。
+    //
+    //   新口径照猎人 Maintain 那套（先算窗口还放得下什么，放得下就放，绝不放空等）：
+    //   规则表（顺序，命中即停）：
+    //     ⓪ 叠层（沿用）：debuff 没满 3 层 ⇒ 奥冲（不叠满就没有 3 层的增伤/加速）
+    //     ① 剩余 ≥ 寒冰箭读条 + `fill_margin`(默认 200ms) ⇒ 寒冰箭
+    //        （**只要能读就必须读**，不再有"这一轮最多 3 发"的上限）
+    //     ② 剩余不够一发寒冰箭，但有瞬发可用 ⇒ 火焰冲击（CD 好）→ 冰枪（**仅目标被冻住时**，
+    //        见 ② 处的 [2026-11-01 站长口径]：普通目标打冰枪是白占 GCD）
+    //     ③ 寒冰箭会正好落在窗口尾巴（剩余 ∈ [寒冰箭读条, 寒冰箭读条 + `fill_margin`]）
+    //        ⇒ 奥冲（卡秒那发：起手仍吃到 3 层，落地时叠层已回落，同时是下一轮的第一发）
+    //     ④ 以上都不成立且确实什么都放不进 ⇒ Hold（**并自己转向**：Hold 时引擎整 tick 不跑，
+    //        朝向会冻结 ⇒ 下一发施法/挥击被 IsInFront 判掉，战士那套的坑对法系一样成立）
+    //     ⑤ 蓝不足放任何技能 ⇒ 交回引擎（下一 tick `recover_enter` 判据会把它送进 Recover）
+    //
+    //   planId=2 保留为"蓝见底、在 3+3 里"的标记（和 legacy 的 planId=1 分开，两边不共用状态）；
+    //   planStep 从"上一轮放了几发寒冰箭"退化成**纯诊断计数**（真实节奏由窗口预算决定，不再当上限用）。
     //   打断条件：目标没了/换了、进 Burst 或 Recover（由 TickArcaneFsm 清计划）、
     //             蓝回到 `burn_mana` 以上（回到无脑奥冲）。
     // --------------------------------------------------------------------------
@@ -3720,7 +3832,10 @@ namespace ai
 
         // 读条/引导中一律不插技能（与 legacy TickMage 一致；CastChecked 也会因为 GCD 拒绝）
         if (s.casting)
+        {
+            m->arcBranch = 'G';
             return TickResult::Acted;
+        }
 
         // 别的决策模式（mode=3 的 legacy 3+3）可能留下 planId=1，这里不认它，清成"无计划"
         if (m->planId != 0 && m->planId != 2)
@@ -3749,7 +3864,10 @@ namespace ai
         if (m->planId != 2)
         {
             if (s.power >= burnMana || !s.target)
+            {
+                m->arcBranch = 'U';     // 蓝够：无脑奥冲（不进 3+3）
                 return FsmResult(CastFirst(ai, m, s, { "arcane blast" }));
+            }
 
             m->planId = 2;
             m->planStep = 0;
@@ -3759,51 +3877,98 @@ namespace ai
         // ---- 计划执行（每一步都走标准施法入口：记账/退避/朝向都在 CastChecked 里）----
         if (!SpellId(ai, s.bot, m, "arcane blast", false))
             return TickResult::Decline;     // 没学会奥冲 ⇒ 这个专精走不了 3+3，交回引擎
-        uint32 const fbId = SpellId(ai, s.bot, m, "frostbolt", false);
 
         int const stacks = std::min(3, int(s.bot->GetAuraCount(kArcaneBlastDebuff)));
         int remain = -1;
         if (SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(kArcaneBlastDebuff))
             remain = holder->GetAuraDuration();
 
-        // ① 叠层：没满 3 层就继续奥冲（debuff 掉光也从 0 开始）
+        // ⓪ 叠层：没满 3 层就继续奥冲（debuff 掉光也从 0 开始）
         if (stacks < 3)
         {
+            m->arcBranch = 'S';
             if (m->planStep >= 3)       // 窗口断了（掉光/被驱散）⇒ 整组从叠层重来
                 m->planStep = 0;
             if (!CastFirst(ai, m, s, { "arcane blast" }))
-                return TickResult::Decline;
+            {
+                // [2026-10-31 站长口径] 只在**确知是 GCD 还在转**的时候 Hold：那一 tick 谁也放不出技能，
+                //   交回引擎它只会插一手自己的（把叠层节奏打乱）。
+                //   其它失败原因（射程/LOS/真没蓝）**必须 Decline**：引擎要负责走位/喝水/魔杖，
+                //   这里 Hold 会把它锁死 —— 实测 Hold 版在低蓝段出现过整窗 `holds=48 casts=0` 的死等。
+                uint32 const abId = SpellId(ai, s.bot, m, "arcane blast", false);
+                return GcdActive(s.bot, abId) ? TickResult::Hold : TickResult::Decline;
+            }
             if (m->planStep <= stacks)
                 m->planStep = stacks + 1;   // 已经放出去几发 = 当前层数 + 这一发
             return TickResult::Acted;
         }
 
-        // ② 叠满了 ⇒ 进入填窗相位（进入 Maintain 时本来就带着 3 层也走这条）
+        // 叠满了 ⇒ 进入填窗相位（进入 Maintain 时本来就带着 3 层也走这条）
         if (m->planStep < 3)
             m->planStep = 3;
 
-        int const weave = int(TP(m, "arc_weave_margin", 500.0));   // 与猎人的 weave_margin(150ms) 分开，两者含义不同
+        // ---- 窗口预算：这一发寒冰箭要读多久（当前急速）+ 填充余量 ----
+        //   余量的意义：读条的最后 `fill_margin` 毫秒里 debuff 已经掉光也不亏（寒冰箭本来就不吃叠层），
+        //   留这点余量是为了容忍"读条开始到服务器结算"的那点时间差，别把一发读条截在尾巴上。
+        //   ⚠️ `GetSpellCastTime` **不含天赋/装备的 SPELLMOD_CASTING_TIME**（改良寒冰箭 −0.5 秒这类
+        //    只有拿到 Spell 对象才套得上），所以自动值会**偏高**（实测 3000ms，真实约 2500ms）。
+        //    偏高 ⇒ 规则①提前收手、规则③的窄带很难命中 ⇒ 可以用 `fb_cast_ms` 手工钉住真实读条做 A/B。
+        int const fillMargin = int(TP(m, "fill_margin", 200.0));
+        int const fbCastCfg = int(TP(m, "fb_cast_ms", 0.0));
+        int const fbCast = (fbCastCfg >= 300 && fbCastCfg <= 6000)
+            ? fbCastCfg : CastMsWithMod(ai, m, s, "frostbolt", 2500);
+        int const fbBudget = fbCast + fillMargin;
 
-        // ③ 卡秒：debuff 只剩 weave 毫秒 ⇒ 现在起手，落地时叠层已经回落（高速低费）
-        if (remain >= 0 && remain <= weave)
+        // ① 放得下整发寒冰箭 ⇒ 读它（能读就必须读；这里**没有**发数上限）
+        if (remain >= fbBudget && CastFirst(ai, m, s, { "frostbolt" }))
         {
-            if (!CastFirst(ai, m, s, { "arcane blast" }))
-                return TickResult::Decline;
+            m->arcBranch = 'F';
+            ++m->planStep;              // 纯诊断计数（见上面的说明，不再当上限）
+            return TickResult::Acted;
+        }
+
+        // ② 剩余不够一发寒冰箭 ⇒ 塞瞬发：火焰冲击（8 秒 CD，平时就是最便宜的 GCD 填充）→ 冰枪
+        //   [2026-11-01 站长口径] 冰枪（30455）在 TBC **只对冰冻目标**才有 3 倍伤害
+        //   （本核心 `Scripting/ClassScripts/Mage.cpp` 的 `IceLance::OnEffectExecute` 就是用
+        //   `target->isFrozen()` 判的，同一个判据），打普通目标是极低伤害 + 白占一个 GCD
+        //   ⇒ 从"通用填充"降级成"只在目标确实被冻住时才用"；没冻住就跳过，交给 ③/④。
+        //   判据直接用核心的 `Unit::isFrozen()`（= `HasAuraState(AURA_STATE_FROZEN)`）：
+        //   它与冰枪脚本同一份实现，比自己数 aura 更准（不会把法师自己/别人的冰环算成目标冻结）。
+        //   `ice_lance_frozen_only`（默认 1）：置 0 即恢复旧行为（非冻结也拿冰枪填），留作 A/B 兜底。
+        if (remain >= 0 && remain < fbCast)
+        {
+            bool const iceLanceOk = s.target && s.target->isFrozen()
+                && TP(m, "ice_lance_frozen_only", 1.0) >= 0.5;
+            if (CastFirst(ai, m, s, { "fire blast" })
+                || (iceLanceOk && CastFirst(ai, m, s, { "ice lance" })))
+            {
+                m->arcBranch = 'I';
+                return TickResult::Acted;
+            }
+        }
+
+        // ③ 窄带：寒冰箭会正好落在窗口尾巴 ⇒ 卡秒那发奥冲（起手吃 3 层，落地已回落）
+        //   `remain < 0` 是异常兜底（模板在、holder 却读不到时长）⇒ 直接起手奥冲，绝不空等。
+        if ((remain < 0 || (remain >= fbCast && remain < fbBudget))
+            && CastFirst(ai, m, s, { "arcane blast" }))
+        {
+            m->arcBranch = 'B';
             m->planStep = 1;            // 这一发就是下一轮的第 1 发奥冲
             return TickResult::Acted;
         }
 
-        // ④ 填窗：寒冰箭塞得进剩余窗口才放（塞不进就等卡秒，别让读条被窗口截断）
-        int const fbCast = (fbId && sServerFacade.LookupSpellInfo(fbId))
-            ? int(GetSpellCastTime(sServerFacade.LookupSpellInfo(fbId), s.bot)) : 0;
-        if (m->planStep < 6 && fbId && remain >= fbCast
-            && CastFirst(ai, m, s, { "frostbolt" }))
+        // ⑤ 蓝不足放任何技能 ⇒ 交回引擎（下一 tick 的 recover_enter 会把它送进 Recover）
+        if (!AffordSpell(ai, m, s, "arcane blast") && !AffordSpell(ai, m, s, "frostbolt"))
         {
-            ++m->planStep;
-            return TickResult::Acted;
+            m->arcBranch = 'M';
+            return TickResult::Decline;
         }
 
-        // ⑤ 窗口里塞不下、又还没到卡秒点 ⇒ **有意空着**（让引擎插一手会把 8 秒窗口打乱）
+        // ④ 以上都不成立（真的一手都放不进）⇒ 有意空着；但**自己转向**，别让朝向冻住
+        //    （Hold 时引擎整 tick 都不跑，而转向本来是引擎在 tick 里做的；见战士那套的注释）
+        if (s.target && s.target != s.bot)
+            s.bot->SetFacingToObject(s.target);
+        m->arcBranch = 'H';
         return TickResult::Hold;
     }
 
@@ -3837,6 +4002,7 @@ namespace ai
         int const ivTail = IvTailMs(ai, m, s);
 
         TickResult result = TickResult::Decline;
+        m->arcBranch = '?';     // 分支取证（arc_diag）本 tick 重新记；非 Maintain 状态保持 '?'
         switch (st)
         {
             case State::Recover:
@@ -3854,11 +4020,24 @@ namespace ai
                     result = TickResult::Acted;
                 else
                 {
-                    bool const waitForIvTail = (ivRemain > ivTail);
-                    if (!waitForIvTail && TryCastSelf(ai, m, s, "evocation"))
+                    // [2026-10-31 站长口径] 冰脉尾巴判据是**预判**，不是"等"：
+                    //   `ivRemain > ivTail` ⇒ 这一发读下来还不会跨过冰脉结束 ⇒ **不开唤醒，回去继续打**；
+                    //   `ivRemain <= ivTail` ⇒ 再读一发就会跨过 ⇒ 现在开唤醒，让引导落在冰脉窗口里。
+                    //   旧口径在中段一律 Hold（"等尾巴"），实测就是冰脉尾巴那串空转的 GCD ——
+                    //   与 Maintain 里"等 debuff 掉到 500ms"是同一个病，这里一起改掉。
+                    bool const atIvTail = (ivRemain <= ivTail);
+                    if (!atIvTail)
+                    {
+                        TickResult const fill = TickArcaneMaintain(ai, m, s);
+                        if (fill != TickResult::Decline)
+                            result = fill;                       // 继续吃冰脉输出（填充逻辑与 Maintain 同一份）
+                        else if (TryCastSelf(ai, m, s, "evocation"))
+                            result = TickResult::Acted;          // 填窗也放不出（蓝空/技能全 CD）⇒ 别干等，唤醒
+                        else
+                            result = TickResult::Hold;
+                    }
+                    else if (TryCastSelf(ai, m, s, "evocation"))
                         result = TickResult::Acted;
-                    else if (waitForIvTail)
-                        result = TickResult::Hold;    // 冰脉还没到尾巴：本 tick 有意空着（也不让引擎插手）
                     else
                         result = TickResult::Decline;
                 }
@@ -3903,12 +4082,45 @@ namespace ai
                 break;
         }
 
+        // [2026-10-31 站长口径] `arc_diag=1` 的分支取证（默认关，1 秒一条）：
+        //   回答"这一秒为什么没出手/出的是哪一手" —— 只有窗口预算与分支都在手里，才谈得上调排程。
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (TP(m, "arc_diag", 0.0) >= 1.0
+            && (!m->arcDiagAt || WorldTimer::getMSTimeDiff(m->arcDiagAt, safeNow) >= 1000))
+        {
+            m->arcDiagAt = safeNow;
+            int diagStacksD = std::min(3, int(s.bot->GetAuraCount(kArcaneBlastDebuff)));
+            int diagRemainD = -1;
+            if (SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(kArcaneBlastDebuff))
+                diagRemainD = holder->GetAuraDuration();
+            uint32 const abId = SpellId(ai, s.bot, m, "arcane blast", false);
+            uint32 const fbIdD = SpellId(ai, s.bot, m, "frostbolt", false);
+            int const fbCastD = (int(TP(m, "fb_cast_ms", 0.0)) >= 300)
+                ? int(TP(m, "fb_cast_ms", 0.0)) : CastMsWithMod(ai, m, s, "frostbolt", 2500);
+            char const* resTxt = (result == TickResult::Acted) ? "acted"
+                : (result == TickResult::Hold ? "hold" : "decline");
+            sLog.outError("[DPSFSM-ARC-DIAG] %s state=%s branch=%c res=%s remain=%d stacks=%d "
+                "fbCast=%d fbBudget=%d mana=%.0f casting=%d gcdAb=%d gcdFb=%d moving=%d dist=%.1f",
+                s.bot->GetName(), ai::dpsfsm::StateName(st), m->arcBranch, resTxt, diagRemainD,
+                diagStacksD, fbCastD, fbCastD + int(TP(m, "fill_margin", 200.0)),
+                s.power, s.casting ? 1 : 0, GcdActive(s.bot, abId) ? 1 : 0,
+                GcdActive(s.bot, fbIdD) ? 1 : 0, s.moving ? 1 : 0, s.dist);
+        }
+
         // [2026-10-31 站长口径] 奥法诊断：10 秒一条，字段固定 plan/step/stacks/mana/abaRemain，
         //   便于脚本直接切（abaRemain = 奥冲叠层 debuff 剩余毫秒，没有该 debuff 时为 -1）；
         //   [2026-10-31] 追加 ivRemain/ivTail：唤醒尾巴判据的两个原始数（ivTail 已含急速与 iv_tail_margin），
         //   一眼能看出"这次为什么还在等 / 为什么现在开唤醒"。
-        uint32 const nowMs = WorldTimer::getMSTime();
-        uint32 const safeNow = nowMs ? nowMs : 1;
+        //   [2026-10-31 站长口径] 再追加 holds/casts（**本轮 10 秒窗口**的计数，打一条清一次）：
+        //     holds = 本窗口 Hold 的 tick 数，casts = 本窗口成功施法数。
+        //     这两个数是"空转 GCD"的直接证据 —— 旧口径的 27 次施法/60 秒就是 holds 堆出来的；
+        //     只要 casts 上不去，就说明还在等，而不是"不会打"。
+        if (result == TickResult::Hold)
+            ++m->arcHolds;
+        else if (result == TickResult::Acted && m->castThisTick)
+            ++m->arcCasts;
+
         if (!m->lastArcLog || WorldTimer::getMSTimeDiff(m->lastArcLog, safeNow) >= 10000)
         {
             m->lastArcLog = safeNow;
@@ -3916,8 +4128,11 @@ namespace ai
             int diagRemain = -1;
             if (SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(kArcaneBlastDebuff))
                 diagRemain = holder->GetAuraDuration();
-            sLog.outError("[DPSFSM-ARC] %s plan=%d step=%d stacks=%d mana=%.0f abaRemain=%d ivRemain=%d ivTail=%d",
-                s.bot->GetName(), m->planId, m->planStep, diagStacks, s.power, diagRemain, ivRemain, ivTail);
+            sLog.outError("[DPSFSM-ARC] %s plan=%d step=%d stacks=%d mana=%.0f abaRemain=%d ivRemain=%d ivTail=%d holds=%u casts=%u",
+                s.bot->GetName(), m->planId, m->planStep, diagStacks, s.power, diagRemain, ivRemain,
+                ivTail, m->arcHolds, m->arcCasts);
+            m->arcHolds = 0;            // 本轮窗口的计数打一条清一次（累计值看 [DPSFSM-HB] 的 casts=）
+            m->arcCasts = 0;
         }
 
         return result;
@@ -4228,8 +4443,9 @@ namespace ai
         return State::Maintain;
     }
 
-    // Maintain 动作表（顺序，命中即停）：核心（武器=致死 / 狂暴=嗜血）→ 旋风斩 → 压制 → 猛击
-    //   → 英勇打击（怒气 >= rage_reserve 才泄怒；它是"下一次挥击附带"，用 TrySwing 防重复挂）。
+    // Maintain 动作表（顺序，命中即停）：核心（武器=致死 / 狂暴=嗜血）→ 旋风斩 → 压制 → 猛击(*)
+    //   → 英勇打击（怒气 >= `rage_reserve` 才泄怒；它是"下一次挥击附带"，用 TrySwing 防重复挂）。
+    //   (*) 猛击默认关：`use_slam`（默认 0）—— 见下面的实测注释。
     ai::dpsfsm::TickResult TickWarriorMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         using ai::dpsfsm::TickResult;
@@ -4243,11 +4459,16 @@ namespace ai
             return TickResult::Acted;
         if (CastFirst(ai, m, s, { "overpower" }))
             return TickResult::Acted;
-        if (CastFirst(ai, m, s, { "slam" }))
+        // [2026-10-31 站长口径] 猛击默认**不读**（`use_slam` 默认 0）：实测它的 1.5 秒读条会把白字压掉
+        //   （melee 40 → 63、每轮还要放 8~14 次），读条期间不能挥击 ⇒ 白字和怒气两头亏。
+        //   代码路径保留（`use_slam=1` 可开）就是为了 A/B —— 别把这条删了，否则拿不出对照。
+        if (TP(m, "use_slam", 0.0) >= 1.0 && CastFirst(ai, m, s, { "slam" }))
             return TickResult::Acted;
         // 英勇打击会顶掉这次普攻（等于用普攻的怒换伤害）⇒ 只有怒气高出保留线才泄
         //   （真实怒气 vs `rage_reserve`，见 RageReal 的说明）
-        if (RageReal(s) >= int(TP(m, "rage_reserve", 75.0)) && TrySwing(ai, m, s, "heroic strike"))
+        //   [2026-10-31 站长口径] 保留线默认 75 → **45**：上一轮 A/B 落在噪声里（方向是"敢花"），
+        //   怒气压着不用就是手上没有伤害，所以照方向把默认值调下来。
+        if (RageReal(s) >= int(TP(m, "rage_reserve", 45.0)) && TrySwing(ai, m, s, "heroic strike"))
             return TickResult::Acted;
 
         return TickResult::Decline;
