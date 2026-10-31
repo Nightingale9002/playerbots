@@ -707,6 +707,29 @@ void PlayerbotFactory::InitPet()
             pet->AIM_Initialize();
             pet->AI()->SetReactState(REACT_DEFENSIVE);
             pet->InitPetCreateSpells();
+
+            // [2026-10-31 站长口径] **InitPetCreateSpells 只学技能、不写动作条**：
+            //   它内部 InitPetActionBar() 把每一格写成 ACT_DISABLED，而 PetAI 的自动施法循环
+            //   读的正是动作条（GetPetAutoSpellOnPos）⇒ 学到的家族技能（角刺/撕咬…）一次都不会自动放，
+            //   宠物输出只剩平砍（实测 70 级掠食者只有 ~35 dps）。
+            //   真实玩家的宠物没这问题：Pet::LoadPetFromDB() 会 LoadPetActionBar 从 character_pet 恢复。
+            //   程序化创建的宠物必须自己把"可自动施法的非被动技能"打开。
+            if (PetCreateSpellEntry const* createSpells = sObjectMgr.GetPetCreateSpellEntry(pet->GetEntry()))
+            {
+                for (uint8 s = 0; s < 4; ++s)
+                {
+                    if (!createSpells->spellid[s])
+                        break;
+                    SpellEntry const* learnSpell = sSpellTemplate.LookupEntry<SpellEntry>(createSpells->spellid[s]);
+                    if (!learnSpell)
+                        continue;
+                    uint32 const petSpellId = (learnSpell->Effect[0] == SPELL_EFFECT_LEARN_SPELL
+                            || learnSpell->Effect[0] == SPELL_EFFECT_LEARN_PET_SPELL)
+                        ? learnSpell->EffectTriggerSpell[0] : learnSpell->Id;
+                    if (petSpellId && pet->HasSpell(petSpellId) && !IsPassiveSpell(petSpellId))
+                        pet->ToggleAutocast(petSpellId, true);
+                }
+            }
             pet->LearnPetPassives();
             pet->CastPetAuras(true);
             pet->CastOwnerTalentAuras();

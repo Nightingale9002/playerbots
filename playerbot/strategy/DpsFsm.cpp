@@ -1152,6 +1152,30 @@ namespace
         // InitPetCreateSpells 会按 DBC 的 CreatureSpellData（22123 → 11568）学家族技能：
         //   角刺 Gore（还有低吼/撕咬），这也是"掠食者"作为目标宠物的理由。
         pet->InitPetCreateSpells();
+
+        // [2026-10-31 站长口径] **学了 ≠ 会放**：InitPetCreateSpells 内部把动作条清零（ACT_DISABLED），
+        //   而 PetAI 的自动施法循环读的是动作条 ⇒ 技能永远不会自动释放，宠物只剩平砍。
+        //   这里把"可自动施法的非被动家族技能"逐个打开（与 PlayerbotFactory::InitPet 同一份修法）。
+        if (PetCreateSpellEntry const* createSpells = sObjectMgr.GetPetCreateSpellEntry(pet->GetEntry()))
+        {
+            for (uint8 ci = 0; ci < 4; ++ci)
+            {
+                if (!createSpells->spellid[ci])
+                    break;
+                SpellEntry const* learnSpell = sSpellTemplate.LookupEntry<SpellEntry>(createSpells->spellid[ci]);
+                if (!learnSpell)
+                    continue;
+                uint32 const petSpellId = (learnSpell->Effect[0] == SPELL_EFFECT_LEARN_SPELL
+                        || learnSpell->Effect[0] == SPELL_EFFECT_LEARN_PET_SPELL)
+                    ? learnSpell->EffectTriggerSpell[0] : learnSpell->Id;
+                if (petSpellId && pet->HasSpell(petSpellId) && !IsPassiveSpell(petSpellId))
+                {
+                    pet->ToggleAutocast(petSpellId, true);
+                    sLog.outError("[DPSFSM-PET] %s 开启宠物自动施法 spell=%u entry=%u",
+                        bot->GetName(), petSpellId, pet->GetEntry());
+                }
+            }
+        }
         pet->LearnPetPassives();
         pet->CastPetAuras(true);
         pet->CastOwnerTalentAuras();
