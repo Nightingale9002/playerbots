@@ -703,8 +703,15 @@ void PlayerbotFactory::InitPet()
 #endif
             pet->SetPower(POWER_HAPPINESS, HAPPINESS_LEVEL_SIZE * 2);
             pet->GetCharmInfo()->SetPetNumber(pet->GetObjectGuid().GetEntry(), true);
+            // [2026-10-31 根因修] `UNIT_FLAG_PLAYER_CONTROLLED` 必须在 `AIM_Initialize()` **之前**设：
+            //   `CreatureAISelector.cpp → FactorySelector::selectAI()` 用它决定 HUNTER_PET 是
+            //   PetAI（每 tick 复检追击 + 自动施法循环）还是 GuardianAI（只在"主人被打"时出手、
+            //   不管追击）。核心自己的建宠路径（Pet.cpp → Pet::LoadPetFromDB / CreateBaseAtCreature）
+            //   也都是先设 flag 再 AIM_Initialize；以前写在后面 ⇒ 程序化建的宠物全是 GuardianAI。
+            pet->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
             pet->GetMap()->Add((Creature*)pet);
             pet->AIM_Initialize();
+            // 反应状态保持 REACT_DEFENSIVE（不主动拉怪）；"咬谁"由 DpsFsm 每 tick 显式 COMMAND_ATTACK。
             pet->AI()->SetReactState(REACT_DEFENSIVE);
             pet->InitPetCreateSpells();
 

@@ -7,7 +7,14 @@
 #include "Maps/Map.h"
 #include "Entities/Pet.h"           // [2026-10-31 站长口径] 猎人宠物生命周期守卫要现场建宠物（Pet::Create）
 #include "Server/SQLStorages.h"     // sCreatureStorage：按 entry 取 CreatureInfo（hunter_pet_entry）
+// [2026-10-31 根因] 宠物 AI 的选择由 `FactorySelector::selectAI` 按 UNIT_FLAG_PLAYER_CONTROLLED 决定：
+//   带这个 flag 的 HUNTER_PET 才是 PetAI（每 tick 复检追击 + 自动施法），否则退化成 GuardianAI
+//   （只在"主人被打"时 AttackStart，之后不管追击）。这里只用 dynamic_cast 打一行诊断日志。
+#include "AI/BaseAI/PetAI.h"
+#include "AI/BaseAI/GuardianAI.h"
+#include "Movement/MoveSpline.h"    // 诊断用：pet->movespline->Finalized()（Unit.h 里只有前向声明）
 
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <fstream>
@@ -179,6 +186,7 @@ namespace
     std::map<uint32, std::map<std::string, double>> s_overrides; // guid → 本轮参数覆盖（调优并发用）
     std::map<uint32, uint32> s_scenarioRun;                      // guid → 登记它的 runId
     std::map<uint32, uint32> s_petLogAt;                         // [2026-10-31] guid → 上次打 [DPSFSM-PET] 周期日志的毫秒时刻
+    std::map<uint32, uint32> s_petStuckAt;                       // [2026-10-31] guid → "在追但贴不上且没在动"的起始毫秒时刻
 
     std::mutex s_memMutex;
     std::unordered_map<uint32, std::unique_ptr<BotMem>> s_mem;
@@ -976,6 +984,99 @@ namespace
         return false;
     }
 
+    // [2026-10-31 修] 宠物命令状态 / AI 类型的可读名（只给 [DPSFSM-PET] 日志用）。
+    //   排查结论：程序化建宠时 `UNIT_FLAG_PLAYER_CONTROLLED` 是在 `AIM_Initialize()` **之后**才设的，
+    //   而 `FactorySelector::selectAI()` 用 `creature->IsPlayerControlled() && pet->isControlled()`
+    //   才选 PetAI；否则走 `ai_registry.GetRegistryItem("GuardianAI")`
+    //   （见 CreatureAISelector.cpp → FactorySelector::selectAI）。
+    //   GuardianAI 只在"主人被谁打了"时 AttackStart（GuardianAI.cpp → GuardianAI::UpdateAI），
+    //   没有任何"我没贴到目标就再追"的复检 ⇒ 宠物拿到 victim 之后停在原地不动（实测 dist 恒定 ~17）。
+    char const* PetCommandName(Pet* pet)
+    {
+        CharmInfo* charmInfo = pet ? pet->GetCharmInfo() : nullptr;
+        if (!charmInfo)
+            return "-";
+        switch (charmInfo->GetCommandState())
+        {
+            case COMMAND_STAY:   return "stay";
+            case COMMAND_FOLLOW: return "follow";
+            case COMMAND_ATTACK: return "attack";
+            default:             return "?";
+        }
+    }
+
+    char const* PetAiName(Pet* pet)
+    {
+        if (!pet || !pet->AI())
+            return "-";
+        if (dynamic_cast<PetAI*>(pet->AI()))
+            return "PetAI";
+        if (dynamic_cast<GuardianAI*>(pet->AI()))
+            return "GuardianAI";
+        return "other";
+    }
+
+    bool PetIsChasing(Pet* pet)
+    {
+        return pet && pet->GetMotionMaster() &&
+            pet->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE;
+    }
+
+    // [2026-10-31 修] **地形卡宠兜底**：`MovePoint(..., generatePath=false)` = 直线点移动（不寻路）。
+    //   触发条件只有一种：宠物已经在咬这个目标，但**追击 spline 已经走完（Finalized）却仍够不着**
+    //   且**连续 1.5 秒没动** —— 实测态是"dist 恒定 11.7、splineDone=1、moving=0"。
+    //   原因（core 侧）：`ChaseMovementGenerator::HandleFinalizedMovement()` 把 spline 结束当成
+    //   "到达目标"；随后 `m_reachable=false` 让 `HandleTargetedMovement()` 直接 return
+    //   （TargetedMovementGenerator.cpp），不再重新寻路 ⇒ 宠物卡在半路再也不动。
+    //   1.5 秒防抖是为了不误伤正常追击：两次寻路之间 spline 可能刚好结束一瞬，
+    //   那种情况不该插直线（会抄近路穿地形）。
+    void StraightApproachPet(Pet* pet, Unit* target, float meleeReach)
+    {
+        if (!pet || !target || !pet->GetMotionMaster())
+            return;
+
+        float dx = pet->GetPositionX() - target->GetPositionX();
+        float dy = pet->GetPositionY() - target->GetPositionY();
+        float len = std::sqrt(dx * dx + dy * dy);
+        if (len < 0.01f)
+        {
+            dx = 0.0f; dy = 1.0f; len = 1.0f;
+        }
+        // 落点放在目标身边（近战距离内侧），别站进目标模型中心
+        float const stop = std::max(0.5f, std::min(meleeReach * 0.5f, 2.0f));
+        pet->GetMotionMaster()->MovePoint(0,
+            target->GetPositionX() + dx / len * stop,
+            target->GetPositionY() + dy / len * stop,
+            target->GetPositionZ(), FORCED_MOVEMENT_NONE, false);
+    }
+
+    // 卡宠计时：movingOrPathing=true（还在走 / 追击 spline 没结束）就清零；
+    //   否则连续 1.5s 才返回 true（= 真的卡住了，可以走直线兜底）。
+    bool PetStuckLongEnough(uint32 guid, bool movingOrPathing)
+    {
+        std::lock_guard<std::mutex> lock(s_disabledMutex);
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        uint32& since = s_petStuckAt[guid];
+        if (movingOrPathing)
+        {
+            since = 0;
+            return false;
+        }
+        if (!since)
+        {
+            since = safeNow;
+            return false;
+        }
+        return WorldTimer::getMSTimeDiff(since, safeNow) >= 1500;
+    }
+
+    void ResetPetStuck(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(s_disabledMutex);
+        s_petStuckAt[guid] = 0;
+    }
+
     // 每 tick 的"宠物事务"：宠物没在咬当前目标（换目标 / 掉队 / 刚召出来）就重新下令。
     //   返回 true = 这一 tick 宠物事务已处理（已在打同一目标，或刚下完令）；
     //   没有宠物 / 没目标 / 宠物被禁止行动时返回 false（调用方照常放技能）。
@@ -996,11 +1097,15 @@ namespace
         {
             Unit* petVictim = present ? pet->GetVictim() : nullptr;
             float petDist = -1.0f;
+            bool chasing = false;
             if (present && s.target && s.target->IsInWorld() && s.target->GetMap() == pet->GetMap())
+            {
                 petDist = pet->GetDistance(s.target);
-            sLog.outError("[DPSFSM-PET] %s pet=%s victim=%s dist=%.1f tgt=%s",
-                s.bot->GetName(), present ? "有" : "无",
-                petVictim ? petVictim->GetName() : "-", petDist,
+                chasing = PetIsChasing(pet);
+            }
+            sLog.outError("[DPSFSM-PET] %s pet=%s ai=%s victim=%s cmd=%s chasing=%d dist=%.1f tgt=%s",
+                s.bot->GetName(), present ? "有" : "无", PetAiName(pet),
+                petVictim ? petVictim->GetName() : "-", PetCommandName(pet), chasing ? 1 : 0, petDist,
                 s.target ? s.target->GetName() : "-");
         }
 
@@ -1009,13 +1114,72 @@ namespace
         if (!s.target->IsInWorld() || !s.target->IsAlive() || s.target->GetMap() != pet->GetMap())
             return false;
 
-        // 已经在咬这个目标：无需下令，宠物事务算处理完
+        // 本核心没有 `Unit::GetMeleeReach()`（grep 全仓库无此符号）；近战距离用
+        //   `GetCombinedCombatReach(target, true)`（= 双方体积，和 CanReachWithMeleeAttack 同一口径）。
+        //   法系宠物（水元素/小鬼）由 PetAI 的 m_meleeEnabled=false 标记，它们要保持距离，
+        //   绝不能补 MoveChase（默认 dist=0 会把它拽进近战）⇒ 只有近战宠物才走补追那段。
+        float const meleeReach = pet->GetCombinedCombatReach(s.target, true);
+        bool const tooFar = pet->GetDistance(s.target) > meleeReach + 1.0f;
+        bool const meleePet = pet->AI() ? pet->AI()->IsMeleeEnabled() : true;
+
+        // 已经在咬这个目标：正常情况下无需下令，宠物事务算处理完。
+        //   [2026-10-31 修] **但**"GetVictim()==target 却停在 17 码外"正是实测的故障态：
+        //   追击一旦被打断（跟随/施法/选 AI 错误）就再也没人重发 ⇒ 整场 25 dps 平砍都没有。
+        //   所以近战宠物在这个状态下也要补一次追击（每 tick 判一次，追上后就不再调用）。
         if (pet->GetVictim() == s.target)
+        {
+            if (tooFar && meleePet)
+            {
+                if (pet->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE)
+                    return true;    // 下面那条"直线接近"正在走，别打断
+                // 追击 spline 已经走完却仍够不着 = ChaseMovementGenerator 判过 i_targetReached /
+                //   m_reachable=false，不会再重新寻路（实测宠物停在 11.7 码外不动，splineDone=1）。
+                //   连续 1.5s 确认卡住后，改用**不寻路的直线点移动**（generatePath=false）送到目标身边。
+                bool const splineDone = !pet->movespline || pet->movespline->Finalized();
+                bool const stuck = PetStuckLongEnough(s.bot->GetGUIDLow(), pet->IsMoving() || !splineDone);
+                if (stuck)
+                    StraightApproachPet(pet, s.target, meleeReach);
+                else if (pet->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+                    pet->GetMotionMaster()->MoveChase(s.target);
+            }
+            else
+                ResetPetStuck(s.bot->GetGUIDLow());   // 已经贴上目标 ⇒ 清掉卡宠计时
             return true;
+        }
+
+        ResetPetStuck(s.bot->GetGUIDLow());
 
         // 宠物被禁止行动（支配/惊吓/临时禁手）时下不了令，交回调用方，下一 tick 再试
         if (pet->HasActionsDisabled())
             return false;
+
+        // [2026-10-31 站长口径] **走引擎同一条命令路径**：发 `CMSG_PET_ACTION`
+        //   （`ACT_COMMAND | COMMAND_ATTACK`），由核心 `HandlePetAction` 去设命令状态、
+        //   停掉旧追击、重新 AttackStart —— 这就是真玩家点"攻击"的流程，也是引擎自己用的那条
+        //   （`AttackAction::PetAttack()` 里就是这么发；它是成员函数、依赖它自己的 bot/ai，
+        //   所以这里照抄那 6 行，不硬调）。
+        //   只有拿不到 WorldSession 时才回退到下面的手工路径。
+        if (s.bot->GetSession())
+        {
+            const uint8 flag = ACT_COMMAND;
+            const uint32 command = (uint32(flag) << 24) | COMMAND_ATTACK;
+            WorldPacket petData(CMSG_PET_ACTION);
+            petData << pet->GetObjectGuid();
+            petData << command;
+            petData << s.target->GetObjectGuid();
+            s.bot->GetSession()->HandlePetAction(petData);
+            ResetPetStuck(s.bot->GetGUIDLow());
+            return true;
+        }
+
+        // ---- 回退：无会话时手工下同样的令（保留旧行为）----
+        // [2026-10-31 修] 真玩家的宠物收到"攻击"命令时，`PetHandler.cpp → HandlePetActionHelper()`
+        //   的 COMMAND_ATTACK 分支做的是：SetPetLastAttackCommandTime → AttackStop →
+        //   MotionMaster()->Clear() → AI()->AttackStart(target)，并且**命令状态是 COMMAND_ATTACK**。
+        //   我们以前只调 AttackStart，CharmInfo 默认 COMMAND_FOLLOW（Unit.cpp → CharmInfo::CharmInfo
+        //   的 m_CommandState(COMMAND_FOLLOW)），PetAI 在不咬目标时按"跟随"处理，也不会重发追击。
+        if (CharmInfo* charmInfo = pet->GetCharmInfo())
+            charmInfo->SetCommandState(COMMAND_ATTACK);
 
         // 换目标 / 掉队：走 PetAI::AttackStart（它按宠物类型自己选近战还是远程，并开始追击）。
         //   裸 Unit::Attack 也可以，但会把"远程宠物该不该冲上去"这种判断留给调用方。
@@ -1023,6 +1187,12 @@ namespace
             pet->AI()->AttackStart(s.target);
         else
             pet->Attack(s.target, false);
+
+        // AttackStart → UnitAI::HandleMovementOnAttackStart 只在"真的从没目标变成有目标"时发一次追击。
+        //   刚下令这一 tick 不动直线兜底：先让它按寻路走（下一 tick GetVictim() 已经是这个目标，
+        //   真被地形卡住会走上面那段 1.5s 防抖 + 直线接近）。
+        ResetPetStuck(s.bot->GetGUIDLow());
+
         return true;
     }
 
@@ -1146,8 +1316,17 @@ namespace
 #endif
         pet->SetPower(POWER_HAPPINESS, HAPPINESS_LEVEL_SIZE * 2);
         pet->GetCharmInfo()->SetPetNumber(pet->GetObjectGuid().GetEntry(), true);
+        // [2026-10-31 根因修] `UNIT_FLAG_PLAYER_CONTROLLED` 必须在 `AIM_Initialize()` **之前**设：
+        //   `CreatureAISelector.cpp → FactorySelector::selectAI()` 正是用
+        //   `creature->IsPlayerControlled() && pet->isControlled()` 选 PetAI，否则落到 GuardianAI。
+        //   核心自己的两条建宠路径（Pet.cpp → Pet::LoadPetFromDB / CreateBaseAtCreature）也都是
+        //   先设这个 flag、后 AIM_Initialize；我们以前写在 Add/AIM_Initialize 之后 ⇒ 拿到 GuardianAI
+        //   （GuardianAI.cpp → GuardianAI::UpdateAI 只在"主人被谁打了"时 AttackStart，没有追击复检）。
+        pet->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
         pet->GetMap()->Add((Creature*)pet);
         pet->AIM_Initialize();
+        // 反应状态保持 REACT_DEFENSIVE（不主动开视野里的怪/不算乱拉怪）；
+        // "咬哪一只"由每 tick 的 CommandPetAttack 用 COMMAND_ATTACK 显式指定。
         pet->AI()->SetReactState(REACT_DEFENSIVE);
         // InitPetCreateSpells 会按 DBC 的 CreatureSpellData（22123 → 11568）学家族技能：
         //   角刺 Gore（还有低吼/撕咬），这也是"掠食者"作为目标宠物的理由。
@@ -1181,7 +1360,7 @@ namespace
         pet->CastOwnerTalentAuras();
         pet->UpdateAllStats();
         pet->SetHealth(pet->GetMaxHealth());
-        pet->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
+        // （UNIT_FLAG_PLAYER_CONTROLLED 已在 AIM_Initialize 之前设好，见上面"根因修"注释）
         bot->SetPet(pet);
         bot->SetPetGuid(pet->GetObjectGuid());
 #ifdef MANGOSBOT_TWO
@@ -1190,7 +1369,8 @@ namespace
         pet->SavePetToDB(PET_SAVE_AS_CURRENT, bot);
         bot->PetSpellInitialize();
 
-        sLog.outError("[DPSFSM-PET] %s 创建宠物 entry=%u", bot->GetName(), entry);
+        sLog.outError("[DPSFSM-PET] %s 创建宠物 entry=%u ai=%s react=%d",
+            bot->GetName(), entry, PetAiName(pet), int(pet->AI() ? pet->AI()->GetReactState() : -1));
         return pet;
     }
 
@@ -1290,20 +1470,48 @@ namespace
 
         // 诊断：每 10 秒一行，字段 = pet=<有/无> alive=<0/1> hp=<%> action=<mend/revive/call/create/none>
         //   （外加原来的 victim/dist/tgt，保持既有日志解析脚本可用）
+        //   [2026-10-31 修] 追加 ai= / cmd= / chasing=：宠物"没贴上"时要能一眼看出
+        //   到底是 AI 选错（GuardianAI）、命令状态还是 follow、还是追击没发出去。
         if (PetLogDue(s.bot->GetGUIDLow()))
         {
             Pet* const pet = s.bot->GetPet();
             bool const nowPresent = PetPresent(s);
             Unit* petVictim = (nowPresent && pet) ? pet->GetVictim() : nullptr;
             float petDist = -1.0f;
+            bool chasing = false;
             if (nowPresent && pet && s.target && s.target->IsInWorld() && s.target->GetMap() == pet->GetMap())
+            {
                 petDist = pet->GetDistance(s.target);
-            sLog.outError("[DPSFSM-PET] %s pet=%s alive=%d hp=%.0f action=%s victim=%s dist=%.1f tgt=%s",
-                s.bot->GetName(), nowPresent ? "有" : "无",
+                chasing = PetIsChasing(pet);
+            }
+            sLog.outError("[DPSFSM-PET] %s pet=%s ai=%s alive=%d hp=%.0f action=%s victim=%s cmd=%s chasing=%d dist=%.1f tgt=%s",
+                s.bot->GetName(), nowPresent ? "有" : "无", nowPresent ? PetAiName(pet) : "-",
                 (pet && pet->IsAlive()) ? 1 : 0,
                 pet ? pet->GetHealthPercent() : -1.0f,
-                action, petVictim ? petVictim->GetName() : "-", petDist,
+                action, petVictim ? petVictim->GetName() : "-", PetCommandName(pet), chasing ? 1 : 0, petDist,
                 s.target ? s.target->GetName() : "-");
+
+            // [2026-10-31 诊断] 只在"够不着"时打：宠物在追却贴不上，要能看出卡在哪一层
+            //   （spline 是否已经走完、是否被施法/定身打断、是否还有 CHASE_MOVE）。
+            if (nowPresent && pet && s.target
+                && pet->GetDistance(s.target) > pet->GetCombinedCombatReach(s.target, true) + 1.0f)
+            {
+                sLog.outError("[DPSFSM-PETDBG] %s pos=(%.1f,%.1f,%.1f) tpos=(%.1f,%.1f,%.1f) moving=%d splineDone=%d "
+                    "casting=%d immobilized=%d rooted=%d st=%d%d%d%d speedRate=%.2f",
+                    s.bot->GetName(),
+                    pet->GetPositionX(), pet->GetPositionY(), pet->GetPositionZ(),
+                    s.target->GetPositionX(), s.target->GetPositionY(), s.target->GetPositionZ(),
+                    pet->IsMoving() ? 1 : 0,
+                    (pet->movespline && pet->movespline->Finalized()) ? 1 : 0,
+                    pet->IsNonMeleeSpellCasted(false, false, true, true) ? 1 : 0,
+                    pet->IsImmobilizedState() ? 1 : 0,
+                    pet->IsRooted() ? 1 : 0,
+                    pet->hasUnitState(UNIT_STAT_NOT_MOVE) ? 1 : 0,
+                    pet->hasUnitState(UNIT_STAT_CHASE) ? 1 : 0,
+                    pet->hasUnitState(UNIT_STAT_CHASE_MOVE) ? 1 : 0,
+                    pet->hasUnitState(UNIT_STAT_MELEE_ATTACKING) ? 1 : 0,
+                    pet->GetSpeedRate(MOVE_RUN));
+            }
         }
         return acted;
     }
