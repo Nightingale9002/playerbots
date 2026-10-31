@@ -237,6 +237,10 @@ namespace
         int wlDots = 0;
         int wlMulti = 1;
         uint32 demoPetAt = 0;
+        // [2026-11-01 实测修正] 诅咒位的重放保护：放出去但读不到目标 debuff 时累计次数，
+        //   连续 2 次仍读不到就退避 30 秒（实测一轮 18 次诅咒空转、dps 205、dots 恒 0）。
+        int wlCurseTries = 0;
+        uint32 wlCurseSkipUntil = 0;
         // [2026-11-01 站长口径] 法师·火法（mode=5）专用（详见 DpsFsm.cpp 的“法师·火法”一节）：
         //   fireFbSinceScorch —— 自上次补灼烧以来**放出的火球数**：维护节奏的**主**判据
         //                        （叠满后每 scorch_refresh_fireballs(8) 发火球补一次 ≈ 24 秒）；
@@ -5458,6 +5462,37 @@ namespace ai
     //   恶魔：诅咒位 → 腐蚀 → 暗影箭填充。
     //   每条 DoT 走**同一个续期判据**：`TargetAuraRemain() < refresh_dot(3000ms)` 就补，
     //   不是"没挂才补"—— 这才是站长要的"到期续期"，旧口径会让 DoT 在到期的那一刻才想起来补。
+    // [2026-11-01 实测修正] 诅咒位：用 TargetAuraRemain（任意 rank）判"有没有"，
+    //   旧的 `AuraStacks()==0` 在"挂上了但读不到层数"时会每 tick 重放诅咒。
+    //   另加保护：连续 2 次放出去仍读不到 ⇒ 退避 30 秒，避免整场空转。
+    bool WarlockCurseTick(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!s.target)
+            return false;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (m->wlCurseSkipUntil && nowMs < m->wlCurseSkipUntil)
+            return false;
+        bool const cursed =
+            TargetAuraRemain(ai, s.bot, m, "curse of the elements", s.target) > 0 ||
+            TargetAuraRemain(ai, s.bot, m, "curse of shadows", s.target) > 0 ||
+            TargetAuraRemain(ai, s.bot, m, "curse of agony", s.target) > 0 ||
+            TargetAuraRemain(ai, s.bot, m, "curse of doom", s.target) > 0;
+        if (cursed)
+        {
+            m->wlCurseTries = 0;
+            return false;
+        }
+        if (!TryCast(ai, m, s, "curse of the elements", nullptr))
+            return false;
+        if (++m->wlCurseTries >= 2)
+        {
+            m->wlCurseSkipUntil = nowMs + 30000;
+            m->wlCurseTries = 0;
+            sLog.outError("[DPSFSM-WARLOCK] %s 连续 2 次放诅咒仍读不到目标 debuff ⇒ 退避 30s",
+                s.bot->GetName());
+        }
+        return true;
+    }
     ai::dpsfsm::TickResult TickWarlockDotsMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         using ai::dpsfsm::TickResult;
@@ -5467,12 +5502,8 @@ namespace ai
 
         bool const aff = (m->spec == Spec::Affliction);
 
-        // ① 诅咒位：目标身上没有任何诅咒 ⇒ 元素诅咒（与毁灭同一份判据）
-        if (AuraStacks(ai, s.bot, m, "curse of the elements", s.target) == 0
-            && AuraStacks(ai, s.bot, m, "curse of shadows", s.target) == 0
-            && AuraStacks(ai, s.bot, m, "curse of agony", s.target) == 0
-            && AuraStacks(ai, s.bot, m, "curse of doom", s.target) == 0
-            && TryCast(ai, m, s, "curse of the elements", nullptr))
+        // ① 诅咒位：目标身上没有任何诅咒 ⇒ 元素诅咒（判据与退避见 WarlockCurseTick）
+        if (WarlockCurseTick(ai, m, s))
             return TickResult::Acted;
 
         // ② 多目标（痛苦）：先把血量最多的前 multidot_max 个都铺上腐蚀，再谈单体；
@@ -5544,12 +5575,8 @@ namespace ai
 
         bool const threatOk = WarlockThreatOk(m, s);
 
-        // ① 诅咒位：目标身上没有任何诅咒才补（元素/暗影/痛苦/末日任一在场就不动）
-        if (AuraStacks(ai, s.bot, m, "curse of the elements", s.target) == 0
-            && AuraStacks(ai, s.bot, m, "curse of shadows", s.target) == 0
-            && AuraStacks(ai, s.bot, m, "curse of agony", s.target) == 0
-            && AuraStacks(ai, s.bot, m, "curse of doom", s.target) == 0
-            && TryCast(ai, m, s, "curse of the elements", nullptr))
+        // ① 诅咒位：目标身上没有任何诅咒才补（判据与退避见 WarlockCurseTick）
+        if (WarlockCurseTick(ai, m, s))
             return TickResult::Acted;
 
         // ② DoT：只在"目标预期存活 > dot_min_lifetime"时才上（每 GCD 预期收益 > 暗影箭）
