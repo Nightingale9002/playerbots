@@ -116,6 +116,8 @@ namespace
         time_t lastPotionTry = 0;              // 上一次尝试喝药水的时间
         time_t lastSummary = 0;
         uint32 castCount = 0;
+        std::map<std::string, time_t> prereqLast;   // [2026-10-31] 前置动作按名字记上次施放时间
+                                                    //   （图腾必须 60 秒内不重铺；靠 spell id 不可靠）
         uint32 stuckSpellId = 0;      // [2026-10-31] 读条看门狗：当前卡住的法术
         time_t stuckSince = 0;        //                       开始卡住的时间
 

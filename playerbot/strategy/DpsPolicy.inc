@@ -213,6 +213,9 @@ namespace dpspolicy
 
     // 元素萨：火震维护 > 闪电链(群) > 闪电箭 > 地震
     static PStep const kEle[] = {
+        // [2026-10-31 回退] 图腾前置需要"按图腾槽判空 + 名字解析都正确"才能用：
+        //   实测直接挂 Prereq 会每 tick 重铺（法力之泉图腾 25 秒 14~16 次），dps 从 ~400 掉到 ~290。
+        //   后续要做的话：先用 SpellId 解析出 id 并缓存，再用 GetTotemGuid(slot) 判空 + 60 秒兜底间隔。
         { "flame shock",        PKind::Target, "flame shock" },
         { "chain lightning",    PKind::Target, nullptr, 0, 0, 0, nullptr, 2 },
         { "lightning bolt",     PKind::Target },
@@ -590,6 +593,23 @@ namespace dpspolicy
     // [2026-10-30 站长口径] 策略执行入口：一次 tick 从上往下找**第一条能放的**策略步骤。
     //   返回 true = 这一 tick 状态机真的放出了技能（引擎这一 tick 不再插自己的施法）。
     //   返回 false = 没放出（没目标/都在冷却/资源不够/够不着）⇒ 交回引擎负责追击、走位、上马等。
+    // [2026-10-31] 图腾是"按槽存在"的：同一槽已有图腾就必须跳过，否则 Prereq 会每 tick 重铺
+    //   （实测元素萨 25 秒放同一个图腾 20 次、dps=0）。按法术名映射到四系槽位。
+    inline int TotemSlotOf(std::string const& name)
+    {
+        if (name.find("strength of earth") != std::string::npos || name.find("stoneskin") != std::string::npos)
+            return TOTEM_SLOT_EARTH;
+        if (name.find("grace of air") != std::string::npos || name.find("wrath of air") != std::string::npos
+            || name.find("windfury") != std::string::npos)
+            return TOTEM_SLOT_AIR;
+        if (name.find("searing") != std::string::npos || name.find("magma") != std::string::npos
+            || name.find("flametongue") != std::string::npos)
+            return TOTEM_SLOT_FIRE;
+        if (name.find("mana spring") != std::string::npos || name.find("healing stream") != std::string::npos)
+            return TOTEM_SLOT_WATER;
+        return TOTEM_SLOT_NONE;
+    }
+
     bool TickPolicy(PlayerbotAI* ai, BotMem* m)
     {
         Snapshot s;
@@ -660,8 +680,20 @@ namespace dpspolicy
                     continue;
                 if (!dpspolicy::StepAllowed(ai, m, s, st))
                     continue;
+                if (st.name && st.name[0] && std::string(st.name).find("totem") != std::string::npos)
+                {
+                    // [2026-10-31] 图腾按"槽"判空不可靠：实测召唤成功后 `GetTotemGuid(WATER)` 仍为空
+                    //   ⇒ 法力之泉图腾 25 秒被重铺 15 次。改用**时间间隔**（图腾持续 2 分钟，60 秒内不重铺）。
+                    int const slot = TotemSlotOf(st.name);
+                    if (slot != TOTEM_SLOT_NONE && !s.bot->GetTotemGuid(TotemSlot(slot)).IsEmpty())
+                        continue;
+                    auto pre = m->prereqLast.find(st.name);
+                    if (pre != m->prereqLast.end() && time(nullptr) - pre->second < 60)
+                        continue;       // 60 秒内不重铺（图腾持续 2 分钟）
+                }
                 if (dpspolicy::TryStep(ai, m, s, st))
                 {
+                    m->prereqLast[st.name] = time(nullptr);
                     // [2026-10-31 修] 前置动作**不要让出整个 tick**：它不造成伤害，
                     //   若就此 return，就没伤害 ⇒ 不进战斗 ⇒ 引擎也没机会开怪，
                     //   实测冰法 3 轮里 2 轮 "incombat=0 casts=3"（只放了前置 buff）。
