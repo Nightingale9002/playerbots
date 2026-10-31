@@ -105,6 +105,8 @@ namespace
         bool policyLogged = false;
         bool behindWarned = false;
         bool coverageLogged = false;    // 覆盖率断言只打一次
+        bool aoeLogDone = false;        // [2026-10-31 站长口径] 冰法 Aoe 的 [DPSFSM-AOE] 诊断只打一次
+        std::set<std::string> rankWarned;   // [2026-10-31 站长口径] "没有这条 rank 链/rank 越界"只报一次
         bool modeLogged = false;        // [2026-10-31 S1] 决策模式日志只打一次
         int  mode = 0;                  // [2026-10-31 S1] 本 tick 解析出的 DecisionMode（存 int：
                                         //   枚举声明在 BotMem 之后；TickPolicy 直接读它，不再二次读 conf）
@@ -420,6 +422,61 @@ namespace
         if (!id && warn && m->unresolved.insert(name).second)
             sLog.outError("[DPSFSM] %s(%s) 没有可用技�?'%s'", bot->GetName(), ai::dpsfsm::SpecName(m->spec), name);
         return id;
+    }
+
+    // [2026-10-31 站长口径] **按指定 rank 取法术 id**：先拿到"已学会的最高 rank"（复用 SpellId），
+    //   再顺着 cmangos 的法术链往回退到第 rank 级（rank 从 1 开始数）。
+    //   为什么要它：省蓝/控场场景要的常常不是满级技能（1 级暴风雪减速效果一样、蓝耗低得多），
+    //   而 SpellId 一律顶到最高 rank ⇒ 以前只能放满级的。
+    //   兜底：该法术没有链（GetSpellChainNode 为空）或 rank 越界时，返回最高 rank 的 id，并只打一条日志
+    //         （别每 tick 刷屏）。
+    uint32 SpellIdAtRank(PlayerbotAI* ai, BotMem* m, char const* name, uint32 rank, bool warn = true)
+    {
+        Player* bot = ai->GetBot();
+        uint32 const top = SpellId(ai, bot, m, name, warn);
+        if (!top)
+            return 0;
+
+        if (rank < 1)
+            rank = 1;
+
+        // 链上没有这个法术（GetSpellChainNode 为空 ⇒ GetSpellRank 返回 0）：不是多 rank 技能，别退。
+        SpellChainNode const* node = sSpellMgr.GetSpellChainNode(top);
+        uint32 const topRank = node ? uint32(node->rank) : 0;
+        if (!topRank)
+        {
+            if (rank > 1)
+            {
+                std::string const key = std::string(name) + "#nochain";
+                if (m->rankWarned.insert(key).second)
+                    sLog.outError("[DPSFSM-RANK] %s 技能 '%s' 没有 rank 链（id=%u），只能用最高 rank，忽略 rank=%u",
+                        bot->GetName(), name, top, rank);
+            }
+            return top;
+        }
+        if (rank > topRank)
+        {
+            std::string const key = std::string(name) + "#oob";
+            if (m->rankWarned.insert(key).second)
+                sLog.outError("[DPSFSM-RANK] %s 技能 '%s' 只有 %u 级（最高 id=%u），rank=%u 越界，按最高 rank 放",
+                    bot->GetName(), name, topRank, top, rank);
+            return top;
+        }
+
+        // 往回退：GetPrevSpellInChain 一路走到第 rank 级（rank=1 走到链首）
+        uint32 cur = top;
+        uint32 curRank = topRank;
+        while (curRank > rank)
+        {
+            uint32 const prev = sSpellMgr.GetPrevSpellInChain(cur);
+            if (!prev)
+                break;
+            cur = prev;
+            curRank = sSpellMgr.GetSpellRank(cur);
+            if (!curRank)
+                break;
+        }
+        return cur;
     }
 
     // [2026-10-29 站长口径] **有些技能不吃 GCD**（下一个平砍附带 / 无 GCD 的爆发技），
@@ -857,6 +914,38 @@ namespace
         m->lastOk[id] = now;
         m->castThisTick = true;
         PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        return true;
+    }
+
+    // [2026-10-31 站长口径] **按指定 id 对地面/位置施法**：TryCastAt 只吃名字（一律顶到最高 rank），
+    //   而冰法 Aoe 要按 `aoe_slow_rank` 放**低 rank 暴风雪**（1 级一样减速、蓝耗低得多）。
+    //   实现照抄 TryCastAt：Ready → failUntil 退避 → CanCastSpell 带结果码 → 核心位置施法 → 记账，
+    //   失败同样按资源类/其它类退避，并返回 false 让调用方回落到下一个技能。
+    bool CastIdAt(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 spellId, float x, float y, float z)
+    {
+        if (!Ready(s.bot, spellId))
+            return false;
+
+        time_t const now = time(nullptr);
+        auto it = m->failUntil.find(spellId);
+        if (it != m->failUntil.end() && now < it->second)
+            return false;
+
+        SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+        if (!ai->CanCastSpell(spellId, x, y, z, 0, true, nullptr, false, false, false, &res))
+        {
+            bool const waitingResource = (res == SPELL_FAILED_NO_POWER
+                || res == SPELL_FAILED_OUT_OF_RANGE || res == SPELL_FAILED_LINE_OF_SIGHT
+                || res == SPELL_FAILED_NOT_READY);
+            m->failUntil[spellId] = now + (waitingResource ? 1 : 2);
+            return false;
+        }
+        if (!ai->CastSpell(spellId, x, y, z))
+            return false;
+        ++m->castCount;
+        m->lastOk[spellId] = now;
+        m->castThisTick = true;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), spellId);
         return true;
     }
 
@@ -2604,9 +2693,24 @@ namespace ai
                 // [2026-10-31 站长口径] 群伤也不能让宠物闲着：掉队/换目标就重新下令（每 tick 检查，
                 //   10 秒一条 [DPSFSM-PET] 状态日志）
                 CommandPetAttack(s);
-                if (TryCastAt(ai, m, s, "blizzard", s.target->GetPositionX(),
-                        s.target->GetPositionY(), s.target->GetPositionZ()))
-                    return true;
+                // [2026-10-31 站长口径] 暴风雪是**范围减速**，一次覆盖一片，不需要逐个目标检查；
+                //   中心点直接用当前目标的坐标（pack30>1 就是这个怪堆，不做聚类）。
+                //   默认放 **1 级暴风雪**（aoe_slow_rank=1）：减速效果一样、蓝耗低得多；
+                //   放不出来再回落 ice lance → frostbolt（保持原顺序）。
+                {
+                    uint32 const slowRank = uint32(TP(m, "aoe_slow_rank", 1.0) + 0.5);
+                    uint32 const blizzardId = SpellIdAtRank(ai, m, "blizzard", slowRank ? slowRank : 1);
+                    if (!m->aoeLogDone)
+                    {
+                        m->aoeLogDone = true;
+                        sLog.outError("[DPSFSM-AOE] %s blizzard rank=%u id=%u pack30=%d",
+                            s.bot->GetName(), slowRank ? slowRank : 1, blizzardId, s.pack30);
+                    }
+                    if (blizzardId
+                        && CastIdAt(ai, m, s, blizzardId, s.target->GetPositionX(),
+                            s.target->GetPositionY(), s.target->GetPositionZ()))
+                        return true;
+                }
                 if (CastFirst(ai, m, s, { "ice lance" }))
                     return true;
                 return CastFirst(ai, m, s, { "frostbolt" });
