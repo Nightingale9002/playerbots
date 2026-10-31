@@ -112,13 +112,17 @@ namespace dpsvalue
                             utility = true;
                     }
                 }
-                // 不跳过：交给 w_utility 加权（默认 0 ⇒ 不会被选）
+                // [2026-10-31 站长口径] **控制法术是独立模块**，不并进 DPS 这套：
+                //   DPS 引擎只负责输出循环，控制/减益由将来单独的模块做。
+                //   所以这里是模块边界——直接排除，不做权重（避免把控制塞进 DPS 的调参空间）。
                 isUtilitySpell = utility;
 
             }
 
+            if (isUtilitySpell)
+                continue;               // 控制类不进入 DPS 候选（属于独立模块）
+
             Cand c;
-            c.isUtility = isUtilitySpell;
             c.id = id;
             c.name = sp->SpellName[0] ? sp->SpellName[0] : "?";
             c.auraState = sp->TargetAuraState;

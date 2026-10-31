@@ -869,13 +869,6 @@ namespace dpspolicy
                                     ww *= float(TP(m, "w_crossschool", 1.0));
                             }
                         }
-                        if (c.isUtility)
-                        {
-                            // [2026-10-31 站长口径] 控制/效用类不硬性关闭，用权重决定（默认 0）
-                            ww *= float(TP(m, "w_utility", 0.0));
-                            if (ww <= 0.0f)
-                                continue;
-                        }
                         score = dmg / std::max(0.2f, actSec) * ww;
                     }
                     if (score > bestAutoScore)
