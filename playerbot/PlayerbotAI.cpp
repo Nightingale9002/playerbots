@@ -17,6 +17,9 @@
 #include "strategy/actions/LogLevelAction.h"
 #include "strategy/actions/SayAction.h"
 #include "strategy/actions/EmoteAction.h"
+// [2026-10-31 假人测量台] 动作层闸门要按**动作类型**判断"这是不是施法动作"（见 IsSpellCastingAction）
+#include "strategy/actions/GenericSpellActions.h"
+#include "strategy/actions/CastCustomSpellAction.h"
 #include "strategy/values/LastSpellCastValue.h"
 #include "LootObjectStack.h"
 #include "playerbot/PlayerbotAIConfig.h"
@@ -63,6 +66,9 @@
 #include "strategy/values/GuildValues.h"
 
 using namespace ai;
+
+// [2026-10-31 假人测量台] 前向声明：UpdateAIInternal 在文件前部就要用，定义在 CastSpell 附近。
+static void NoteEngineCastGateArmed(Player* bot);
 
 std::vector<std::string>& split(const std::string &s, char delim, std::vector<std::string> &elems);
 std::vector<std::string> split(const std::string &s, char delim);
@@ -181,6 +187,11 @@ PlayerbotAI::PlayerbotAI(Player* bot) :
     engines[(uint8)BotState::BOT_STATE_NON_COMBAT]->AddActionExecutionListener(new ActionHistoryListener(this, false));
     engines[(uint8)BotState::BOT_STATE_DEAD]->AddActionExecutionListener(new ActionHistoryListener(this, false));
     engines[(uint8)BotState::BOT_STATE_REACTION]->AddActionExecutionListener(new ActionHistoryListener(this, true));
+    // [2026-10-31 站长口径] 假人场景里状态机独占施法：动作层闸门（见 EngineCastGuardListener）。
+    //   只挂战斗/非战斗引擎 —— 死亡/反应引擎不挂（反应是保命；而且闸门只在 DoNextAction 期间合上，
+    //   反应引擎本来就在那之前跑）。
+    engines[(uint8)BotState::BOT_STATE_COMBAT]->AddActionExecutionListener(new EngineCastGuardListener(this));
+    engines[(uint8)BotState::BOT_STATE_NON_COMBAT]->AddActionExecutionListener(new EngineCastGuardListener(this));
 
     currentEngine = engines[(uint8)BotState::BOT_STATE_NON_COMBAT];
     currentState = BotState::BOT_STATE_NON_COMBAT;
@@ -2026,11 +2037,30 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     //   其余 tick 引擎照常跑（追击/站位都归它）。远程职业被拉进近战的问题，
     //   在**引擎侧**修（见 PlayerbotAI::GetRange("attack")）。
     uint32 const guid = bot->GetGUIDLow();
-    bool const skipEngine = fsmHandled && dpsfsm::SkipEngine(guid) && dpsfsm::DidCastThisTick(guid);
+    bool const fsmOwnsBot = fsmHandled && dpsfsm::SkipEngine(guid);
+    bool const skipEngine = fsmOwnsBot && dpsfsm::DidCastThisTick(guid);
     if (!skipEngine)
     {
         dpsfsm::NoteEngineRun(guid);
+        // [2026-10-31 站长口径] 假人场景里**状态机独占施法，引擎只保留走位/追击/平砍**：
+        //   引擎这一 tick 照跑（逼近、站位、开自动攻击都还归它 —— 把这些一起关掉近战就站着不动，
+        //   实测 fury 40 秒只有 11 次普攻、arms 2 次），但它在 DoNextAction 期间发起的**任何施法**
+        //   都被拒掉：动作层见 EngineCastGuardListener，出口层见 PlayerbotAI::CastSpell。
+        //   为什么不靠"在 SimScenario 里少加策略"：引擎的轮转不是那一个 `+专精策略` 给的 ——
+        //   专精策略只是类型标记，真正的法术是 "update pve strats" 触发器按天赋树挂上的
+        //   "xxx pve"（curse / aoe / pet / buff / boost / cc 都各有自己的 pve 变种）再加上
+        //   通用策略里的咒术/宠物流。要删它们就得逐个名字删，还删不掉（触发器会重新挂），
+        //   而且里面掺着走位/角色判定用的标记策略（删了会翻成近战/远程错判）。
+        //   闸门按"动作是不是施法动作"判，与专精无关，新增技能自动覆盖。
+        //   ⚠️ 闸门只在"已经开打"时合上（bot 在战斗 / 有 victim）。开打前那几 tick 状态机自己会
+        //   早退（dpsfsm::Tick 的 no-victim），引擎本来就不受闸 —— 那里放行是给猎人的宠物、
+        //   术士的宠物/恶魔牺牲、圣骑的圣印留的余地，全拦会把宠物 DPS 一起打掉。
+        bool const prevCastLock = m_fsmCastLock;
+        m_fsmCastLock = fsmOwnsBot && (bot->IsInCombat() || bot->GetVictim());
+        if (m_fsmCastLock && !prevCastLock)
+            NoteEngineCastGateArmed(bot);
         DoNextAction(minimal);
+        m_fsmCastLock = prevCastLock;
     }
 
     // [2026-10-30 已删除] 这里曾有一条"远程职业绝不进近战"的不变量：
@@ -5584,6 +5614,69 @@ uint8 PlayerbotAI::GetManaPercent() const
    return GetManaPercent(*bot);
 }
 
+// [2026-10-31 站长口径·假人测量台] **施法权完全归状态机**（引擎只保留走位/追击/平砍/自动射击）。
+//   两层闸门，都在 m_fsmCastLock（只有"跑引擎那一 tick"才合上）之内：
+//     ① 动作层 `EngineCastGuardListener`：引擎在 DoNextAction 里选中的"施法类动作"在**执行入口**被拒。
+//        必须有这一层，因为引擎的法术动作有的走 `ai->CastSpell`，有的直接走核心 `bot->CastSpell`
+//        （例：CastShadowstepAction、CastSelfCentered 类），后一种出口闸门拦不到。
+//     ② 出口层 `PlayerbotAI::CastSpell`：剩下那些自己 new Spell / 调 ai->CastSpell 的动作也被拒。
+//   "是不是施法动作"按**类型**判（CastSpellAction / CastCustomSpellAction 的派生类 —— 所有职业的
+//   法术动作都派生自这两个基类），既不看专精也不看技能名，新增技能自动被覆盖。
+//   走位/追击/平砍不是施法动作（MovementAction / AttackAction），自动射击由状态机自己在 Tick 里
+//   调 DoSpecificAction("auto shot")（那时闸门没合上），所以 melee 白字与猎人自动射击不受影响。
+static bool IsSpellCastingAction(ai::Action* action)
+{
+    return dynamic_cast<ai::CastSpellAction*>(action) != nullptr
+        || dynamic_cast<ai::CastCustomSpellAction*>(action) != nullptr;
+}
+
+// 诊断限流：每只 bot 每 10 秒一条，能看清引擎到底还想抢哪些技能（改完策略应逐步归零）。
+static void NoteEngineCastDenied(Player* bot, std::string const& detail)
+{
+    static std::mutex s_mutex;
+    static std::unordered_map<uint32, std::pair<uint32, uint32>> s_stat;   // guid -> (上次打印 ms, 期间被拒次数)
+    uint32 const nowMs = WorldTimer::getMSTime();
+    uint32 const guid = bot ? bot->GetGUIDLow() : 0;
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+    auto& e = s_stat[guid];
+    ++e.second;
+    if (!e.first || WorldTimer::getMSTimeDiff(e.first, nowMs) >= 10000)
+    {
+        e.first = nowMs ? nowMs : 1;
+        sLog.outError("[FSM-CASTLOCK] bot=%s 引擎施法被拒 %u 次（最近 %s）—— 施法权在状态机",
+            bot ? bot->GetName() : "?", e.second, detail.c_str());
+        e.second = 0;
+    }
+}
+
+// 每只 bot 只打一条：证明这份二进制里闸门对这只 bot**真的合上了**（否则"没有 [FSM-CASTLOCK]"
+// 分不清是"闸没开"还是"引擎根本没想施法"）。
+static void NoteEngineCastGateArmed(Player* bot)
+{
+    static std::mutex s_mutex;
+    static std::set<uint32> s_seen;
+    uint32 const guid = bot ? bot->GetGUIDLow() : 0;
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!s_seen.insert(guid).second)
+        return;
+    sLog.outError("[FSM-CASTLOCK] bot=%s 施法闸门已合上：本 tick 起引擎的施法动作/施法调用一律被拒（走位/平砍不受影响）",
+        bot ? bot->GetName() : "?");
+}
+
+bool EngineCastGuardListener::Before(Action* action, const Event& event)
+{
+    if (!ai || !action || !ai->IsEngineCastLocked())
+        return true;
+
+    if (!IsSpellCastingAction(action))
+        return true;
+
+    NoteEngineCastDenied(ai->GetBot(), "action=" + action->getName());
+    return false;
+}
+
 bool PlayerbotAI::CastSpell(std::string name, Unit* target, Item* itemTarget, bool waitForSpell, uint32* outSpellDuration)
 {
     bool result = CastSpell(aiObjectContext->GetValue<uint32>("spell id", name)->Get(), target, itemTarget, waitForSpell, outSpellDuration);
@@ -5600,6 +5693,14 @@ bool PlayerbotAI::CastSpell(std::string name, Unit* target, Item* itemTarget, bo
 //   现在拆成两层：CastSpell 只在**真正成功**时记账，实际逻辑在 CastSpellBody 里。
 bool PlayerbotAI::CastSpell(uint32 spellId, Unit* target, Item* itemTarget, bool waitForSpell, uint32* outSpellDuration)
 {
+    // [2026-10-31 站长口径] 假人场景里状态机独占施法 ⇒ 引擎这一 tick 的施法在这里被拒（第二层闸门，
+    //   见 NoteEngineCastDenied 上面的说明；第一层是 EngineCastGuardListener 的动作入口拦截）。
+    if (m_fsmCastLock)
+    {
+        NoteEngineCastDenied(bot, "spell=" + std::to_string(spellId));
+        return false;
+    }
+
     bool const ok = CastSpellBody(spellId, target, itemTarget, waitForSpell, outSpellDuration);
     if (ok && spellId && bot)
         PlayerbotAI::RecordSpellCast(bot->GetObjectGuid(), spellId);
@@ -5856,6 +5957,13 @@ bool PlayerbotAI::CastSpell(uint32 spellId, GameObject* goTarget, Item* itemTarg
     if (!spellId)
         return false;
 
+    // [2026-10-31 站长口径] 状态机独占施法：引擎这一 tick 的施法被拒（见 NoteEngineCastDenied 上面的说明）。
+    if (m_fsmCastLock)
+    {
+        NoteEngineCastDenied(bot, "spell=" + std::to_string(spellId));
+        return false;
+    }
+
     aiObjectContext->GetValue<LastMovement&>("last movement")->Get().Set(NULL);
     aiObjectContext->GetValue<time_t>("stay time")->Set(0);
 
@@ -6002,6 +6110,13 @@ bool PlayerbotAI::CastSpell(uint32 spellId, float x, float y, float z, Item* ite
 {
     if (!spellId)
         return false;
+
+    // [2026-10-31 站长口径] 状态机独占施法：引擎这一 tick 的施法被拒（见 NoteEngineCastDenied 上面的说明）。
+    if (m_fsmCastLock)
+    {
+        NoteEngineCastDenied(bot, "spell=" + std::to_string(spellId));
+        return false;
+    }
 
     Pet* pet = bot->GetPet();
     if (pet && pet->HasSpell(spellId))

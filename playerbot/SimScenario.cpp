@@ -283,6 +283,10 @@ uint32 stuckFightCleared = 0;
             // 基线（用来算增量）
             uint64 dmg0 = 0, pet0 = 0, melee0 = 0, casts0 = 0;
             std::map<uint32, uint64> spells0;   // 施法分布也要取增量，否则 top 里是历史累计
+            // [2026-10-31 站长口径] 分窗口瞬时 DPS：每 10 秒一条，用来画曲线。
+            //   只看 120 秒总数会把"起手爆发 / 掉蓝段 / 空窗"平均掉，也容易被噪声带偏。
+            uint32 lastWinMs = 0;
+            uint64 lastWinDmg = 0;
         };
 
         std::vector<DummyRun> s_dummies;
@@ -330,6 +334,54 @@ uint32 stuckFightCleared = 0;
             { "ret",          CLASS_PALADIN, "retribution",   "protection",    "holy",         2, "pve dps ret" },
             { "shadow",       CLASS_PRIEST,  "shadow",        "discipline",    "holy",         2, "pve dps shadow" },
         };
+
+        // [2026-10-31] 一堆一专精的场地表，与上面的 s_specKeys 一一对应。
+        //   17 个专精 = 17 堆独立木桩，堆心两两最小间距 34.1 码（≥30 ⇒ AoE 不会跨堆）。
+        //   `dummyall`（17 专精各一堆）与 `arms`（每批每专精一个臂，各自一堆）共用这张表。
+        //   ⚠️ 改专精表时必须同步改这里，长度不一致会直接拒绝开跑。
+        //   ⚠️ 场地只有 17 堆 ⇒ `arms` 一批里**每个专精只能有一个臂**（同专精两个臂没法都拿到场地）。
+        struct SpecPileSpot
+        {
+            float x, y, z;          // 堆心：假人围在这个点 PILE_DUMMY_R 码一圈
+            float standAngle;       // bot 站位方向（弧度）：从 0 号假人（堆心正东 PILE_DUMMY_R）量起
+            float standZ;           // bot 站位处的实测地面高度（近战取 3 码点 / 远程取 18 码点）
+        };
+
+        // ⚠️ GM 岛（map 1, DUMMY_SPOT）是座小山：z≈12.6 的平地只有沿海一条窄带，
+        //   **30 码见方的 17 堆场地放不下**（实测 5×4 / 4×5 网格最多只能到 19~20 码）。
+        //   所以沿岛的下层台阶排一条 17 点蛇形环带，每堆 z 取地形实测值（运行期再用
+        //   Map::GetHeight 校正一次）；已避开岛上的房子（chairs 那片 WMO）和 Spirit Healer。
+        //   坐标/高度来自 ad.exe 的 .map 采样（2026-10-30）。
+        SpecPileSpot const s_specPiles[] =
+        {
+            { 16346.0f, 16204.0f,  8.1f, 4.5815f,  6.1f },  // fire
+            { 16348.0f, 16238.0f, 13.3f, 1.7890f, 11.6f },  // frost
+            { 16320.0f, 16262.0f, 21.9f, 3.6652f, 23.6f },  // arcane
+            { 16286.0f, 16270.0f, 18.6f, 4.6688f, 19.9f },  // arms
+            { 16262.0f, 16296.0f, 14.2f, 3.5779f, 13.9f },  // fury
+            { 16274.0f, 16328.0f, 13.5f, 0.0000f, 12.8f },  // combat
+            { 16286.0f, 16360.0f, 27.8f, 1.2217f, 28.3f },  // assassination
+            { 16242.0f, 16342.0f, 14.9f, 0.9163f, 16.8f },  // bm
+            { 16210.0f, 16322.0f, 17.8f, 3.0543f, 17.6f },  // marks
+            { 16186.0f, 16294.0f, 13.8f, 1.8326f, 12.5f },  // affliction
+            { 16222.0f, 16272.0f, 12.9f, 3.3161f, 12.9f },  // destro
+            { 16210.0f, 16238.0f,  8.2f, 4.3633f,  7.5f },  // enhance
+            { 16254.0f, 16254.0f, 21.1f, 3.8834f, 22.7f },  // elemental
+            { 16272.0f, 16216.0f, 13.3f, 3.7961f, 14.2f },  // feral
+            { 16310.0f, 16228.0f, 26.6f, 2.4871f, 25.0f },  // balance
+            { 16302.0f, 16306.0f,  8.2f, 5.6287f,  8.3f },  // ret
+            { 16188.0f, 16354.0f, 18.5f, 5.6723f, 20.3f },  // shadow
+        };
+
+        SpecPileSpot const* PileSpotForSpec(std::string const& key)
+        {
+            uint32 const n = uint32(sizeof(s_specKeys) / sizeof(s_specKeys[0]));
+            uint32 const m = uint32(sizeof(s_specPiles) / sizeof(s_specPiles[0]));
+            for (uint32 i = 0; i < n && i < m; ++i)
+                if (key == s_specKeys[i].key)
+                    return &s_specPiles[i];
+            return nullptr;
+        }
 
         SpecKey const* FindSpecKey(std::string const& key)
         {
@@ -3715,14 +3767,16 @@ uint32 stuckFightCleared = 0;
             return true;
         }
 
-        // [2026-10-29 站长口径] 所有专精在**同一轮**里一起打同一堆木桩：
-        //   堆主（第一个专精）负责召唤，其余人加入同一堆；每人仍只数"自己声明的目标"，
-        //   所以 1 目标/5 目标的口径不变，但一轮就能把 17 个专精全测完。
         // [2026-10-29 站长口径] 一轮里同时跑多组不同参数（A/B 并发）：
-        //   每个 "spec:key=value" 是一臂，各用**不同 bot**、共用同一堆木桩（玩家之间没有碰撞体积，站一起没事）。
+        //   每个 "spec:key=value" 是一臂，各用**不同 bot**。
         //   "spec:@" 表示该专精的基线（不覆盖任何参数）。
+        // [2026-10-31 站长口径·测量台] 每臂**独占一堆木桩**（场地表 s_specPiles），
+        //   不再共用一堆：共用时多臂抢同一批木桩、AoE 跨臂重叠 ⇒ 数字不可用。
+        //   pins 可选：按臂顺序给"固定 bot guid"（0=自动挑），同专精跨批用同一个 bot
+        //   可去掉个体差异（调参时必须）。
         void StartArms(std::list<std::string>& messages, std::vector<std::string> const& arms,
-                       uint32 targets, uint32 seconds)
+                       uint32 targets, uint32 seconds,
+                       std::vector<uint32> const& pins = std::vector<uint32>())
         {
             if (targets < 1) targets = 1;
             if (targets > 5) targets = 5;
@@ -3808,12 +3862,38 @@ uint32 stuckFightCleared = 0;
                 for (uint32 g : r.guids)
                     used.insert(g);
 
-            uint32 ownerId = 0;
+            // [2026-10-31 修] 每个臂**自己一堆**（用 s_specPiles 的专精场地），不再共用一堆。
+            //   共用一堆时多个臂抢同一批木桩：AoE 跨臂重叠、伤害互相抢 ⇒ 数字不可用
+            //   （就是 dummyall 已被证伪的那个坑）。场地只有 17 堆 ⇒
+            //   **一批里每个专精只能有一个臂**；重复的臂直接跳过并报出来。
+            std::map<std::string, uint32> specCount;
+            for (auto const& arm : parsed)
+                ++specCount[arm.spec->key];
+
             uint32 started = 0;
             std::string skipped;
-            for (auto const& arm : parsed)
+            std::string dupSpecs;
+            for (size_t ai = 0; ai < parsed.size(); ++ai)
             {
-                Player* bot = FindOnlineBotOfClass(arm.spec->cls, used);
+                Arm const& arm = parsed[ai];
+                if (specCount[arm.spec->key] > 1)
+                {
+                    if (dupSpecs.find(arm.spec->key) == std::string::npos)
+                        dupSpecs += std::string(dupSpecs.empty() ? "" : ",") + arm.spec->key;
+                    skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
+                    continue;
+                }
+                // 固定 bot（调参用）：仍然是这个 guid 就直接用，省掉重天赋/换装，也去掉个体差异
+                Player* bot = nullptr;
+                uint32 const pin = (ai < pins.size()) ? pins[ai] : 0;
+                if (pin)
+                {
+                    bot = FindPlayerAny(pin);
+                    if (bot && (!bot->IsInWorld() || !bot->IsAlive() || used.count(bot->GetGUIDLow())))
+                        bot = nullptr;
+                }
+                if (!bot)
+                    bot = FindOnlineBotOfClass(arm.spec->cls, used);
                 uint32 loginGuid = 0;
                 if (!bot)
                 {
@@ -3855,8 +3935,6 @@ uint32 stuckFightCleared = 0;
                 d.mapId = 1;
                 d.standDist = melee ? 3.0f : 18.0f;
                 d.meleeSpec = melee;
-                d.z = DUMMY_SPOT_Z;
-                d.sharedPile = true;
                 d.armLabel = arm.label;
                 if (!arm.baseline)
                     if (!arm.kv.empty())
@@ -3869,28 +3947,24 @@ uint32 stuckFightCleared = 0;
                         d.overrides[arm.key] = arm.value;
                     }
 
-                // 所有臂共用同一堆木桩：第一个臂当堆主（召 1 个假人），其余加入
-                d.ringAngle = 6.2831853f * float(started) / float(parsed.size());
-                if (!ownerId)
+                // 自己一堆（与 dummyall 同一张场地表）：假人摆在 pileX/pileY，
+                //   bot 站到 standAngle 方向 standDist 码处，z 用实测地面高度。
+                SpecPileSpot const* spot = PileSpotForSpec(arm.spec->key);
+                if (!spot)
                 {
-                    ownerId = d.id;
-                    d.centerPile = true;
-                    d.pileX = DUMMY_SPOT_X;
-                    d.pileY = DUMMY_SPOT_Y;
-                    d.pileZ = DUMMY_SPOT_Z;
-                    d.pileSet = true;
-                    // 堆主也站到自己那一侧（远程 18 / 近战 3），量的是**离 0 号假人**的距离
-                    //   （假人在堆心正东 PILE_DUMMY_R 处；站到堆心西侧 3 码的话离假人是 5 码，近战够不着）
-                    d.x = DUMMY_SPOT_X + PILE_DUMMY_R - d.standDist;
-                    d.y = DUMMY_SPOT_Y;
-                    d.z = DUMMY_SPOT_Z;
+                    skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
+                    continue;
                 }
-                else
-                {
-                    d.pileOwner = ownerId;
-                    d.x = DUMMY_SPOT_X + PILE_DUMMY_R + cos(d.ringAngle) * d.standDist;
-                    d.y = DUMMY_SPOT_Y + sin(d.ringAngle) * d.standDist;
-                }
+                d.centerPile = true;
+                d.sharedPile = false;
+                d.pileX = spot->x;
+                d.pileY = spot->y;
+                d.pileZ = spot->z;
+                d.pileSet = true;
+                d.ringAngle = spot->standAngle;
+                d.x = spot->x + PILE_DUMMY_R + cos(spot->standAngle) * d.standDist;
+                d.y = spot->y + sin(spot->standAngle) * d.standDist;
+                d.z = spot->standZ;
 
                 if (d.waitingLogin)
                 {
@@ -3908,10 +3982,14 @@ uint32 stuckFightCleared = 0;
                 ++started;
             }
 
-            sLog.outError("[DUMMY] arms 开跑：%u 臂、木桩 %u 个、%u 秒、堆主 id=%u、跳过=[%s]",
-                started, targets, seconds, ownerId, skipped.c_str());
-            messages.push_back("参数并发开跑：" + std::to_string(started) + " 臂 × "
-                + std::to_string(targets) + " 木桩 × " + std::to_string(seconds) + " 秒");
+            sLog.outError("[DUMMY] arms 开跑：%u 臂（每臂独立一堆，每堆 %u 个木桩）、%u 秒、"
+                "跳过=[%s]、重复专精被跳过=[%s]",
+                started, targets, seconds, skipped.c_str(), dupSpecs.c_str());
+            if (!dupSpecs.empty())
+                messages.push_back("arms: 一批里每专精只能一个臂（场地只有 17 堆），已跳过重复专精："
+                    + dupSpecs);
+            messages.push_back("参数并发开跑：" + std::to_string(started) + " 臂（各自独立木桩 × "
+                + std::to_string(targets) + " 个）× " + std::to_string(seconds) + " 秒");
         }
 
         void StartDummyAll(std::list<std::string>& messages, uint32 targets, uint32 seconds)
@@ -3927,40 +4005,8 @@ uint32 stuckFightCleared = 0;
                 for (uint32 g : r.guids)
                     used.insert(g);
 
+            // 场地表在文件作用域（s_specPiles），arms 也用同一张；这里只校验长度。
             uint32 const n = uint32(sizeof(s_specKeys) / sizeof(s_specKeys[0]));
-            struct PileSpot
-            {
-                float x, y, z;          // 堆心：假人围在这个点 PILE_DUMMY_R 码一圈
-                float standAngle;       // bot 站位方向（弧度）：从 0 号假人（堆心正东 PILE_DUMMY_R）量起
-                float standZ;           // bot 站位处的实测地面高度（近战取 3 码点 / 远程取 18 码点）
-            };
-            // [2026-10-30 站长口径] 一个专精一堆：17 个专精 = 17 堆独立木桩，互不干扰。
-            //   ⚠️ GM 岛（map 1, DUMMY_SPOT）是座小山：z≈12.6 的平地只有沿海一条窄带，
-            //   **30 码见方的 17 堆场地放不下**（实测 5×4 / 4×5 网格最多只能到 19~20 码）。
-            //   所以沿岛的下层台阶排一条 17 点蛇形环带，每堆 z 取地形实测值（运行期再用
-            //   Map::GetHeight 校正一次），两两堆心最小间距 **34.1 码**（≥30 ⇒ AoE 不会跨堆）；
-            //   已避开岛上的房子（chairs 那片 WMO）和 Spirit Healer。
-            //   本表与上面的 s_specKeys 一一对应；坐标/高度来自 ad.exe 的 .map 采样（2026-10-30）。
-            static PileSpot const s_specPiles[] =
-            {
-                { 16346.0f, 16204.0f,  8.1f, 4.5815f,  6.1f },  // fire
-                { 16348.0f, 16238.0f, 13.3f, 1.7890f, 11.6f },  // frost
-                { 16320.0f, 16262.0f, 21.9f, 3.6652f, 23.6f },  // arcane
-                { 16286.0f, 16270.0f, 18.6f, 4.6688f, 19.9f },  // arms
-                { 16262.0f, 16296.0f, 14.2f, 3.5779f, 13.9f },  // fury
-                { 16274.0f, 16328.0f, 13.5f, 0.0000f, 12.8f },  // combat
-                { 16286.0f, 16360.0f, 27.8f, 1.2217f, 28.3f },  // assassination
-                { 16242.0f, 16342.0f, 14.9f, 0.9163f, 16.8f },  // bm
-                { 16210.0f, 16322.0f, 17.8f, 3.0543f, 17.6f },  // marks
-                { 16186.0f, 16294.0f, 13.8f, 1.8326f, 12.5f },  // affliction
-                { 16222.0f, 16272.0f, 12.9f, 3.3161f, 12.9f },  // destro
-                { 16210.0f, 16238.0f,  8.2f, 4.3633f,  7.5f },  // enhance
-                { 16254.0f, 16254.0f, 21.1f, 3.8834f, 22.7f },  // elemental
-                { 16272.0f, 16216.0f, 13.3f, 3.7961f, 14.2f },  // feral
-                { 16310.0f, 16228.0f, 26.6f, 2.4871f, 25.0f },  // balance
-                { 16302.0f, 16306.0f,  8.2f, 5.6287f,  8.3f },  // ret
-                { 16188.0f, 16354.0f, 18.5f, 5.6723f, 20.3f },  // shadow
-            };
             if (uint32(sizeof(s_specPiles) / sizeof(s_specPiles[0])) != n)
             {
                 messages.push_back("dummyall: 木桩布局表与专精表长度不一致（改专精表时别忘了它）");
@@ -3973,7 +4019,7 @@ uint32 stuckFightCleared = 0;
             for (uint32 i = 0; i < n; ++i)
             {
                 SpecKey const& spec = s_specKeys[i];
-                PileSpot const& spot = s_specPiles[i];
+                SpecPileSpot const& spot = s_specPiles[i];
                 Player* bot = FindOnlineBotOfClass(spec.cls, used);
                 uint32 loginGuid = 0;
                 if (!bot)
@@ -4464,6 +4510,10 @@ uint32 stuckFightCleared = 0;
                         it = s_dummies.erase(it);
                         continue;
                     }
+                    // [2026-10-31 站长口径·测量台] 每轮开跑前**清冷却**（所有路径统一）。
+                    //   以前只有单专精路径清，`arms`/`dummyall` 没有 ⇒ 2 分钟级大招（冰冷血脉/召唤水元素）
+                    //   会从上一条臂继承，同一套参数跨批差 30%+。参数必须传 false 才真清服务端冷却。
+                    bot->RemoveAllCooldowns(false);
                     // 基线改成"假人到手之后"，避免把传送前的动作算进来
                     d.dmg0 = bot->botDamageDealt;
                     d.pet0 = bot->botPetDamageDealt;
@@ -4689,6 +4739,28 @@ uint32 stuckFightCleared = 0;
                             d.id, acted ? 1 : 0, direct ? 1 : 0,
                             bot->GetVictim() ? bot->GetVictim()->GetName() : "-",
                             bot->getAttackerForHelper() ? 1 : 0);
+                    }
+                }
+
+                // [2026-10-31] 每 10 秒记一条窗口 DPS（bot + 宠物），供画瞬时曲线
+                {
+                    uint32 const WIN_MS = 10000;
+                    uint64 const cur = bot->botDamageDealt + bot->botPetDamageDealt;
+                    if (!d.lastWinMs)
+                    {
+                        d.lastWinMs = d.startMs;
+                        d.lastWinDmg = d.dmg0 + d.pet0;
+                    }
+                    if (now >= d.lastWinMs + WIN_MS)
+                    {
+                        uint64 const delta = cur > d.lastWinDmg ? cur - d.lastWinDmg : 0;
+                        double const winSec = (now - d.lastWinMs) / 1000.0;
+                        sLog.outError("[DPS-WIN] id=%u spec=%s t=%.0f win=%.1f dps=%.1f cum=%llu",
+                            d.id, d.spec.c_str(), (now - d.startMs) / 1000.0, winSec,
+                            winSec > 0.0 ? double(delta) / winSec : 0.0,
+                            (unsigned long long)(cur > (d.dmg0 + d.pet0) ? cur - (d.dmg0 + d.pet0) : 0));
+                        d.lastWinMs = now;
+                        d.lastWinDmg = cur;
                     }
                 }
 
@@ -5087,6 +5159,65 @@ uint32 stuckFightCleared = 0;
             uint32 seconds = uint32(atoi(args[2].c_str()));
             std::vector<std::string> arms(args.begin() + 3, args.end());
             StartArms(messages, arms, targets, seconds);
+            return messages;
+        }
+
+        // [2026-10-31] 控制台命令行走的是 CliRunnable 的 fgets(commandbuf[256]) ⇒ 一行最多 255 字符。
+        //   组合搜索一个臂要带 10 组 k=v（约 200 字符），17 个臂要 3.4KB，直接发命令必然被截断
+        //   （实测 17 臂只解析到 2 个、第二个 label 还被砍了一半）⇒ 参数改从**文件**读：
+        //   `.rndbot sim armsfile <targets> <seconds> <path>`，文件每行一个 `spec:k=v,...`（# 开头跳过）。
+        if (args[0] == "armsfile")
+        {
+            if (args.size() < 4)
+            {
+                messages.push_back("用法：.rndbot sim armsfile <targets> <seconds> <file>"
+                    "（文件每行一个 spec:key=value,... 或 spec:@，# 开头为注释）");
+                return messages;
+            }
+            uint32 targets = uint32(atoi(args[1].c_str()));
+            uint32 seconds = uint32(atoi(args[2].c_str()));
+            std::ifstream in(args[3].c_str());
+            if (!in)
+            {
+                messages.push_back("armsfile: 打不开文件 " + args[3]);
+                return messages;
+            }
+            std::vector<std::string> arms;
+            std::vector<uint32> pins;      // 与 arms 一一对应：0 = 自动挑 bot
+            std::string line;
+            while (std::getline(in, line))
+            {
+                // 去 CR/前后空白
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+                    line.pop_back();
+                size_t const b = line.find_first_not_of(" \t");
+                if (b == std::string::npos) continue;
+                line = line.substr(b);
+                if (line.empty() || line[0] == '#') continue;
+                // 可选固定 bot：`spec|<guid>|k=v,...`（没有 '|' 就是老格式 `spec:k=v,...`）
+                size_t const p1 = line.find('|');
+                if (p1 != std::string::npos)
+                {
+                    std::string const spec = line.substr(0, p1);
+                    size_t const p2 = line.find('|', p1 + 1);
+                    uint32 const guid = uint32(atoi(line.substr(p1 + 1,
+                        p2 == std::string::npos ? std::string::npos : p2 - p1 - 1).c_str()));
+                    std::string const params = (p2 == std::string::npos) ? "@" : line.substr(p2 + 1);
+                    arms.push_back(spec + ":" + params);
+                    pins.push_back(guid);
+                }
+                else
+                {
+                    arms.push_back(line);
+                    pins.push_back(0);
+                }
+            }
+            if (arms.empty())
+            {
+                messages.push_back("armsfile: 文件里没有臂 " + args[3]);
+                return messages;
+            }
+            StartArms(messages, arms, targets, seconds, pins);
             return messages;
         }
 

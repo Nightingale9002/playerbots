@@ -122,6 +122,10 @@ namespace
         time_t stuckSince = 0;        //                       开始卡住的时间
 
         uint32 tickCount = 0;
+        // [2026-10-31 站长口径] 组动作（macro）的执行状态：价值引擎选中"整组"之后，
+        //   这里只负责把选中的那组一步步走完。选择仍然只有价值引擎一处。
+        int planId = 0;          // 0=无；1=奥法 3+3（3 奥冲 + 寒冰箭填窗 + 卡秒那发）
+        int planStep = 0;
     };
 
     std::mutex s_disabledMutex;
@@ -208,12 +212,36 @@ namespace
 
     double TuneForBot(BotMem* m, char const* key, double def);
 
+    // [2026-10-31 根因] conf 里的参数前缀用的是**短名**（destro/bm/marks/enhance/ret），
+    //   而 `SpecName()` 返回的是**长名**（destruction/beast mastery/marksmanship/enhancement/retribution）
+    //   ⇒ 这 5 个专精的 conf 参数（包括 `policy=1`）**从来没有被读到过**，一直跑旧的硬编码轮转。
+    //   实测证据：毁灭术 HB 里 `pol=0`、casts 里全是 TickWarlock 的献祭/腐蚀/燃烧/痛苦诅咒。
+    //   这里做一次别名映射，两个名字都能命中（新配置写短名、老配置写长名都不会踩空）。
+    static char const* TuneAlias(char const* spec)
+    {
+        if (!spec)
+            return spec;
+        if (!strcmp(spec, "destruction"))   return "destro";
+        if (!strcmp(spec, "beast mastery")) return "bm";
+        if (!strcmp(spec, "marksmanship"))  return "marks";
+        if (!strcmp(spec, "enhancement"))   return "enhance";
+        if (!strcmp(spec, "retribution"))   return "ret";
+        return spec;
+    }
+
     double Tune(char const* spec, char const* key, double def)
     {
         std::lock_guard<std::mutex> lock(s_tuneMutex);
         auto it = s_tune.vals.find(std::string(spec) + ":" + key);
         if (it != s_tune.vals.end())
             return it->second;
+        char const* alias = TuneAlias(spec);
+        if (alias && strcmp(alias, spec) != 0)
+        {
+            it = s_tune.vals.find(std::string(alias) + ":" + key);
+            if (it != s_tune.vals.end())
+                return it->second;
+        }
         it = s_tune.vals.find(std::string("*:") + key);
         if (it != s_tune.vals.end())
             return it->second;
@@ -559,6 +587,16 @@ namespace
         return CastChecked(ai, m, s, name, nullptr, s.bot);
     }
 
+    // [2026-10-31] **以自己宠物为目标**的施法（恶魔牺牲 18788 就是这样：目标必须是自己的恶魔，
+    //   对着自己放会 BAD_TARGETS）。以前 Prereq 一律走 TryCastSelf ⇒ 牺牲暗的 18788 一次都没放出来。
+    bool TryCastPet(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        Pet* pet = s.bot->GetPet();
+        if (!pet || !pet->IsAlive())
+            return false;
+        return CastChecked(ai, m, s, name, pet, nullptr);
+    }
+
     // [2026-10-30 修] 地面目标技（暴风雪/烈焰风暴/飓风/箭雨/火雨）原来**不做任何校验**就直接
     //   交给 `PlayerbotAI::CastSpell(id, x, y, z)`：那一层只看"能不能排队"，里面 `Spell::SpellStart`
     //   的 CheckCast 失败时是**静默**的（不返回错误码）⇒ 状态机以为放出去了，整条优先级表
@@ -837,8 +875,8 @@ namespace
                     int const blastStacks = int(s.bot->GetAuraCount(36032));
                     // 蓝够就继续奥冲（叠层既加伤害也加耗蓝）；蓝紧了再用飞弹把叠层泄掉、稳住续航
                     if (blastStacks >= 3 && s.power < 45.0f && CastFirst(ai, m, s, { "arcane missiles" })) break;
-                    // 奥术弹幕：瞬发、CD 好了就打（没点这个天赋时 SpellId 取不到，自动跳过）
-                    if (CastFirst(ai, m, s, { "arcane barrage" })) break;
+                    // [2026-10-31 修正] TBC 2.4.3 **没有奥术弹幕**（Arcane Barrage 是 WLK 的）。
+                    //   原来这里挂着它：SpellId 取不到 → 每 tick 白试一次，日志更会误导读技能表的人。
                 }
 
                 CastFirst(ai, m, s, { filler });

@@ -54,6 +54,9 @@ namespace dpspolicy
         int holdBelowEnergy = 0;              // PKind::Hold：能量低于这个值时才"等"（0 = 一直等）
         char const* holdParam = nullptr;      // 等待阈值也可扫（例如 hold_energy）
         double holdDefault = 45.0;
+        // [2026-10-31 先验注入] 叠层目标：aura 层数没到 stackTarget 就继续放（攻略里的"灼烧叠 5 层"）。
+        //   以前只有 needAuraGone 的"有没有"，表达不了"叠到几层"，火法只能靠 TickMage 的专用分支。
+        int stackTarget = 0;
     };
 
     struct PPolicy
@@ -161,7 +164,11 @@ namespace dpspolicy
     static PStep const kFire[] = {
         { "combustion",         PKind::Burst },
         { "presence of mind",   PKind::Burst },
-        { "scorch",             PKind::Target, "fire vulnerability" },
+        // [2026-10-31 先验注入] 攻略：先把灼烧叠到 5 层（火焰易伤），再搓火球；火冲留给移动/斩杀。
+        //   stackTarget=5 让"层数没满就继续放"，不受 DoT 的 8 秒重放门限制。
+        { "scorch",             PKind::Target, "fire vulnerability", 0, 0, 0, nullptr, 0, 100.0f,
+                                nullptr, nullptr, nullptr, 1.0, nullptr, 60.0, false, 0, 0, false, 0,
+                                nullptr, 45.0, 5 },
         { "fireball",           PKind::Target },
         { "fire blast",         PKind::Target },
         { "flamestrike",        PKind::Ground, nullptr, 0, 0, 0, nullptr, 2 },
@@ -177,10 +184,13 @@ namespace dpspolicy
         { "blizzard",           PKind::Ground, nullptr, 0, 0, 0, nullptr, 2 },
     };
 
-    // 奥法：奥强 > 奥术冲击 > 奥术飞弹 > 魔爆(群)
+    // 奥法（3+3）：奥强 > 奥术冲击（叠 3 层）> **寒冰箭**（填满 8 秒窗口）> 奥术飞弹 > 魔爆(群)
+    //   [2026-10-31 站长口径] 寒冰箭是 3+3 的正式组成部分，必须写进表里；
+    //   否则它算"表外候选"，会被 w_offtable(0.1) 压掉，整条 3+3 就不成立。
     static PStep const kArcane[] = {
         { "arcane power",       PKind::Burst },
         { "arcane blast",       PKind::Target },
+        { "frostbolt",          PKind::Target },
         { "arcane missiles",    PKind::Target },
         { "arcane explosion",   PKind::Target, nullptr, 0, 0, 0, nullptr, 2 },
     };
@@ -194,14 +204,17 @@ namespace dpspolicy
         { "shadow bolt",        PKind::Target },
     };
 
-    // 毁灭术：元素诅咒 > 献祭 > 燃烧 > 腐蚀(跨系填充) > 暗影箭 > 火雨(群)
+    // 毁灭术（牺牲暗）：**开战前准备** 召唤魅魔 → 恶魔牺牲（魅魔给 +15% 暗影伤害）→
+    //   开打后只有 暗影箭 填充。
+    //   [站长口径 2026-10-31] **诅咒不进 DPS 循环**：诅咒按团队需求分配，
+    //   DPS 表不为它占位，也不要用权重去"选"它。
+    //   不写死"几秒一次"：召唤与牺牲走 `PKind::Prereq` + 宠物/牺牲光环门禁（见 PetPrereqNeeded），
+    //   有魅魔就不再召、已有牺牲光环就不再牺牲 ⇒ 自然只在开场做一次。
+    //   献祭/燃烧/腐蚀/火雨不在牺牲暗的循环里（若以后要做火毁，另开一张表，别在这一张里塞）。
     static PStep const kDestro[] = {
-        { "curse of elements",  PKind::Target, "curse of elements" },
-        { "immolate",           PKind::Target, "immolate" },
-        { "conflagrate",        PKind::Target },
-        { "corruption",         PKind::Target, "corruption" },
+        { "summon succubus",    PKind::Prereq },
+        { "demonic sacrifice",  PKind::Prereq },
         { "shadow bolt",        PKind::Target },
-        { "rain of fire",       PKind::Ground, nullptr, 0, 0, 0, nullptr, 2 },
     };
 
     // 恶魔术：献祭 > 腐蚀 > 暗影箭
@@ -476,10 +489,14 @@ namespace dpspolicy
         //   （武器战 Rend 40 秒放了 14 次，GCD 全废）。加一道"同一手最少间隔 8 秒"的硬门。
         if (st.needAuraGone)
         {
-            uint32 const gid = SpellId(ai, s.bot, m, st.name, false);
-            auto const lo = m->lastOk.find(gid);
-            if (gid && lo != m->lastOk.end() && time(nullptr) - lo->second < 8)
-                return false;
+            // 叠层类不受 8 秒门限制（叠 5 层要连着放 5 次，8 秒门会把它卡成 1~2 层）
+            if (st.stackTarget <= 0)
+            {
+                uint32 const gid = SpellId(ai, s.bot, m, st.name, false);
+                auto const lo = m->lastOk.find(gid);
+                if (gid && lo != m->lastOk.end() && time(nullptr) - lo->second < 8)
+                    return false;
+            }
         }
         if (st.minPack > 0 && s.pack10 < st.minPack && s.pack30 < st.minPack)
             return false;
@@ -532,6 +549,12 @@ namespace dpspolicy
                 if (remain > st.refreshMs)        // 还够久，先不续
                     return false;
             }
+            else if (st.stackTarget > 0)
+            {
+                // [2026-10-31 先验注入] 叠层目标（攻略："灼烧叠满 5 层"）：层数到了就跳过
+                if (AuraStacks(ai, s.bot, m, st.needAuraGone, auraUnit) >= st.stackTarget)
+                    return false;
+            }
             else if (AuraStacks(ai, s.bot, m, st.needAuraGone, auraUnit) > 0)
                 return false;
         }
@@ -558,7 +581,12 @@ namespace dpspolicy
             case PKind::Swing:
                 return TrySwing(ai, m, s, st.name);
             case PKind::Burst:
+                return TryCastSelf(ai, m, s, st.name);
             case PKind::Prereq:
+                // [2026-10-31] 少数前置动作的目标是**自己的宠物**（恶魔牺牲 18788），
+                //   对着自己放会 BAD_TARGETS（实测 90 秒一次都没放出来）。
+                if (st.name && std::string(st.name).find("sacrifice") != std::string::npos)
+                    return TryCastPet(ai, m, s, st.name);
                 return TryCastSelf(ai, m, s, st.name);
             case PKind::PowerShift:
             {
@@ -610,6 +638,159 @@ namespace dpspolicy
         return TOTEM_SLOT_NONE;
     }
 
+    // [2026-10-31] 宠物类**开战前准备**（召唤/牺牲）：术士的牺牲暗就是
+    //   "召唤魅魔 → 恶魔牺牲（+15% 暗影伤害）"，做完这辈子都别再动它。
+    //   门禁用"有没有宠物 / 有没有牺牲光环"，不用时间间隔：
+    //     召唤 → 没宠物 **且** 没有牺牲光环（否则牺牲完又去召，会反复召唤/牺牲）
+    //     牺牲 → 身上有宠物才做
+    //   牺牲光环 id 来自 core 的 DemonicSacrifice 脚本（小鬼18789/虚空18790/魅魔18791/地狱犬18792/末日35701）。
+    //   [2026-10-31] 牺牲**必须选魅魔**（只有魅魔给 +15% 暗影伤害）；所以召唤条件按"宠物是不是魅魔"判断，
+    //     而不是"有没有宠物"——否则身上挂着一只地狱犬时永远不会去召魅魔。
+    inline bool PetPrereqNeeded(Player* bot, char const* name)
+    {
+        if (!bot || !name)
+            return false;
+        static uint32 const kSacrificeAuras[] = { 18789, 18790, 18791, 18792, 35701 };
+        bool hasSacrifice = false;
+        for (uint32 aura : kSacrificeAuras)
+            if (bot->HasAura(aura)) { hasSacrifice = true; break; }
+        Pet* pet = bot->GetPet();
+        bool const hasPet = (pet != nullptr);
+        uint32 const PET_SUCCUBUS = 1863;
+        bool const isSuccubus = hasPet && pet->GetEntry() == PET_SUCCUBUS;
+        std::string const n(name);
+        if (n.find("summon ") == 0)
+        {
+            // 魅魔：没有牺牲光环、且当前宠物不是魅魔 ⇒ 召唤（会顶掉现有宠物）
+            if (n.find("succubus") != std::string::npos)
+                return !hasSacrifice && !isSuccubus;
+            // 其它召唤（水元素等）：没宠物才召
+            return !hasPet && !hasSacrifice;
+        }
+        if (n.find("sacrifice") != std::string::npos)
+            return isSuccubus;      // 只牺牲魅魔，拿对的增益
+        return true;
+    }
+
+    // [2026-10-31 站长口径] **只有一套评分**：表内条目和表外候选都必须用同一个公式。
+    //   以前表内走 ValueOfId(旧 base 公式)、表外走 EstDamage/actSec，
+    //   结果火球（表内）输给奥术冲击（表外）——不是火球差，是两把尺子不同。
+    //   公式：伤害(核心算) / (施法时间 + 回蓝时间)，再乘权重。
+    inline float ScoreCand(Player* bot, Unit* target, dpsvalue::Cand const& c,
+                           float weaponHit, uint8 combo, int pack, float weight)
+    {
+        float dmg = dpsvalue::EstDamage(bot, target, c, weaponHit, combo, pack);
+        if (dmg <= 0.0f)
+            return 0.0f;
+        // [2026-10-31 站长口径·简化] 奥法单体就是"奥冲 + 寒冰箭"两把技能：
+        //   按**单发 + 当前层数的真实蓝耗**定价即可，不要让模型自己发明链条。
+        //   3+3 是算出来的：0 层奥冲便宜又快 → 连打出层；3 层变贵 → 寒冰箭填窗口；
+        //   窗口只剩不到一发读条时，EffectiveCost 会给"基础蓝耗"，那发便宜的快读自然胜出。
+        //   （上一版把整条链平均进一发里，等于用最贵的几发拖累当前决策，实测 dps 803→591，已撤。）
+        float actSec = std::max(1.5f, float(c.castMs) / 1000.0f);
+        if (SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(c.id))
+            actSec = std::max(1.5f, float(GetSpellCastTime(sp, bot)) / 1000.0f);
+        if (c.winSec > 0.0f)                       // 通道法术占用整个通道时长
+            actSec = std::max(actSec, c.winSec);
+        actSec += dpsvalue::ResourceSeconds(bot, c, dpsvalue::EffectiveCost(bot, c));
+        return dmg / std::max(0.2f, actSec) * weight;
+    }
+
+    inline dpsvalue::Cand const* FindCand(Player* bot, uint32 guid, uint32 id)
+    {
+        // 表内技能也要按"当前这次施法"的真实参数评分：从候选表里取同一个 Cand
+        std::vector<dpsvalue::Cand>& cands = dpsvalue::Candidates(bot, guid);
+        for (auto const& c : cands)
+            if (c.id == id)
+                return &c;
+        return nullptr;
+    }
+
+    // [2026-10-31 站长口径·统一机制] 奥法 3+3 不再是一条独立分支，而是价值引擎里的**一个组候选**：
+    //   组 = 补满 3 发奥冲（各自读条/蓝耗）+ 寒冰箭填满 8 秒窗口 + 卡秒那发；
+    //   组价值 = 组总伤害 / (Σ各步读条 + Σ各步蓝耗/回蓝)。
+    //   它和"寒冰箭单发"等普通候选放在**同一个池子**里，由同一套评分选出来。
+    //   选中后才进入执行（planId=1），执行只负责按状态把这一组走完。
+    inline float Arcane33GroupScore(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!s.target)
+            return 0.0f;
+        dpsvalue::Cand const* ab = FindCand(s.bot, s.bot->GetGUIDLow(), 30451);
+        if (!ab)
+            return 0.0f;
+        uint32 const fbId = SpellId(ai, s.bot, m, "frostbolt", false);
+        dpsvalue::Cand const* fb = fbId ? FindCand(s.bot, s.bot->GetGUIDLow(), fbId) : nullptr;
+        SpellEntry const* abSp = sSpellTemplate.LookupEntry<SpellEntry>(30451);
+        if (!abSp)
+            return 0.0f;
+        float const weaponHit = s.bot->CalculateDamage(BASE_ATTACK, false);
+        float const dmgAb = dpsvalue::EstDamage(s.bot, s.target, *ab, weaponHit, s.combo, s.pack10);
+        float const dmgFb = fb ? dpsvalue::EstDamage(s.bot, s.target, *fb, weaponHit, s.combo, s.pack10) : 0.0f;
+        if (dmgAb <= 0.0f)
+            return 0.0f;
+        float const regen = std::max(30.0f, float(s.bot->GetMaxPower(POWER_MANA)) * 0.02f);
+        int const stacks = std::min(3, int(s.bot->GetAuraCount(36032)));
+        // 0 层读条（当前读条 + 已叠层数 × 334ms 还原）
+        float const t0 = std::max(1.0f, float(GetSpellCastTime(abSp, s.bot)) / 1000.0f
+            + 0.334f * float(stacks));
+        float totalTime = 0.0f, totalDmg = 0.0f;
+        for (int i = stacks; i < 3; ++i)                 // 还没打满的起手层
+        {
+            totalTime += std::max(1.0f, t0 - 0.334f * float(i))
+                + float(ab->cost) * (1.0f + 0.75f * float(i)) / regen;
+            totalDmg += dmgAb;
+        }
+        float const ab3 = std::max(1.0f, t0 - 0.334f * 3.0f);   // 3 层时奥冲读条
+        if (fb && dmgFb > 0.0f)                          // 寒冰箭填满 8 秒窗口
+        {
+            float const fbCast = std::max(1.0f,
+                float(GetSpellCastTime(sSpellTemplate.LookupEntry<SpellEntry>(fbId), s.bot)) / 1000.0f);
+            int n = int((8.0f - ab3) / fbCast);
+            n = std::max(0, std::min(4, n));
+            for (int i = 0; i < n; ++i)
+            {
+                totalTime += fbCast + float(fb->cost) / regen;
+                totalDmg += dmgFb;
+            }
+        }
+        totalTime += ab3 + float(ab->cost) / regen;      // 卡秒那发（3 层速度、基础蓝耗）
+        totalDmg += dmgAb;
+        return totalDmg / std::max(0.5f, totalTime);
+    }
+
+    // 执行已经选中的 3+3 组：按当前状态走下一步（放不出来就等下一 tick，**不回退**到别的技能）
+    inline void ExecuteArcane33(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        SpellEntry const* abSp = sSpellTemplate.LookupEntry<SpellEntry>(30451);
+        if (!abSp || !s.target)
+            return;
+        uint32 const fbId = SpellId(ai, s.bot, m, "frostbolt", false);
+        int const abCast = int(GetSpellCastTime(abSp, s.bot));
+        int const fbCast = fbId ? int(GetSpellCastTime(sSpellTemplate.LookupEntry<SpellEntry>(fbId), s.bot)) : 2500;
+        int const stacks = std::min(3, int(s.bot->GetAuraCount(36032)));
+        int remain = -1;
+        if (SpellAuraHolder* h = s.bot->GetSpellAuraHolder(36032))
+            remain = h->GetAuraDuration();
+
+        if (stacks < 3 || remain < 0)                   // 起手：继续叠层（或已过期）
+        {
+            dpsvalue::CastId(ai, m, s, 30451, s.target);
+            return;
+        }
+        if (remain <= abCast)                           // 卡秒：现在起手，落地时已过期
+        {
+            if (dpsvalue::CastId(ai, m, s, 30451, s.target))
+                m->planId = 0;                          // 组走完（卡秒那发是下一轮的第一发）
+            return;
+        }
+        if (fbId && remain >= fbCast)                   // 填窗口
+        {
+            dpsvalue::CastId(ai, m, s, fbId, s.target);
+            return;
+        }
+        // 窗口只剩不到一发寒冰箭、又没到卡秒点 ⇒ 等（最多约 1 秒）
+    }
+
     bool TickPolicy(PlayerbotAI* ai, BotMem* m)
     {
         Snapshot s;
@@ -659,6 +840,15 @@ namespace dpspolicy
 
         dpspolicy::LogMissingOnce(ai, m, s.bot, pol);
 
+        // [2026-10-31 站长口径] 已经选中"3+3 组" ⇒ 这一 tick 只负责执行它。
+        //   注意：**选择**只在价值引擎那一处做（见下面 Arcane33GroupScore 与统一打分），
+        //   这里只是把已选中的组按状态走完，不是第二套判断。
+        if (m->planId == 1)
+        {
+            ExecuteArcane33(ai, m, s);
+            return true;
+        }
+
         // [2026-10-30 站长口径] 表内价值驱动：pselect=1 时先给所有"当前可执行"的步骤打分，再放最高的那个。
         //   pselect=0（默认）= 原来的"第一条能放就放"，两条路可同轮 A/B。
         if (TP(m, "pselect", 0.0) >= 1.0)
@@ -700,6 +890,14 @@ namespace dpspolicy
                         }
                     }
                     if (!needTotem)
+                        continue;
+                }
+                // [2026-10-31] 宠物类前置（召唤魅魔 / 恶魔牺牲）：按宠物与牺牲光环判断，
+                //   否则 Prereq 会每 tick 重放（和图腾同一个坑）。
+                if (st.name && (std::string(st.name).find("summon ") == 0
+                        || std::string(st.name).find("sacrifice") != std::string::npos))
+                {
+                    if (!PetPrereqNeeded(s.bot, st.name))
                         continue;
                 }
                 if (dpspolicy::TryStep(ai, m, s, st))
@@ -744,10 +942,30 @@ namespace dpspolicy
                 float mag = 0.0f;
                 if (dpsvalue::IsUpkeepId(ai, m, s, sid, mag))
                     continue;                      // 吞吐类第二遍再算
-                float base = 0.0f;
-                if (!dpsvalue::ValueOfId(ai, m, s, sid, base))
-                    continue;
-                float const score = base * dpspolicy::StepWeight(m, st);
+                float score = 0.0f;
+                // [2026-10-31 站长口径] 表内条目与表外候选**用同一个公式**（见 ScoreCand）
+                if (dpsvalue::Cand const* tc = FindCand(s.bot, s.bot->GetGUIDLow(), sid))
+                {
+                    score = ScoreCand(s.bot, s.target, *tc, s.bot->CalculateDamage(BASE_ATTACK, false),
+                        s.combo, s.pack10, dpspolicy::StepWeight(m, st));
+                    if (score <= 0.0f)
+                        continue;
+                    // [2026-10-31 诊断] 表内评分也打出来，才能和表外候选在同一行比较
+                    if (m->flags.insert(std::string("estt:") + st.name).second)
+                        sLog.outError("[DPS-EST-T] %s spec=%s spell=%s score=%.1f stack=%d castMs=%u cost=%d",
+                            s.bot->GetName(), ai::dpsfsm::SpecName(m->spec), st.name, score,
+                            (int)s.bot->GetAuraCount(36032),
+                            uint32(dpsvalue::Candidates(s.bot, s.bot->GetGUIDLow()).empty() ? 0 :
+                                   GetSpellCastTime(sSpellTemplate.LookupEntry<SpellEntry>(sid), s.bot)),
+                            dpsvalue::EffectiveCost(s.bot, *tc));
+                }
+                else
+                {
+                    float base = 0.0f;
+                    if (!dpsvalue::ValueOfId(ai, m, s, sid, base))
+                        continue;
+                    score = base * dpspolicy::StepWeight(m, st);
+                }
                 if (score > vmax)
                     vmax = score;
                 if (dpsvalue::ResourceOk(ai, m, s, sid) && score > bestScore)
@@ -832,7 +1050,12 @@ namespace dpspolicy
                             : (c.weaponMul > 0.0f ? "strike" : (c.needsCombo ? "finisher" : "nuke"))));
                     char wkey[24];
                     snprintf(wkey, sizeof(wkey), "w_%s", wclass);
-                    float const w = float(TP(m, wkey, 1.0));
+                    // [2026-10-31 站长口径] **攻略里没提到的技能**（表外候选）权重默认 ×0.1：
+                    //   它们不是被禁掉，只是先验上认为"不在最优循环里"，降到可以竞争但不主动选。
+                    //   参数 `w_offtable` 可调（每专精可覆盖），先验与实测都通过它表达。
+                    float const w = float(TP(m, wkey, 1.0)) * float(TP(m, "w_offtable", 0.1));
+                    if (w <= 0.0f)
+                        continue;       // 表外技能权重为 0 = 完全不参与竞争（奥法的 3+3 形状不能被它打碎）
 
                     float mag = 0.0f;
                     float score = 0.0f;
@@ -853,23 +1076,29 @@ namespace dpspolicy
                     {
                         // [2026-10-30 站长口径] 按角色实际属性估值（法伤/暴击），不再只看技能基础伤害
                         float const dmg = dpsvalue::EstDamage(s.bot, s.target, c, weaponHit, s.combo, s.pack10);
-                        float const actSec = std::max(1.5f, float(c.castMs) / 1000.0f)
-                            + dpsvalue::ResourceSeconds(s.bot, c);
+                        // [2026-10-31 口径核对] 占用时间：
+                        //   直伤/DoT = 读条时间（DoT 只占 1 个 GCD）；
+                        //   **通道法术**（飓风/暴风雪/火雨）= 整个通道时长，不能用 1.5 秒当分母。
+                        float actSec = std::max(1.5f, float(c.castMs) / 1000.0f);
+                        if (c.winSec > 0.0f)
+                            actSec = std::max(actSec, c.winSec);
+                        // [2026-10-31 站长口径] 蓝耗按**这一发、当前状态**取（奥冲叠层会涨到 195*(1+2N)）
+                        actSec += dpsvalue::ResourceSeconds(s.bot, c, dpsvalue::EffectiveCost(s.bot, c));
                         if (dmg <= 0.0f)
                             continue;
                         float ww = w;
-                        // [2026-10-31 站长口径] 跨系技能不硬性关闭：用 `w_crossschool`（默认 1.0）加权，
-                        //   优化器可以把它压到 0（等于只用自己的系），也可以放大（混搭流派）。
-                        {
-                            SpellEntry const* csp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
-                            if (csp)
-                            {
-                                uint32 const specFamily = dpsvalue::SpecFamily(s.bot->getClass(), int(m->spec));
-                                if (specFamily && csp->SpellFamilyName && csp->SpellFamilyName != specFamily)
-                                    ww *= float(TP(m, "w_crossschool", 1.0));
-                            }
-                        }
+                        // [2026-10-31 站长口径·修正] **不再按"是否跨专精"打折**。
+                        //   每个技能用同一套权重，选不选只看它自己的**效果**（伤害/耗蓝/时间）。
+                        //   之前用 `w_crossschool` 压跨系，等于用标签代替估值：奥法搓寒冰箭被压住了，
+                        //   但真正的原因是寒冰箭对奥法**效果差**——那应该由 EstDamage（含天赋百分比增伤）算出来。
                         score = dmg / std::max(0.2f, actSec) * ww;
+                        // [2026-10-31 诊断] 估值构成：每专精每技能只打一次，用来核对"估值 vs 实际"。
+                        //   为什么需要它：火法一发火球都不放，但光看施法分布分不清是
+                        //   "没进候选"还是"估值算低了"——这条日志直接把 dmg / actSec / cost / score 摊开。
+                        if (m->flags.insert(std::string("est:") + c.name).second)
+                            sLog.outError("[DPS-EST] %s spec=%s spell=%s dmg=%.0f actSec=%.2f cost=%d score=%.1f",
+                                s.bot->GetName(), ai::dpsfsm::SpecName(m->spec), c.name, dmg, actSec,
+                                dpsvalue::EffectiveCost(s.bot, c), score);
                     }
                     if (score > bestAutoScore)
                     {
@@ -883,11 +1112,44 @@ namespace dpspolicy
                 {
                     if (dpsvalue::CastId(ai, m, s, bestAutoId, s.target))
                     {
+                        // [2026-10-31 诊断] 表外技能被选中时，记录**主技能当时能不能放**：
+                        //   castable=1 ⇒ 明明能放主技能却选了表外（这是估值误差，亏 dps）；
+                        //   castable=0 ⇒ 主技能不可用（移动/距离/蓝/打断），表外是替代品（赚）。
+                        //   有了这条，`w_offtable` 该设 0.1 还是 0.02 就不用猜。
+                        if (bestIdx >= 0 && s.target)
+                        {
+                            char const* const mainName = pol->steps[bestIdx].name;
+                            uint32 const mainId = SpellId(ai, s.bot, m, mainName, false);
+                            bool mainOk = false;
+                            SpellCastResult mainRes = SPELL_FAILED_DONT_REPORT;
+                            if (mainId)
+                                mainOk = ai->CanCastSpell(mainId, s.target, 0, true, nullptr, false, false, false, &mainRes);
+                            sLog.outError("[DPS-OFFTABLE] %s spec=%s chose=%u score=%.1f main=%s(%u) castable=%d res=%d moving=%d",
+                                s.bot->GetName(), ai::dpsfsm::SpecName(m->spec), bestAutoId, bestAutoScore,
+                                mainName ? mainName : "-", mainId, mainOk ? 1 : 0, int(mainRes),
+                                s.bot->IsMoving() ? 1 : 0);
+                        }
                         if (bestAutoUpkeep && s.target)
                             dpsvalue::ClaimSlot(s.target, bestAutoId, s.bot->GetGUIDLow(), 15000);
                         m->state = (s.pack10 >= AoEPack(m)) ? State::Aoe : State::Burn;
                         return true;
                     }
+                }
+            }
+
+            // [2026-10-31 站长口径·统一机制] 奥法 3+3 作为**组候选**和普通技能一起比：
+            //   它的价值是整组的平均 DPS（每步各自的读条与蓝耗），不是单发。
+            //   赢了才把 planId 置 1，进入执行；选择只有这一处。
+            if (m->spec == Spec::Arcane && m->planId == 0 && s.target)
+            {
+                float const groupScore = Arcane33GroupScore(ai, m, s);
+                // 走到这里时，表外自动候选要么没赢、要么施放失败（赢了就已经 return），
+                // 所以基准就是表内最高分 bestScore。
+                if (groupScore > 0.0f && groupScore > bestScore)
+                {
+                    m->planId = 1;
+                    ExecuteArcane33(ai, m, s);
+                    return true;
                 }
             }
 

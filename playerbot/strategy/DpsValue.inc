@@ -24,6 +24,10 @@ namespace dpsvalue
         uint32 id = 0;
         std::string name;          // 法术名（覆盖率日志用）
         float  base = 0.0f;        // 基础伤害（DoT 为整段总量）
+        // [2026-10-31 站长口径] 比较口径必须统一成"每秒产出"：
+        //   直伤 = 总伤 / 施法时间；DoT / 通道 = 总伤 / 它自己的持续时长（winSec）。
+        //   否则 DoT 和通道会被系统性高估（实测痛苦诅咒 20 次、野德放飓风 508 次，都是"总伤 ÷ 1.5s GCD"算出来的）。
+        float  winSec = 0.0f;
         float  weaponMul = 0.0f;   // 武器伤害倍数（物理技能）
         bool   dot = false;        // 周期性伤害
         bool   needsCombo = false; // 连击点法术
@@ -52,6 +56,19 @@ namespace dpsvalue
 
     inline std::unordered_map<uint32, std::vector<Cand>>& Cache() { static std::unordered_map<uint32, std::vector<Cand>> c; return c; }
     inline std::unordered_map<uint32, time_t>& BuiltAt() { static std::unordered_map<uint32, time_t> b; return b; }
+    // [2026-10-31 根因] 候选缓存必须跟着**法术书变化**失效，不能只靠 120 秒 TTL。
+    //   实测：bot 上一轮是奥法、这一轮重天赋成火法，缓存还是旧的 ⇒ 火法的候选里
+    //   **没有火球(425蓝)/火焰冲击(465蓝)**，只有奥冲(195)/寒冰箭(330)，于是"火法搓奥冲"。
+    //   指纹用**法术 id 之和 + 数量**（重天赋一换一也不怕），一变就重建。
+    inline std::unordered_map<uint32, uint64>& CacheFingerprint() { static std::unordered_map<uint32, uint64> s; return s; }
+
+    inline uint64 SpellbookFingerprint(Player* bot)
+    {
+        uint64 h = 0;
+        for (auto const& kv : bot->GetSpellMap())
+            h += uint64(kv.first) * 1000003ULL;
+        return h ^ (uint64(bot->GetSpellMap().size()) << 40);
+    }
 
     // 法术书扫描：只留"能造成伤害"的法术（直接伤害/武器伤害/周期性伤害），且只留最高 rank。
     // [2026-10-31] 该专精"本系"的法术家族（用于跨系权重 w_crossschool）。
@@ -122,12 +139,20 @@ namespace dpsvalue
             if (isUtilitySpell)
                 continue;               // 控制类不进入 DPS 候选（属于独立模块）
 
+            // [2026-10-31 站长口径] 被动/天赋法术不可施放，绝不进候选。
+            //   实测 top= 里出现过 "Playing with Fire"（那是个被动天赋），说明之前把它们也当技能在试。
+            if (sp->HasAttribute(SPELL_ATTR_PASSIVE))
+                continue;
+
             Cand c;
             c.id = id;
             c.name = sp->SpellName[0] ? sp->SpellName[0] : "?";
             c.auraState = sp->TargetAuraState;
             c.castMs = GetSpellCastTime(sp, bot);
             c.durationMs = GetSpellDuration(sp) > 0 ? uint32(GetSpellDuration(sp)) : 0;
+            // 通道类（飓风/暴风雪/火雨）：占用的是整个通道时长，按它自己的窗口摊
+            if (IsChanneledSpell(sp) && c.durationMs)
+                c.winSec = float(c.durationMs) / 1000.0f;
             c.powerType = uint8(sp->powerType);
             c.requiredForm = sp->Stances;
             c.schoolMask = sp->SchoolMask;
@@ -172,6 +197,10 @@ namespace dpsvalue
                     if (ticks < 1) ticks = 1;
                     c.base += float(simple > 0 ? simple : 0) * float(ticks);
                     c.dot = true;
+                    // [2026-10-31 口径核对] DoT **不要**按"持续时长"摊：
+                    //   它占用施法者的时间只有 1 个 GCD，伤害在后续自己跳完
+                    //   ⇒ 比较口径仍是 "总伤 / GCD"（原来的算法是对的）。
+                    //   只有**通道**法术（飓风/暴风雪/火雨）才占用整个时长，见下面的 IsChanneledSpell 分支。
                     anyDamage = true;
                 }
             }
@@ -185,9 +214,14 @@ namespace dpsvalue
                     uint32 const aura = sp->EffectApplyAuraName[i];
                     int32 const val = sp->CalculateSimpleValue(SpellEffectIndex(i));
                     uint8 kind = 0;
+                    // [2026-10-31 口径核对] 攻强类只认**自己/队友身上的正向 buff**（战斗怒吼那类）。
+                    //   之前不看正负、也不看是不是负面法术 ⇒ 敌人身上的"痛苦诅咒（降攻强）"被当成"攻强增益"，
+                    //   于是痛苦术 90 秒上了 20 次诅咒（对木桩 0 收益）。诅咒对 DPS 没有效果，就不该有价值。
+                    bool const positiveEffect = IsPositiveEffect(sp, SpellEffectIndex(i));
                     if (aura == SPELL_AURA_MOD_MELEE_HASTE)                       kind = 1;   // 切割类
-                    else if (aura == SPELL_AURA_MOD_ATTACK_POWER
-                        || aura == SPELL_AURA_MOD_RANGED_ATTACK_POWER)           kind = 2;   // 攻强 buff
+                    else if ((aura == SPELL_AURA_MOD_ATTACK_POWER
+                        || aura == SPELL_AURA_MOD_RANGED_ATTACK_POWER)
+                        && val > 0 && positiveEffect)                              kind = 2;   // 攻强 buff（只认正向）
                     else if (aura == SPELL_AURA_MOD_RESISTANCE && val < 0)       kind = 3;   // 削护甲（破甲/精灵之火）
                     else if (aura == SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN)        kind = 4;   // 易伤
                     if (!kind)
@@ -210,6 +244,23 @@ namespace dpsvalue
         }
         Cache()[guid] = out;
         BuiltAt()[guid] = time(nullptr);
+        CacheFingerprint()[guid] = SpellbookFingerprint(bot);
+        // [2026-10-31 诊断] 把候选的 id/蓝耗摊开：DBC 名在日志里取不到（显示为空），
+        //   所以用 id+cost 定位"火球(425)/火焰冲击(465) 到底有没有进候选"。
+        {
+            std::string lst;
+            for (auto const& c : out)
+            {
+                if (lst.size() > 1200)
+                {
+                    lst += "...";
+                    break;
+                }
+                lst += std::to_string(c.id) + "/" + std::to_string(c.cost) + " ";
+            }
+            sLog.outError("[DPSVALUE-LIST] %s guid=%u 候选=%u 法术书=%u : %s",
+                bot->GetName(), guid, uint32(out.size()), uint32(spells.size()), lst.c_str());
+        }
         sLog.outError("[DPSVALUE] %s 候选技能 %u 个（法术书 %u）",
             bot->GetName(), uint32(out.size()), uint32(spells.size()));
     }
@@ -217,25 +268,86 @@ namespace dpsvalue
     inline std::vector<Cand>& Candidates(Player* bot, uint32 guid)
     {
         auto it = BuiltAt().find(guid);
-        if (it == BuiltAt().end() || time(nullptr) - it->second > 120)
+        bool stale = (it == BuiltAt().end()) || (time(nullptr) - it->second > 120);
+        if (!stale)
+        {
+            auto fp = CacheFingerprint().find(guid);
+            if (fp == CacheFingerprint().end() || fp->second != SpellbookFingerprint(bot))
+                stale = true;      // 法术书变了（重天赋）⇒ 立刻重建
+        }
+        if (stale)
             Rebuild(bot, guid);
         return Cache()[guid];
     }
 
     // 资源折算成"秒"（收入速度按经验常数；目的只是让不同技能的消耗可比）
-    inline float ResourceSeconds(Player* bot, Cand const& c)
+    // [2026-10-31 站长口径] 估值必须按**本次施法**、**当前状态**算，不能离线取常数。
+    //   典型：奥术冲击(30451) 自叠层（aura 36032），第 N 层时这一发的蓝耗 ≈ 195*(1+2N)，
+    //   伤害也随层数上升（后者由核心 SpellDamageBonusDone 按当前 aura 算，不用我管）。
+    //   用常数 195 去估，会把"连搓奥冲"永远估成很划算——实测火法因此去搓奥冲。
+    inline int32 EffectiveCost(Player* bot, Cand const& c)
     {
-        if (c.cost <= 0)
+        if (!bot)
+            return c.cost;
+        // [2026-10-31 站长口径·3+3] 奥术冲击(30451) 的 debuff(36032) 是**两个 spellmod**：
+        //   · ADD_FLAT_MODIFIER, op=SPELLMOD_CASTING_TIME, 每层 -334ms  （读条变快）
+        //   · ADD_PCT_MODIFIER,  op=SPELLMOD_COST,         每层 +75%   （蓝耗变贵）
+        //   这里不写死数字：**直接读 aura 的实际幅度**（spell_template 里 basepoints 是 74/-335，
+        //   mangos 的取值是 basepoints+1 ⇒ 75%/-334ms），层数也读 aura 层数。
+        //   读条时间用 GetSpellCastTime 现算 —— 很多法术的读条被天赋改过（强化火球/强化寒冰箭等），
+        //   绝不能用建表时缓存的 castMs。
+        if (c.id != 30451)
+            return c.cost;
+        int const stacks = std::min(3, int(bot->GetAuraCount(36032)));
+        if (stacks <= 0)
+            return c.cost;
+
+        uint32 castMs = c.castMs;
+        if (SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(c.id))
+            castMs = GetSpellCastTime(sp, bot);          // 现算：含天赋与叠层加速
+
+        // 卡秒：3 层且 debuff 剩余时间 < 这一发的（加速后）读条 ⇒ 读条在到期后落地，付 0 层蓝费
+        int remain = -1;
+        if (SpellAuraHolder* h = bot->GetSpellAuraHolder(36032))
+            remain = h->GetAuraDuration();
+        if (stacks >= 3 && remain >= 0 && remain < int(castMs))
+        {
+            // [2026-10-31 诊断] "卡秒"命中：这一发享受 3 层速度、只付 0 层蓝费。
+            //   这条日志能直接验证 3+3 是不是真的跑起来了（每轮应该出现 1 次）。
+            sLog.outError("[DPS-AB-RESET] %s 卡秒命中 stacks=3 remain=%dms castMs=%dms cost=%d(基础)",
+                bot->GetName(), remain, int(castMs), c.cost);
+            return c.cost;
+        }
+
+        int pctCost = 0;
+        for (auto const& a : bot->GetAurasByType(SPELL_AURA_ADD_PCT_MODIFIER))
+        {
+            if (!a || !a->GetModifier() || !a->GetSpellProto())
+                continue;
+            if (a->GetSpellProto()->Id != 36032)
+                continue;
+            if (a->GetModifier()->m_miscvalue == SPELLMOD_COST)
+                pctCost += a->GetModifier()->m_amount;
+        }
+        if (pctCost <= 0)
+            pctCost = 75 * stacks;                      // 兜底（读不到 aura 时才用）
+        return c.cost * (100 + pctCost) / 100;
+    }
+
+    inline float ResourceSeconds(Player* bot, Cand const& c, int32 costOverride = -1)
+    {
+        int32 const cost = (costOverride >= 0) ? costOverride : c.cost;
+        if (cost <= 0)
             return 0.0f;
         switch (c.powerType)
         {
-            case POWER_RAGE:   return float(c.cost) / 3.0f;      // 约 3 怒/秒
-            case POWER_ENERGY: return float(c.cost) / 10.0f;     // 10 能量/秒
+            case POWER_RAGE:   return float(cost) / 3.0f;      // 约 3 怒/秒
+            case POWER_ENERGY: return float(cost) / 10.0f;     // 10 能量/秒
             case POWER_MANA:
             {
                 float const maxMana = float(bot->GetMaxPower(POWER_MANA));
                 float const regen = std::max(30.0f, maxMana * 0.02f);
-                return float(c.cost) / regen;
+                return float(cost) / regen;
             }
             default: return 0.0f;
         }
@@ -679,38 +791,108 @@ namespace dpsvalue
 
 namespace dpsvalue
 {
-    // [2026-10-30 站长口径] **按角色实际属性估值**，而不是只看技能基础伤害：
-    //   伤害 = 基础伤害 + 武器伤害×倍数 + 法伤×系数，再乘暴击期望。
-    //   法伤从 SpellBaseDamageBonusDone(学派) 取（这就是角色面板上的法伤）；
-    //   暴击用 CalculateSpellCritChance(victim, 学派, 法术)。
+    // [2026-10-31 站长口径·重做] **估值必须等于实际伤害**。
+    //   不再自己拼"基础 + 法伤×系数"：那套公式漏掉了天赋百分比增伤
+    //   （TBC 里大多是 SPELL_AURA_ADD_PCT_MODIFIER，按法术家族匹配），
+    //   结果就是"火法搓奥冲、奥法搓寒冰箭"——估值算出来的和真打出来的不是一回事。
+    //   现在直接用核心施法伤害用的两步：
+    //     SpellDamageBonusDone（施法者：天赋/增益/法伤/法术家族修正）
+    //     SpellDamageBonusTaken（目标：易伤/诅咒/破甲等）
+    //   物理技能仍走武器伤害（weaponHit 来自 CalculateDamage，本来就含 AP/武器）。
     inline float EstDamage(Player* bot, Unit* target, Cand const& c, float weaponHit, uint8 combo, int pack)
     {
-        float dmg = c.base + c.weaponMul * weaponHit;
-        bool const physical = (c.weaponMul > 0.0f);
-        // [2026-10-31 修 Bug B] 法伤只加在**纯法术**上；物理技能（weaponMul>0）加武器伤害即可。
-        //   之前物理技能也被加法伤（瞬发 coeff=0.43），会把骑/萨/野德的物理技能估值抬高。
-        if (!physical && c.schoolMask && c.coeff > 0.0f)
+        SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
+        if (!sp)
+            return 0.0f;
+
+        float dmg = 0.0f;
+        uint32 const schoolMask = uint32(c.schoolMask ? c.schoolMask : SPELL_SCHOOL_MASK_NORMAL);
+
+        for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
         {
-            int32 const sp = bot->SpellBaseDamageBonusDone(SpellSchoolMask(c.schoolMask));
-            if (sp > 0)
-                dmg += float(sp) * c.coeff;
+            uint32 const eff = sp->Effect[i];
+            SpellEffectIndex const ei = SpellEffectIndex(i);
+            if (eff == SPELL_EFFECT_SCHOOL_DAMAGE)
+            {
+                int32 const base = sp->CalculateSimpleValue(ei);
+                if (base <= 0)
+                    continue;
+                uint32 v = bot->SpellDamageBonusDone(target, SpellSchoolMask(schoolMask), sp, ei,
+                    uint32(base), SPELL_DIRECT_DAMAGE);
+                if (target)
+                    v = target->SpellDamageBonusTaken(bot, SpellSchoolMask(schoolMask), sp, ei, v, SPELL_DIRECT_DAMAGE);
+                float add = float(v);
+                if (sp->EffectRadiusIndex[i])
+                    add *= float(std::max(1, pack));      // 范围伤害按目标数放大
+                // [2026-10-31 诊断] 中间量：同一只 bot 的"基础/法伤/修正后"必须是可解释的。
+                //   实测奥冲估值 1188、寒冰箭 2346，差 2 倍——先看清每一步被改了多少。
+                {
+                    int32 const schoolSp = bot->SpellBaseDamageBonusDone(SpellSchoolMask(schoolMask));
+                    if (c.id == 30451 || c.id == 27072 || c.id == 27070)
+                        sLog.outError("[DPS-EST-D] %s spell=%u base=%d schoolSp=%d afterDone+Taken=%u effIdx=%d schoolMask=%u",
+                            bot->GetName(), c.id, base, schoolSp, v, int(i), schoolMask);
+                }
+                dmg += add;
+            }
+            else if (eff == SPELL_EFFECT_WEAPON_DAMAGE || eff == SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL)
+            {
+                dmg += weaponHit + float(sp->CalculateSimpleValue(ei));
+            }
+            else if (eff == SPELL_EFFECT_WEAPON_PERCENT_DAMAGE)
+            {
+                dmg += weaponHit * float(sp->CalculateSimpleValue(ei)) / 100.0f;
+            }
+            else if (eff == SPELL_EFFECT_APPLY_AURA && sp->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE)
+            {
+                int32 const base = sp->CalculateSimpleValue(ei);
+                int32 const amp = int32(sp->EffectAmplitude[i]);
+                int32 const dur = GetSpellDuration(sp);
+                int ticks = (amp > 0 && dur > 0) ? (dur / amp) : 1;
+                if (ticks < 1) ticks = 1;
+                if (base <= 0)
+                    continue;
+                uint32 v = bot->SpellDamageBonusDone(target, SpellSchoolMask(schoolMask), sp, ei, uint32(base), DOT);
+                if (target)
+                    v = target->SpellDamageBonusTaken(bot, SpellSchoolMask(schoolMask), sp, ei, v, DOT);
+                dmg += float(v) * float(ticks);
+            }
         }
+        if (dmg <= 0.0f)
+            return 0.0f;
+
         if (c.needsCombo)
             dmg *= 0.35f + 0.13f * float(combo);
-        if (c.aoeTargets > 1)
-            dmg *= float(std::min(std::max(pack, 1), c.aoeTargets));
 
-        // 暴击期望（法术暴击；物理技能用同一接口的近似，误差可接受）
+        // 暴击期望（法术暴击；物理技能不吃法术暴击，先不乘）
+        bool const physical = (c.weaponMul > 0.0f);
         if (target)
         {
-            SpellEntry const* sp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
-            if (sp)
+            SpellEntry const* critSp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
+            if (critSp)
             {
-                // 物理技能不吃法术暴击（用同一接口会算错，宁可先不乘）
                 float const crit = physical ? 0.0f
-                    : bot->CalculateSpellCritChance(target, SpellSchoolMask(c.schoolMask ? c.schoolMask : SPELL_SCHOOL_MASK_NORMAL), sp);
+                    : bot->CalculateSpellCritChance(target,
+                        SpellSchoolMask(c.schoolMask ? c.schoolMask : SPELL_SCHOOL_MASK_NORMAL), critSp);
                 if (crit > 0.0f)
-                    dmg *= 1.0f + crit / 100.0f;
+                {
+                    float critMult = 1.0f + crit / 100.0f;
+                    // [2026-10-31 站长口径] **点燃**：火系法术暴击后，核心会通过 proc(12654) 把
+                    //   40% 的暴击伤害转成 DoT。不折进来，火球的真实价值就被低估，
+                    //   结果火法会去搓寒冰箭（实测就是这么发生的）。
+                    //   期望口径：暴击额外伤害 c + 点燃 0.4c ⇒ 乘数 1 + 1.4c。
+                    if (!physical && (schoolMask & SPELL_SCHOOL_MASK_FIRE))
+                    {
+                        for (auto const& a : bot->GetAurasByType(SPELL_AURA_PROC_TRIGGER_SPELL))
+                        {
+                            if (a && uint32(a->GetModifier()->m_miscvalue) == 12654)   // Ignite (DoT)
+                            {
+                                critMult += crit / 100.0f * 0.4f;
+                                break;
+                            }
+                        }
+                    }
+                    dmg *= critMult;
+                }
             }
         }
         return dmg;

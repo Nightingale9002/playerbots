@@ -59,6 +59,25 @@ private:
     uint32 startMs = 0;
 };
 
+// [2026-10-31 站长口径·假人测量台] **状态机独占施法（动作层闸门）**：
+//   引擎在 DoNextAction 里选中的"施法类动作"（CastSpellAction / CastCustomSpellAction 的派生类 ——
+//   所有职业的法术动作都派生自这两个基类）在**执行入口**被拒。必须有这一层：引擎的法术动作有的走
+//   `ai->CastSpell`，有的直接走核心 `bot->CastSpell`（例：CastShadowstepAction），后一种出口闸门拦不到。
+//   走位/追击/平砍/自动射击不是施法动作，不受影响；状态机自己的施法/DoSpecificAction 在闸门合上之前执行。
+class EngineCastGuardListener : public ActionExecutionListener
+{
+public:
+    explicit EngineCastGuardListener(PlayerbotAI* ai) : ai(ai) {}
+
+    virtual bool Before(Action* action, const Event& event) override;
+    virtual bool AllowExecution(Action* action, const Event& event) override { return true; }
+    virtual void After(Action* action, bool executed, const Event& event) override {}
+    virtual bool OverrideResult(Action* action, bool executed, const Event& event) override { return executed; }
+
+private:
+    PlayerbotAI* ai;
+};
+
 class PlayerbotChatHandler: protected ChatHandler
 {
 public:
@@ -772,6 +791,10 @@ public:
     void SetLastEvent(Event& event) { lastEvent = event; }
     Event& GetLastEvent() { return lastEvent; }
 
+    // [2026-10-31 站长口径·假人测量台] 状态机独占施法：为 true 时引擎这一 tick 的施法
+    //   （施法类动作 + PlayerbotAI::CastSpell 出口）都会被拒；走位/追击/平砍不受影响。
+    bool IsEngineCastLocked() const { return m_fsmCastLock; }
+
 #ifdef BUILD_ELUNA
     MaNGOS::unique_weak_ptr<PlayerbotAI> GetWeakPtr() const { return m_weakRef; }
     void SetWeakPtr(MaNGOS::unique_weak_ptr<PlayerbotAI> weakRef) { m_weakRef = std::move(weakRef); }
@@ -817,6 +840,10 @@ protected:
     bool inCombat = false;
     bool isMoving = false;
     bool isWaiting = false;
+    // [2026-10-31 站长口径·假人测量台] 状态机独占施法：引擎跑 DoNextAction 的这一段里，
+    //   它发起的任何施法都被 PlayerbotAI::CastSpell 闸掉（走位/追击/平砍不受影响）。
+    //   只在"状态机已接管这只 bot（dpsfsm::SkipEngine）+ 已经开打"时置位，副本里恒为 false。
+    bool m_fsmCastLock = false;
     // [2026-10-22 站长口径] 进本换装去重：记录本 bot 上一次所在 (地图, 实例)，进新副本时换一次装备
     uint64 lastGearEntryKey = 0;
 
