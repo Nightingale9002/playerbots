@@ -228,6 +228,31 @@ namespace
         uint32 dotPrevAt = 0;
         int dotLastLifeSec = -1;
         float wlManaGap = 0.0f;   // 本 tick 的原始法力缺口（max - cur），[DPSFSM-WARLOCK] 与 life tap 共用
+        // [2026-11-01 站长口径] 法师·火法（mode=5）专用（详见 DpsFsm.cpp 的“法师·火法”一节）：
+        //   fireFbSinceScorch —— 自上次补灼烧以来**放出的火球数**：维护节奏的**主**判据
+        //                        （叠满后每 scorch_refresh_fireballs(8) 发火球补一次 ≈ 24 秒）；
+        //   fireScorchTries   —— 已放过几次灼烧（配合"从没见过 debuff"判定没有强化灼烧天赋）；
+        //   fireScorchSeen    —— 真的见过层数 > 0（天赋在，debuff 会挂上）⇒ 静态事实缓存，不跨轮清；
+        //   fireScorchPending / Before —— 刚补过一发灼烧、还没核对（被抵抗的判据）；
+        //   fireScorchForce   —— 抵抗后的"**立刻**再补一次"（下一手直接补，不再等 8 个火球）；
+        //   fireScorchResent  —— 本轮维护已经重补过一次（重补只做一次，不退化成链）；
+        //   fireFlameToggle   —— 烈焰风暴 7 级 / 6 级交替计数（两级地面火池互不覆盖）；
+        //   fireBurstDone     —— 三套爆发表里已经开过的轮次（位掩码：1 起手 / 2 尾轮 / 4 斩杀 / 8 急冷）；
+        //   fireBurstRound / Want* —— 当前这一轮要放哪些牌（Burst 状态里按它出手）。
+        uint32 lastFireLog = 0;
+        int    fireFbSinceScorch = 0;
+        int    fireScorchTries = 0;
+        bool   fireScorchSeen = false;
+        bool   fireScorchPending = false;
+        int    fireScorchBefore = 0;
+        bool   fireScorchForce = false;
+        bool   fireScorchResent = false;
+        int    fireFlameToggle = 0;
+        int    fireBurstDone = 0;
+        int    fireBurstRound = 0;
+        bool   fireBurstWantIcy = false;
+        bool   fireBurstWantComb = false;
+        bool   fireBurstWantTrinket = false;
     };
 
     std::mutex s_disabledMutex;
@@ -3277,6 +3302,20 @@ namespace ai
             m->dotTarget = ObjectGuid();
             m->dotPrevAt = 0;
             m->dotLastLifeSec = -1;
+            // [2026-11-01 站长口径] 法师·火法：火球计数 / 灼烧记账 / 爆发轮次必须跨轮清零 ——
+            //   否则上一轮已经开过起手轮（fireBurstDone & 1），下一轮的起手爆发直接哑掉；
+            //   火球计数也会带着上一轮的尾巴，开局就补灼烧。
+            //   **保留** `fireScorchSeen`（"有没有强化灼烧天赋"是静态事实，与 ids/flags 同类）。
+            m->fireFbSinceScorch = 0;
+            m->fireScorchTries = 0;
+            m->fireScorchPending = false;
+            m->fireScorchBefore = 0;
+            m->fireScorchForce = false;
+            m->fireScorchResent = false;
+            m->fireFlameToggle = 0;
+            m->fireBurstDone = 0;
+            m->fireBurstRound = 0;
+            m->lastFireLog = 0;
 
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
@@ -5339,6 +5378,580 @@ namespace ai
         return result;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] 法师 · 火法（Fire）—— mode=5 的第六张职业图
+    //   legacy 的 `TickMage`（mode=0/1/2/3/4 的火法路径）**一个字节都不动**：
+    //   这张图只在 `mode=5` 且 `Spec::Fire` 时接管（见 `Tick()` 的派发）。
+    //
+    //   平稳期：**灼烧是轴，火球是体**。
+    //     ① 起手 scorch ×5 叠满"强化灼烧"（每层 +5% 火焰伤害、5 层 25%、30 秒、全团火法共享）；
+    //        层数读的是**目标身上的 Fire Vulnerability（22959）**，与灼烧本体不是同一个 id（见 SeedFireIds）；
+    //     ② 叠满后 fireball 是**唯一填充**（占火法 95% 总伤害），**不用 fire blast 填充**；
+    //     ③ 维护节奏：叠满后每 `scorch_refresh_fireballs`(8) 个火球补一次灼烧（≈24 秒）——
+    //        **按"已经放了多少个火球"计数**是主判据，剩余时间只当兜底
+    //        （`scorch_refresh_ms`(6000) 以下也必须补），**不卡最后 2 秒**；
+    //     ④ 被抵抗：补完灼烧后 debuff 既没涨层、也没被续上 ⇒ **立刻再补一次**
+    //        （日志 `recast-scorch(resist)`；只重补一次，不退化成链）；
+    //     ⑤ 移动中：fire blast（瞬发，读条会被移动取消）；
+    //     ⑥ 瞬发炎爆（法术连击）：**绝不打断当前火球读条**（`s.casting` 为真时本函数直接返回），读完再打。
+    //
+    //   爆发：**按预计战斗时长选三套**（时长是外部输入：`fight_length_est`，读不到才用
+    //   `fight_length_default`(180 秒)；**不自己猜**）：
+    //     short ≤180s：叠满 5 层 → icy veins + 饰品 打一轮 → 目标 ~25% cold snap 重置
+    //                  → 进 20% 斩杀再开 icy veins + combustion + 饰品；
+    //     mid 180~210s：起手**直接** icy veins + combustion，**再**叠灼烧；
+    //                   结尾约 `fire_tail_sec`(20 秒) 第二轮自然转好，再打一轮；
+    //     long >210s：起手叠满 → icy veins + 饰品 + combustion 一起；
+    //                 之后 icy veins **单独**按 CD 开（不绑燃烧）；combustion 留给 20% 斩杀。
+    //   combustion 机制（暴击叠 3 层即消耗进 3 分钟 CD）⇒ 它只放在"能连续暴击"的火球连发窗口里开，
+    //   绝不和"移动/走位/空 GCD"的时段绑一起。
+    //
+    //   斩杀（目标 < `fire_execute_hp`(20%)）：molten fury 让火球伤害翻倍 ⇒ 所有爆发资源往这个窗口倾斜；
+    //   学了 cold snap 就重置一次 icy veins（一场只重置一次，位掩码 8 记账）。
+    //
+    //   AoE：**起手先等坦克仇恨**（火法没有奥法魔爆那种减仇恨手段）⇒ `EvalThreat != Open` 时不许开；
+    //        静止目标 flamestrike 7 级与 6 级交替（两级地面火池互不覆盖，可叠两层）；
+    //        近身 blast wave / dragon's breath（学会了才放，仇恨更高，适合收尾）；
+    //        blizzard 只用于减速需求（`slow_role`）。
+    //   恢复：**宝石 → 大蓝 → 唤醒**（火法耗蓝高于冰法，但唤醒**不改变循环**，与奥法不同）。
+    //
+    //   可复用的现成口径（不重新发明）：`BuildSnapshot` / `CastFirst` / `TryCast` / `TryCastSelf` /
+    //   `CastIdAt` / `CastMsWithMod` 与 `CandCastMs`（同一份真实读条口径）/ `SpellIdAtRank` /
+    //   `AuraStacks` / `AuraRemain`（自身 buff）/ `EvalThreat` 三档 / `UseManaPotion` / `UseManaGem` /
+    //   `UseTrinket` / `TP` / `TickResult{Acted,Hold,Decline}`。
+    //   本图**不用** `FillCand`/`PickFill`：火法没有"按窗口放得下什么"的排程问题
+    //   （火球是唯一填充），硬套只会把两套语义缝在一起（与毁灭术同一判断）。
+    // ==========================================================================
+
+    // [2026-11-01 站长口径] 强化灼烧挂的 debuff 与灼烧本体**不是同一个 id**：
+    //   · 灼烧本体 = Scorch（bot 自己学的，27073/27074 一串 rank 走 `SpellId()` 自动顶最高级）；
+    //   · 叠层     = **Fire Vulnerability 22959**（5 层、30 秒；TBC 2.3 起全团火法共享）。
+    //     它由天赋"强化灼烧"(Improved Scorch 11095)
+    //     的 `SPELL_AURA_ADD_TARGET_TRIGGER`（aura 109 → 触发 22959，见核心 `Spell::ProcSpellAuraTriggers`）
+    //     在命中时挂上去 ⇒ **它永远不在 bot 的法术书里**。
+    //   而 `AuraStacks()` 是**按名字**反查 id 的（`SpellId()` → "spell id" 值只扫 `bot->GetSpellMap()`）
+    //   ⇒ 直接按名字读恒为 0 —— legacy `TickMage` 的火法灼烧分支整段失效就是这个原因
+    //   （`scorchStacks` 恒 0，而 `scorch seen` 永远立不起来 ⇒ 一次灼烧都不放）。
+    //   修法不是另写一套读层数：把 22959 **播种**进 BotMem 的 id 缓存
+    //   （`SpellId()` 命中 `m->ids` 就直接返回、不再问引擎/法术书），之后一律用现成的
+    //   `AuraStacks()` 与 spell_chain 遍历。
+    uint32 const kFireVulnerability = 22959;
+
+    void SeedFireIds(BotMem* m)
+    {
+        if (!m->ids.count("fire vulnerability"))
+            m->ids["fire vulnerability"] = kFireVulnerability;
+    }
+
+    int FireScorchStacks(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        SeedFireIds(m);
+        return AuraStacks(ai, s.bot, m, "fire vulnerability", s.target);
+    }
+
+    // 目标身上这个 debuff 的剩余毫秒（-1 = 不在 / 读不到）。
+    //   `AuraRemain()` 只看 **bot 自己**的 buff，目标身上的 debuff 要自己按链取
+    //   （与 `AuraStacks()` 同一条链：`GetFirstSpellInChain` → `GetNextSpellInChain`）。
+    int FireDebuffRemain(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        if (!s.target)
+            return -1;
+        SeedFireIds(m);
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
+        if (!id)
+            return -1;
+        int best = -1;
+        uint32 const first = sSpellMgr.GetFirstSpellInChain(id);
+        for (uint32 cur = first ? first : id; cur; cur = sSpellMgr.GetNextSpellInChain(cur))
+            if (SpellAuraHolder* holder = s.target->GetSpellAuraHolder(cur))
+            {
+                int const dur = holder->GetAuraDuration();
+                if (dur > best)
+                    best = dur;
+            }
+        return best;
+    }
+
+    // ---- 爆发表：由**外部输入**的战斗时长决定（不自己猜） ----
+    enum class FirePlan { Short = 0, Mid = 1, Long = 2 };
+
+    char const* FirePlanName(FirePlan p)
+    {
+        switch (p)
+        {
+            case FirePlan::Mid:  return "mid";
+            case FirePlan::Long: return "long";
+            default:             return "short";
+        }
+    }
+
+    // 预计战斗时长（秒）。`TP()` 的缺省值机制没法区分"没配"和"配成 0"
+    //   ⇒ `fight_length_est` 用 **-1 当哨兵**：读不到才落 `fight_length_default`(180 秒)。
+    //   两个键都是**外部输入**（boss 战略数据 / 调用方给），状态机不猜、不按已打时长反推。
+    double FireFightLength(BotMem* m)
+    {
+        double est = TP(m, "fight_length_est", -1.0);
+        if (est <= 0.0)
+            est = TP(m, "fight_length_default", 180.0);
+        if (est <= 0.0)
+            est = 180.0;
+        return est;
+    }
+
+    FirePlan FirePlanFor(double sec)
+    {
+        if (sec <= 180.0)
+            return FirePlan::Short;
+        if (sec <= 210.0)
+            return FirePlan::Mid;
+        return FirePlan::Long;
+    }
+
+    // [2026-11-01 站长口径] 瞬发炎爆（法术连击）的**检测**：
+    //   TBC 2.4.3 里"瞬发炎爆"只有两个真实来源 ——
+    //     ① 气定神闲（presence of mind，奥系天赋）："下一发法术瞬发"；
+    //     ② Hot Streak 类 proc：**WLK 才有的天赋**（本核心 2.4.3 的 DBC 里没有这个法术 ⇒ 查不到 id）。
+    //   两个都按名字取（`SpellId` 取不到就恒 false），绝不自己编一个"hot streak"状态、
+    //   也绝不凭感觉打 6 秒读条的炎爆（那是净亏 DPS）。
+    bool FireInstantPyroReady(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (m->flags.count("fire no pyro"))
+            return false;
+        if (!SpellId(ai, s.bot, m, "pyroblast", false))
+        {
+            m->flags.insert("fire no pyro");
+            return false;
+        }
+        if (AuraStacks(ai, s.bot, m, "presence of mind", s.bot) > 0)
+            return true;
+        if (AuraStacks(ai, s.bot, m, "hot streak", s.bot) > 0)
+            return true;
+        return false;
+    }
+
+    // 灼烧轴的记账与纠错（每 tick 一次，读 Snapshot + 层数，不发技能）：
+    //   ① 第一次真的看到层数 ⇒ 记下"有强化灼烧天赋"（静态事实，跨轮保留）；
+    //   ② 抵抗判据：补完灼烧后 debuff **既没涨层、也没被续上时长** ⇒ 立刻再补一次；
+    //      ⚠️ 只按"层数有没有涨"会误判：满 5 层时的维护性补灼烧**本来就不涨层**
+    //      （只续 30 秒时长）⇒ 必须同时看剩余时间是否被续上（`scorch_fresh_ms`）。
+    //   ③ 没有天赋的兜底：放了 N 次灼烧目标仍 0 层 ⇒ 别再用 GCD 烧它（只打火球）。
+    void FireScorchTick(PlayerbotAI* ai, BotMem* m, Snapshot& s, int stacks, int scorchFull)
+    {
+        if (stacks > 0 && !m->fireScorchSeen)
+        {
+            m->fireScorchSeen = true;
+            m->fireScorchTries = 0;
+            sLog.outError("[DPSFSM-FIRE] %s 强化灼烧 debuff(%u) 已挂上 scorch=%d ⇒ 灼烧轴建立",
+                s.bot->GetName(), kFireVulnerability, stacks);
+        }
+
+        if (m->fireScorchPending && !s.casting)
+        {
+            int const remain = FireDebuffRemain(ai, m, s, "fire vulnerability");
+            bool const stacksUp = (stacks > m->fireScorchBefore);
+            // 只有"续上了时长"才算这一发真的落地：`remain < 0` 是**根本没这个 debuff**
+            //   （不是刷新），所以它属于 miss，不能当 refreshed。
+            bool const refreshed = (remain >= int(TP(m, "scorch_fresh_ms", 20000.0)));
+            m->fireScorchPending = false;
+            if (!stacksUp && !refreshed && !m->fireScorchResent)
+            {
+                m->fireScorchResent = true;
+                m->fireScorchForce = true;      // 下一手就补，不再等 8 个火球
+                m->fireFbSinceScorch = 0;
+                sLog.outError("[DPSFSM-FIRE] %s recast-scorch(resist) scorch=%d before=%d remain=%d",
+                    s.bot->GetName(), stacks, m->fireScorchBefore, remain);
+            }
+        }
+
+        // N 默认 = scorch_stacks + 3：留余量，低等级天赋是"概率挂"，别把它误判成"没天赋"。
+        //   [2026-11-01 实测] 没有这个天赋时 debuff **永远不会**出现 ⇒ 起手那 5 发灼烧纯属白丢 GCD
+        //   （实测 30 秒单目标：8 发灼烧 0 层 debuff，dps 716 vs 纯火球 938）⇒ 先用**法术书**一票否决，
+        //   连 5 发都不试：天赋没点就直接走纯火球，点了一定会挂上（5/5 是 100% 触发）。
+        //   诊断字段：天赋 id（0 = 没学）、bot 身上 `ADD_TARGET_TRIGGER` 的 aura 条数（core 侧触发链）。
+        if (!m->fireScorchSeen && !m->fireScorchPending && !m->fireScorchForce
+            && !m->flags.count("fire scorch absent"))
+        {
+            uint32 const talent = ScanSpellbookByName(s.bot, "Improved Scorch");
+            int const absentTries = int(TP(m, "scorch_absent_tries", double(scorchFull + 3)));
+            if (!talent || m->fireScorchTries >= absentTries)
+            {
+                m->flags.insert("fire scorch absent");
+                uint32 triggers = 0;
+                for (Aura* aura : s.bot->GetAurasByType(SPELL_AURA_ADD_TARGET_TRIGGER))
+                    if (aura)
+                        ++triggers;
+                sLog.outError("[DPSFSM-FIRE] %s 灼烧轴关闭：Improved Scorch=%u（0=没学）"
+                    " ADD_TARGET_TRIGGER=%u 灼烧次数=%d 层数=%d ⇒ 改纯火球填充",
+                    s.bot->GetName(), talent, triggers, m->fireScorchTries, stacks);
+            }
+        }
+    }
+
+    // 这一手该不该补灼烧：**按"已经放了几个火球"计数**是主判据（口径 ③），
+    //   剩余时间只是兜底（< scorch_refresh_ms 也必须补），**不卡最后 2 秒**。
+    bool FireWantScorch(PlayerbotAI* ai, BotMem* m, Snapshot& s, int stacks, int scorchFull)
+    {
+        if (m->fireScorchForce)
+            return true;                                  // 抵抗重补：无条件再来一次
+        if (m->flags.count("fire scorch absent"))
+            return false;                                 // 没有强化灼烧天赋：灼烧只白占 GCD
+        if (!SpellId(ai, s.bot, m, "scorch", false))
+            return false;
+
+        int const perFb = int(TP(m, "scorch_refresh_fireballs", 8.0));
+        int const floorMs = int(TP(m, "scorch_refresh_ms", 6000.0));
+        int const remainMs = FireDebuffRemain(ai, m, s, "fire vulnerability");
+
+        if (scorchFull > 0 && stacks < scorchFull)
+            return true;                                  // 起手叠满 / 层数被抵消
+        if (perFb > 0 && m->fireFbSinceScorch >= perFb)
+            return true;                                  // 已经放了 8 个火球（≈24 秒）：该补
+        if (remainMs >= 0 && remainMs < floorMs)
+            return true;                                  // 兜底：剩余不足 6 秒
+        return false;
+    }
+
+    // 该开哪一轮爆发（0 = 不开）。位掩码：1 起手轮 / 2 结尾轮 / 4 斩杀轮。
+    //   三套表**只差在"什么时候点火"**，点火之后的出手顺序是同一份（见 TickFireBurst）。
+    int FireBurstRound(PlayerbotAI* ai, BotMem* m, Snapshot& s, FirePlan plan,
+                       double elapsedSec, double fightLen, int scorchFull)
+    {
+        if (!s.target)
+            return 0;
+        int const stacks = FireScorchStacks(ai, m, s);
+        bool const execute = (s.targetHp <= float(TP(m, "fire_execute_hp", 20.0)));
+        double const remainSec = fightLen - elapsedSec;
+        double const tailSec = TP(m, "fire_tail_sec", 20.0);
+
+        switch (plan)
+        {
+            case FirePlan::Short:
+                // 起手：**叠满 5 层之后**才开第一轮（口径：叠满 → icy veins + 饰品）
+                if (!(m->fireBurstDone & 1) && (scorchFull <= 0 || stacks >= scorchFull))
+                    return 1;
+                // 斩杀：进 20% all-in（icy veins + combustion + 饰品）
+                if (!(m->fireBurstDone & 4) && execute)
+                    return 4;
+                break;
+
+            case FirePlan::Mid:
+                // 起手**直接**开（不先叠灼烧），叠灼烧放在爆发窗口之后（口径 180~210s）
+                if (!(m->fireBurstDone & 1))
+                    return 1;
+                // 结尾约 `fire_tail_sec`(20 秒)：第二轮自然转好，再打一轮
+                if (!(m->fireBurstDone & 2) && remainSec > 0.0 && remainSec <= tailSec)
+                    return 2;
+                break;
+
+            case FirePlan::Long:
+                // 起手叠满 → icy veins + 饰品 + combustion 一起
+                if (!(m->fireBurstDone & 1) && (scorchFull <= 0 || stacks >= scorchFull))
+                    return 1;
+                // combustion 留给 20% 斩杀（icy veins 单独按 CD 开，见 TickFireBurn 的 ⑤）
+                if (!(m->fireBurstDone & 4) && execute)
+                    return 4;
+                break;
+        }
+        return 0;
+    }
+
+    // 点火：记账 + 撑开跨 tick 的爆发窗口（一个 GCD 一手，"饰品 → 冰冷血脉 → 燃烧"要分几个 tick 放完）。
+    void FireBurstOpen(BotMem* m, FirePlan plan, int round)
+    {
+        m->fireBurstDone |= round;
+        m->fireBurstRound = round;
+        m->lastBurst = time(nullptr);
+        m->burstUntil = m->lastBurst + time_t(TP(m, "burst_window", 6.0));
+
+        // 每一轮放哪些牌（逐条对应站长口径）：
+        //   short 起手轮   = 冰冷血脉 + 饰品（**combustion 留给 20% 斩杀**）；
+        //   short 斩杀轮   = 冰冷血脉 + combustion + 饰品；
+        //   mid   两轮     = 冰冷血脉 + combustion（口径没点名饰品，`fire_burst_trinket` 默认开）；
+        //   long  起手/斩杀 = 冰冷血脉 + combustion + 饰品（之后 icy veins 单独按 CD 开）。
+        m->fireBurstWantIcy = true;
+        m->fireBurstWantTrinket = (TP(m, "fire_burst_trinket", 1.0) >= 1.0);
+        switch (plan)
+        {
+            case FirePlan::Short: m->fireBurstWantComb = (round == 4); break;
+            case FirePlan::Mid:   m->fireBurstWantComb = true;         break;
+            case FirePlan::Long:  m->fireBurstWantComb = true;         break;
+        }
+    }
+
+    // 状态转移只看 Snapshot + TP + 本 tick 已经点好的爆发窗口（不读世界、不打日志）：
+    //   Idle → Recover(蓝见底) → Approach(够不着) → Aoe(群架且仇恨 Open) → Burst → Burn
+    State EvalFire(BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        // ① 资源：蓝见底 ⇒ Recover。`fire:recover_power` 是 conf 里的历史键名，两个都认。
+        float const recoverEnter = float(TP(m, "recover_enter", TP(m, "recover_power", 10.0)));
+        if (s.power < recoverEnter)
+            return State::Recover;
+
+        // ② 射程：先到位再谈别的（爆发牌打在 OUT_OF_RANGE 上等于白丢一个 GCD）
+        if (s.dist > float(TP(m, "range_caster", 30.0)))
+            return State::Approach;
+
+        // ③ 群架：火法**没有减仇恨手段** ⇒ 只有 `EvalThreat == Open` 才许开 AoE。
+        //    Throttle/Wait 时继续单点：替坦克把怪拉过来，比多打几发烈焰风暴亏得多。
+        if (s.pack30 >= AoEPack(m) && threat == ThreatLevel::Open)
+            return State::Aoe;
+
+        // ④ 爆发窗口（`TickFireFsm` 在调用本函数之前已经点好火）
+        if (time(nullptr) < m->burstUntil)
+            return State::Burst;
+
+        return State::Burn;
+    }
+
+    // 群伤动作表：**仇恨不是 Open 一律不开**（上面已经挡过一次，这里再挡一次：
+    //   进段之后仇恨可能变差 —— 火法没有奥法魔爆那种减免）。
+    ai::dpsfsm::TickResult TickFireAoe(PlayerbotAI* ai, BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        using ai::dpsfsm::TickResult;
+
+        if (threat != ThreatLevel::Open || !s.target)
+            return TickResult::Decline;
+
+        bool const inMelee = s.dist <= float(TP(m, "aoe_melee_range", 10.0));
+        if (inMelee)
+        {
+            // 近身收尾牌：冲击波 / 龙息（**学会了才放**：`SpellId` 取不到就自动跳过；
+            //   两者仇恨更高，口径把它们定位成"适合收尾"）。
+            if (CastFirst(ai, m, s, { "blast wave" }))
+                return TickResult::Acted;
+            if (CastFirst(ai, m, s, { "dragon's breath" }))
+                return TickResult::Acted;
+        }
+
+        // 静止目标：烈焰风暴**7 级与 6 级交替**（两级的地面火池互不覆盖，可以叠两层）。
+        //   为什么要指定 rank：`SpellId()` 一律顶到最高 rank，只放 7 级就只有一层火。
+        uint32 const fsTop = SpellIdAtRank(ai, m, "flamestrike", 7);
+        uint32 const fsLow = SpellIdAtRank(ai, m, "flamestrike", 6);
+        bool const alternate = (fsTop && fsLow && fsTop != fsLow);
+        bool const useTop = ((m->fireFlameToggle % 2) == 0);
+        uint32 const id = alternate ? (useTop ? fsTop : fsLow) : (fsTop ? fsTop : fsLow);
+        if (!m->aoeLogDone)
+        {
+            m->aoeLogDone = true;
+            sLog.outError("[DPSFSM-AOE] %s spec=fire threat=%s inmelee=%d flamestrike rank7=%u rank6=%u alternate=%d pack30=%d dist=%.1f",
+                s.bot->GetName(), ThreatLevelName(threat), inMelee ? 1 : 0, fsTop, fsLow,
+                alternate ? 1 : 0, s.pack30, s.dist);
+        }
+        if (id && CastIdAt(ai, m, s, id, s.target->GetPositionX(), s.target->GetPositionY(),
+                s.target->GetPositionZ()))
+        {
+            ++m->fireFlameToggle;
+            return TickResult::Acted;
+        }
+
+        // 减速需求（`slow_role`）：暴风雪（1 级一样减速、蓝耗低得多；中心点就是这堆怪）
+        if (TP(m, "slow_role", 0.0) >= 1.0)
+        {
+            uint32 const slowRank = uint32(TP(m, "aoe_slow_rank", 1.0) + 0.5);
+            uint32 const blizzardId = SpellIdAtRank(ai, m, "blizzard", slowRank ? slowRank : 1);
+            if (blizzardId && CastIdAt(ai, m, s, blizzardId, s.target->GetPositionX(),
+                    s.target->GetPositionY(), s.target->GetPositionZ()))
+                return TickResult::Acted;
+        }
+
+        // 兜底：单体火球（群伤放不出时也别空着一个 GCD）
+        return FsmResult(CastFirst(ai, m, s, { "fireball" }));
+    }
+
+    // 平稳期动作表：**灼烧是轴，火球是体**（顺序 = 口径 ①②③④⑤⑥）。
+    ai::dpsfsm::TickResult TickFireBurn(PlayerbotAI* ai, BotMem* m, Snapshot& s, ThreatLevel threat,
+                                        int stacks, int scorchFull, FirePlan plan)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 仇恨 Wait 档：**不施法、也不让引擎动**（与冰法同一套口径：抢在坦克前面打，
+        //   换来的是一只追着法师的怪；火法还没有冰法那种减速自保）。
+        //   Throttle 档照常打（火球是低威胁填充），只是不开爆发、不开群伤。
+        if (threat == ThreatLevel::Wait)
+            return TickResult::Hold;
+
+        // ⑤ 移动中：只有瞬发打得出去（读条会被移动取消）⇒ 火焰冲击，不是火球
+        if (s.moving)
+            return FsmResult(CastFirst(ai, m, s, { "fire blast" }));
+
+        // short 表第二步：目标约 25% 时用急冷重置冰冷血脉/燃烧（一场只重置一次，位 8 记账）
+        if (plan == FirePlan::Short && !(m->fireBurstDone & 8)
+            && s.targetHp <= float(TP(m, "cold_snap_hp", 25.0))
+            && !Ready(s.bot, SpellId(ai, s.bot, m, "icy veins", false))
+            && TryCastSelf(ai, m, s, "cold snap"))
+        {
+            m->fireBurstDone |= 8;
+            return TickResult::Acted;
+        }
+
+        // ⑥ 瞬发炎爆（法术连击）：上面已经挡掉 `s.casting` ⇒ 这里只可能在**火球读完**之后打
+        if (FireInstantPyroReady(ai, m, s) && CastFirst(ai, m, s, { "pyroblast" }))
+            return TickResult::Acted;
+
+        // ①③④ 灼烧轴：起手叠满 / 按"已放火球数"维护 / 剩余时间兜底 / 被抵抗重补
+        if (FireWantScorch(ai, m, s, stacks, scorchFull)
+            && TryCast(ai, m, s, "scorch", nullptr))
+        {
+            m->fireScorchForce = false;      // 抵抗重补只补一次
+            m->fireScorchPending = true;     // 下一 tick 核对（涨层 / 续时长）
+            m->fireScorchBefore = stacks;
+            m->fireScorchResent = false;
+            m->fireFbSinceScorch = 0;
+            ++m->fireScorchTries;
+            return TickResult::Acted;
+        }
+
+        // long 表：冰冷血脉**单独**按 CD 开（不绑燃烧；燃烧留给 20% 斩杀）。
+        //   它不吃 GCD（`NoGcd`）⇒ 开了之后这一 tick 照常读火球，不白丢一手。
+        bool actedOffGcd = false;
+        if (plan == FirePlan::Long && CastFirst(ai, m, s, { "icy veins" }))
+            actedOffGcd = true;
+
+        // ② 火球是**唯一填充**（不用火焰冲击填充：它 8 秒 CD、射程 20 码，只给移动/斩杀用）
+        if (CastFirst(ai, m, s, { "fireball" }))
+        {
+            ++m->fireFbSinceScorch;
+            return TickResult::Acted;
+        }
+        return actedOffGcd ? TickResult::Acted : TickResult::Decline;
+    }
+
+    // 爆发动作表：三套表共用这一份顺序 —— **饰品 → 冰冷血脉 → 燃烧** →（瞬发炎爆）→ 火球。
+    //   饰品先开不浪费持续时间；燃烧最后开，让"连续暴击"的窗口正好落在火球连发上
+    //   （combustion 暴击叠 3 层就被消耗进 3 分钟 CD，开在走位/空 GCD 里等于白开）。
+    ai::dpsfsm::TickResult TickFireBurst(PlayerbotAI* ai, BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        using ai::dpsfsm::TickResult;
+
+        if (threat == ThreatLevel::Wait)
+            return TickResult::Hold;
+
+        // 斩杀轮（位 4）：冰冷血脉还在 CD ⇒ 先用急冷重置一次（一场一次，位 8 记账）
+        uint32 const icyId = SpellId(ai, s.bot, m, "icy veins", false);
+        if (m->fireBurstRound == 4 && !(m->fireBurstDone & 8)
+            && icyId && !Ready(s.bot, icyId)
+            && TryCastSelf(ai, m, s, "cold snap"))
+        {
+            m->fireBurstDone |= 8;
+            return TickResult::Acted;
+        }
+
+        if (m->fireBurstWantTrinket && UseTrinket(ai, m, s))
+            return TickResult::Acted;
+        if (m->fireBurstWantIcy && CastFirst(ai, m, s, { "icy veins" }))
+            return TickResult::Acted;
+        if (m->fireBurstWantComb && CastFirst(ai, m, s, { "combustion" }))
+            return TickResult::Acted;
+        if (FireInstantPyroReady(ai, m, s) && CastFirst(ai, m, s, { "pyroblast" }))
+            return TickResult::Acted;
+        return FsmResult(CastFirst(ai, m, s, { "fireball" }));
+    }
+
+    ai::dpsfsm::TickResult TickFireFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 读条/引导中一律不插技能 —— **瞬发炎爆也不打断当前火球**（口径 ⑥）：
+        //   炎爆的"瞬发"是它自己瞬发，插进去会把读到一半的火球顶掉，净亏一个火球的伤害。
+        if (s.casting)
+            return TickResult::Acted;
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+
+        // 交战计时（"预计战斗时长"要跟**已经打了多久**比）：有目标就开始计，没目标清场
+        if (s.target)
+        {
+            if (!m->engagedAt)
+                m->engagedAt = safeNow;
+        }
+        else
+        {
+            m->engagedAt = 0;
+            m->fireBurstDone = 0;
+        }
+
+        double const fightLen = FireFightLength(m);
+        FirePlan const plan = FirePlanFor(fightLen);
+        double const elapsedSec = m->engagedAt
+            ? double(WorldTimer::getMSTimeDiff(m->engagedAt, safeNow)) / 1000.0 : 0.0;
+
+        int const scorchFull = int(TP(m, "scorch_stacks", 5.0));
+        int const stacks = FireScorchStacks(ai, m, s);
+        FireScorchTick(ai, m, s, stacks, scorchFull);
+
+        // 仇恨档位本 tick 只算一次：AoE / 爆发 / 平稳三处共用同一份判断
+        //   （诊断日志在 EvalThreat 内部按 10 秒节流）。
+        ThreatLevel const threat = EvalThreat(m, s);
+
+        // 爆发点火：**唯一一处**写 fireBurstDone / burstUntil（窗口从这一刻撑开）。
+        //   出射程时不点火：爆发牌打在 OUT_OF_RANGE 上等于白丢（口径的"先到位"同理）。
+        if (time(nullptr) >= m->burstUntil && s.target
+            && s.dist <= float(TP(m, "range_caster", 30.0)))
+        {
+            int const round = FireBurstRound(ai, m, s, plan, elapsedSec, fightLen, scorchFull);
+            if (round)
+                FireBurstOpen(m, plan, round);
+        }
+
+        State const st = EvalFire(m, s, threat);
+        m->state = st;
+
+        TickResult result = TickResult::Decline;
+        switch (st)
+        {
+            case State::Recover:
+                // [2026-11-01 站长口径] 恢复顺序：**宝石 → 大蓝 → 唤醒**。
+                //   唤醒是 8 秒引导 ⇒ 只在宝石/药水都不行时才用；它**不改变循环**
+                //   （与奥法不同：奥法的唤醒是 3+3 的排程起点，火法的唤醒只是回蓝）。
+                if (UseManaGem(ai, m, s))
+                    result = TickResult::Acted;
+                else if (UseManaPotion(m, s))
+                    result = TickResult::Acted;
+                else if (TryCastSelf(ai, m, s, "evocation"))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Decline;      // 喝水/魔杖交回引擎
+                break;
+
+            case State::Approach:
+                result = TickResult::Decline;          // 走位归引擎
+                break;
+
+            case State::Aoe:
+                result = TickFireAoe(ai, m, s, threat);
+                break;
+
+            case State::Burst:
+                result = TickFireBurst(ai, m, s, threat);
+                break;
+
+            case State::Burn:
+                result = TickFireBurn(ai, m, s, threat, stacks, scorchFull, plan);
+                break;
+
+            case State::Idle:
+            default:
+                result = TickResult::Decline;
+                break;
+        }
+
+        // [2026-11-01 站长口径] 每 10 秒一条状态日志（WorldTimer 节流，别每 tick 刷屏）：
+        //   state / scorch=层数 / sinceFb=自上次补灼烧放出的火球数 / hotstreak=0|1 / mana=% / burstPlan
+        if (!m->lastFireLog || WorldTimer::getMSTimeDiff(m->lastFireLog, safeNow) >= 10000)
+        {
+            m->lastFireLog = safeNow;
+            sLog.outError("[DPSFSM-FIRE] %s state=%s scorch=%d sinceFb=%d hotstreak=%d mana=%.0f burstPlan=%s",
+                s.bot->GetName(), ai::dpsfsm::StateName(st), stacks, m->fireFbSinceScorch,
+                FireInstantPyroReady(ai, m, s) ? 1 : 0, s.power, FirePlanName(plan));
+        }
+
+        return result;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -5496,20 +6109,34 @@ namespace ai
             // [2026-11-01 站长口径] 术士只接**毁灭**（三系里最简单：主输出只有暗影箭）；
             //   Affliction / Demonology 继续走 legacy `TickWarlock`（保持 Decline ⇒ 不改变任何行为）。
             bool const warlockFsm = (m->spec == Spec::Destruction);
+            // [2026-11-01 站长口径] 火法接进 mode=5（第六张职业图）：`TickFireFsm`。
+            //   mode=0/1/2/3/4 的火法照旧走 legacy `TickMage`，这条判断只影响 mode=5。
+            bool const mageFsm = (m->spec == Spec::Frost || m->spec == Spec::Arcane
+                || m->spec == Spec::Fire);
             if (dmode == DecisionMode::Fsm
-                && (m->spec == Spec::Frost || m->spec == Spec::Arcane || IsHunterSpec(m->spec)
-                    || warriorFsm || rogueFsm || warlockFsm))
+                && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
                 // [2026-10-31 站长口径] 三态返回：Acted=我出手了；Hold=我有意空着（引擎也别插）；
                 //   Decline=我不处理，交回引擎（走位/追击/开怪/喝水）。
-                ai::dpsfsm::TickResult const fsmResult = (m->spec == Spec::Frost)
-                    ? TickFrostFsm(ai, m, s)
-                    : (m->spec == Spec::Arcane ? TickArcaneFsm(ai, m, s)
-                    : (IsHunterSpec(m->spec) ? TickHunterFsm(ai, m, s)
-                    : (warriorFsm ? TickWarriorFsm(ai, m, s)
-                    : (rogueFsm ? TickRogueFsm(ai, m, s) : TickWarlockFsm(ai, m, s)))));
+                //   改成 if/else 链而不是嵌套三元：专精越加越多，三元的括号已经很难数
+                //   （行为与原来的三元完全一致，逐个专精对应不变）。
+                ai::dpsfsm::TickResult fsmResult = ai::dpsfsm::TickResult::Decline;
+                if (m->spec == Spec::Frost)
+                    fsmResult = TickFrostFsm(ai, m, s);
+                else if (m->spec == Spec::Arcane)
+                    fsmResult = TickArcaneFsm(ai, m, s);
+                else if (m->spec == Spec::Fire)
+                    fsmResult = TickFireFsm(ai, m, s);
+                else if (IsHunterSpec(m->spec))
+                    fsmResult = TickHunterFsm(ai, m, s);
+                else if (warriorFsm)
+                    fsmResult = TickWarriorFsm(ai, m, s);
+                else if (rogueFsm)
+                    fsmResult = TickRogueFsm(ai, m, s);
+                else
+                    fsmResult = TickWarlockFsm(ai, m, s);
                 // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）
                 ManaLogTick(m, bot);
                 switch (fsmResult)
