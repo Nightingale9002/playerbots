@@ -5529,6 +5529,50 @@ namespace ai
         return false;
     }
 
+    // [2026-11-01 站长口径] 用急冷（cold snap）把冰冷血脉重置回来：**一场只交一次**（位掩码 8）。
+    //   core 侧口径（`SpellEffects.cpp → Spell::EffectDummy` 的 11958 分支）：急冷只清
+    //   **冰霜系 + 有 RecoveryTime** 的冷却 ⇒ 冰冷血脉会被清掉，**燃烧是火焰系、清不掉**
+    //   （所以 combustion 必须另有可用窗口 —— 见三套爆发表）。
+    //   只在"冰冷血脉已经进 CD"时才交（还在手上就别浪费这张牌）。
+    bool FireColdSnap(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (m->fireBurstDone & 8)
+            return false;
+        bool const dbg = (TP(m, "fire_coldsnap_dbg", 0.0) >= 1.0);
+        uint32 const id = SpellId(ai, s.bot, m, "cold snap", false);
+        if (!id)
+        {
+            // 没学急冷 ⇒ 这条分支不存在（一次性留痕，避免"为什么没重置"变成悬案）
+            if (dbg && !m->flags.count("fire coldsnap dbg"))
+            {
+                m->flags.insert("fire coldsnap dbg");
+                sLog.outError("[DPSFSM-FIRE] %s 没有 cold snap（11958 未学）⇒ 斩杀窗不会重置冰冷血脉",
+                    s.bot->GetName());
+            }
+            return false;
+        }
+        uint32 const icyId = SpellId(ai, s.bot, m, "icy veins", false);
+        if (!icyId || Ready(s.bot, icyId))
+            return false;                        // 冰冷血脉本来就好着（或没学）⇒ 没必要交急冷
+        if (!TryCastSelf(ai, m, s, "cold snap"))
+        {
+            // 一次性诊断（`fire_coldsnap_dbg=1` 才打）：把"到底为什么放不出"留痕。
+            if (dbg && !m->flags.count("fire coldsnap dbg"))
+            {
+                m->flags.insert("fire coldsnap dbg");
+                SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+                bool const can = ai->CanCastSpell(id, s.bot, 0, false, nullptr, false, false, false, &res);
+                sLog.outError("[DPSFSM-FIRE] %s cold snap 放不出：id=%u spellReady=%d canCast=%d res=%d mana=%.0f",
+                    s.bot->GetName(), id, Ready(s.bot, id) ? 1 : 0, can ? 1 : 0, int(res), s.power);
+            }
+            return false;
+        }
+        m->fireBurstDone |= 8;
+        if (dbg)
+            sLog.outError("[DPSFSM-FIRE] %s cold snap 已交（icy=%u 重置）", s.bot->GetName(), icyId);
+        return true;
+    }
+
     // 灼烧轴的记账与纠错（每 tick 一次，读 Snapshot + 层数，不发技能）：
     //   ① 第一次真的看到层数 ⇒ 记下"有强化灼烧天赋"（静态事实，跨轮保留）；
     //   ② 抵抗判据：补完灼烧后 debuff **既没涨层、也没被续上时长** ⇒ 立刻再补一次；
@@ -5777,15 +5821,10 @@ namespace ai
         if (s.moving)
             return FsmResult(CastFirst(ai, m, s, { "fire blast" }));
 
-        // short 表第二步：目标约 25% 时用急冷重置冰冷血脉/燃烧（一场只重置一次，位 8 记账）
-        if (plan == FirePlan::Short && !(m->fireBurstDone & 8)
-            && s.targetHp <= float(TP(m, "cold_snap_hp", 25.0))
-            && !Ready(s.bot, SpellId(ai, s.bot, m, "icy veins", false))
-            && TryCastSelf(ai, m, s, "cold snap"))
-        {
-            m->fireBurstDone |= 8;
+        // short 表第二步：目标约 `cold_snap_hp`(25%) 时用急冷重置冰冷血脉（一场一次，位 8 记账）
+        if (plan == FirePlan::Short && s.targetHp <= float(TP(m, "cold_snap_hp", 25.0))
+            && FireColdSnap(ai, m, s))
             return TickResult::Acted;
-        }
 
         // ⑥ 瞬发炎爆（法术连击）：上面已经挡掉 `s.casting` ⇒ 这里只可能在**火球读完**之后打
         if (FireInstantPyroReady(ai, m, s) && CastFirst(ai, m, s, { "pyroblast" }))
@@ -5830,14 +5869,8 @@ namespace ai
             return TickResult::Hold;
 
         // 斩杀轮（位 4）：冰冷血脉还在 CD ⇒ 先用急冷重置一次（一场一次，位 8 记账）
-        uint32 const icyId = SpellId(ai, s.bot, m, "icy veins", false);
-        if (m->fireBurstRound == 4 && !(m->fireBurstDone & 8)
-            && icyId && !Ready(s.bot, icyId)
-            && TryCastSelf(ai, m, s, "cold snap"))
-        {
-            m->fireBurstDone |= 8;
+        if (m->fireBurstRound == 4 && FireColdSnap(ai, m, s))
             return TickResult::Acted;
-        }
 
         if (m->fireBurstWantTrinket && UseTrinket(ai, m, s))
             return TickResult::Acted;
