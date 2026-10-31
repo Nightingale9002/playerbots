@@ -849,9 +849,10 @@ namespace dpspolicy
             return true;
         }
 
-        // [2026-10-30 站长口径] 表内价值驱动：pselect=1 时先给所有"当前可执行"的步骤打分，再放最高的那个。
-        //   pselect=0（默认）= 原来的"第一条能放就放"，两条路可同轮 A/B。
-        if (TP(m, "pselect", 0.0) >= 1.0)
+        // [2026-10-30 站长口径] 表内价值驱动：mode=2/3 时先给所有"当前可执行"的步骤打分，再放最高的那个。
+        //   mode=1（table）= 原来的"第一条能放就放"，两条路可同轮 A/B。
+        //   [2026-10-31 S1] 旧键 `pselect` 已并入 DecisionMode（见 DpsFsm.cpp 顶部说明）。
+        if (ModeIsScored(DecisionMode(m->mode)))
         {
             // [2026-10-30 站长口径] 表内价值驱动，**两遍打分**：
             //   第一遍：伤害类（直接/武器/DoT/AoE）→ 得到本 tick 的参考价值 Vmax
@@ -1008,10 +1009,11 @@ namespace dpspolicy
                 }
             }
 
-            // [2026-10-30 站长口径] **pauto=1：法术书里所有可用法术都进候选**（跨系混搭也允许）。
+            // [2026-10-30 站长口径] **mode=3：法术书里所有可用法术都进候选**（跨系混搭也允许）。
             //   表只提供"约束 + 权重"；表外候选按 Cand 自身字段推导权重类别，走同一套价值公式。
             //   用不用跨系技能由权重（Optuna 可调）和实测决定，而不是我手写排除。
-            if (TP(m, "pauto", 0.0) >= 1.0)
+            //   [2026-10-31 S1] 旧键 `pauto` 已并入 DecisionMode（原嵌套在 pselect 内）。
+            if (ModeIsBook(DecisionMode(m->mode)))
             {
                 uint32 bestAutoId = 0;
                 float bestAutoScore = bestScore;

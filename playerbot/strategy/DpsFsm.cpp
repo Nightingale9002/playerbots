@@ -105,6 +105,9 @@ namespace
         bool policyLogged = false;
         bool behindWarned = false;
         bool coverageLogged = false;    // 覆盖率断言只打一次
+        bool modeLogged = false;        // [2026-10-31 S1] 决策模式日志只打一次
+        int  mode = 0;                  // [2026-10-31 S1] 本 tick 解析出的 DecisionMode（存 int：
+                                        //   枚举声明在 BotMem 之后；TickPolicy 直接读它，不再二次读 conf）
         uint32 engRuns = 0;
         uint32 dupDebuff = 0;       // [2026-10-30] 同类 debuff 已被更强/相等效果占住时仍施放的次数（互斥分析用）         // 引擎真正跑过的 tick 数（诊断白字缺口用）
         uint32 movTicks = 0;        // 在移动的 tick 数（移动会打断挥击）
@@ -267,6 +270,90 @@ namespace
     double TP(BotMem* m, char const* key, double def)
     {
         return TuneForBot(m, key, def);
+    }
+
+    // ==========================================================================
+    // [2026-10-31 S1] 决策模式：**一个键取代四个布尔**
+    //   旧口径 value / policy / pselect / pauto 是历史叠加出来的：
+    //     - pselect 只在 policy=1 时被读；pauto 又只在 pselect=1 时被读
+    //       ⇒ 4 个布尔理论 16 态，实际有意义的只有 4 种（另有 value 引擎 1 种）。
+    //     - 典型哑弹：pauto=1 但 pselect=0 完全不生效；policy 没开时 pselect/pauto 全废。
+    //   新口径只有一个键 `mode`（数值，便于 Optuna 当 categorical 采样）：
+    //     0 legacy            手写 Tick<Class>（现默认）
+    //     1 table             策略表，顺序"第一条能放就放"
+    //     2 table_scored      策略表 + 表内两遍打分
+    //     3 table_scored_book 2 + 法术书表外候选（w_offtable 打折后参与同一把尺子）
+    //     4 value             价值引擎（TickValue）
+    //   旧四键仍会被读一次做**自动迁移**，并打一条 WARN 告诉该写 `mode=N`；
+    //   tuner 的 `k=v` 里也常直接带旧键，所以兼容层保留到调参脚本改完再删。
+    // 详见 dev/DESIGN_dps_fsm.md §1。
+    // ==========================================================================
+    // 名字避开 ai::Engine（经典策略引擎），别让两个 Engine 在同一命名空间打架。
+    enum class DecisionMode { Legacy = 0, Table = 1, TableScored = 2, TableScoredBook = 3, Value = 4 };
+
+    char const* DecisionModeName(DecisionMode m)
+    {
+        switch (m)
+        {
+            case DecisionMode::Table:           return "table";
+            case DecisionMode::TableScored:     return "table_scored";
+            case DecisionMode::TableScoredBook: return "table_scored_book";
+            case DecisionMode::Value:           return "value";
+            default:                            return "legacy";
+        }
+    }
+
+    bool ModeIsTable(DecisionMode m)
+    {
+        return m == DecisionMode::Table || m == DecisionMode::TableScored || m == DecisionMode::TableScoredBook;
+    }
+
+    bool ModeIsScored(DecisionMode m)
+    {
+        return m == DecisionMode::TableScored || m == DecisionMode::TableScoredBook;
+    }
+
+    bool ModeIsBook(DecisionMode m)
+    {
+        return m == DecisionMode::TableScoredBook;
+    }
+
+    // 解析顺序：新键 `mode` 优先；没有它才从旧四键推导（并警告一次，告诉你该写哪个 mode）。
+    DecisionMode ResolveMode(BotMem* m, bool& derivedFromLegacy)
+    {
+        derivedFromLegacy = false;
+
+        double const raw = TP(m, "mode", -1.0);     // -1 = 没配
+        if (raw >= 0.0)
+        {
+            int const v = int(raw + 0.5);
+            if (v >= 0 && v <= 4)
+                return DecisionMode(v);
+            sLog.outError("[DPSFSM-MODE] mode=%d 越界（合法 0..4），按 legacy 处理", v);
+            return DecisionMode::Legacy;
+        }
+
+        // ---- 旧口径兼容（derive 一次，行为与旧代码逐一等价）----
+        bool const value   = TP(m, "value",   0.0) >= 1.0;
+        bool const policy  = TP(m, "policy",  0.0) >= 1.0;
+        bool const pselect = TP(m, "pselect", 0.0) >= 1.0;
+        bool const pauto   = TP(m, "pauto",   0.0) >= 1.0;
+
+        if (!value && !policy && !pselect && !pauto)
+            return DecisionMode::Legacy;        // 什么都没配 = 原默认，不必警告
+
+        derivedFromLegacy = true;
+        if (value)
+            return DecisionMode::Value;         // 旧代码里 value 先跑、失败后还能落 policy；见警告
+
+        // 旧代码的 nested 读法：pauto 只在 pselect=1 时才被读
+        if (policy)
+        {
+            if (!pselect)
+                return DecisionMode::Table;     // pselect=0 ⇒ pauto 配了也不生效
+            return pauto ? DecisionMode::TableScoredBook : DecisionMode::TableScored;
+        }
+        return DecisionMode::Legacy;            // 只有 pselect/pauto、没有 policy ⇒ 原来完全无效
     }
 
     int   AoEPack(BotMem* m)  { return int(TP(m, "aoe_pack", 3.0)); }
@@ -2287,19 +2374,9 @@ namespace ai
             ReloadTune();
 
             uint32 const hbNow = WorldTimer::getMSTime();
-            if (!m->hbLast || WorldTimer::getMSTimeDiff(m->hbLast, hbNow ? hbNow : 1) >= 10000)
-            {
+            bool const hbDue = (!m->hbLast || WorldTimer::getMSTimeDiff(m->hbLast, hbNow ? hbNow : 1) >= 10000);
+            if (hbDue)
                 m->hbLast = hbNow ? hbNow : 1;
-                // [2026-10-30] 加了 pol/eng/mov/melee 四个字段：
-                //   pol=1 走职业空间策略；eng=引擎真跑的 tick 数；mov=在移动的 tick 数；melee=白字命中数。
-                //   定位"policy 模式白字平砍变少"就看 eng/mov/melee 三者的关系。
-                sLog.outError("[DPSFSM-HB] %s spec=%s state=%s pol=%d incombat=%d target=%s hp=%.0f res=%.0f auras=%u dup=%u ticks=%u casts=%u eng=%u mov=%u melee=%u",
-                    bot->GetName(), SpecName(m->spec), StateName(m->state),
-                    TP(m, "policy", 0.0) >= 1.0 ? 1 : 0, bot->IsInCombat() ? 1 : 0,
-                    bot->GetVictim() ? bot->GetVictim()->GetName() : "-", bot->GetHealthPercent(), bot->GetPowerPercent(),
-                    bot->GetVictim() ? uint32(bot->GetVictim()->GetSpellAuraHolderMap().size()) : 0u,
-                    m->dupDebuff, m->tickCount, m->castCount, m->engRuns, m->movTicks, bot->botMeleeHits);
-            }
 
             // [2026-10-29 诊断结论] 原来只认 IsInCombat()：本核心里"有目标但还没造成/受到伤害"不算战斗，
             //   于是远程 bot 永远不挥刀 -> 不进战斗 -> 状态机拒绝运行 -> 死锁（实测整场 incombat=0）。
@@ -2361,17 +2438,52 @@ namespace ai
             if (dpspolicy::PPolicy const* covPol = dpspolicy::PolicyFor(bot->getClass(), m->spec))
                 dpspolicy::LogCoverage(ai, m, bot, covPol);
 
-            // [2026-10-30] 价值驱动优先：value=1 时先由价值引擎选技能；
+            // [2026-10-31 S1] 决策模式在这里**唯一一次**解析（新键 `mode` 优先；旧四键只用于
+            //   自动迁移并给一条 WARN）。TickPolicy 读 m->mode，不再自己去看 pselect/pauto。
+            bool derivedFromLegacy = false;
+            DecisionMode const dmode = ResolveMode(m, derivedFromLegacy);
+            m->mode = int(dmode);
+            if (!m->modeLogged)
+            {
+                m->modeLogged = true;
+                sLog.outError("[DPSFSM-MODE] %s spec=%s mode=%d(%s)%s",
+                    bot->GetName(), SpecName(m->spec), int(dmode), DecisionModeName(dmode),
+                    derivedFromLegacy
+                        ? " WARN:旧键 value/policy/pselect/pauto 已废弃，请改成 mode=N（见 dev/DESIGN_dps_fsm.md）"
+                        : "");
+            }
+
+            if (hbDue)
+            {
+                // [2026-10-30] 心跳，10 秒一条；pol/eng/mov/melee 用于定位"白字平砍变少"。
+                //   [2026-10-31 S1] pol 改为"这一轮是否走策略表"（mode=1/2/3）——原先是读 policy 布尔，
+                //   现在只是 DecisionMode 的一个投影；字段名保持不变，避免打断既有解析脚本。
+                sLog.outError("[DPSFSM-HB] %s spec=%s state=%s pol=%d incombat=%d target=%s hp=%.0f res=%.0f auras=%u dup=%u ticks=%u casts=%u eng=%u mov=%u melee=%u",
+                    bot->GetName(), SpecName(m->spec), StateName(m->state),
+                    ModeIsTable(dmode) ? 1 : 0, bot->IsInCombat() ? 1 : 0,
+                    bot->GetVictim() ? bot->GetVictim()->GetName() : "-", bot->GetHealthPercent(), bot->GetPowerPercent(),
+                    bot->GetVictim() ? uint32(bot->GetVictim()->GetSpellAuraHolderMap().size()) : 0u,
+                    m->dupDebuff, m->tickCount, m->castCount, m->engRuns, m->movTicks, bot->botMeleeHits);
+
+                // [2026-10-31 S1] 唯一一处"语义会变"的旧组合：value=1 且 policy=1。
+                //   旧代码是 value 先跑、失败后落 policy（两段串联）；新口径只保留 value 引擎。
+                //   仓库里没有任何配置这样配过（conf 与 arms 都不带 value=），但要留痕，别让人以为是静默改行为。
+                if (derivedFromLegacy && TP(m, "value", 0.0) >= 1.0 && TP(m, "policy", 0.0) >= 1.0)
+                    sLog.outError("[DPSFSM-MODE] %s WARN:value=1 与 policy=1 同时设置在新口径里不再串联，已按 mode=4(value) 处理",
+                        bot->GetName());
+            }
+
+            // [2026-10-30] 价值驱动：mode=4 时由价值引擎选技能；
             //   它没有伤害技能可用（或都放不出）时返回 false，落回下面做 buff/圣印/形态维护。
-            if (TP(m, "value", 0.0) >= 1.0)
+            if (dmode == DecisionMode::Value)
             {
                 if (TickValue(ai, m))
                     return true;
                 NoteBail(bot, "value-engine-declined");
             }
 
-            // [2026-10-30] 职业技能空间 + 专精策略（policy=1 开启；默认 0 走原分专精处理器，便于同轮 A/B）
-            if (TP(m, "policy", 0.0) >= 1.0)
+            // [2026-10-30] 职业技能空间 + 专精策略（mode=1/2/3 开启；默认 legacy 走原分专精处理器）
+            if (ModeIsTable(dmode))
                 return TickPolicy(ai, m);
 
             bool handled = false;
