@@ -3733,6 +3733,9 @@ uint32 stuckFightCleared = 0;
                 SpecKey const* spec = nullptr;
                 std::string key;
                 double value = 0.0;
+                // [2026-10-31 站长口径] 并行 Optuna：一个臂可以带**多组** key=value
+                //   （格式 `spec:k1=v1,k2=v2,...`），这样一次命令能并行评估多组完整参数。
+                std::vector<std::pair<std::string, double>> kv;
                 bool baseline = false;
                 std::string label;
             };
@@ -3762,9 +3765,33 @@ uint32 stuckFightCleared = 0;
                     size_t const eq = rest.find('=');
                     if (eq == std::string::npos)
                         continue;
-                    arm.key = rest.substr(0, eq);
-                    arm.value = atof(rest.substr(eq + 1).c_str());
-                    arm.label = arm.key + "=" + rest.substr(eq + 1);
+                    // 逗号分隔的多组：k1=v1,k2=v2,...
+                    {
+                        std::string rest2 = rest;
+                        size_t start = 0;
+                        while (start <= rest2.size())
+                        {
+                            size_t const comma = rest2.find(',', start);
+                            std::string const piece = rest2.substr(start,
+                                comma == std::string::npos ? std::string::npos : comma - start);
+                            size_t const e2 = piece.find('=');
+                            if (e2 != std::string::npos)
+                            {
+                                std::string const kk = piece.substr(0, e2);
+                                double const vv = atof(piece.substr(e2 + 1).c_str());
+                                arm.kv.push_back(std::make_pair(kk, vv));
+                                if (arm.key.empty())
+                                {
+                                    arm.key = kk;
+                                    arm.value = vv;
+                                }
+                            }
+                            if (comma == std::string::npos)
+                                break;
+                            start = comma + 1;
+                        }
+                    }
+                    arm.label = rest;
                 }
                 parsed.push_back(arm);
             }
@@ -3832,7 +3859,15 @@ uint32 stuckFightCleared = 0;
                 d.sharedPile = true;
                 d.armLabel = arm.label;
                 if (!arm.baseline)
-                    d.overrides[arm.key] = arm.value;
+                    if (!arm.kv.empty())
+                    {
+                        for (auto const& p : arm.kv)
+                            d.overrides[p.first] = p.second;
+                    }
+                    else
+                    {
+                        d.overrides[arm.key] = arm.value;
+                    }
 
                 // 所有臂共用同一堆木桩：第一个臂当堆主（召 1 个假人），其余加入
                 d.ringAngle = 6.2831853f * float(started) / float(parsed.size());
