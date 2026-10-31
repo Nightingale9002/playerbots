@@ -6,6 +6,7 @@
 #include "Grids/CellImpl.h"
 #include "Maps/Map.h"
 #include "Entities/Pet.h"           // [2026-10-31 站长口径] 猎人宠物生命周期守卫要现场建宠物（Pet::Create）
+#include "Entities/Totem.h"         // [2026-11-01 站长口径] 萨满图腾：GetTotem()/GetTotemDuration() 要完整类型
 #include "Server/SQLStorages.h"     // sCreatureStorage：按 entry 取 CreatureInfo（hunter_pet_entry）
 #include "Server/DBCStores.h"       // [2026-11-01 站长口径] sSpellRangeStore：填充候选的射程过滤
 // [2026-10-31 根因] 宠物 AI 的选择由 `FactorySelector::selectAI` 按 UNIT_FLAG_PLAYER_CONTROLLED 决定：
@@ -275,6 +276,40 @@ namespace
         bool   retNeedSeal = false;
         bool   retRestoreSeal = false;
         ObjectGuid retTarget;
+        // [2026-11-01 站长口径] 萨满·图腾子系统（元素/增强共用）—— **自己记账，不看槽位**。
+        //   核心事实（KNOWN_ISSUES §10.53 实证）：施放图腾后 `GetTotemGuid(slot)` 仍是空的
+        //   （召唤走 SPELL_EFFECT_SUMMON，没登记成玩家的图腾槽位）⇒ 一旦按槽位判空，
+        //   每 tick 都认为"这槽没图腾"，GCD 全喂给图腾（实测 25 秒 20 次法力之泉、元素萨 dps 0~250）。
+        //   ⇒ 每个槽登记三样：**什么时候插的**（totemCastAt）、**插的是哪个法术**（totemEntry，
+        //     用来识别"换图腾组"）、**插在哪里**（totemPos，队伍移动 > totem_range 就重插）。
+        //   totemExpireAt = totemCastAt + 该法术的 Duration（拿不到按 120 秒兜底），
+        //   剩余 < totem_refresh_ms(3000) 就补 —— 四条判据见 DpsFsm.cpp → ShTotemNeed()。
+        uint32 totemCastAt[MAX_TOTEM_SLOT] = {};
+        uint32 totemEntry[MAX_TOTEM_SLOT] = {};
+        uint32 totemExpireAt[MAX_TOTEM_SLOT] = {};
+        float  totemPos[MAX_TOTEM_SLOT][3] = {};
+        // 图腾舞（增强，可选）：空气槽 风怒 → 立刻优雅 → twist_period_ms(10s) 后换回风怒。
+        //   phase 0=该挂风怒 / 1=风怒已挂、等切优雅 / 2=优雅期、等切回。
+        int    twistPhase = 0;
+        uint32 twistNextAt = 0;
+        // 萨满诊断/验收字段（只用于日志，不参与决策）：
+        uint32 lastShLog = 0;          // [DPSFSM-SH] 10 秒节流
+        uint32 lastShDiag = 0;         // [DPSFSM-SH-DIAG] 10 秒节流（sh_diag=1 才打）
+        bool   shClOk = false;         // 这一手是否走"闪电链优先"（蓝 ≥ cl_mana_min）
+        int    shLightningShield = 0;  // 闪电盾层数（AuraStacks/charge 取大，见 ShLightningShieldStacks）
+        uint32 lsCastAt = 0;           // 上一次补闪电盾的时刻（防"引擎水盾 ↔ 我方闪电盾"互顶时紧着补）
+        uint32 shEarthShocks = 0;      // 本场地震击次数（层数达标才震）
+        uint32 shTotemCasts = 0;       // 本场补图腾次数（验收"图腾真的在补"）
+        // 本场（= 同一个目标）的一次性开手：Aoe 起手只放一次火元素新星；开门准备只做一次
+        bool   shAoeNova = false;
+        ObjectGuid shTarget;
+        uint32 shEngagedAt = 0;
+        // 风怒武器 3 秒 ICD 的**观测值**（核心不暴露 proc 冷却，只能看 proc 法术的冷却边沿；
+        //   -1 = 还没观测到 / 没附风怒武器）。只做日志，不做微延迟对齐。
+        int    wfIcdMs = -1;
+        int    wfLastProcAt = 0;
+        uint32 wfProcs = 0;
+        bool   wfReadyPrev = true;
     };
 
     std::mutex s_disabledMutex;
@@ -3353,6 +3388,33 @@ namespace ai
             m->retNeedSeal = false;
             m->retRestoreSeal = false;
             m->retTarget = ObjectGuid();
+            // [2026-11-01 站长口径] 萨满：图腾账本必须跨轮清零 —— 上一轮的 totemEntry/totemExpireAt
+            //   会让新一轮开局"以为图腾还在"（假人重开后 bot 往往已被挪回原点，旧账本直接骗自己）。
+            //   清掉账本 = 新一轮的第一件事就是重铺图腾（这正是干净开局该有的样子）。
+            for (int i = 0; i < MAX_TOTEM_SLOT; ++i)
+            {
+                m->totemCastAt[i] = 0;
+                m->totemEntry[i] = 0;
+                m->totemExpireAt[i] = 0;
+                for (int k = 0; k < 3; ++k)
+                    m->totemPos[i][k] = 0.0f;
+            }
+            m->twistPhase = 0;
+            m->twistNextAt = 0;
+            m->lastShLog = 0;
+            m->lastShDiag = 0;
+            m->shClOk = false;
+            m->shLightningShield = 0;
+            m->lsCastAt = 0;
+            m->shEarthShocks = 0;
+            m->shTotemCasts = 0;
+            m->shAoeNova = false;
+            m->shTarget = ObjectGuid();
+            m->shEngagedAt = 0;
+            m->wfIcdMs = -1;
+            m->wfLastProcAt = 0;
+            m->wfProcs = 0;
+            m->wfReadyPrev = true;
 
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
@@ -6467,6 +6529,604 @@ namespace ai
         return result;
     }
 
+    // =====================================================================================
+    // [2026-11-01 站长口径] 萨满接进 mode=5（第八张职业图）：元素（Elemental）+ 增强（Enhancement）。
+    //   恢复（Restoration）**不做 DPS**：派发处不选它，`TickShamanFsm` 里也 Decline，
+    //   继续走 legacy `TickShaman`（治疗以后单独做）。
+    //
+    //   ① 图腾子系统（三系共用，必须先做）—— 核心坑（KNOWN_ISSUES §10.53 实证）：
+    //     施放图腾后 `GetTotemGuid(slot)` **仍为空**（召唤走 SPELL_EFFECT_SUMMON，没有登记成
+    //     玩家的图腾槽位）⇒ **绝不能按槽位判空**，否则每 tick 都重铺、把 GCD 全吃光
+    //     （实测：25 秒放了 20 次法力之泉，元素萨 dps 410~818 → 0~250）。
+    //     ⇒ 自己记账（BotMem 的 totemCastAt / totemEntry / totemExpireAt / totemPos），四条判据：
+    //         ① 槽位没有登记过（从没插过 / 上一轮清过）
+    //         ② 剩余时间 < totem_refresh_ms(3000)
+    //         ③ 离插下去的位置 > totem_range(40)（队伍移动，光环照不到）
+    //         ④ 想要的法术变了（切图腾组：单体↔群体、元素↔增强、图腾舞 优雅↔风怒）
+    //     图腾时长取 `SpellEntry` 的 Duration（sSpellMgr.GetSpellDuration）；拿不到/无限按 120 秒兜底。
+    //     补图腾占**一个 GCD**，优先级：空槽/快到期 > 输出技能。
+    //   ② 三系图腾组（站长口径）：
+    //     元素：大地 stoneskin（或 tremor 功能优先）/ 火焰 totem of wrath / 水 mana spring / 空气 wrath of air
+    //     增强：大地 strength of earth / 火焰 magma(群) 或 searing(单) / 水 mana spring / 空气 windfury
+    //   ③ 图腾舞（增强，可选）：空气槽插风怒后立刻换优雅，twist_period_ms(10s) 后再换回。
+    //     `totem_twist_enable` 默认 -1=自动：本小队近战 ≥ twist_melee_min(2) 才开。
+    // =====================================================================================
+
+    char const* ShTotemSlotKey(int slot)
+    {
+        switch (slot)
+        {
+            case TOTEM_SLOT_EARTH: return "earth";
+            case TOTEM_SLOT_FIRE:  return "fire";
+            case TOTEM_SLOT_WATER: return "water";
+            case TOTEM_SLOT_AIR:   return "air";
+        }
+        return "?";
+    }
+
+    // 图腾时长（毫秒）：从**召唤法术**的 Duration 取。
+    //   TBC 的图腾召唤法术 DurationIndex 大多是 4（=120 秒），灼热/熔岩/新星另有值；
+    //   拿不到（没有 entry / DurationIndex 缺失）或 -1（无限）都按 120 秒兜底 —— 宁可早补，不要空着。
+    int ShTotemDurationMs(uint32 id)
+    {
+        SpellEntry const* entry = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
+        int32 const d = entry ? GetSpellDuration(entry) : 0;
+        if (d <= 0)
+            return 120000;
+        return int(d);
+    }
+
+    bool ShHasTotem(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        // warn=false：低等级 bot 本来就可能没学某个图腾，不能每 tick 刷 "没有可用技能"
+        return SpellId(ai, s.bot, m, name, false) != 0;
+    }
+
+    // 图腾组的上下文（一次 tick 算好，传给规划函数）
+    struct ShTotemCtx
+    {
+        bool elemental = false;
+        bool enhance = false;
+        bool inAoe = false;      // 群架：火焰槽换成 magma（增强）/ magma（元素）
+        bool twist = false;      // 图腾舞开（只影响空气槽，由 ShTickTwist 单独处理）
+    };
+
+    // 这一槽这一手**该插哪个**图腾（nullptr = 这槽不插）。
+    //   名字一律用 DB 规范名；`SpellId(..., false)` 返回 0（没学）就静默跳过，不报错。
+    char const* ShDesiredTotem(PlayerbotAI* ai, BotMem* m, Snapshot& s, ShTotemCtx const& c, int slot)
+    {
+        if (c.elemental)
+        {
+            switch (slot)
+            {
+                case TOTEM_SLOT_EARTH:
+                    // 功能优先：自己吃到恐惧/迷惑就先插震颤图腾（解控 > 属性），否则石甲图腾
+                    if ((s.bot->isFeared() || s.bot->HasAuraType(SPELL_AURA_MOD_CONFUSE))
+                        && ShHasTotem(ai, m, s, "tremor totem"))
+                        return "tremor totem";
+                    return "stoneskin totem";
+                case TOTEM_SLOT_FIRE:
+                    // AOE 起手只放一次火元素新星（5 秒后自己炸），之后火焰槽回到熔岩图腾
+                    if (c.inAoe && !m->shAoeNova && ShHasTotem(ai, m, s, "fire nova totem"))
+                        return "fire nova totem";
+                    if (c.inAoe)
+                        return ShHasTotem(ai, m, s, "magma totem") ? "magma totem" : "searing totem";
+                    // 站长口径：元素火焰槽 = 愤怒图腾（3% 命中 + 3% 法爆）；没这天赋就退回灼热
+                    return ShHasTotem(ai, m, s, "totem of wrath") ? "totem of wrath" : "searing totem";
+                case TOTEM_SLOT_WATER:
+                    return "mana spring totem";
+                case TOTEM_SLOT_AIR:
+                    return ShHasTotem(ai, m, s, "wrath of air totem") ? "wrath of air totem" : "grace of air totem";
+            }
+            return nullptr;
+        }
+        if (c.enhance)
+        {
+            switch (slot)
+            {
+                case TOTEM_SLOT_EARTH: return "strength of earth totem";
+                case TOTEM_SLOT_FIRE:
+                    // 站长口径：群架熔岩图腾、单体灼热图腾；AOE 起手先来一发火元素新星（只一次）
+                    if (c.inAoe && !m->shAoeNova && ShHasTotem(ai, m, s, "fire nova totem"))
+                        return "fire nova totem";
+                    return c.inAoe ? "magma totem" : "searing totem";
+                case TOTEM_SLOT_WATER: return "mana spring totem";
+                case TOTEM_SLOT_AIR:   return c.twist ? "grace of air totem" : "windfury totem";
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    // 这一槽**要不要补**（四条判据，见节头注释）。
+    bool ShTotemNeed(PlayerbotAI* ai, BotMem* m, Snapshot& s, int slot, uint32 wantId, uint32 now)
+    {
+        if (!wantId)
+            return false;
+        int const refreshMs = int(TP(m, "totem_refresh_ms", 3000.0));
+        float const range = float(TP(m, "totem_range", 40.0));
+
+        // ① 槽位没有登记过
+        if (!m->totemEntry[slot])
+            return true;
+        // ④ 切了图腾组：想要的法术与记着的不一样（单体↔群体 / 元素↔增强 / 舞 优雅↔风怒）
+        if (m->totemEntry[slot] != wantId)
+            return true;
+        // ② 快到期
+        if (m->totemExpireAt[slot] && now + uint32(refreshMs > 0 ? refreshMs : 0) >= m->totemExpireAt[slot])
+            return true;
+        // ③ 队伍移动：离插下去的位置太远，光环照不到（重插比"等它过期"值）
+        if (range > 0.0f
+            && s.bot->GetDistance(m->totemPos[slot][0], m->totemPos[slot][1], m->totemPos[slot][2]) > range)
+            return true;
+        // 机会主义校对：**只有**槽位真的登记了（本核心通常为空）才拿它当真相；
+        //   槽位为空时绝不据此重插 —— 那就是 §10.53 的坑。
+        if (!s.bot->GetTotemGuid(TotemSlot(slot)).IsEmpty())
+        {
+            Totem* t = s.bot->GetTotem(TotemSlot(slot));
+            if (!t || !t->IsAlive())
+                return true;
+        }
+        return false;
+    }
+
+    // 补一个图腾（占 1 个 GCD）。**成功了才记账** —— 记账是唯一真相源。
+    bool ShCastTotem(PlayerbotAI* ai, BotMem* m, Snapshot& s, int slot, char const* name, uint32 now)
+    {
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
+        if (!id)
+            return false;                       // 没学这个图腾：静默跳过，不占 GCD、不报错
+        if (!TryCastSelf(ai, m, s, name))
+            return false;
+        m->totemCastAt[slot] = now;
+        m->totemEntry[slot] = id;
+        m->totemExpireAt[slot] = now + uint32(ShTotemDurationMs(id));
+        m->totemPos[slot][0] = s.bot->GetPositionX();
+        m->totemPos[slot][1] = s.bot->GetPositionY();
+        m->totemPos[slot][2] = s.bot->GetPositionZ();
+        ++m->shTotemCasts;
+        if (slot == TOTEM_SLOT_FIRE && strcmp(name, "fire nova totem") == 0)
+            m->shAoeNova = true;                // AOE 起手只放一次
+        return true;
+    }
+
+    // 本小队（同一 sub-group）的近战人数，**含自己**。
+    //   站长口径点的是"战/贼/增强/猫德/惩戒"，这里用核心自己的近战判定（PlayerbotAI::IsMelee，
+    //   与引擎决定接近距离用的是同一份口径）近似，不另写一张职业表（会跟 IsMeleeSpec 漂移）。
+    //   ⚠️ `IsMelee` 不是 static 成员（`IsTank`/`IsHeal` 才是），但实现里只读**参数**那个玩家
+    //      （`player->GetPlayerbotAI()`），与 this 无关 ⇒ 借这只 bot 的 ai 当接收者即可；
+    //      `inGroup=true` 才能走到"按策略判断"那一支（否则萨满会按职业表被当成远程）。
+    int ShMeleeInParty(PlayerbotAI* ai, Player* bot)
+    {
+        if (!ai || !bot)
+            return 0;
+        int n = ai->IsMelee(bot, true) ? 1 : 0;
+        if (Group* group = bot->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->getSource();
+                if (!member || member == bot || !sServerFacade.IsAlive(member))
+                    continue;
+                if (group->SameSubGroup(bot, member) && ai->IsMelee(member, true))
+                    ++n;
+            }
+        }
+        return n;
+    }
+
+    // 图腾舞开不开：0=关 / 1=开 / -1(默认)=自动（本小队近战 ≥ twist_melee_min）
+    bool ShTwistEnabled(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool enhance)
+    {
+        if (!enhance)
+            return false;
+        int const cfg = int(TP(m, "totem_twist_enable", -1.0));
+        if (cfg == 0)
+            return false;
+        if (cfg == 1)
+            return true;
+        return ShMeleeInParty(ai, s.bot) >= int(TP(m, "twist_melee_min", 2.0));
+    }
+
+    // 图腾舞：空气槽 风怒 → 立刻换优雅 → twist_period_ms(10s) 后换回风怒。
+    //   ⚠️ 每次换插都占一个 GCD（这是图腾舞的固有代价，不是 bug）；默认只在 ≥2 近战时开。
+    bool ShTickTwist(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 now)
+    {
+        int const air = TOTEM_SLOT_AIR;
+        uint32 const wfId = SpellId(ai, s.bot, m, "windfury totem", false);
+        uint32 const goaId = SpellId(ai, s.bot, m, "grace of air totem", false);
+        if (!wfId || !goaId)
+            return false;
+
+        int const switchMs = int(TP(m, "twist_switch_ms", 300.0));
+        int const periodMs = int(TP(m, "twist_period_ms", 10000.0));
+
+        if (m->twistPhase == 0)
+        {
+            bool cast = false;
+            if (ShTotemNeed(ai, m, s, air, wfId, now))
+                cast = ShCastTotem(ai, m, s, air, "windfury totem", now);
+            // 风怒已经在（或刚插上）⇒ 进入"等切优雅"相位；**没真施法就返回 false**，
+            //   别把这一手当成 Acted 白占一个 GCD。
+            if (cast || !ShTotemNeed(ai, m, s, air, wfId, now))
+            {
+                m->twistPhase = 1;
+                m->twistNextAt = now + uint32(switchMs > 0 ? switchMs : 0);
+            }
+            return cast;
+        }
+        if (m->twistPhase == 1)
+        {
+            if (now < m->twistNextAt)
+                return false;
+            if (!ShCastTotem(ai, m, s, air, "grace of air totem", now))
+                return false;
+            m->twistPhase = 2;
+            m->twistNextAt = now + uint32(periodMs > 0 ? periodMs : 0);
+            return true;
+        }
+        // 相位 2：优雅期到点 ⇒ 换回风怒，回到相位 1（等下一个 GCD 再切优雅）
+        if (now < m->twistNextAt)
+            return false;
+        if (!ShCastTotem(ai, m, s, air, "windfury totem", now))
+            return false;
+        m->twistPhase = 1;
+        m->twistNextAt = now + uint32(switchMs > 0 ? switchMs : 0);
+        return true;
+    }
+
+    // 一次 tick 最多补**一个**图腾（占一个 GCD）。顺序：大地 → 火焰 → 水 → 空气。
+    bool ShTickTotems(PlayerbotAI* ai, BotMem* m, Snapshot& s, ShTotemCtx const& c, uint32 now)
+    {
+        bool const twist = (c.enhance && c.twist);
+        static int const kOrder[] = { TOTEM_SLOT_EARTH, TOTEM_SLOT_FIRE, TOTEM_SLOT_WATER, TOTEM_SLOT_AIR };
+        for (int slot : kOrder)
+        {
+            // 图腾舞开着时空气槽交给 ShTickTwist（它要在 风怒↔优雅 之间来回换）
+            if (twist && slot == TOTEM_SLOT_AIR)
+                continue;
+            char const* name = ShDesiredTotem(ai, m, s, c, slot);
+            if (!name)
+                continue;
+            uint32 const id = SpellId(ai, s.bot, m, name, false);
+            if (!ShTotemNeed(ai, m, s, slot, id, now))
+                continue;
+            if (ShCastTotem(ai, m, s, slot, name, now))
+                return true;
+            // 放不出（没蓝 / 正被控 / GCD 没转完）⇒ 本 tick 不再试下一槽，
+            //   免得把这一手的时间全花在"失败的图腾施放"上
+            return false;
+        }
+        if (twist)
+            return ShTickTwist(ai, m, s, now);
+        return false;
+    }
+
+    // 目标身上某个 debuff（任意 rank）的剩余毫秒；没有 = 0，永久 = 999999。
+    int ShTargetDebuffRemain(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
+        if (!id || !s.target)
+            return 0;
+        uint32 const first = sSpellMgr.GetFirstSpellInChain(id);
+        for (uint32 cur = first ? first : id; cur; cur = sSpellMgr.GetNextSpellInChain(cur))
+        {
+            if (!s.target->HasAura(cur))
+                continue;
+            SpellAuraHolder* holder = s.target->GetSpellAuraHolder(cur);
+            if (!holder)
+                continue;
+            int const dur = holder->GetAuraDuration();
+            return dur < 0 ? 999999 : dur;
+        }
+        return 0;
+    }
+
+    // 闪电盾的**层数**。站长口径写的是"用 AuraStacks 读自己身上的 lightning shield"，
+    //   但本核心的 `AuraStacks()` 走 `Unit::GetAuraCount()` = **stack 数量**，而 TBC 闪电盾的
+    //   层数是 **charge**（存在 `Aura::GetAuraCharges()` / m_procCharges）⇒ 只读 stack 永远是 1，
+    //   `ls_stacks` 这辈子都不可能满足（实测：ls=1、es=0 整场不发）。所以两个都读，取大的：
+    //     ① 先按站长口径取 AuraStacks（stack）；② 再翻这条链上每个 rank 的 aura 取 charge。
+    int ShLightningShieldStacks(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        int const stacks = AuraStacks(ai, s.bot, m, "lightning shield", s.bot);
+        uint32 const id = SpellId(ai, s.bot, m, "lightning shield", false);
+        if (!id)
+            return stacks;
+        int charges = 0;
+        uint32 const first = sSpellMgr.GetFirstSpellInChain(id);
+        for (uint32 cur = first ? first : id; cur; cur = sSpellMgr.GetNextSpellInChain(cur))
+        {
+            if (!s.bot->HasAura(cur))
+                continue;
+            SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(cur);
+            if (!holder)
+                continue;
+            // charge 记在 **holder** 上（SpellAuraHolder::GetAuraCharges → m_procCharges），
+            //   不是记在单个 Aura 上 —— 闪电盾掉一层就是这里 -1。
+            charges = std::max(charges, int(holder->GetAuraCharges()));
+        }
+        return std::max(stacks, charges);
+    }
+
+    // 风怒武器 3 秒 ICD：**只做日志**（不做微延迟对齐，进阶先不做）。
+    //   本核心不暴露 proc 法术的剩余冷却，只能观测 `Windfury Attack`(25504) 从"就绪"跳到
+    //   "冷却中"的边沿 ⇒ wfIcd 是**两次触发之间的观测间隔**（≥3000 说明 ICD 生效）；
+    //   观测不到（没附风怒武器 / 核心不给这条法术挂冷却）就是 -1，日志如实反映，不编造。
+    void ShNoteWindfury(BotMem* m, Player* bot, uint32 now)
+    {
+        if (!bot)
+            return;
+        bool const ready = bot->IsSpellReady(25504);
+        if (!ready && m->wfReadyPrev)
+        {
+            if (m->wfLastProcAt)
+                m->wfIcdMs = int(int64(now) - int64(m->wfLastProcAt));
+            m->wfLastProcAt = int(now);
+            ++m->wfProcs;
+        }
+        m->wfReadyPrev = ready;
+    }
+
+    // [DPSFSM-SH] <bot> spec=<ele|enh> state= totems=<已登记槽数> mana=<%> cl=<0/1> twist=<0/1>
+    //   每 10 秒一条（WorldTimer 节流）。增强额外带 wfIcd=（风怒触发间隔观测值，-1 = 观测不到）。
+    void ShLogTick(BotMem* m, Snapshot& s, bool elemental, bool twist)
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (m->lastShLog && WorldTimer::getMSTimeDiff(m->lastShLog, safeNow) < 10000)
+            return;
+        m->lastShLog = safeNow;
+
+        int registered = 0;
+        for (int i = 0; i < MAX_TOTEM_SLOT; ++i)
+            if (m->totemEntry[i] && (!m->totemExpireAt[i] || m->totemExpireAt[i] > safeNow))
+                ++registered;
+
+        if (elemental)
+            sLog.outError("[DPSFSM-SH] %s spec=ele state=%s totems=%d mana=%.0f cl=%d twist=0",
+                s.bot ? s.bot->GetName() : "-", StateName(m->state), registered, s.power,
+                m->shClOk ? 1 : 0);
+        else
+            sLog.outError("[DPSFSM-SH] %s spec=enh state=%s totems=%d mana=%.0f cl=0 twist=%d wfIcd=%d",
+                s.bot ? s.bot->GetName() : "-", StateName(m->state), registered, s.power,
+                twist ? 1 : 0, m->wfIcdMs);
+
+        // `sh_diag=1`：每 10 秒多一条，专门回答验收的两个问题 ——
+        //   ① 图腾到底有没有在补（每槽 entry / 剩余秒，以及**槽位登记**的真相）；
+        //   ② 闪电盾层数读不读得到（earth shock 的 ls_stacks 判据靠它）。
+        if (TP(m, "sh_diag", 0.0) < 1.0)
+            return;
+        if (m->lastShDiag && WorldTimer::getMSTimeDiff(m->lastShDiag, safeNow) < 10000)
+            return;
+        m->lastShDiag = safeNow;
+        int slotGuid = 0;
+        for (int i = 0; i < MAX_TOTEM_SLOT; ++i)
+            if (s.bot && !s.bot->GetTotemGuid(TotemSlot(i)).IsEmpty())
+                ++slotGuid;
+        sLog.outError("[DPSFSM-SH-DIAG] %s slotguid=%d/%d casts=%u earth=%u/%d fire=%u/%d water=%u/%d air=%u/%d ls=%d es=%u tw=%d/%u",
+            s.bot ? s.bot->GetName() : "-", slotGuid, int(MAX_TOTEM_SLOT), m->shTotemCasts,
+            m->totemEntry[TOTEM_SLOT_EARTH], int(m->totemExpireAt[TOTEM_SLOT_EARTH] > safeNow
+                ? (m->totemExpireAt[TOTEM_SLOT_EARTH] - safeNow) / 1000 : 0),
+            m->totemEntry[TOTEM_SLOT_FIRE], int(m->totemExpireAt[TOTEM_SLOT_FIRE] > safeNow
+                ? (m->totemExpireAt[TOTEM_SLOT_FIRE] - safeNow) / 1000 : 0),
+            m->totemEntry[TOTEM_SLOT_WATER], int(m->totemExpireAt[TOTEM_SLOT_WATER] > safeNow
+                ? (m->totemExpireAt[TOTEM_SLOT_WATER] - safeNow) / 1000 : 0),
+            m->totemEntry[TOTEM_SLOT_AIR], int(m->totemExpireAt[TOTEM_SLOT_AIR] > safeNow
+                ? (m->totemExpireAt[TOTEM_SLOT_AIR] - safeNow) / 1000 : 0),
+            m->shLightningShield, m->shEarthShocks, m->twistPhase, m->wfProcs);
+    }
+
+    ai::dpsfsm::TickResult TickShamanFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        bool const elemental = (m->spec == Spec::Elemental);
+        bool const enhance   = (m->spec == Spec::Enhancement);
+        // 恢复（Restoration）不做 DPS：不接管，交回引擎
+        if (!elemental && !enhance)
+            return TickResult::Decline;
+        if (!s.target)
+            return TickResult::Decline;
+        // 读条/引导中（闪电箭 2 秒 / 闪电链 1.5 秒）：一个技能都不插，否则把这一发顶掉
+        if (s.casting)
+            return TickResult::Acted;
+
+        Player* bot = s.bot;
+        if (s.target != bot)
+            bot->SetFacingToObject(s.target);   // Acted/Hold 时引擎整 tick 不跑，朝向得自己转
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+
+        // 换目标 = 换一场战斗：Aoe 起手（火元素新星只放一次）与交战计时从头来
+        ObjectGuid const targetGuid = s.target->GetObjectGuid();
+        if (targetGuid != m->shTarget)
+        {
+            m->shTarget = targetGuid;
+            m->shEngagedAt = safeNow;
+            m->shAoeNova = false;
+            m->shEarthShocks = 0;
+        }
+        if (!m->shEngagedAt)
+            m->shEngagedAt = safeNow;
+
+        ShTotemCtx c;
+        c.elemental = elemental;
+        c.enhance = enhance;
+        c.inAoe = (s.pack10 >= int(TP(m, "aoe_pack", 3.0)));
+        c.twist = ShTwistEnabled(ai, m, s, enhance);
+        m->shClOk = elemental && (s.power >= float(TP(m, "cl_mana_min", 60.0)));
+
+        // ------------------------------------------------------------------
+        // ① 图腾优先（占一个 GCD）：空槽 / 快到期 / 换组 / 队伍走远
+        // ------------------------------------------------------------------
+        TickResult result = TickResult::Decline;
+        if (ShTickTotems(ai, m, s, c, safeNow))
+            result = TickResult::Acted;
+
+        // ------------------------------------------------------------------
+        // ② 状态转移（阈值全部走 TP()）
+        // ------------------------------------------------------------------
+        State st = State::Maintain;
+        if (elemental)
+        {
+            // 闪电盾：earth shock 的层数来源，也是减伤；没了就是 Prep（开局/被驱散后）。
+            //   注意顺序：先判"够不着 / 蓝低"，最后才判盾 —— 否则蓝不够放盾时会卡在 Prep 里不出手。
+            m->shLightningShield = ShLightningShieldStacks(ai, m, s);
+            if (s.dist > float(TP(m, "range_cast", 25.0)))
+                st = State::Approach;      // > 25 码：交给移动层，自己不空放
+            else if (s.power < float(TP(m, "recover_power", 10.0)))
+                st = State::Recover;
+            else if (m->shLightningShield == 0)
+                st = State::Prep;
+            else if (c.inAoe)
+                st = State::Aoe;
+            else
+            {
+                // 元素爆发 = 元素掌握 + 饰品，**早用早 CD**（不是攒到最后）；
+                //   `burst_delay`（默认 0 秒）留给坦克拉仇恨；目标 < burst_hp 也进 Burst。
+                uint32 const emId = SpellId(ai, bot, m, "elemental mastery", false);
+                bool const emReady = emId && Ready(bot, emId);
+                double const elapsed = double(WorldTimer::getMSTimeDiff(m->shEngagedAt, safeNow)) / 1000.0;
+                bool const burstDoor = emReady && elapsed >= TP(m, "burst_delay", 0.0);
+                st = (s.targetHp <= BurstHp(m) || burstDoor) ? State::Burst : State::Maintain;
+            }
+        }
+        else
+        {
+            if (!bot->CanReachWithMeleeAttack(s.target))
+                st = State::Approach;
+            else if (s.power < float(TP(m, "recover_power", 20.0)))
+                st = State::Recover;
+            else if (c.inAoe)
+                st = State::Aoe;
+            else
+                st = State::Maintain;
+        }
+
+        LogTransition(ai, m, s, st);
+
+        // ------------------------------------------------------------------
+        // ③ 各状态动作（一 tick 一个 GCD，放成就返回 Acted）
+        // ------------------------------------------------------------------
+        if (result == TickResult::Decline && st == State::Prep)
+        {
+            // 元素开场：闪电盾（earth shock 靠它叠层，也是减伤）。
+            //   ⚠️ 被顶掉时**别紧着补**：本核心的引擎在"状态机 Decline 的 tick"仍会跑它自己的
+            //   萨满 buff（实测插 Water Shield 33736），两个盾互顶 ⇒ 45 秒里闪电盾放 7 次、
+            //   水盾放 7 次，元素萨 dps 从 900 掉到 450。这里 `ls_recast_ms`(5 秒) 内补过就等一轮，
+            //   把互顶的代价封顶；真要根治得把"自身护盾"也收进 FSM 并让引擎闭嘴（后续）。
+            uint32 const lsGap = uint32(std::max(0, int(TP(m, "ls_recast_ms", 5000.0))));
+            if (elemental
+                && (!m->lsCastAt || WorldTimer::getMSTimeDiff(m->lsCastAt, safeNow) >= lsGap)
+                && TryCastSelf(ai, m, s, "lightning shield"))
+            {
+                m->lsCastAt = safeNow;
+                result = TickResult::Acted;
+            }
+        }
+
+        // ---------------- 元素萨（蓝色驱动） ----------------
+        if (result == TickResult::Decline && elemental)
+        {
+            if (st == State::Maintain || st == State::Burst)
+            {
+                if (s.moving)
+                {
+                    // 移动中读条会被打断 ⇒ 只有瞬发烈焰震击能放；其余交回引擎走位
+                    if (AuraStacks(ai, bot, m, "flame shock", s.target) == 0
+                        && CastFirst(ai, m, s, { "flame shock" }))
+                        result = TickResult::Acted;
+                }
+                else if (st == State::Burst && UseTrinket(ai, m, s))
+                {
+                    result = TickResult::Acted;      // 爆发窗口：先开饰品
+                }
+                else if (st == State::Burst && TryCastSelf(ai, m, s, "elemental mastery"))
+                {
+                    // 元素掌握**绑给下一发闪电链/闪电箭**，不空交（这一手只交掌握，下一手交技能）
+                    result = TickResult::Acted;
+                }
+                else
+                {
+                    // 震击**不是常规填充**：只有闪电盾叠到 ls_stacks 才把它震出去换伤害
+                    //   ⚠️ TBC 闪电盾是 3 层（charge），默认 ls_stacks=7 达不到 ⇒ 这条默认不触发；
+                    //     把 ls_stacks 调到 3 就是"每满盾震一次"。层数的读法见 ShLightningShieldStacks()。
+                    int const lsStacks = ShLightningShieldStacks(ai, m, s);
+                    m->shLightningShield = lsStacks;
+                    if (lsStacks >= int(TP(m, "ls_stacks", 7.0))
+                        && CastFirst(ai, m, s, { "earth shock" }))
+                    {
+                        ++m->shEarthShocks;
+                        result = TickResult::Acted;
+                    }
+                    // 蓝够 ⇒ 闪电链优先（1.5 秒读条，DPS 更高）；蓝吃紧 ⇒ 无脑闪电箭
+                    else if (m->shClOk
+                        && (CastFirst(ai, m, s, { "chain lightning" })
+                            || CastFirst(ai, m, s, { "lightning bolt" })))
+                        result = TickResult::Acted;
+                    else if (!m->shClOk && CastFirst(ai, m, s, { "lightning bolt" }))
+                        result = TickResult::Acted;
+                }
+            }
+            else if (st == State::Aoe)
+            {
+                // 站长口径：fire nova totem → chain lightning → magma totem → lightning bolt
+                //   （两个图腾已由图腾子系统按"火焰槽 = 火元素新星一次 → 熔岩"的顺序补完）
+                if (!s.moving && CastFirst(ai, m, s, { "chain lightning" }))
+                    result = TickResult::Acted;
+                else if (!s.moving && m->shClOk && CastFirst(ai, m, s, { "lightning bolt" }))
+                    result = TickResult::Acted;
+            }
+            else if (st == State::Recover)
+            {
+                // 蓝低：先喝药；还能放就继续闪电箭（空 GCD 比低效填充更亏），最后才交回引擎
+                if (UseManaPotion(m, s))
+                    result = TickResult::Acted;
+                else if (!s.moving && CastFirst(ai, m, s, { "lightning bolt" }))
+                    result = TickResult::Acted;
+            }
+        }
+
+        // ---------------- 增强萨 ----------------
+        if (result == TickResult::Decline && enhance
+            && (st == State::Maintain || st == State::Aoe || st == State::Burst))
+        {
+            // ① 空蓝 ⇒ 萨满之怒（这是**回蓝手段**，不是"减伤窗口"；不吃 GCD）
+            if (s.power < float(TP(m, "rage_power", 20.0)) && TryCastSelf(ai, m, s, "shamanistic rage"))
+                result = TickResult::Acted;
+            // ② 风暴打击卡 CD
+            else if (CastFirst(ai, m, s, { "stormstrike" }))
+                result = TickResult::Acted;
+            else
+            {
+                // ③ 震击（共享 6 秒冷却）
+                //   站长口径的字面顺序是"目标有风暴打击 debuff ⇒ 地震，否则烈焰震击维持 DoT"。
+                //   但风暴打击 debuff 12 秒 > 风暴打击 10 秒 CD ⇒ 它几乎**永远**是 up，
+                //   字面照做烈焰震击会一发都不放 ⇒ 把"维持 DoT"的判断抬到前面：
+                //   DoT 缺 / 快到期 ⇒ 烈焰震击；否则按字面走地震（两者不冲突）。
+                int const fsRemain = ShTargetDebuffRemain(ai, m, s, "flame shock");
+                bool const fsNeed = (fsRemain < int(TP(m, "fs_refresh_ms", 2000.0)));
+                bool const ssUp = AuraStacks(ai, bot, m, "stormstrike", s.target) > 0;
+                if (fsNeed && CastFirst(ai, m, s, { "flame shock" }))
+                    result = TickResult::Acted;
+                else if (ssUp && CastFirst(ai, m, s, { "earth shock" }))
+                    result = TickResult::Acted;
+                else if (!ssUp)
+                    result = TickResult::Hold;   // 风暴打击 debuff 不在、DoT 也在期：这一手**有意空着**等震击 CD
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // ④ 收尾：日志（10 秒一条）+ 风怒 ICD 观测（只记日志）
+        // ------------------------------------------------------------------
+        if (enhance)
+            ShNoteWindfury(m, bot, safeNow);
+        ShLogTick(m, s, elemental, c.twist);
+        return result;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -6632,8 +7292,13 @@ namespace ai
             //   **只接 Retribution**：Protection/Holy 继续走 legacy `TickPaladin`（并在那里 Decline），
             //   mode=0/1/2/3/4 的惩戒也照旧走 `TickPaladin`，行为不变。
             bool const retFsm = (m->spec == Spec::Retribution);
+            // [2026-11-01 站长口径] 萨满接进 mode=5（第八张职业图）：`TickShamanFsm`。
+            //   **元素 / 增强**进图；**恢复（Restoration）不做 DPS**（治疗以后单独做）⇒ 不进图，
+            //   继续走 legacy `TickShaman`（在那里保持原有行为）。mode=0/1/2/3/4 的萨满也不变。
+            bool const shamanFsm = (m->spec == Spec::Elemental || m->spec == Spec::Enhancement);
             if (dmode == DecisionMode::Fsm
-                && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm || retFsm))
+                && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm || retFsm
+                    || shamanFsm))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
@@ -6656,6 +7321,8 @@ namespace ai
                     fsmResult = TickRogueFsm(ai, m, s);
                 else if (retFsm)
                     fsmResult = TickRetFsm(ai, m, s);
+                else if (shamanFsm)
+                    fsmResult = TickShamanFsm(ai, m, s);
                 else
                     fsmResult = TickWarlockFsm(ai, m, s);
                 // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）

@@ -163,6 +163,19 @@ namespace ai
         //   如果 policy 模式让引擎"少跑了"，白字/开怪这些由引擎负责的部分就会掉。
         void NoteEngineRun(uint32 guid);
 
+        // [2026-11-01 站长口径] mode=5（显式状态图）当前覆盖的专精：
+        //   法师 冰/奥/火 · 猎人 兽王/射击/生存 · 战士 武器/狂暴 · 盗贼 战斗/刺杀/敏锐
+        //   · 术士 毁灭 · 圣骑士 惩戒 · **萨满 元素/增强**（第八张图：DpsFsm.cpp → TickShamanFsm()）。
+        //   萨满·恢复（Restoration）**不做 DPS** ⇒ 不进图，继续走 legacy TickShaman（治疗以后单独做）。
+        //   萨满状态表（细节见 DpsFsm.cpp 的"萨满"一节）：
+        //     元素：Idle / Prep(闪电盾缺失) / Approach(>range_cast) / Recover(蓝<recover_power)
+        //           / Aoe / Burst(元素掌握就绪或目标<burst_hp) / Maintain(蓝够闪电链优先、
+        //           蓝<cl_mana_min 只打闪电箭；震击只按 ls_stacks 层数震)
+        //     增强：Idle / Approach(够不着) / Recover(空蓝→萨满之怒) / Aoe(火元素新星一次→熔岩) / Maintain
+        //   ⚠️ 图腾**不进状态表**，是每 tick 的最高优先级动作（空槽/快到期 > 输出技能）：
+        //     施放图腾后 `GetTotemGuid(slot)` **仍为空**（召唤走 SPELL_EFFECT_SUMMON，不登记槽位，
+        //     见 KNOWN_ISSUES §10.53）⇒ 状态机自己记账（BotMem 的 totemCastAt/totemEntry/totemPos），
+        //     判据见 DpsFsm.cpp → ShTotemNeed()。**不要**改回"查槽位判空"，那会把 GCD 全吃在图腾上。
         bool Tick(PlayerbotAI* ai);
     }
 }
