@@ -43,6 +43,18 @@ namespace ai
         char const* StateName(State s);
         char const* SpecName(Spec s);
 
+        // [2026-10-31 站长口径] 一 tick 的三种结果（不再用 bool：bool 逼着"什么都不放"和"我不管"共用一个返回值）：
+        //   Acted   —— 本 tick 我放了技能（= 原来的 true，引擎让位，语义完全不变）；
+        //   Hold    —— 本 tick 我**有意空着**：不放技能，引擎也不许动这一手
+        //              （例：猎人自动射击锁定窗口期间；交回引擎它立刻插自己的技能，窗口就废了）；
+        //   Decline —— 我不处理，交回引擎（走位/追击/开怪/喝水/魔杖都归它）。
+        enum class TickResult
+        {
+            Acted,
+            Hold,
+            Decline
+        };
+
         // 一次 tick 的局面快照。
         //   selfHp / power   —— 自己血量百分比、主资源百分比（法力按 %；怒气/能量按占满值 %）
         //   rage/energy      —— 原始数值（判断"够不够放这一手"用）
@@ -68,6 +80,12 @@ namespace ai
             bool silenced = false;
             int pack10 = 0;     // 10 码内敌对（近身群伤判断）
             int pack30 = 0;     // 30 码内敌对（"这一坨是不是群架"）
+            // [2026-10-31 站长口径] 仇恨三档的输入：自己 / 坦克对**同一个 target** 的威胁值。
+            //   坦克 = 组队成员里第一个 PlayerbotAI::IsTank() 的人；没有队伍或没有坦克
+            //   ⇒ tankAlive=false、tankThreat=0 ⇒ EvalThreat 恒 Open（假人场景绝不掉 DPS）。
+            float myThreat = 0.0f;
+            float tankThreat = 0.0f;
+            bool tankAlive = false;
         };
 
         Spec DetectSpec(PlayerbotAI* ai);
@@ -90,7 +108,10 @@ namespace ai
         bool SkipEngine(uint32 guid);
 
 
-        // 这一 tick 状态机是否真的放出了技能（只在这种情况下才让引擎让位，否则引擎要负责追击/走位）
+        // 这一 tick 状态机是否占了**施法输出**（放了技能，或有意的 TickResult::Hold）。
+        //   只有在这种情况下才让引擎让位，否则引擎要负责追击/走位。
+        //   [2026-10-31 站长口径] 从"真的放了技能"扩成"放了技能 **或** 有意空着"：
+        //   Hold 的全部意义就是"这一 tick 什么都别放，引擎也别插"（否则引擎立刻放自己的技能）。
         bool DidCastThisTick(uint32 guid);
 
         // [2026-10-29] 调优并发：给**单只 bot** 覆盖某个参数，这样同一轮里可以用不同的参数值做 A/B。

@@ -102,6 +102,11 @@ namespace
         std::map<uint32, time_t> lastOk;       // 技能 id → 上次成功时间
         uint32 hbLast = 0;                     // 这只 bot 上次打心跳的时间
         bool castThisTick = false;
+        // [2026-10-31 站长口径] 本 tick 状态机**有意空着**（TickResult::Hold）：引擎这一手也不许动。
+        //   生命周期 = 一个 tick：Tick 开头清零，返回后留到引擎读到为止（引擎的让位判断在 Tick 返回之后）。
+        bool holdThisTick = false;
+        // [2026-10-31 站长口径] [DPSFSM-THREAT] 诊断的节流（WorldTimer 毫秒，10 秒一条）
+        uint32 lastThreatLog = 0;
         bool policyLogged = false;
         bool behindWarned = false;
         bool coverageLogged = false;    // 覆盖率断言只打一次
@@ -622,6 +627,36 @@ namespace
 
         s.pack10 = CountHostilesNear(ai, bot, 10.0f);
         s.pack30 = CountHostilesNear(ai, bot, 30.0f);
+
+        // [2026-10-31 站长口径] 仇恨三档的输入：自己 / 坦克对**同一个目标**的威胁值。
+        //   坦克认定直接复用 PlayerbotAI::IsTank（与 AttackAction 同一份口径），不自己按职业/天赋猜；
+        //   没有队伍、队伍里没坦克、坦克和我不打同一个目标 ⇒ tankAlive=false / tankThreat=0
+        //   ⇒ EvalThreat 恒 Open（假人场景绝不能因为"没仇恨"把 DPS 卡住）。
+        s.myThreat = 0.0f;
+        s.tankThreat = 0.0f;
+        s.tankAlive = false;
+        if (s.target)
+        {
+            s.myThreat = bot->getThreatManager().getThreat(s.target);
+            if (Group* group = bot->GetGroup())
+            {
+                Player* tank = nullptr;
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* member = ref->getSource();
+                    if (member && member != bot && sServerFacade.IsAlive(member) && PlayerbotAI::IsTank(member))
+                    {
+                        tank = member;
+                        break;
+                    }
+                }
+                if (tank)
+                {
+                    s.tankAlive = true;
+                    s.tankThreat = tank->getThreatManager().getThreat(s.target);
+                }
+            }
+        }
     }
 
     void LogTransition(PlayerbotAI* ai, BotMem* m, Snapshot& s, State next)
@@ -2340,11 +2375,14 @@ namespace ai
             s_overrides.erase(guid);
         }
 
+        // [2026-10-31 站长口径] 让位判据 = "放了技能 **或** 有意 Hold"。
+        //   消费方（PlayerbotAI 的引擎让位）只问"这一 tick 的施法输出归不归状态机"，
+        //   Hold 的语义正是"归状态机、但这一手我什么都不放"，所以两者在这里合并。
         bool DidCastThisTick(uint32 guid)
         {
             std::lock_guard<std::mutex> lock(s_memMutex);
             auto it = s_mem.find(guid);
-            return it != s_mem.end() && it->second && it->second->castThisTick;
+            return it != s_mem.end() && it->second && (it->second->castThisTick || it->second->holdThisTick);
         }
 
         bool SkipEngine(uint32 guid)
@@ -2642,12 +2680,55 @@ namespace ai
     //         ② 转移条件只读 Snapshot + TP 参数，不读世界、不打日志；
     //         ③ 没放出去就 return false，把走位/追击交回引擎（共同作用，不是抢活）。
     // ==========================================================================
-    // [2026-10-31 站长口径] "仇恨领先"的保守近似：没有落后于坦克即视为领先。
-    //   与 AttackAction 同一份实现（不复制判断）；假人场景 SkipEngine 恒真 ⇒ 恒领先。
-    bool ThreatLead(PlayerbotAI* ai, Snapshot& s)
+    // ==========================================================================
+    // [2026-10-31 站长口径] 仇恨从"二元门"改成**三档**。
+    //   旧 ThreatLead() 只有"等/不等"两态，卡在中间态时只能二选一：要么白等一整轮（DPS 掉），
+    //   要么一上来就开爆发把仇恨抢过来（怪转头咬法师）。三档把中间态单列出来：
+    //     Open      —— 全力打：开爆发、冰锥这类高威胁牌都能用；
+    //     Throttle  —— 照常打（寒冰箭/魔爆/暴风雪这类低威胁填充），但**不开爆发、不用高威胁牌**；
+    //     Wait      —— 等坦克把仇恨拉开：Maintain 里用 Hold（不施法，引擎也不许动）。
+    //   阈值是**坦克威胁的倍数**，全部走 TP()：threat_open 默认 0.9、threat_floor 默认 0.7
+    //   （0.9 意味着"我快追平坦克了"才放开全力，0.7 以上算中间态）。
+    //   ⚠️ 没有坦克（假人）或状态机独占（SkipEngine）⇒ **恒 Open**：之前 WaitingForTankThreat
+    //      在假人里恒真，和引擎互相推诿把 bot 卡死（实测 1/3 轮次有目标却 0 施法 0 伤害）。
+    // ==========================================================================
+    enum class ThreatLevel { Wait, Throttle, Open };
+
+    char const* ThreatLevelName(ThreatLevel l)
     {
-        return dpsfsm::SkipEngine(s.bot->GetGUIDLow())
-            || !AttackAction::WaitingForTankThreat(ai, s.bot, s.target);
+        switch (l)
+        {
+            case ThreatLevel::Wait:     return "wait";
+            case ThreatLevel::Throttle: return "throttle";
+            case ThreatLevel::Open:     return "open";
+        }
+        return "?";
+    }
+
+    ThreatLevel EvalThreat(BotMem* m, Snapshot& s)
+    {
+        ThreatLevel level;
+        if (!s.tankAlive || dpsfsm::SkipEngine(s.bot->GetGUIDLow()))
+            level = ThreatLevel::Open;          // 假人 / 状态机独占：绝不卡住
+        else if (s.myThreat >= s.tankThreat * float(TP(m, "threat_open", 0.9)))
+            level = ThreatLevel::Open;          // 快追平坦克：再压就是白亏 DPS，放开打
+        else if (s.myThreat >= s.tankThreat * float(TP(m, "threat_floor", 0.7)))
+            level = ThreatLevel::Throttle;      // 中间态：打，但把高威胁牌收起来
+        else
+            level = ThreatLevel::Wait;          // 离坦克还远：等一下比抢一手划算
+
+        // [2026-10-31 站长口径] 诊断：每 10 秒一条（WorldTimer 节流，别每 tick 刷屏）。
+        //   字段固定为 my / tank / tankAlive / level，方便脚本直接切。
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const nowSafe = nowMs ? nowMs : 1;
+        if (!m->lastThreatLog || WorldTimer::getMSTimeDiff(m->lastThreatLog, nowSafe) >= 10000)
+        {
+            m->lastThreatLog = nowSafe;
+            sLog.outError("[DPSFSM-THREAT] %s my=%.0f tank=%.0f tankAlive=%d level=%s",
+                s.bot ? s.bot->GetName() : "-", s.myThreat, s.tankThreat,
+                s.tankAlive ? 1 : 0, ThreatLevelName(level));
+        }
+        return level;
     }
 
     // [2026-10-31 站长口径] 冰法 Aoe 里**暴风雪已降级为可选**：只有
@@ -2686,7 +2767,9 @@ namespace ai
         time_t const now = time(nullptr);
         if (now < m->burstUntil)
             return State::Burst;
-        if (ThreatLead(ai, s)
+        // [2026-10-31 站长口径] 爆发门换成三档里的 Open（原先是二元 ThreatLead）：
+        //   只有"可以全力打"才开爆发；Throttle/Wait 一律不开（爆发牌本身全是高威胁）。
+        if (EvalThreat(m, s) == ThreatLevel::Open
             && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
             return State::Burst;
 
@@ -2694,9 +2777,19 @@ namespace ai
         return State::Burn;
     }
 
-    bool TickFrostFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    // [2026-10-31 站长口径] bool → 三态的小换算：动作放出去了=Acted，没放成=Decline（交回引擎）。
+    //   Hold 只在真正"有意空着"的地方单独写，绝不靠这个换算顺手产生。
+    inline ai::dpsfsm::TickResult FsmResult(bool acted)
+    {
+        return acted ? ai::dpsfsm::TickResult::Acted : ai::dpsfsm::TickResult::Decline;
+    }
+
+    ai::dpsfsm::TickResult TickFrostFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         State const st = EvalFrost(ai, m, s);
+        // [2026-10-31 站长口径] 仇恨档位本 tick 只算一次，Aoe/Burst/Maintain 共用同一份判断
+        //   （诊断日志在 EvalThreat 内部按 10 秒节流）。
+        ThreatLevel const threat = EvalThreat(m, s);
         // [2026-10-31 站长口径] 急冷只在"第二轮及以后"：每进入一次 Burst 计一轮（不是每 tick）。
         //   进入时同时打点 lastBurst / 开 burstUntil 窗口，本轮爆发才能分几个 tick 依次放完。
         if (st == State::Burst && m->state != State::Burst)
@@ -2713,32 +2806,34 @@ namespace ai
                 // [2026-10-31 站长口径] 有蓝职业通用：蓝缺口 > potion_mana_deficit(3000) 就先喝法力药水
                 //   （瞬发、不打断输出），还缺再唤醒；都不行交回引擎喝水/魔杖。
                 if (UseManaPotion(m, s))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 if (TryCastSelf(ai, m, s, "evocation"))
-                    return true;
-                return false;               // 剩下的（喝水/魔杖）交回引擎
+                    return ai::dpsfsm::TickResult::Acted;
+                return ai::dpsfsm::TickResult::Decline;   // 剩下的（喝水/魔杖）交回引擎
 
             case State::Flee:
                 if (CastSelfCentered(ai, m, s, "frost nova"))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 if (TryCastSelf(ai, m, s, "ice barrier"))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 if (TryCastSelf(ai, m, s, "blink"))
-                    return true;
-                return CastFirst(ai, m, s, { "ice lance" });
+                    return ai::dpsfsm::TickResult::Acted;
+                return FsmResult(CastFirst(ai, m, s, { "ice lance" }));
 
             case State::Approach:
-                return false;               // 走位归引擎
+                return ai::dpsfsm::TickResult::Decline;   // 走位归引擎
 
             case State::Aoe:
             {
                 // [2026-10-31 站长口径] 群伤也不能让宠物闲着：掉队/换目标就重新下令（每 tick 检查，
                 //   10 秒一条 [DPSFSM-PET] 状态日志）
                 CommandPetAttack(s);
-                // 动作表：**魔爆术（近身、仇恨安全）→ 冰锥（近身且仇恨领先）→ 暴风雪（可选）→ 冰枪/寒冰箭**。
+                // 动作表：**魔爆术（近身、仇恨安全）→ 冰锥（近身且仇恨 Open）→ 暴风雪（可选）→ 冰枪/寒冰箭**。
                 //   暴风雪已降级：只在"不在近身 10 码"或"需要减速"时用（aoe_slow_rank 默认 1 级，
                 //   减速效果一样、蓝耗低得多；中心点直接用当前目标坐标，pack30>1 就是这个怪堆）。
-                bool const threatOk = ThreatLead(ai, s);
+                // [2026-10-31 站长口径] 冰锥=高威胁牌，**只在 Open 档用**；Throttle/Wait 时改用
+                //   魔爆术/暴风雪这类低威胁群伤 —— 仇恨没拉开时把冰锥砸下去，等于替坦克把怪拉过来。
+                bool const threatOpen = (threat == ThreatLevel::Open);
                 bool const inMelee = s.dist <= float(TP(m, "aoe_melee_range", 10.0));
                 bool const wantBlizzard = AoeWantBlizzard(ai, m, s);
                 uint32 const slowRank = uint32(TP(m, "aoe_slow_rank", 1.0) + 0.5);
@@ -2746,63 +2841,73 @@ namespace ai
                 if (!m->aoeLogDone)
                 {
                     m->aoeLogDone = true;
-                    sLog.outError("[DPSFSM-AOE] %s inmelee=%d threatOk=%d blizzard rank=%u id=%u use=%d pack30=%d dist=%.1f",
-                        s.bot->GetName(), inMelee ? 1 : 0, threatOk ? 1 : 0,
+                    sLog.outError("[DPSFSM-AOE] %s inmelee=%d threatOk=%d threat=%s blizzard rank=%u id=%u use=%d pack30=%d dist=%.1f",
+                        s.bot->GetName(), inMelee ? 1 : 0, threatOpen ? 1 : 0, ThreatLevelName(threat),
                         slowRank ? slowRank : 1, blizzardId, wantBlizzard ? 1 : 0, s.pack30, s.dist);
                 }
                 // 主力：魔爆术（近身群伤，仇恨安全）
                 if (inMelee && TryCast(ai, m, s, "arcane explosion", nullptr))
-                    return true;
-                // 冰锥：只在近身且仇恨领先时用（否则容易抢坦的仇恨）
-                if (inMelee && threatOk && CastFirst(ai, m, s, { "cone of cold" }))
-                    return true;
-                // 暴风雪（可选）：不在近身 / 需要减速才用
+                    return ai::dpsfsm::TickResult::Acted;
+                // 冰锥：只在近身**且仇恨 Open**时用（Throttle/Wait 时容易抢坦的仇恨）
+                if (inMelee && threatOpen && CastFirst(ai, m, s, { "cone of cold" }))
+                    return ai::dpsfsm::TickResult::Acted;
+                // 暴风雪（可选、低威胁）：不在近身 / 需要减速才用
                 if (wantBlizzard && blizzardId
                     && CastIdAt(ai, m, s, blizzardId, s.target->GetPositionX(),
                         s.target->GetPositionY(), s.target->GetPositionZ()))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 if (CastFirst(ai, m, s, { "ice lance" }))
-                    return true;
-                return CastFirst(ai, m, s, { "frostbolt" });
+                    return ai::dpsfsm::TickResult::Acted;
+                return FsmResult(CastFirst(ai, m, s, { "frostbolt" }));
             }
 
             case State::Burst:
                 // 早用早 CD：lastBurst/burstUntil 已在"进入 Burst"那一刻打点，这里不再每 tick 重置
                 // [2026-10-31 站长口径] 无蓝职业（战/贼）的爆发消耗品 = 加速药水；有蓝的这里自动跳过
                 if (UseHastePotion(m, s))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 // [2026-10-31 站长口径] 爆发顺序（修正）：**水元素 → 饰品 → 冰冷血脉** → 急冷（第 2 轮起）→ 寒冰箭填充。
                 //   水元素先出场才来得及打；饰品/冰脉放后面不浪费它们的持续时间。
                 // 水元素走统一入口：没有宠物才召，失败留一条可区分的 [DPSFSM-PET] 诊断
                 if (SummonPetIfNeeded(ai, m, s, "summon water elemental"))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 if (TP(m, "burst_trinket", 1.0) >= 1.0 && UseTrinket(ai, m, s))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 if (CastFirst(ai, m, s, { "icy veins" }))
-                    return true;
+                    return ai::dpsfsm::TickResult::Acted;
                 {
                     int const snapRound = int(TP(m, "burst_cold_snap_round", 2.0));
                     if (m->burstRounds >= snapRound && CastFirst(ai, m, s, { "cold snap" }))
-                        return true;
+                        return ai::dpsfsm::TickResult::Acted;
                 }
-                return CastFirst(ai, m, s, { "frostbolt" });
+                return FsmResult(CastFirst(ai, m, s, { "frostbolt" }));
 
             case State::Burn:
                 // [2026-10-31 站长口径] 单体常规输出每 tick 先确认宠物在咬当前目标
-                //   （宠物掉队/换目标时要重新指令）。
-                //   平稳核心：寒冰箭是**唯一填充**（节能施法时也照打寒冰箭，不插别的）；
-                //   移动中读条会被取消 ⇒ 先试瞬发冰枪。
+                //   （宠物掉队/换目标时要重新指令；宠物仇恨不算在 bot 头上，Wait 档也让它继续咬）。
                 CommandPetAttack(s);
+                // [2026-10-31 站长口径] Hold 的测试通路：`burn_hold=1` 时本 tick **有意空着**
+                //   （用于验证 TickResult::Hold 真的能让引擎收手）。默认 0 ⇒ 行为与改造前一致。
+                if (TP(m, "burn_hold", 0.0) >= 1.0)
+                    return ai::dpsfsm::TickResult::Hold;
+                // [2026-10-31 站长口径] 仇恨 Wait 档（Maintain）：**不施法、也不让引擎动**。
+                //   此时抢在坦克前面打，换来的是一只追着法师的怪（治疗多花蓝、坦克多花时间），
+                //   就像把家门让给了对方；等一下让坦克把仇恨拉开，比多打一发寒冰箭划算。
+                //   Throttle 档不 Hold：照常打低威胁填充（寒冰箭/冰枪），只是不开爆发、不用冰锥。
+                if (threat == ThreatLevel::Wait)
+                    return ai::dpsfsm::TickResult::Hold;
+                // 平稳核心：寒冰箭是**唯一填充**（节能施法时也照打寒冰箭，不插别的）；
+                //   移动中读条会被取消 ⇒ 先试瞬发冰枪。
                 if (TP(m, "burn_lance_moving", 1.0) >= 1.0 && s.moving
                     && CastFirst(ai, m, s, { "ice lance" }))
-                    return true;
-                return CastFirst(ai, m, s, { "frostbolt" });
+                    return ai::dpsfsm::TickResult::Acted;
+                return FsmResult(CastFirst(ai, m, s, { "frostbolt" }));
 
             case State::Idle:
             default:
                 break;
         }
-        return CastFirst(ai, m, s, { "frostbolt" });
+        return FsmResult(CastFirst(ai, m, s, { "frostbolt" }));
     }
 
     bool Tick(PlayerbotAI* ai)
@@ -2826,6 +2931,9 @@ namespace ai
             }
             BotMem* m = Mem(bot->GetGUIDLow());
             m->castThisTick = false;
+            // [2026-10-31 站长口径] Hold 只活一个 tick：本 tick 重新决定。
+            //   上一 tick 的标记要一直留到引擎读（引擎的让位判断发生在 Tick 返回之后），所以在这里清、不在返回前清。
+            m->holdThisTick = false;
             ReloadTune();
 
             uint32 const hbNow = WorldTimer::getMSTime();
@@ -2947,9 +3055,19 @@ namespace ai
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
-                if (TickFrostFsm(ai, m, s))
-                    return true;
-                return false;   // 没出手 ⇒ 交回引擎（走位/追击/开怪）
+                // [2026-10-31 站长口径] 三态返回：Acted=我出手了；Hold=我有意空着（引擎也别插）；
+                //   Decline=我不处理，交回引擎（走位/追击/开怪/喝水）。
+                switch (TickFrostFsm(ai, m, s))
+                {
+                    case ai::dpsfsm::TickResult::Acted:
+                        return true;
+                    case ai::dpsfsm::TickResult::Hold:
+                        m->holdThisTick = true;
+                        return true;
+                    case ai::dpsfsm::TickResult::Decline:
+                    default:
+                        return false;
+                }
             }
 
             bool handled = false;
