@@ -108,6 +108,7 @@ namespace
         bool modeLogged = false;        // [2026-10-31 S1] 决策模式日志只打一次
         int  mode = 0;                  // [2026-10-31 S1] 本 tick 解析出的 DecisionMode（存 int：
                                         //   枚举声明在 BotMem 之后；TickPolicy 直接读它，不再二次读 conf）
+        time_t lastBurst = 0;           // [2026-10-31 S2] 上次进入爆发的时间（"早用早 CD"的门）
         uint32 engRuns = 0;
         uint32 dupDebuff = 0;       // [2026-10-30] 同类 debuff 已被更强/相等效果占住时仍施放的次数（互斥分析用）         // 引擎真正跑过的 tick 数（诊断白字缺口用）
         uint32 movTicks = 0;        // 在移动的 tick 数（移动会打断挥击）
@@ -289,7 +290,7 @@ namespace
     // 详见 dev/DESIGN_dps_fsm.md §1。
     // ==========================================================================
     // 名字避开 ai::Engine（经典策略引擎），别让两个 Engine 在同一命名空间打架。
-    enum class DecisionMode { Legacy = 0, Table = 1, TableScored = 2, TableScoredBook = 3, Value = 4 };
+    enum class DecisionMode { Legacy = 0, Table = 1, TableScored = 2, TableScoredBook = 3, Value = 4, Fsm = 5 };
 
     char const* DecisionModeName(DecisionMode m)
     {
@@ -299,6 +300,7 @@ namespace
             case DecisionMode::TableScored:     return "table_scored";
             case DecisionMode::TableScoredBook: return "table_scored_book";
             case DecisionMode::Value:           return "value";
+            case DecisionMode::Fsm:             return "fsm";
             default:                            return "legacy";
         }
     }
@@ -327,9 +329,9 @@ namespace
         if (raw >= 0.0)
         {
             int const v = int(raw + 0.5);
-            if (v >= 0 && v <= 4)
+            if (v >= 0 && v <= 5)
                 return DecisionMode(v);
-            sLog.outError("[DPSFSM-MODE] mode=%d 越界（合法 0..4），按 legacy 处理", v);
+            sLog.outError("[DPSFSM-MODE] mode=%d 越界（合法 0..5），按 legacy 处理", v);
             return DecisionMode::Legacy;
         }
 
@@ -2350,6 +2352,85 @@ namespace ai
             ++it->second->engRuns;
     }
 
+    // ==========================================================================
+    // [2026-10-31 S2] 冰法状态图（试点，mode=5 才用；其它专精仍走原路径）
+    //   图见 dev/DESIGN_dps_fsm_graphs.md §2.1
+    //   规矩：① 状态只决定"用哪张动作表"，不直接施法；
+    //         ② 转移条件只读 Snapshot + TP 参数，不读世界、不打日志；
+    //         ③ 没放出去就 return false，把走位/追击交回引擎（共同作用，不是抢活）。
+    // ==========================================================================
+    State EvalFrost(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!s.target)                                     return State::Idle;
+
+        // [2026-10-31 站长口径] 先保命：血太低先撤（风筝），不做"站桩换血"
+        if (s.selfHp < float(TP(m, "flee_hp", 30.0)))
+            return State::Flee;
+
+        if (s.power < float(TP(m, "recover_enter", 8.0)))  return State::Recover;
+        if (s.pack30 >= AoEPack(m))                        return State::Aoe;
+
+        // [2026-10-31 站长口径] 爆发 = 仇恨稳定后**立刻开**、早用早 CD（不再等目标血量低）。
+        //   单 bot 用时间间隔当"CD 门"，`burst_interval` 可调（越小越激进）。
+        //   假人场景没有仇恨（SkipEngine 为真），视为仇恨稳定。
+        bool const threatOk = dpsfsm::SkipEngine(s.bot->GetGUIDLow())
+            || !AttackAction::WaitingForTankThreat(ai, s.bot, s.target);
+        if (threatOk && time(nullptr) - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+            return State::Burst;
+
+        if (s.dist > float(TP(m, "range_caster", 30.0)))   return State::Approach;
+        return State::Burn;
+    }
+
+    bool TickFrostFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        State const st = EvalFrost(ai, m, s);
+        m->state = st;
+
+        switch (st)
+        {
+            case State::Recover:
+                if (TryCastSelf(ai, m, s, "evocation"))
+                    return true;
+                return false;               // 剩下的（喝水/魔杖）交回引擎
+
+            case State::Flee:
+                if (CastSelfCentered(ai, m, s, "frost nova"))
+                    return true;
+                if (TryCastSelf(ai, m, s, "ice barrier"))
+                    return true;
+                if (TryCastSelf(ai, m, s, "blink"))
+                    return true;
+                return CastFirst(ai, m, s, { "ice lance" });
+
+            case State::Approach:
+                return false;               // 走位归引擎
+
+            case State::Aoe:
+                if (TryCastAt(ai, m, s, "blizzard", s.target->GetPositionX(),
+                        s.target->GetPositionY(), s.target->GetPositionZ()))
+                    return true;
+                if (CastFirst(ai, m, s, { "ice lance" }))
+                    return true;
+                return CastFirst(ai, m, s, { "frostbolt" });
+
+            case State::Burst:
+                m->lastBurst = time(nullptr);      // 早用早 CD：进来就打点，别每 tick 重判
+                if (!s.bot->GetPet() && CastFirst(ai, m, s, { "summon water elemental" }))
+                    return true;
+                if (CastFirst(ai, m, s, { "icy veins" }))
+                    return true;
+                if (CastFirst(ai, m, s, { "cold snap" }))
+                    return true;
+                return CastFirst(ai, m, s, { "frostbolt" });
+
+            case State::Idle:
+            default:
+                break;
+        }
+        return CastFirst(ai, m, s, { "frostbolt" });
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -2485,6 +2566,17 @@ namespace ai
             // [2026-10-30] 职业技能空间 + 专精策略（mode=1/2/3 开启；默认 legacy 走原分专精处理器）
             if (ModeIsTable(dmode))
                 return TickPolicy(ai, m);
+
+            // [2026-10-31 S2] mode=5：显式状态图。目前只有冰法有图（试点），
+            //   其它专精还没有图 ⇒ 继续往下走手写处理器，行为与 legacy 相同。
+            if (dmode == DecisionMode::Fsm && m->spec == Spec::Frost)
+            {
+                Snapshot s;
+                BuildSnapshot(ai, m, s);
+                if (TickFrostFsm(ai, m, s))
+                    return true;
+                return false;   // 没出手 ⇒ 交回引擎（走位/追击/开怪）
+            }
 
             bool handled = false;
             switch (m->spec)

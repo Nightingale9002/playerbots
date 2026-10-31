@@ -13,13 +13,15 @@ namespace ai
         enum class State
         {
             Idle,       // 没目标
+            Prep,       // [2026-10-31] 开怪前准备（buff/护甲/姿态/资源），原 Form+Buff 并入
+            Flee,       // [2026-10-31] 逃跑/风筝：血太低或扛不住，先拉开
             Approach,   // 有目标但不在射程，交给移动策略
-            Burn,       // 单体常规输出
+            Burn,       // 单体常规输出（平稳输出期）
             Instant,    // 移动中/需要瞬发
-            Burst,      // 爆发窗口（大招/饰品/斩杀）
+            Burst,      // 爆发窗口（仇恨稳定 + CD 好即开，早用早 CD）
             Aoe,        // 群伤
             Weave,      // 等自动射击窗口（猎人：读条会顶掉自动射击）
-            Recover     // 资源不足，回蓝/等待
+            Recover     // 资源/血量不足，回蓝回血
         };
 
         enum class Spec
