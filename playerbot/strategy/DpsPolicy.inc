@@ -682,14 +682,25 @@ namespace dpspolicy
                     continue;
                 if (st.name && st.name[0] && std::string(st.name).find("totem") != std::string::npos)
                 {
-                    // [2026-10-31] 图腾按"槽"判空不可靠：实测召唤成功后 `GetTotemGuid(WATER)` 仍为空
-                    //   ⇒ 法力之泉图腾 25 秒被重铺 15 次。改用**时间间隔**（图腾持续 2 分钟，60 秒内不重铺）。
+                    // [2026-10-31 站长口径] 图腾**不能用时间间隔判断**：队伍移动走了必须补铺。
+                    //   正确判据 = 槽位为空（含召唤后未登记的情况）**或** 图腾离当前站位超过 `totem_range`。
+                    //   `totem_range` 是可调参数（默认 30 码），由优化器决定"多远该补"。
                     int const slot = TotemSlotOf(st.name);
-                    if (slot != TOTEM_SLOT_NONE && !s.bot->GetTotemGuid(TotemSlot(slot)).IsEmpty())
+                    bool needTotem = true;
+                    if (slot != TOTEM_SLOT_NONE)
+                    {
+                        TotemSlot const ts = TotemSlot(slot);
+                        ObjectGuid const tg = s.bot->GetTotemGuid(ts);
+                        if (!tg.IsEmpty())
+                        {
+                            float const range = float(TP(m, "totem_range", 30.0));
+                            Creature* tc = s.bot->GetMap() ? s.bot->GetMap()->GetCreature(tg) : nullptr;
+                            if (tc && s.bot->GetDistance(tc) <= range)
+                                needTotem = false;      // 还在范围内 ⇒ 不补
+                        }
+                    }
+                    if (!needTotem)
                         continue;
-                    auto pre = m->prereqLast.find(st.name);
-                    if (pre != m->prereqLast.end() && time(nullptr) - pre->second < 60)
-                        continue;       // 60 秒内不重铺（图腾持续 2 分钟）
                 }
                 if (dpspolicy::TryStep(ai, m, s, st))
                 {
@@ -846,7 +857,26 @@ namespace dpspolicy
                             + dpsvalue::ResourceSeconds(s.bot, c);
                         if (dmg <= 0.0f)
                             continue;
-                        score = dmg / std::max(0.2f, actSec) * w;
+                        float ww = w;
+                        // [2026-10-31 站长口径] 跨系技能不硬性关闭：用 `w_crossschool`（默认 1.0）加权，
+                        //   优化器可以把它压到 0（等于只用自己的系），也可以放大（混搭流派）。
+                        {
+                            SpellEntry const* csp = sSpellTemplate.LookupEntry<SpellEntry>(c.id);
+                            if (csp)
+                            {
+                                uint32 const specFamily = dpsvalue::SpecFamily(s.bot->getClass(), int(m->spec));
+                                if (specFamily && csp->SpellFamilyName && csp->SpellFamilyName != specFamily)
+                                    ww *= float(TP(m, "w_crossschool", 1.0));
+                            }
+                        }
+                        if (c.isUtility)
+                        {
+                            // [2026-10-31 站长口径] 控制/效用类不硬性关闭，用权重决定（默认 0）
+                            ww *= float(TP(m, "w_utility", 0.0));
+                            if (ww <= 0.0f)
+                                continue;
+                        }
+                        score = dmg / std::max(0.2f, actSec) * ww;
                     }
                     if (score > bestAutoScore)
                     {

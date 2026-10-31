@@ -45,6 +45,8 @@ namespace dpsvalue
         //   变形会清空能量/怒气、耗 GCD 与法力 ⇒ 候选里只允许"当前形态可用"的技能。
         uint32 schoolMask = 0;     // [2026-10-30 站长口径] 按角色实际属性估值：需要学派（法伤加成按学派算）
         float  coeff = 0.0f;       // 法术强度系数（读条技能 ≈ 施法时间/3.5；DoT ≈ 时长/15）
+        bool   isUtility = false;  // [2026-10-31 站长口径] 控制/效用类（恐惧/魅惑/沉默…）
+                                   //   不硬性排除，而是乘以可调权重 `w_utility`（默认 0）
         uint32 requiredForm = 0;    // 0 = 无形态要求；否则是 Stances 位掩码
     };
 
@@ -52,6 +54,23 @@ namespace dpsvalue
     inline std::unordered_map<uint32, time_t>& BuiltAt() { static std::unordered_map<uint32, time_t> b; return b; }
 
     // 法术书扫描：只留"能造成伤害"的法术（直接伤害/武器伤害/周期性伤害），且只留最高 rank。
+    // [2026-10-31] 该专精"本系"的法术家族（用于跨系权重 w_crossschool）。
+    //   返回 0 表示不判定（例如物理系）
+    inline uint32 SpecFamily(uint8 cls, int spec)
+    {
+        switch (cls)
+        {
+            case CLASS_MAGE:    return SPELLFAMILY_MAGE;
+            case CLASS_WARLOCK: return SPELLFAMILY_WARLOCK;
+            case CLASS_PRIEST:  return SPELLFAMILY_PRIEST;
+            case CLASS_DRUID:   return SPELLFAMILY_DRUID;
+            case CLASS_SHAMAN:  return SPELLFAMILY_SHAMAN;
+            case CLASS_PALADIN: return SPELLFAMILY_PALADIN;
+            case CLASS_HUNTER:  return SPELLFAMILY_HUNTER;
+            default:            return 0;
+        }
+    }
+
     inline void Rebuild(Player* bot, uint32 guid)
     {
         std::vector<Cand> out;
@@ -73,6 +92,7 @@ namespace dpsvalue
             // [2026-10-31] 排除控制/仇恨类法术：它们不是输出技能，但会因为"有光环"被当候选，
             //   实测暗牧在假人循环里放了 4 次精神控制（10912）。
             //   判据：控制类光环（恐惧/困惑/眩晕/定身/魅惑/沉默/安抚）或"强制攻击我"类效果。
+            bool isUtilitySpell = false;
             {
                 bool utility = false;
                 for (int32 ei = 0; ei < 3 && !utility; ++ei)
@@ -92,11 +112,13 @@ namespace dpsvalue
                             utility = true;
                     }
                 }
-                if (utility)
-                    continue;
+                // 不跳过：交给 w_utility 加权（默认 0 ⇒ 不会被选）
+                isUtilitySpell = utility;
+
             }
 
             Cand c;
+            c.isUtility = isUtilitySpell;
             c.id = id;
             c.name = sp->SpellName[0] ? sp->SpellName[0] : "?";
             c.auraState = sp->TargetAuraState;
@@ -266,8 +288,10 @@ namespace dpsvalue
             }
             if (noDmg)
             {
+                // [2026-10-31 站长口径] 不写死秒数：间隔也是可调权重（nodmg_interval，默认 10 秒，0=不限）
+                int const minGap = int(TP(m, "nodmg_interval", 10.0));
                 auto lo = m->lastOk.find(id);
-                if (lo != m->lastOk.end() && now - lo->second < 10)
+                if (minGap > 0 && lo != m->lastOk.end() && now - lo->second < minGap)
                     return false;
             }
         }
