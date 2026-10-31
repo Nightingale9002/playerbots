@@ -2771,13 +2771,14 @@ namespace ai
                 // [2026-10-31 站长口径] 无蓝职业（战/贼）的爆发消耗品 = 加速药水；有蓝的这里自动跳过
                 if (UseHastePotion(m, s))
                     return true;
-                // [2026-10-31 站长口径] 爆发顺序：冰冷血脉 → 饰品 → 水元素 → 急冷（第 2 轮起）→ 寒冰箭填充
-                if (CastFirst(ai, m, s, { "icy veins" }))
+                // [2026-10-31 站长口径] 爆发顺序（修正）：**水元素 → 饰品 → 冰冷血脉** → 急冷（第 2 轮起）→ 寒冰箭填充。
+                //   水元素先出场才来得及打；饰品/冰脉放后面不浪费它们的持续时间。
+                // 水元素走统一入口：没有宠物才召，失败留一条可区分的 [DPSFSM-PET] 诊断
+                if (SummonPetIfNeeded(ai, m, s, "summon water elemental"))
                     return true;
                 if (TP(m, "burst_trinket", 1.0) >= 1.0 && UseTrinket(ai, m, s))
                     return true;
-                // 水元素走统一入口：没有宠物才召，失败留一条可区分的 [DPSFSM-PET] 诊断
-                if (SummonPetIfNeeded(ai, m, s, "summon water elemental"))
+                if (CastFirst(ai, m, s, { "icy veins" }))
                     return true;
                 {
                     int const snapRound = int(TP(m, "burst_cold_snap_round", 2.0));
