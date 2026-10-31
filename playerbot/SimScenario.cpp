@@ -3193,12 +3193,18 @@ uint32 stuckFightCleared = 0;
             // [2026-10-29 站长口径] "毕业装 bot 也只有 500 dps" 的根因之一：随机 bot 的天赋树是随机的、
             //   装备也是旧的（StaticBots=1 不会自己换）。这里按目标专精**重天赋 + 换最好装备**，
             //   否则测的既不是毕业装、也不是这个专精的循环上限。
-            static std::set<std::string> s_prepared;   // "<guid>:<premade>" 已经准备过的组合
-            std::string const prepKey = std::to_string(d.guid) + ":" + d.premade;
-            if (d.respec && !d.respecced && !s_prepared.count(prepKey))
+            // [2026-10-31 根因] 原来用 `set<"guid:premade">` 记"已准备过"：同一个 bot 被**别的专精**用过之后
+            //   （那次会 resetTalents 换成另一个专精的天赋），再回到本专精时缓存命中 ⇒ **不重新套用天赋**
+            //   ⇒ 它带着上一个专精的天赋跑测（实测 feral 用 guid 9 只有 94 dps，用一直是 feral 的 guid 95 是 568~670；
+            //     全日志只有 17 次"天赋已套用"、0 次"没找到 premade"，正是被缓存跳过的证据）。
+            //   改成按 guid 记录**当前已套用的天赋名**，只要目标天赋与当前不同就重新套用。
+            static std::map<uint32, std::string> s_preparedSpec;
+            bool const needRespec = (s_preparedSpec.find(d.guid) == s_preparedSpec.end()
+                || s_preparedSpec[d.guid] != d.premade);
+            if (d.respec && !d.respecced && needRespec)
             {
                 d.respecced = true;
-                s_prepared.insert(prepKey);
+                s_preparedSpec[d.guid] = d.premade;
                 if (bot->GetLevel() >= 70)
                 {
                     // [站长口径 2026-10-29] 天赋是**按专精固定一套**（AiPlayerbot.PremadeSpecName/Link），
