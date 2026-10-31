@@ -1033,7 +1033,14 @@ namespace
     //   假人场景里会被判成"不 useful"，实测一次都没喝到。
     bool UseManaPotion(BotMem* m, Snapshot& s)
     {
-        if (s.power > float(TP(m, "potion_mana", 35.0)))
+        // [2026-10-31 站长口径] 改成按**蓝缺口**判断：缺得超过 `potion_mana_deficit`（默认 3000）就喝。
+        //   比按百分比准——不同职业/装备的蓝上限差很多，35% 对 8000 蓝的号是缺 5200、对 14000 蓝的号是缺 9100。
+        //   `potion_mana` 保留为兜底（没有蓝上限信息时按百分比）。
+        uint32 const maxMana = s.bot->GetMaxPower(POWER_MANA);
+        int32 const deficit = int32(maxMana) - int32(s.bot->GetPower(POWER_MANA));
+        bool const byDeficit = maxMana > 0 && deficit > int32(TP(m, "potion_mana_deficit", 3000.0));
+        bool const byPct = maxMana == 0 && s.power <= float(TP(m, "potion_mana", 35.0));
+        if (!byDeficit && !byPct)
             return false;
 
         time_t const now = time(nullptr);
@@ -1073,6 +1080,53 @@ namespace
                 s.bot->CastItemUseSpell(item, targets, 0, 0);
                 sLog.outError("[DPSFSM] %s 喝法力药水（item=%u, res=%.0f%%）",
                     s.bot->GetName(), proto->ItemId, s.power);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // [2026-10-31 站长口径] **没有蓝的职业（战士/盗贼）用加速药水当爆发消耗品**：
+    //   只在 Burst 状态里喝；有蓝的职业一律走 UseManaPotion（这里直接返回 false）。
+    //   识别方式：按物品名匹配（本服 DB 是英文，`Haste Potion`），也可用参数 `haste_potion_item`
+    //   直接指定物品 id（换了自定义药水时用）。
+    bool UseHastePotion(BotMem* m, Snapshot& s)
+    {
+        if (s.bot->GetMaxPower(POWER_MANA) > 0)
+            return false;
+
+        time_t const now = time(nullptr);
+        if (m->lastPotionTry && now - m->lastPotionTry < 3)
+            return false;
+        m->lastPotionTry = now;
+
+        uint32 const wantId = uint32(TP(m, "haste_potion_item", 0.0));
+        for (int slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+            Item* item = s.bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!item)
+                continue;
+            ItemPrototype const* proto = item->GetProto();
+            if (!proto)
+                continue;
+
+            bool const match = wantId ? (proto->ItemId == wantId)
+                                      : (std::string(proto->Name1).find("Haste Potion") != std::string::npos);
+            if (!match)
+                continue;
+
+            for (int e = 0; e < MAX_ITEM_PROTO_SPELLS; ++e)
+            {
+                uint32 const spellId = proto->Spells[e].SpellId;
+                if (!spellId || proto->Spells[e].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+                    continue;
+                if (!s.bot->IsSpellReady(spellId))
+                    continue;
+
+                SpellCastTargets targets;
+                targets.setUnitTarget(s.bot);
+                s.bot->CastItemUseSpell(item, targets, 0, 0);
+                sLog.outError("[DPSFSM] %s 喝加速药水（item=%u）", s.bot->GetName(), proto->ItemId);
                 return true;
             }
         }
@@ -2390,6 +2444,10 @@ namespace ai
         switch (st)
         {
             case State::Recover:
+                // [2026-10-31 站长口径] 有蓝职业通用：蓝缺口 > potion_mana_deficit(3000) 就先喝法力药水
+                //   （瞬发、不打断输出），还缺再唤醒；都不行交回引擎喝水/魔杖。
+                if (UseManaPotion(m, s))
+                    return true;
                 if (TryCastSelf(ai, m, s, "evocation"))
                     return true;
                 return false;               // 剩下的（喝水/魔杖）交回引擎
@@ -2416,6 +2474,9 @@ namespace ai
 
             case State::Burst:
                 m->lastBurst = time(nullptr);      // 早用早 CD：进来就打点，别每 tick 重判
+                // [2026-10-31 站长口径] 无蓝职业（战/贼）的爆发消耗品 = 加速药水；有蓝的这里自动跳过
+                if (UseHastePotion(m, s))
+                    return true;
                 if (!s.bot->GetPet() && CastFirst(ai, m, s, { "summon water elemental" }))
                     return true;
                 if (CastFirst(ai, m, s, { "icy veins" }))
