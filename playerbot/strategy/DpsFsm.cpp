@@ -253,6 +253,28 @@ namespace
         bool   fireBurstWantIcy = false;
         bool   fireBurstWantComb = false;
         bool   fireBurstWantTrinket = false;
+        // [2026-11-01 站长口径] 圣骑士·惩戒（mode=5）专用：
+        //   retPrevSwingMs —— 上一次读到的 BASE 平砍计时（毫秒）。核心 `Unit::Update` 每 tick 递减
+        //                     `m_attackTimer[BASE_ATTACK]`，平砍成功后会 `resetAttackTimer()` 跳回攻速
+        //                     ⇒ "读数突然变大（> 旧读数 + 800ms）"就是刚过了一刀；用它记平砍数，
+        //                     不维护任何影子计时器（RANGED 那个死值更不能用）。
+        //   retSwings      —— 距上次圣印舞已经过去的平砍数（twist_every_swings 的输入）。
+        //   retTwistCount  —— 本场累计舞次数（[DPSFSM-RET] 的 twists=，验收"真的切了"）。
+        //   retEngagedAt   —— 本场交战开始的毫秒时刻（fight_length_est / burst_delay 用它判断"开打多久"）。
+        //   retBurstUntil  —— 本轮爆发的结束时刻：窗口内保持 Burst，让"复仇之怒 → 饰品 → 药水"跨几个 tick 放完。
+        //   retNeedSeal   —— 审判刚放完、下一轮圣印必须立刻补（审判会吃掉当前圣印）。
+        //   retRestoreSeal—— 刚舞过（当前挂的是鲜血/正义），要回到命令圣印；只在**非窗口**时回切，
+        //                     否则回切本身也会在 400ms 内触发一次双印，破坏"2 刀 1 舞"的节奏。
+        //   retTarget      —— 本场的目标；换目标 = 换一场战斗（计数/计时全清）。
+        uint32 lastRetLog = 0;
+        uint32 retSwings = 0;
+        uint32 retTwistCount = 0;
+        int    retPrevSwingMs = -1;
+        uint32 retEngagedAt = 0;
+        uint32 retBurstUntil = 0;
+        bool   retNeedSeal = false;
+        bool   retRestoreSeal = false;
+        ObjectGuid retTarget;
     };
 
     std::mutex s_disabledMutex;
@@ -2096,9 +2118,12 @@ namespace
     //   只在 Burst 状态里喝；有蓝的职业一律走 UseManaPotion（这里直接返回 false）。
     //   识别方式：按物品名匹配（本服 DB 是英文，`Haste Potion`），也可用参数 `haste_potion_item`
     //   直接指定物品 id（换了自定义药水时用）。
-    bool UseHastePotion(BotMem* m, Snapshot& s)
+    // [2026-11-01 站长口径] 惩戒骑的爆发药水：骑士**有蓝**但加速药水一样有用（爆发窗口里换的是伤害，
+    //   不是续航），所以给 UseHastePotion 加一个"允许有蓝职业"的开关，默认关闭 ——
+    //   战士/盗贼的调用点不传这个参数，行为一个字节不变。
+    bool UseHastePotion(BotMem* m, Snapshot& s, bool allowManaClass = false)
     {
-        if (s.bot->GetMaxPower(POWER_MANA) > 0)
+        if (!allowManaClass && s.bot->GetMaxPower(POWER_MANA) > 0)
             return false;
 
         time_t const now = time(nullptr);
@@ -3316,6 +3341,18 @@ namespace ai
             m->fireBurstDone = 0;
             m->fireBurstRound = 0;
             m->lastFireLog = 0;
+            // [2026-11-01 站长口径] 惩戒骑：平砍计数/舞次数/交战计时/爆发窗口/审判补印都必须跨轮清零 ——
+            //   否则上一轮的 retSwings 会让新一轮开局就在窗口里"到点必舞"，
+            //   retEngagedAt 也会让 fight_length_est 的"稍等"判据直接当成已经等够。
+            m->lastRetLog = 0;
+            m->retSwings = 0;
+            m->retTwistCount = 0;
+            m->retPrevSwingMs = -1;
+            m->retEngagedAt = 0;
+            m->retBurstUntil = 0;
+            m->retNeedSeal = false;
+            m->retRestoreSeal = false;
+            m->retTarget = ObjectGuid();
 
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
@@ -5985,6 +6022,451 @@ namespace ai
         return result;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] 圣骑士 · 惩戒（Retribution）—— mode=5 的第七张职业图
+    //   核心已经实现了 300/400ms 的圣印窗口（`Unit::AddSpellAuraHolder` 的 `[SEALTWIST]` 分支：
+    //   换圣印时旧圣印 aura 保留 `CalculateTime(400)` 毫秒再删）。**我们只负责时机**，
+    //   不维护影子圣印、不自己算双印伤害。
+    //
+    //   站长的口径逐条落到代码：
+    //     ① **平砍计时驱动**：读 `getAttackTimer(BASE_ATTACK)`（核心 `Unit::Update` 每 tick 递减，
+    //        可用；RANGED 那个是死值别用）。`swing=<剩余ms>` 就是"下一刀还有多久"。
+    //     ② **圣印舞**：剩余 ≤ `twist_window_ms`（默认 350）且当前挂的是**命令** ⇒ 切**鲜血**
+    //        （联盟切**正义**，站长口径）。命令用 rank1（`command_rank`），鲜血/正义用满级。
+    //        切完打一条 `[DPSFSM-TWIST]`，便于验收"真的切了"。
+    //     ③ **2 刀 1 舞**：`twist_every_swings`（默认 2）——用"平砍计时器读数跳回攻速"数平砍，
+    //        到点才舞；其余平砍正常挂着命令（舞完由 `retRestoreSeal` 在**非窗口**时切回命令，
+    //        避免回切本身又触发一次双印、把节奏变成"每刀都舞"）。
+    //     ④ **审判禁区**：`judgement` 会吃掉当前圣印 ⇒ 只在 `swing > judge_gcd_ms`（默认 1500，
+    //        一个 GCD）时放；放完 `retNeedSeal=true`，下一手立刻补命令圣印。
+    //     ⑤ **优先级**：舞 > 十字军打击（6s CD）> 审判 > 奉献/驱邪；CS 转好但与舞同 tick 冲突时先舞。
+    //
+    //   填充与蓝量：
+    //     · `consecration` 单体 rank1（`consecration_rank`）；复仇之怒期间用满级；群架（≥aoe_targets）
+    //       也用满级并提到最前；蓝 < `consecration_mana`（25%）⇒ 奉献与驱邪一起停。
+    //     · `exorcism` 只对亡灵/恶魔（`GetCreatureType()`）进候选。
+    //   爆发：`avenging wrath` + 饰品 + `burst_potion`（1=加速药水（默认，骑士有蓝但爆发窗口换的是伤害）、
+    //     2=法力药水、0=不喝）；`fight_length_est`（默认 180）≤120 ⇒ 等到 `burst_delay`（默认 60）
+    //     才开（等嗜血后半段）；>120 ⇒ 开场就开。
+    //   恢复：蓝 < `recover_mana`（20%）⇒ 先 `UseManaPotion`；`use_seal_of_wisdom`（默认 0，先别开）
+    //     =1 时改用智慧圣印替换鲜血/命令。
+    //   防护/神圣**不接**：派发处就排除，`TickRetFsm` 里再兜一次 Decline。
+    //
+    //   可复用（不重新发明）：`BuildSnapshot`、`CastFirst/TryCast/TryCastSelf/CastSelfCentered`、
+    //   `SpellIdAtRank`、`AuraRemain`、`TickResult{Acted,Hold,Decline}`、`EvalThreat`、
+    //   `UseManaPotion`、`UseTrinket`、`TP`。
+    // ==========================================================================
+
+    // [2026-11-01 站长口径] 自身中心 AoE 的**按 id** 版本：`CastSelfCentered` 只吃名字（一律顶到
+    //   最高 rank），而惩戒单目标要放 1 级奉献省蓝、复仇之怒期间才用满级 ⇒ 必须能指定 id。
+    //   入口与 CastSelfCentered 同一口径（核心 `Unit::CastSpell(self)`：奉献是 TARGET_UNIT_CASTER，
+    //   不是 DEST_LOCATION；走 bot 的 CanCastSpell 会被判成"负法术 + 友方目标"）。
+    bool CastSelfCenteredId(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 id, char const* name)
+    {
+        if (!Ready(s.bot, id))
+            return false;
+        SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+        if (entry && s.bot->HasGCD(entry))
+            return false;    // 别顶掉正在转的 GCD
+
+        SpellCastResult const res = s.bot->CastSpell(s.bot, id, uint32(TRIGGERED_NONE));
+        if (res != SPELL_CAST_OK)
+        {
+            time_t const now = time(nullptr);
+            if (!m->lastConsLog || now - m->lastConsLog >= 10)
+            {
+                m->lastConsLog = now;
+                sLog.outError("[DPSFSM-RET] %s 放不出 %s：id=%u result=%d",
+                    s.bot->GetName(), name, id, int(res));
+            }
+            return false;
+        }
+        ++m->castCount;
+        m->castThisTick = true;
+        m->lastOk[id] = time(nullptr);
+        m->lastCastId = id;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        return true;
+    }
+
+    // 惩戒这一轮要用到的法术 id（一次取全：SpellId/SpellIdAtRank 都有 per-bot 缓存，取多几次不贵）。
+    struct RetSealIds
+    {
+        uint32 command = 0;          // 命令圣印 rank1（站长口径：命令只用 1 级）
+        uint32 twist = 0;            // 鲜血（部落）/ 正义（联盟），满级
+        uint32 wisdom = 0;           // 智慧圣印（恢复开关，默认不用）
+        uint32 avenging = 0;
+        uint32 crusader = 0;
+        uint32 judgement = 0;
+        uint32 consecration1 = 0;
+        uint32 consecrationMax = 0;
+        uint32 holyWrath = 0;
+        char const* twistName = "seal of blood";
+    };
+
+    void RetLoadIds(PlayerbotAI* ai, BotMem* m, RetSealIds& out)
+    {
+        Player* bot = ai->GetBot();
+        // [2026-11-01 站长口径] 联盟没有鲜血圣印 ⇒ 用正义圣印当"舞"的另一半（站长口径原文：联盟：正义）。
+        out.twistName = (bot->GetTeam() == HORDE) ? "seal of blood" : "seal of righteousness";
+        double const cmdRank = TP(m, "command_rank", 1.0);
+        out.command = SpellIdAtRank(ai, m, "seal of command", uint32(cmdRank < 1.0 ? 1 : int(cmdRank)), false);
+        out.twist = SpellId(ai, bot, m, out.twistName, false);
+        out.wisdom = SpellId(ai, bot, m, "seal of wisdom", false);
+        out.avenging = SpellId(ai, bot, m, "avenging wrath", false);
+        out.crusader = SpellId(ai, bot, m, "crusader strike", false);
+        out.judgement = SpellId(ai, bot, m, "judgement", false);
+        out.consecrationMax = SpellId(ai, bot, m, "consecration", false);
+        double const consRank = TP(m, "consecration_rank", 1.0);
+        out.consecration1 = SpellIdAtRank(ai, m, "consecration", uint32(consRank < 1.0 ? 1 : int(consRank)), false);
+        out.holyWrath = SpellId(ai, bot, m, "holy wrath", false);
+    }
+
+    bool RetIsUndeadOrDemon(Unit* u)
+    {
+        if (!u)
+            return false;
+        uint32 const type = u->GetCreatureType();
+        return type == CREATURE_TYPE_UNDEAD || type == CREATURE_TYPE_DEMON;
+    }
+
+    // 自身某个 aura 的剩余毫秒（按**精确 id**——命令是 rank1，`AuraRemain(name)` 会去查最高 rank，
+    //   对 rank1 的命令圣印恒返回 0，所以这里不能用它）。
+    int RetSealRemainMs(Player* bot, uint32 id)
+    {
+        if (!id)
+            return 0;
+        SpellAuraHolder* holder = bot->GetSpellAuraHolder(id);
+        if (!holder)
+            return 0;
+        int const dur = holder->GetAuraDuration();
+        return dur < 0 ? 999999 : dur;
+    }
+
+    // 按 id 挂自身圣印：圣印是 TARGET_UNIT_CASTER 的自身增益，直接走核心 `Unit::CastSpell(self)`
+    //   （与 CastChecked 里 TARGET_FRIENDLY 的 selfFix 同一条路），自己守 GCD/会没会。
+    bool RetCastSealId(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 id)
+    {
+        if (!Ready(s.bot, id) || s.bot->HasAura(id))
+            return false;
+        SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+        if (entry && s.bot->HasGCD(entry))
+            return false;    // GCD 没转好：这一 tick 切不了，等下一 tick
+
+        SpellCastResult const res = s.bot->CastSpell(s.bot, id, uint32(TRIGGERED_NONE));
+        if (res != SPELL_CAST_OK)
+            return false;
+        ++m->castCount;
+        m->castThisTick = true;
+        m->lastOk[id] = time(nullptr);
+        m->lastCastId = id;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        return true;
+    }
+
+    // 日志里的 seal=：当前挂的是哪一个（短名，验收脚本好切）。
+    char const* RetSealShortName(Player* bot, RetSealIds const& ids)
+    {
+        if (ids.wisdom && bot->HasAura(ids.wisdom))  return "wisdom";
+        if (ids.command && bot->HasAura(ids.command)) return "command";
+        if (ids.twist && bot->HasAura(ids.twist))
+            return (ids.twistName && strcmp(ids.twistName, "seal of blood") == 0) ? "blood" : "righteousness";
+        return "none";
+    }
+
+    // [DPSFSM-RET] <bot> swing=<剩余ms> seal=<name> twists=<n> cs=<0/1> mana=<%> target=<hp%>：10 秒一条。
+    //   cs = 十字军打击这一 tick 是否可用（学会 + 冷却/GCD 就绪）；twists = 本场累计舞次数。
+    void RetLogTick(BotMem* m, Snapshot& s, RetSealIds const& ids, int swingMs)
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (m->lastRetLog && WorldTimer::getMSTimeDiff(m->lastRetLog, safeNow) < 10000)
+            return;
+        m->lastRetLog = safeNow;
+        bool const csReady = ids.crusader && Ready(s.bot, ids.crusader);
+        sLog.outError("[DPSFSM-RET] %s swing=%d seal=%s twists=%u cs=%d mana=%.0f target=%.0f",
+            s.bot ? s.bot->GetName() : "-", swingMs, RetSealShortName(s.bot, ids),
+            m->retTwistCount, csReady ? 1 : 0, s.power, s.targetHp);
+    }
+
+    // 爆发时间门（站长口径）：
+    //   fight_length_est ≤ 120 秒 ⇒ 稍等（等嗜血后半段）：开打后 `burst_delay`（默认 60）秒才开；
+    //   > 120 秒 ⇒ 开场就开。
+    bool RetBurstTimeOk(BotMem* m, uint32 nowMs)
+    {
+        if (!m->retEngagedAt)
+            return true;
+        double const fightLen = TP(m, "fight_length_est", 180.0);
+        double const elapsed = double(WorldTimer::getMSTimeDiff(m->retEngagedAt, nowMs)) / 1000.0;
+        double delay = 0.0;
+        if (fightLen <= 120.0)
+            delay = std::min(TP(m, "burst_delay", 60.0), fightLen * 0.5);
+        return elapsed >= delay;
+    }
+
+    // 状态转移：Idle → Recover（蓝 < recover_mana）→ Aoe（≥aoe_targets）→ Approach（够不着）
+    //   → Execute（目标 < execute_hp，锤子）→ Burst（时间门 + 复仇之怒就绪 + 仇恨不是 Wait）→ Maintain。
+    State EvalRet(BotMem* m, Snapshot& s, ThreatLevel threat, RetSealIds const& ids)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        // 近战范围用核心判定（与 legacy TickPaladin 同一口径：表面距离会把"中心 5.0 码"误判成在范围内）。
+        //   放在最前：够不着就先让引擎把位置带过去，任何自身中心 AoE / 审判都别对着空地放。
+        if (!s.bot->CanReachWithMeleeAttack(s.target))
+            return State::Approach;
+
+        // 蓝紧：只是"停填充 + 喝药"，不是停手（惩戒的审判/十字军/圣印消耗很低，停手反而白丢 DPS）
+        if (s.power < float(TP(m, "recover_mana", 20.0)))
+            return State::Recover;
+
+        if (s.pack10 >= int(TP(m, "aoe_targets", 3.0)))
+            return State::Aoe;
+
+        if (s.targetHp <= float(TP(m, "execute_hp", 20.0)))
+            return State::Execute;
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (safeNow < m->retBurstUntil)
+            return State::Burst;
+        if (threat != ThreatLevel::Wait
+            && ids.avenging && Ready(s.bot, ids.avenging)
+            && RetBurstTimeOk(m, safeNow))
+            return State::Burst;
+
+        return State::Maintain;
+    }
+
+    ai::dpsfsm::TickResult TickRetFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 防护/神圣不归这张图（派发处已排除，这里再兜一次；派发以后若加专精也不会误接管）
+        if (m->spec != Spec::Retribution)
+            return TickResult::Decline;
+        if (!s.target)
+            return TickResult::Decline;
+
+        // 读条中（驱邪 1.5 秒）：一个技能都不插，否则会把这一发顶掉
+        if (s.casting)
+            return TickResult::Acted;
+
+        Player* bot = s.bot;
+        if (s.target != bot)
+            bot->SetFacingToObject(s.target);   // Acted/Hold 时引擎整 tick 不跑，朝向得自己转
+
+        // 换目标 = 换一场战斗：交战计时/平砍计数/舞次数/爆发窗口都从头来
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        ObjectGuid const targetGuid = s.target->GetObjectGuid();
+        if (targetGuid != m->retTarget)
+        {
+            m->retTarget = targetGuid;
+            m->retEngagedAt = safeNow;
+            m->retBurstUntil = 0;
+            m->retSwings = 0;
+            m->retTwistCount = 0;
+            m->retPrevSwingMs = -1;
+            m->retNeedSeal = false;
+            m->retRestoreSeal = false;
+        }
+        if (!m->retEngagedAt)
+            m->retEngagedAt = safeNow;
+
+        // ① 平砍计时（站长口径：BASE 计时器可用；RANGED 是死值别用）
+        int const swingMs = int(bot->getAttackTimer(BASE_ATTACK));
+        // 平砍成功 ⇒ 核心 resetAttackTimer() 把读数跳回攻速；读数"突然变大"就说明刚刚过了一刀。
+        //   失败挥击（不在范围/朝向错）核心只把计时器设成 100ms，不会触发这个跳变。
+        if (m->retPrevSwingMs >= 0 && swingMs > m->retPrevSwingMs + 800)
+            ++m->retSwings;
+        m->retPrevSwingMs = swingMs;
+
+        RetSealIds ids;
+        RetLoadIds(ai, m, ids);
+
+        int twistWindow = int(TP(m, "twist_window_ms", 350.0));
+        if (twistWindow < 0) twistWindow = 0;
+        // 核心 [SEALTWIST] 的保留窗口是 400ms（Unit.cpp → `CalculateTime(400)`，注释写的是 300ms）。
+        //   这里留 20ms 余量 ⇒ 上限 380；默认 350 稳稳落在窗口里。
+        if (twistWindow > 380) twistWindow = 380;
+        int const twistEvery = std::max(1, int(TP(m, "twist_every_swings", 2.0)));
+        int const judgeGcd = int(TP(m, "judge_gcd_ms", 1500.0));
+
+        bool const wisdomMode = (TP(m, "use_seal_of_wisdom", 0.0) >= 1.0)
+            && s.power < float(TP(m, "recover_mana", 20.0)) && ids.wisdom != 0;
+
+        bool const commandUp = ids.command && bot->HasAura(ids.command);
+        bool const twistUp = ids.twist && bot->HasAura(ids.twist);
+        bool const wisdomUp = ids.wisdom && bot->HasAura(ids.wisdom);
+        bool const sealUp = commandUp || twistUp || wisdomUp;
+        bool const inWindow = swingMs > 0 && swingMs <= twistWindow;
+
+        ThreatLevel const threat = EvalThreat(m, s);
+        State const st = EvalRet(m, s, threat, ids);
+
+        TickResult result = TickResult::Decline;
+
+        // ② 圣印舞（最高优先级）：窗口内且当前挂命令、且"2 刀 1 舞"到点 ⇒ 切鲜血/正义。
+        //   核心会保留旧命令 aura 400ms ⇒ 这一刀双印；我们只负责在 400ms 之前把新圣印放出来。
+        if (!wisdomMode && inWindow && ids.command && ids.twist && commandUp
+            && int(m->retSwings) >= twistEvery)
+        {
+            if (RetCastSealId(ai, m, s, ids.twist))
+            {
+                sLog.outError("[DPSFSM-TWIST] %s swing=%d from=seal of command to=%s",
+                    bot->GetName(), swingMs, ids.twistName);
+                ++m->retTwistCount;
+                m->retSwings = 0;
+                m->retRestoreSeal = true;
+                result = TickResult::Acted;
+            }
+        }
+
+        // ③ 圣印维护 / 舞后回切 / 审判后补印（审判会吃掉圣印，必须立刻补）
+        if (result == TickResult::Decline && wisdomMode)
+        {
+            // 恢复模式：用智慧圣印换续航（默认关，`use_seal_of_wisdom=1` 才走）
+            if (!wisdomUp && RetCastSealId(ai, m, s, ids.wisdom))
+                result = TickResult::Acted;
+        }
+        else if (result == TickResult::Decline)
+        {
+            if (m->retRestoreSeal && !inWindow && commandUp)
+                m->retRestoreSeal = false;      // 已经回到命令（舞完的下一手），不用再补
+
+            bool needSeal = false;
+            if (m->retNeedSeal)
+            {
+                needSeal = true;                // 审判刚吃掉圣印：**不管窗口**，下一手立刻补
+            }
+            else if (m->retRestoreSeal && !inWindow)
+            {
+                needSeal = true;                // 舞完回切命令（非窗口，避免回切也双印）
+            }
+            else if (ids.command ? (!commandUp && !twistUp) : !twistUp)
+            {
+                needSeal = true;                // 开局 / 圣印掉了
+            }
+            else if (ids.command && commandUp && !inWindow
+                && RetSealRemainMs(bot, ids.command) < 2000)
+            {
+                needSeal = true;                // 命令快到期，非窗口时续一次
+            }
+
+            if (needSeal)
+            {
+                uint32 const want = ids.command ? ids.command : ids.twist;
+                if (want && RetCastSealId(ai, m, s, want))
+                {
+                    m->retNeedSeal = false;
+                    m->retRestoreSeal = false;
+                    result = TickResult::Acted;
+                }
+            }
+        }
+
+        // ③.5 回切/补印还没成功（多半是上一个 GCD 还在转）：这一手**先别拿 CS/审判去占 GCD**。
+        //   实测（60 秒 5 轮）舞次数只有 4.4/轮：舞完想切回命令，GCD 一转好就被十字军打击/审判抢走，
+        //   命令迟迟挂不回去 ⇒ 下一轮"2 刀 1 舞"的计数到点了也没有命令可切。
+        //   这里让回切优先；蓝不够放圣印（rank1 只花 65）时不拦，避免低蓝时把自己锁死。
+        bool const sealBlocked = !wisdomMode && ids.command && !commandUp
+            && (m->retRestoreSeal || m->retNeedSeal)
+            && bot->GetPower(POWER_MANA) >= 100;
+        if (result == TickResult::Decline && sealBlocked)
+        {
+            if (st == State::Burst && m->state != State::Burst)
+                m->retBurstUntil = safeNow + 5000;
+            LogTransition(ai, m, s, st);
+            RetLogTick(m, s, ids, swingMs);
+            return TickResult::Decline;
+        }
+
+        // ④ 爆发（Burst 状态）：复仇之怒 → 饰品 → 药水（一个 GCD 一手，跨几个 tick 放完）
+        if (result == TickResult::Decline && st == State::Burst)
+        {
+            if (ids.avenging && TryCastSelf(ai, m, s, "avenging wrath"))
+                result = TickResult::Acted;
+            else if (UseTrinket(ai, m, s))
+                result = TickResult::Acted;
+            else
+            {
+                int const potion = int(TP(m, "burst_potion", 1.0));
+                if (potion == 1)
+                {
+                    if (UseHastePotion(m, s, true))
+                        result = TickResult::Acted;
+                }
+                else if (potion == 2)
+                {
+                    if (UseManaPotion(m, s))
+                        result = TickResult::Acted;
+                }
+            }
+        }
+
+        // ⑤ 锤子（目标 < execute_hp）：TBC 惩戒的斩杀技；木桩满血时这条**永远不触发**（见回报）。
+        if (result == TickResult::Decline && st == State::Execute
+            && CastFirst(ai, m, s, { "hammer of wrath" }))
+            result = TickResult::Acted;
+
+        // ⑥ 群架：奉献优先级上调（满级），亡灵/恶魔再加神圣之怒
+        bool const manaOk = s.power >= float(TP(m, "consecration_mana", 25.0));
+        if (result == TickResult::Decline && st == State::Aoe)
+        {
+            uint32 const consId = ids.consecrationMax ? ids.consecrationMax : ids.consecration1;
+            if (manaOk && consId && CastSelfCenteredId(ai, m, s, consId, "consecration"))
+                result = TickResult::Acted;
+            else if (manaOk && RetIsUndeadOrDemon(s.target) && ids.holyWrath
+                && CastSelfCenteredId(ai, m, s, ids.holyWrath, "holy wrath"))
+                result = TickResult::Acted;
+        }
+
+        // ⑦ 十字军打击（6s CD）—— 排在审判之前
+        if (result == TickResult::Decline && ids.crusader
+            && CastFirst(ai, m, s, { "crusader strike" }))
+            result = TickResult::Acted;
+
+        // ⑧ 审判：只在"平砍剩余 > 一个 GCD"时放（否则吃掉圣印、这一刀落空）；
+        //    放完 retNeedSeal=true，下一手立刻补印（③ 里处理）。
+        if (result == TickResult::Decline && sealUp && swingMs > judgeGcd
+            && CastFirst(ai, m, s, { "judgement" }))
+        {
+            m->retNeedSeal = true;
+            result = TickResult::Acted;
+        }
+
+        // ⑨ 单体填充：奉献 rank1（复仇之怒期间满级）→ 驱邪（仅亡灵/恶魔）。蓝 < consecration_mana 时都停。
+        if (result == TickResult::Decline && manaOk)
+        {
+            bool const awUp = ids.avenging && bot->HasAura(ids.avenging);
+            uint32 const consId = (awUp || st == State::Aoe)
+                ? (ids.consecrationMax ? ids.consecrationMax : ids.consecration1)
+                : (ids.consecration1 ? ids.consecration1 : ids.consecrationMax);
+            if (consId && CastSelfCenteredId(ai, m, s, consId, "consecration"))
+                result = TickResult::Acted;
+            else if (RetIsUndeadOrDemon(s.target) && AffordSpell(ai, m, s, "exorcism")
+                && CastFirst(ai, m, s, { "exorcism" }))
+                result = TickResult::Acted;
+        }
+
+        // ⑩ 恢复：蓝 < recover_mana ⇒ 先喝法力药水（UseManaPotion 内部按蓝缺口判断）；
+        //    智慧圣印在 ③ 里处理。这里不 return，输出照打（填充已被蓝门挡住）。
+        if (result == TickResult::Decline && st == State::Recover)
+        {
+            if (UseManaPotion(m, s))
+                result = TickResult::Acted;
+        }
+
+        // 进入 Burst 的那一刻开窗口，让"复仇之怒 → 饰品 → 药水"跨几个 tick 依次放完
+        if (st == State::Burst && m->state != State::Burst)
+            m->retBurstUntil = safeNow + 5000;
+
+        LogTransition(ai, m, s, st);
+        RetLogTick(m, s, ids, swingMs);
+        return result;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -6146,8 +6628,12 @@ namespace ai
             //   mode=0/1/2/3/4 的火法照旧走 legacy `TickMage`，这条判断只影响 mode=5。
             bool const mageFsm = (m->spec == Spec::Frost || m->spec == Spec::Arcane
                 || m->spec == Spec::Fire);
+            // [2026-11-01 站长口径] 惩戒骑接进 mode=5（第七张职业图）：`TickRetFsm`。
+            //   **只接 Retribution**：Protection/Holy 继续走 legacy `TickPaladin`（并在那里 Decline），
+            //   mode=0/1/2/3/4 的惩戒也照旧走 `TickPaladin`，行为不变。
+            bool const retFsm = (m->spec == Spec::Retribution);
             if (dmode == DecisionMode::Fsm
-                && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm))
+                && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm || retFsm))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
@@ -6168,6 +6654,8 @@ namespace ai
                     fsmResult = TickWarriorFsm(ai, m, s);
                 else if (rogueFsm)
                     fsmResult = TickRogueFsm(ai, m, s);
+                else if (retFsm)
+                    fsmResult = TickRetFsm(ai, m, s);
                 else
                     fsmResult = TickWarlockFsm(ai, m, s);
                 // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）
