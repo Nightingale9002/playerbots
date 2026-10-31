@@ -70,6 +70,32 @@ namespace dpsvalue
             if (next && bot->HasSpell(next))
                 continue;
 
+            // [2026-10-31] 排除控制/仇恨类法术：它们不是输出技能，但会因为"有光环"被当候选，
+            //   实测暗牧在假人循环里放了 4 次精神控制（10912）。
+            //   判据：控制类光环（恐惧/困惑/眩晕/定身/魅惑/沉默/安抚）或"强制攻击我"类效果。
+            {
+                bool utility = false;
+                for (int32 ei = 0; ei < 3 && !utility; ++ei)
+                {
+                    uint32 const eff = sp->Effect[ei];
+                    if (eff == SPELL_EFFECT_ATTACK_ME || eff == SPELL_EFFECT_THREAT
+                        || eff == SPELL_EFFECT_THREAT_ALL || eff == SPELL_EFFECT_DISTRACT)
+                        utility = true;
+                    else if (eff == SPELL_EFFECT_APPLY_AURA)
+                    {
+                        uint32 const at = sp->EffectApplyAuraName[ei];
+                        if (at == SPELL_AURA_MOD_CONFUSE || at == SPELL_AURA_MOD_FEAR
+                            || at == SPELL_AURA_MOD_STUN || at == SPELL_AURA_MOD_ROOT
+                            || at == SPELL_AURA_MOD_CHARM || at == SPELL_AURA_MOD_POSSESS
+                            || at == SPELL_AURA_MOD_SILENCE || at == SPELL_AURA_MOD_PACIFY
+                            || at == SPELL_AURA_MOD_PACIFY_SILENCE)
+                            utility = true;
+                    }
+                }
+                if (utility)
+                    continue;
+            }
+
             Cand c;
             c.id = id;
             c.name = sp->SpellName[0] ? sp->SpellName[0] : "?";
