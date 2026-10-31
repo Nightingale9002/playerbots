@@ -181,6 +181,12 @@ namespace
         ObjectGuid planTarget;
         uint32 lastArcLog = 0;   // [DPSFSM-ARC] 诊断节流（WorldTimer 毫秒，10 秒一条）
         uint32 lastGemTry = 0;   // 吃法力宝石的节流（没有宝石/还在 CD 时别每 tick 走一遍引擎）
+        // [2026-10-31 站长口径] 有蓝职业（奥法/冰法）的耗蓝账本：每次**施法成功**累加 SpellEntry->manaCost。
+        //   只写统计、不参与任何决策（改不了施法选择 ⇒ mode=1/2/3/4 的行为不变，只是多一条 [DPSFSM-MANA]）。
+        uint64 manaSpent = 0;    // 开测以来累计法力消耗（技能面板消耗，不含 5 秒规则回蓝/药水回复）
+        std::map<uint32, uint64> manaCounts; // 上次结算时 bot->botSpellCounts 的快照（id → 成功次数）
+        uint32 lastManaLog = 0;  // [DPSFSM-MANA] 日志节流（WorldTimer 毫秒，10 秒一条）
+        uint64 lastManaSpent = 0;// 上次打日志时的累计值（便于看出这一段涨了多少，也避免"没变化还刷屏"）
     };
 
     std::mutex s_disabledMutex;
@@ -831,6 +837,68 @@ namespace
         m->state = next;
         if (next == State::Idle)
             m->castCount = 0;
+    }
+
+    // ==========================================================================
+    // [2026-10-31 站长口径] 有蓝职业（奥法/冰法）的耗蓝账本（DPM 用）
+    //   `spent` 只根据**真的施法成功**的记录累加，单价一律取 `SpellEntry->manaCost`
+    //   （拿不到 entry 就跳过，绝不按蓝量百分比瞎估）。这里只记账，不做任何条件判断，
+    //   所以 mode=1/2/3/4 的施法路径行为不变（只多一行统计）。
+    //
+    //   结算点 = 核心的 `Player::botSpellCounts`（id → 成功施法次数），**按次数差结算**，
+    //   而不是在每个施法函数里各写一遍 `manaSpent += ...`：
+    //     · mode=5 的 CastChecked / TryCastAt / CastIdAt / CastSelfCentered 每次成功都会
+    //       `PlayerbotAI::RecordSpellCast` ⇒ 计数 +1；
+    //     · mode=1/2/3 的评分路径走 `dpsvalue::CastId`（DpsValue.inc，不在本次允许改动的文件里），
+    //       它同样只调 `RecordSpellCast` ⇒ 只有按"成功次数差"结算才能一次覆盖两条路径，
+    //       也不会因为两处都 + 而重复计数。
+    //   粒度 = 相邻两次 Sync（Tick 每 tick 调一次），但只包含真实成功的施法，不含"施法被拒"。
+    // ==========================================================================
+    void SyncManaSpent(BotMem* m, Player* bot)
+    {
+        if (!m || !bot)
+            return;
+        if (m->spec != Spec::Arcane && m->spec != Spec::Frost)
+            return;
+        for (std::map<uint32, uint64>::const_iterator it = bot->botSpellCounts.begin();
+            it != bot->botSpellCounts.end(); ++it)
+        {
+            uint32 const id = it->first;
+            uint64 const total = it->second;
+            uint64& seen = m->manaCounts[id];
+            if (total <= seen)
+            {
+                if (total < seen)       // 计数被重置（重登/重置统计）⇒ 重新对齐，不补差额
+                    seen = total;
+                continue;
+            }
+            uint64 const fresh = total - seen;
+            seen = total;
+            SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+            if (!entry)                 // 拿不到法术模板 ⇒ 跳过，不瞎估
+                continue;
+            m->manaSpent += uint64(entry->manaCost) * fresh;
+        }
+    }
+
+    // [DPSFSM-MANA] <bot> spent=<累计法力消耗> pct=<当前蓝量%>：10 秒一条节流（不是每 tick 打）。
+    //   由 Tick() 在本 tick 末尾统一调用（mode=5 走完 FSM / mode=1/2/3 走完策略表之后），
+    //   两种模式的统计口径一致，可以直接横向比 DPM。
+    void ManaLogTick(BotMem* m, Player* bot)
+    {
+        if (!m || !bot)
+            return;
+        if (m->spec != Spec::Arcane && m->spec != Spec::Frost)
+            return;
+        SyncManaSpent(m, bot);          // 先结算本 tick 之前新增的成功施法
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (m->lastManaLog && WorldTimer::getMSTimeDiff(m->lastManaLog, safeNow) < 10000)
+            return;
+        m->lastManaLog = safeNow;
+        m->lastManaSpent = m->manaSpent;
+        sLog.outError("[DPSFSM-MANA] %s spent=%llu pct=%.0f",
+            bot->GetName(), (unsigned long long)m->manaSpent, bot->GetPowerPercent());
     }
 
     // [2026-10-29 诊断结论] 原来只判 IsSpellReady 就放，失败也照样每 tick 重试（怒气不够、目标闪避条件、
@@ -3551,6 +3619,38 @@ namespace ai
     // ==========================================================================
     uint32 const kArcaneBlastDebuff = 36032;    // 奥术冲击的叠层 debuff（TBC 独立 id）
 
+    // [2026-10-31 站长口径] **冰脉尾巴窗口按"还能不能放下下一发奥冲"动态算**：
+    //   tail = 当前急速下奥术冲击的实际读条 + `iv_tail_margin`（默认 0）；
+    //   冰脉剩余 `ivRemain > tail` ⇒ 还塞得下一发奥冲 ⇒ 先不放唤醒（继续吃冰脉）；
+    //   `ivRemain <= tail` ⇒ 已经放不完一发奥冲 ⇒ 就是开唤醒（拉满引导落在冰脉尾巴里）的时机。
+    //   固定的 `iv_tail_window`（2500ms）不再是主判据，只留作"查不到奥冲读条"时的兜底
+    //   （例如 bot 没学会奥冲 / SpellEntry 缺失）；正常路径一律用 `iv_tail_margin`。
+    //   ⚠️ `GetSpellCastTime(entry, bot)` 不传 Spell 对象时**不套** UNIT_MOD_CAST_SPEED，
+    //      而冰脉/饰品/英雄正是通过这个字段加速；奥冲是普通法术（非 IS_ABILITY），
+    //      真实路径会乘它 —— 这里按核心同一条件补上，否则"当前急速"这一层就丢了。
+    //      （装备的法术急速走 SPELLMOD_CASTING_TIME，需要 Spell 对象才拿得到；缺口由 `iv_tail_margin` 覆盖。）
+    int IvTailMs(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        uint32 const id = SpellId(ai, s.bot, m, "arcane blast", false);
+        SpellEntry const* entry = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
+        if (!entry)
+            return int(TP(m, "iv_tail_window", 2500.0));     // 兜底：沿用旧的固定尾巴窗口
+
+        int abCast = int(GetSpellCastTime(entry, s.bot));
+        if (abCast > 0
+            && !entry->HasAttribute(SPELL_ATTR_IS_ABILITY)
+            && !entry->HasAttribute(SPELL_ATTR_IS_TRADESKILL)
+            && !entry->HasAttribute(SPELL_ATTR_EX3_IGNORE_CASTER_MODIFIERS))
+        {
+            float const mod = s.bot->GetFloatValue(UNIT_MOD_CAST_SPEED);
+            if (mod > 0.2f && mod < 2.0f)
+                abCast = int(float(abCast) * mod + 0.5f);
+        }
+        if (abCast < 300 || abCast > 6000)                  // 异常值 ⇒ 当没有急速，别把窗口算翻
+            abCast = 2500;
+        return abCast + int(TP(m, "iv_tail_margin", 0.0));
+    }
+
     // [2026-10-31 站长口径] 法力宝石：法师 Recover 的第一顺位（瞬发、应急回蓝）。
     //   复用引擎现成的 "mana gem" 动作（`UseManaGemAction` 自己按等级挑宝石；`BOT_CHEATS=item`
     //   时免物品），不自己扫背包——`UseManaPotion` 那条扫包路已经证明了"物品识别"容易走偏。
@@ -3728,6 +3828,11 @@ namespace ai
             m->planStep = 0;
         }
 
+        // [2026-10-31 站长口径] 冰脉尾巴判据本 tick 只算一次：Recover 用它决定"放不放唤醒"，
+        //   [DPSFSM-ARC] 也用它解密 —— 日志里的 ivRemain/ivTail 必须就是刚才判据用的那两个数。
+        int const ivRemain = AuraRemain(ai, m, s, "icy veins");
+        int const ivTail = IvTailMs(ai, m, s);
+
         TickResult result = TickResult::Decline;
         switch (st)
         {
@@ -3735,17 +3840,17 @@ namespace ai
                 // [站长口径] 恢复顺序：宝石 → 大蓝（缺口 > potion_mana_deficit，默认 3000）→ 唤醒。
                 //   唤醒落地 = 切回 3+3 的节点（`EvalArcane` 下一 tick 就会给回 Maintain）。
                 //   三样都不行 ⇒ 交回引擎（喝水/魔杖）。
-                // [2026-10-31 站长口径] **唤醒要卡在冰脉的尾巴上**：冰脉还在、且剩余 > `iv_tail_window`
-                //   （默认 2500ms）时先不放，继续奥冲吃冰脉；进入尾巴再唤醒，让引导落在冰脉窗口里。
-                //   冰脉没开时不等，蓝到阈值就放。
+                // [2026-10-31 站长口径] **唤醒要卡在冰脉的尾巴上**：尾巴窗口不再写死，
+                //   `ivTail = 当前急速下奥冲实际读条 + iv_tail_margin`（见 IvTailMs）；
+                //   `ivRemain > ivTail` ⇒ 还塞得下一发奥冲 ⇒ 先不放，继续吃冰脉；
+                //   `ivRemain <= ivTail` ⇒ 放不完一发奥冲了 ⇒ 现在开唤醒，让引导落在冰脉窗口里。
+                //   冰脉没开时 ivRemain=0 ⇒ 不等，蓝到阈值就放。
                 if (UseManaGem(ai, m, s))
                     result = TickResult::Acted;
                 else if (UseManaPotion(m, s))
                     result = TickResult::Acted;
                 else
                 {
-                    int const ivRemain = AuraRemain(ai, m, s, "icy veins");
-                    int const ivTail = int(TP(m, "iv_tail_window", 2500.0));
                     bool const waitForIvTail = (ivRemain > ivTail);
                     if (!waitForIvTail && TryCastSelf(ai, m, s, "evocation"))
                         result = TickResult::Acted;
@@ -3796,7 +3901,9 @@ namespace ai
         }
 
         // [2026-10-31 站长口径] 奥法诊断：10 秒一条，字段固定 plan/step/stacks/mana/abaRemain，
-        //   便于脚本直接切（abaRemain = 奥冲叠层 debuff 剩余毫秒，没有该 debuff 时为 -1）。
+        //   便于脚本直接切（abaRemain = 奥冲叠层 debuff 剩余毫秒，没有该 debuff 时为 -1）；
+        //   [2026-10-31] 追加 ivRemain/ivTail：唤醒尾巴判据的两个原始数（ivTail 已含急速与 iv_tail_margin），
+        //   一眼能看出"这次为什么还在等 / 为什么现在开唤醒"。
         uint32 const nowMs = WorldTimer::getMSTime();
         uint32 const safeNow = nowMs ? nowMs : 1;
         if (!m->lastArcLog || WorldTimer::getMSTimeDiff(m->lastArcLog, safeNow) >= 10000)
@@ -3806,8 +3913,8 @@ namespace ai
             int diagRemain = -1;
             if (SpellAuraHolder* holder = s.bot->GetSpellAuraHolder(kArcaneBlastDebuff))
                 diagRemain = holder->GetAuraDuration();
-            sLog.outError("[DPSFSM-ARC] %s plan=%d step=%d stacks=%d mana=%.0f abaRemain=%d",
-                s.bot->GetName(), m->planId, m->planStep, diagStacks, s.power, diagRemain);
+            sLog.outError("[DPSFSM-ARC] %s plan=%d step=%d stacks=%d mana=%.0f abaRemain=%d ivRemain=%d ivTail=%d",
+                s.bot->GetName(), m->planId, m->planStep, diagStacks, s.power, diagRemain, ivRemain, ivTail);
         }
 
         return result;
@@ -4160,7 +4267,14 @@ namespace ai
 
             // [2026-10-30] 职业技能空间 + 专精策略（mode=1/2/3 开启；默认 legacy 走原分专精处理器）
             if (ModeIsTable(dmode))
-                return TickPolicy(ai, m);
+            {
+                bool const handled = TickPolicy(ai, m);
+                // [2026-10-31 站长口径] 本 tick 结束再结一次 [DPSFSM-MANA]（只统计，不改策略表行为）：
+                //   有蓝职业的 `spent` 按 `botSpellCounts` 的成功施法次数差累加（mode=3 的评分路径
+                //   走 dpsvalue::CastId，不经过 CastChecked，所以统一在这里结算），模式之间口径一致 ⇒ 可比 DPM。
+                ManaLogTick(m, bot);
+                return handled;
+            }
 
             // [2026-10-31 S2] mode=5：显式状态图。冰法（试点）+ 猎人三系（兽王/射击/生存）
             //   + [2026-10-31 站长口径] 奥法（蓝量驱动 + 3+3）。
@@ -4175,6 +4289,8 @@ namespace ai
                 ai::dpsfsm::TickResult const fsmResult = (m->spec == Spec::Frost)
                     ? TickFrostFsm(ai, m, s)
                     : (m->spec == Spec::Arcane ? TickArcaneFsm(ai, m, s) : TickHunterFsm(ai, m, s));
+                // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）
+                ManaLogTick(m, bot);
                 switch (fsmResult)
                 {
                     case ai::dpsfsm::TickResult::Acted:
