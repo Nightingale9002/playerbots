@@ -7,6 +7,7 @@
 #include "Maps/Map.h"
 #include "Entities/Pet.h"           // [2026-10-31 站长口径] 猎人宠物生命周期守卫要现场建宠物（Pet::Create）
 #include "Server/SQLStorages.h"     // sCreatureStorage：按 entry 取 CreatureInfo（hunter_pet_entry）
+#include "Server/DBCStores.h"       // [2026-11-01 站长口径] sSpellRangeStore：填充候选的射程过滤
 // [2026-10-31 根因] 宠物 AI 的选择由 `FactorySelector::selectAI` 按 UNIT_FLAG_PLAYER_CONTROLLED 决定：
 //   带这个 flag 的 HUNTER_PET 才是 PetAI（每 tick 复检追击 + 自动施法），否则退化成 GuardianAI
 //   （只在"主人被打"时 AttackStart，之后不管追击）。这里只用 dynamic_cast 打一行诊断日志。
@@ -190,6 +191,7 @@ namespace
         uint32 arcCasts = 0;
         // [2026-10-31 站长口径] `arc_diag=1` 时的分支取证（默认关）：本 tick 走了规则表里的哪一条。
         //   'S'=叠层 'F'=寒冰箭 'I'=瞬发 'B'=卡秒奥冲 'M'=蓝不足交回 'H'=Hold 'G'=读条中 '?'=其它状态
+        //   [2026-11-01 站长口径] 追加 'C' = 其它读条填充（灼烧 / 奥术飞弹，由填充候选表选出）
         char arcBranch = '?';
         uint32 arcDiagAt = 0;    // 取证日志节流（1 秒一条）
         uint32 lastGemTry = 0;   // 吃法力宝石的节流（没有宝石/还在 CD 时别每 tick 走一遍引擎）
@@ -199,6 +201,9 @@ namespace
         std::map<uint32, uint64> manaCounts; // 上次结算时 bot->botSpellCounts 的快照（id → 成功次数）
         uint32 lastManaLog = 0;  // [DPSFSM-MANA] 日志节流（WorldTimer 毫秒，10 秒一条）
         uint64 lastManaSpent = 0;// 上次打日志时的累计值（便于看出这一段涨了多少，也避免"没变化还刷屏"）
+        // [2026-11-01 站长口径] [DPSFSM-FILL] 填充筛选日志的节流（WorldTimer 毫秒，10 秒一条）：
+        //   要回答的是"这一手填充为什么是它"——窗口 W / 实际挑中 / 通过过滤的候选数。
+        uint32 lastFillLog = 0;
     };
 
     std::mutex s_disabledMutex;
@@ -3229,6 +3234,7 @@ namespace ai
             m->manaCounts.clear();
             m->lastManaSpent = 0;
             m->lastArcLog = 0;
+            m->lastFillLog = 0;
             m->lastThreatLog = 0;
             m->state = State::Idle;
             m->holdThisTick = false;
@@ -3734,6 +3740,146 @@ namespace ai
         return castMs;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] **填充改成"按窗口筛候选"**（奥法先做，冰法/火法复用同一套结构）
+    //
+    //   旧口径的填充是**写死的技能顺序**（火焰冲击 → 冰枪），两个实测病：
+    //     ① 1.5 秒级的技能（`scorch`，本核心 27078 一带）根本没被用上 —— 窗口 1.6~2.4 秒时
+    //        它才是唯一放得下的读条填充，写死顺序只会"寒冰箭塞不进 ⇒ 丢一对瞬发 ⇒ 空等"；
+    //     ② `fire blast`（火焰冲击）射程只有 **20 码**，站在 25~30 码放必然
+    //        `SPELL_FAILED_OUT_OF_RANGE` ⇒ **白丢一个 GCD**（写死顺序里它还永远排第一）。
+    //   新口径：候选表 + 过滤器 ——
+    //     窗口 W = 叠层 debuff 剩余（不在 3+3 时用一个很大的值）；
+    //     ① 过滤：学会了（`SpellId` ≠ 0）、**射程够**（核心 `GetSpellMaxRange(SpellRangeEntry)`）、
+    //        `Ready()`、蓝够（`SpellEntry->manaCost` ≤ 当前法力）；
+    //     ② 过滤 `实际读条 > W`（瞬发 castMs=0 恒过）；
+    //     ③ 剩下的按 `weight` 从高到低排序，逐个别试着放（放不出就下一个，绝不空等）；
+    //     ④ 一个都不剩 ⇒ 调用方 Hold。
+    //   `castMs` 是**基准**读条（无急速时的值），实际读条一律再走 `CastMsWithMod`
+    //   （按当前急速算；`fb_cast_ms` / `fill_margin` 那套 A/B 口径照旧生效）。
+    // --------------------------------------------------------------------------
+    struct FillCand
+    {
+        char const* name;
+        int castMs;      // 基准读条毫秒（瞬发 = 0）
+        float weight;    // 相对价值（越大越优先；默认值按 TBC 常识，用 TP() 可调）
+        uint32 gate;     // 额外门槛 FillGate（0 = 通用填充）
+    };
+
+    // 通用过滤（学会/射程/冷却/蓝/读条≤W）之外的那几种"只在特定场合才对"的候选。
+    enum FillGate : uint32
+    {
+        kFillAlways   = 0,
+        kFillTailBand = 1u << 0,   // 只在"卡秒叠层相位"可用（奥冲：读条正好落在 debuff 尾巴上）
+        kFillFrozen   = 1u << 1,   // 只在目标被冻住时可用（冰枪：TBC 只对冰冻目标有 3 倍伤害）
+    };
+
+    // 门槛求值要用到的那几个数，由调用方算好传进来（别在过滤器里重算一遍）。
+    struct FillGateCtx
+    {
+        int remain = -1;        // 3+3 debuff 剩余毫秒（-1 = 没有 / 读不到时长）
+        int tailCastMs = 0;     // 卡秒相位用的基准读条（奥冲）
+        int tailMarginMs = 0;   // 卡秒容差（`fill_margin`）
+        bool frozen = false;    // 目标是否被冻住（`Unit::isFrozen()`，与冰枪脚本同一判据）
+        bool frozenOnly = true; // `ice_lance_frozen_only`：0 ⇒ 冰枪不看冻结（A/B 兜底）
+    };
+
+    // 这个候选现在能不能用：通用过滤 + 额外门槛 + 窗口。返回实际读条毫秒；不能放返回 -1。
+    int FillCastMs(PlayerbotAI* ai, BotMem* m, Snapshot& s, FillCand const& c, int windowMs, FillGateCtx const& g)
+    {
+        uint32 const id = SpellId(ai, s.bot, m, c.name, false);
+        if (!id)
+            return -1;                       // 没学会 / 本体没有这个法术
+        if (!Ready(s.bot, id))
+            return -1;                       // 冷却 / GCD / 沉默
+
+        // 射程：用核心的 `SpellEntry::rangeIndex` → `SpellRangeEntry.maxRange`，
+        //   留 1 码余量（`Snapshot::dist` 是 `GetDistance`，贴着边线会判 OUT_OF_RANGE）。
+        //   ⇒ 火焰冲击（20 码）在 25~30 码自动出局，不会再"放失败白丢 GCD"。
+        if (SpellEntry const* entry = sServerFacade.LookupSpellInfo(id))
+        {
+            float const maxRange = GetSpellMaxRange(sSpellRangeStore.LookupEntry(entry->rangeIndex));
+            if (maxRange > 0.0f && s.dist > maxRange - 1.0f)
+                return -1;
+        }
+
+        if (!AffordSpell(ai, m, s, c.name))
+            return -1;                       // 蓝不够（`SpellEntry->manaCost` vs 当前法力绝对值）
+
+        if (c.gate & kFillTailBand)
+        {
+            // 卡秒相位：**现在起手，读条正好落在 debuff 尾巴上**（起手吃 3 层，落地已回落）。
+            //   remain < 0 是异常兜底（模板在、holder 却读不到时长）⇒ 直接起手奥冲，绝不空等。
+            bool ok = (g.remain < 0);
+            if (!ok && g.remain >= g.tailCastMs)
+                ok = ((g.remain - g.tailCastMs) < g.tailMarginMs);
+            if (!ok)
+                return -1;
+        }
+        if (c.gate & kFillFrozen)
+        {
+            if (g.frozenOnly && !g.frozen)
+                return -1;                   // 普通目标打冰枪 = 极低伤害 + 白占 GCD
+        }
+
+        // 瞬发恒过窗口；读条技能按**当前急速**的实际读条判"这一发塞不塞得进 W"。
+        int const castMs = (c.castMs > 0) ? CastMsWithMod(ai, m, s, c.name, c.castMs) : 0;
+        if (castMs > windowMs)
+            return -1;
+        return castMs;
+    }
+
+    // 按权重从高到低，把"能放"的候选填进 out[]（最多 maxOut 个），返回个数。
+    //   调用方按返回顺序逐个试着放：第一个被拒（移动打断/朝向/核心条件）就试下一个，
+    //   一个都放不出才 Hold —— "能读寒冰箭就必须读"这件事由权重保证，不需要再写死顺序。
+    int PickFill(PlayerbotAI* ai, BotMem* m, Snapshot& s, FillCand const* cands, int candCount,
+                 int windowMs, FillGateCtx const& g, char const* out[], int maxOut)
+    {
+        float weights[8] = { 0.0f };
+        int n = 0;
+        if (maxOut > 8)
+            maxOut = 8;
+        for (int i = 0; i < candCount; ++i)
+        {
+            if (n >= maxOut)
+                break;
+            FillCand const& c = cands[i];
+            if (FillCastMs(ai, m, s, c, windowMs, g) < 0)
+                continue;
+            // 插入排序（候选最多 6 个，没必要为它上 std::sort 的 lambda）
+            int k = n;
+            while (k > 0 && weights[k - 1] < c.weight)
+            {
+                weights[k] = weights[k - 1];
+                out[k] = out[k - 1];
+                --k;
+            }
+            weights[k] = c.weight;
+            out[k] = c.name;
+            ++n;
+        }
+        return n;
+    }
+
+    // 奥法填充候选表（权重默认值照 TBC 常识，全部可用 TP() 覆盖做 A/B）：
+    //   · `arcane blast`（w_fill_ab=1.0）**只在卡秒叠层相位**可用（kFillTailBand）：
+    //     平时它是 3+3 的"叠层 / 收尾"那一手，当通用填充会把叠层一直顶满、吃不到回落节奏；
+    //   · `frostbolt`（w_fill_frostbolt=0.85，2.5 秒）是主填充；
+    //   · `scorch`（w_fill_scorch=0.7，1.5 秒）—— 窗口 1.6~2.4 秒时唯一放得下的读条填充；
+    //   · `fire blast`（w_fill_fireblast=0.6，瞬发）射程只有 20 码，靠射程过滤挡掉；
+    //   · `ice lance`（w_fill_icelance=0.3，瞬发）只在目标被冻住时（kFillFrozen）；
+    //   · `arcane missiles`（w_fill_missiles=0.5，引导 2.5 秒）窗口够才考虑。
+    int ArcaneFillCands(BotMem* m, FillCand out[6])
+    {
+        out[0] = FillCand{ "arcane blast",    2500, float(TP(m, "w_fill_ab", 1.0)),        kFillTailBand };
+        out[1] = FillCand{ "frostbolt",       2500, float(TP(m, "w_fill_frostbolt", 0.85)), kFillAlways };
+        out[2] = FillCand{ "scorch",          1500, float(TP(m, "w_fill_scorch", 0.7)),     kFillAlways };
+        out[3] = FillCand{ "fire blast",         0, float(TP(m, "w_fill_fireblast", 0.6)),  kFillAlways };
+        out[4] = FillCand{ "ice lance",          0, float(TP(m, "w_fill_icelance", 0.3)),   kFillFrozen };
+        out[5] = FillCand{ "arcane missiles", 2500, float(TP(m, "w_fill_missiles", 0.5)),   kFillAlways };
+        return 6;
+    }
+
     // [2026-10-31 站长口径] **冰脉尾巴窗口按"还能不能放下下一发奥冲"动态算**：
     //   tail = 当前急速下奥术冲击的实际读条 + `iv_tail_margin`（默认 0）；
     //   冰脉剩余 `ivRemain > tail` ⇒ 还塞得下一发奥冲 ⇒ 先不放唤醒（继续吃冰脉）；
@@ -3811,13 +3957,12 @@ namespace ai
     //   新口径照猎人 Maintain 那套（先算窗口还放得下什么，放得下就放，绝不放空等）：
     //   规则表（顺序，命中即停）：
     //     ⓪ 叠层（沿用）：debuff 没满 3 层 ⇒ 奥冲（不叠满就没有 3 层的增伤/加速）
-    //     ① 剩余 ≥ 寒冰箭读条 + `fill_margin`(默认 200ms) ⇒ 寒冰箭
-    //        （**只要能读就必须读**，不再有"这一轮最多 3 发"的上限）
-    //     ② 剩余不够一发寒冰箭，但有瞬发可用 ⇒ 火焰冲击（CD 好）→ 冰枪（**仅目标被冻住时**，
-    //        见 ② 处的 [2026-11-01 站长口径]：普通目标打冰枪是白占 GCD）
-    //     ③ 寒冰箭会正好落在窗口尾巴（剩余 ∈ [寒冰箭读条, 寒冰箭读条 + `fill_margin`]）
-    //        ⇒ 奥冲（卡秒那发：起手仍吃到 3 层，落地时叠层已回落，同时是下一轮的第一发）
-    //     ④ 以上都不成立且确实什么都放不进 ⇒ Hold（**并自己转向**：Hold 时引擎整 tick 不跑，
+    //     ①~③ [2026-11-01 站长口径] 合成一步：**按窗口筛候选**（候选表 `ArcaneFillCands()`、
+    //        过滤器 `PickFill()`）—— 学会了 + 射程够 + 冷却好 + 蓝够 + 读条 ≤ 窗口 W 的候选里，
+    //        按权重从高到低逐个别试，挑中的那一手就是本 GCD。
+    //        （旧口径是写死顺序"寒冰箭 → 火焰冲击 → 冰枪 → 卡秒奥冲"：1.5 秒的灼烧永远轮不到，
+    //          而 20 码的火焰冲击在 25~30 码必然施法失败、白丢一个 GCD。）
+    //     ④ 候选一个都不剩且确实什么都放不进 ⇒ Hold（**并自己转向**：Hold 时引擎整 tick 不跑，
     //        朝向会冻结 ⇒ 下一发施法/挥击被 IsInFront 判掉，战士那套的坑对法系一样成立）
     //     ⑤ 蓝不足放任何技能 ⇒ 交回引擎（下一 tick `recover_enter` 判据会把它送进 Recover）
     //
@@ -3907,7 +4052,7 @@ namespace ai
         if (m->planStep < 3)
             m->planStep = 3;
 
-        // ---- 窗口预算：这一发寒冰箭要读多久（当前急速）+ 填充余量 ----
+        // ---- 窗口预算：这一发读条要多久（当前急速）+ 填充余量 ----
         //   余量的意义：读条的最后 `fill_margin` 毫秒里 debuff 已经掉光也不亏（寒冰箭本来就不吃叠层），
         //   留这点余量是为了容忍"读条开始到服务器结算"的那点时间差，别把一发读条截在尾巴上。
         //   ⚠️ `GetSpellCastTime` **不含天赋/装备的 SPELLMOD_CASTING_TIME**（改良寒冰箭 −0.5 秒这类
@@ -3917,43 +4062,74 @@ namespace ai
         int const fbCastCfg = int(TP(m, "fb_cast_ms", 0.0));
         int const fbCast = (fbCastCfg >= 300 && fbCastCfg <= 6000)
             ? fbCastCfg : CastMsWithMod(ai, m, s, "frostbolt", 2500);
+        // [2026-11-01 站长口径] `fbBudget` 只留给 [DPSFSM-ARC]/[DPSFSM-ARC-DIAG] 的日志口径
+        //   （它们要跟旧版数字直接对照）；**决策不再用它** —— 决策一律走下面的候选筛选。
         int const fbBudget = fbCast + fillMargin;
 
-        // ① 放得下整发寒冰箭 ⇒ 读它（能读就必须读；这里**没有**发数上限）
-        if (remain >= fbBudget && CastFirst(ai, m, s, { "frostbolt" }))
+        // ---- 填充：按窗口 W 筛候选（[2026-11-01 站长口径]，表与过滤器见 FillCand / PickFill）----
+        //   W = 叠层 debuff 剩余；读不到时长（remain<0）时用"大值"表示窗口足够
+        //   （卡秒奥冲另有 remain<0 的兜底，判在 kFillTailBand 里）。
+        int const windowMs = (remain >= 0) ? remain : 1000000;
+
+        FillGateCtx g;
+        g.remain = remain;
+        g.tailCastMs = CastMsWithMod(ai, m, s, "arcane blast", 2500);
+        g.tailMarginMs = fillMargin;
+        g.frozen = (s.target && s.target->isFrozen());
+        g.frozenOnly = (TP(m, "ice_lance_frozen_only", 1.0) >= 0.5);
+
+        FillCand cands[6];
+        int const candCount = ArcaneFillCands(m, cands);
+        char const* picks[6];
+        int const pickCount = PickFill(ai, m, s, cands, candCount, windowMs, g, picks, 6);
+
+        // 按权重逐个试着放：第一个被拒（移动打断/朝向/核心条件）就试下一个，绝不空等。
+        char const* picked = nullptr;
+        for (int i = 0; i < pickCount; ++i)
         {
-            m->arcBranch = 'F';
-            ++m->planStep;              // 纯诊断计数（见上面的说明，不再当上限）
-            return TickResult::Acted;
+            if (!CastFirst(ai, m, s, { picks[i] }))
+                continue;
+            picked = picks[i];
+            break;
         }
 
-        // ② 剩余不够一发寒冰箭 ⇒ 塞瞬发：火焰冲击（8 秒 CD，平时就是最便宜的 GCD 填充）→ 冰枪
-        //   [2026-11-01 站长口径] 冰枪（30455）在 TBC **只对冰冻目标**才有 3 倍伤害
-        //   （本核心 `Scripting/ClassScripts/Mage.cpp` 的 `IceLance::OnEffectExecute` 就是用
-        //   `target->isFrozen()` 判的，同一个判据），打普通目标是极低伤害 + 白占一个 GCD
-        //   ⇒ 从"通用填充"降级成"只在目标确实被冻住时才用"；没冻住就跳过，交给 ③/④。
-        //   判据直接用核心的 `Unit::isFrozen()`（= `HasAuraState(AURA_STATE_FROZEN)`）：
-        //   它与冰枪脚本同一份实现，比自己数 aura 更准（不会把法师自己/别人的冰环算成目标冻结）。
-        //   `ice_lance_frozen_only`（默认 1）：置 0 即恢复旧行为（非冻结也拿冰枪填），留作 A/B 兜底。
-        if (remain >= 0 && remain < fbCast)
+        // [DPSFSM-FILL] 10 秒一条：W / 实际挑中 / 通过过滤的候选数。
+        //   验收口径："窗口 1.6~2.4 秒时 pick=scorch"就是这张表在起作用
+        //   （旧写死顺序在同一时刻只会 pick=frostbolt 或 none，1.5 秒技能永远轮不到）。
+        //   [2026-11-01 站长口径] **窄窗候选（灼烧/瞬发）额外补一条、不受 10 秒节流**：
+        //   叠层窗口有 8 秒，`W` 落到 1.6~2.4 秒这种"只够一发 1.5 秒读条"的时刻每轮只出现一两次，
+        //   正好落进节流缝里就永远看不到 —— 而验收要的正是这一条。
+        //   常态（寒冰箭填充 / 卡秒奥冲）仍然 10 秒一条，不刷屏。
         {
-            bool const iceLanceOk = s.target && s.target->isFrozen()
-                && TP(m, "ice_lance_frozen_only", 1.0) >= 0.5;
-            if (CastFirst(ai, m, s, { "fire blast" })
-                || (iceLanceOk && CastFirst(ai, m, s, { "ice lance" })))
+            uint32 const nowMs2 = WorldTimer::getMSTime();
+            uint32 const safeNow2 = nowMs2 ? nowMs2 : 1;
+            bool const narrowPick = (picked
+                && strcmp(picked, "frostbolt") != 0 && strcmp(picked, "arcane blast") != 0);
+            if (narrowPick || !m->lastFillLog
+                || WorldTimer::getMSTimeDiff(m->lastFillLog, safeNow2) >= 10000)
             {
-                m->arcBranch = 'I';
-                return TickResult::Acted;
+                m->lastFillLog = safeNow2;
+                sLog.outError("[DPSFSM-FILL] %s W=%d pick=%s cands=%d",
+                    s.bot->GetName(), windowMs, picked ? picked : "none", pickCount);
             }
         }
 
-        // ③ 窄带：寒冰箭会正好落在窗口尾巴 ⇒ 卡秒那发奥冲（起手吃 3 层，落地已回落）
-        //   `remain < 0` 是异常兜底（模板在、holder 却读不到时长）⇒ 直接起手奥冲，绝不空等。
-        if ((remain < 0 || (remain >= fbCast && remain < fbBudget))
-            && CastFirst(ai, m, s, { "arcane blast" }))
+        if (picked)
         {
-            m->arcBranch = 'B';
-            m->planStep = 1;            // 这一发就是下一轮的第 1 发奥冲
+            if (strcmp(picked, "frostbolt") == 0)
+            {
+                m->arcBranch = 'F';
+                ++m->planStep;          // 纯诊断计数（见上面的说明，不再当上限）
+            }
+            else if (strcmp(picked, "arcane blast") == 0)
+            {
+                m->arcBranch = 'B';
+                m->planStep = 1;        // 卡秒这一发就是下一轮的第 1 发奥冲
+            }
+            else if (strcmp(picked, "fire blast") == 0 || strcmp(picked, "ice lance") == 0)
+                m->arcBranch = 'I';
+            else
+                m->arcBranch = 'C';     // 其它读条填充（灼烧 / 奥术飞弹）
             return TickResult::Acted;
         }
 
@@ -3964,7 +4140,7 @@ namespace ai
             return TickResult::Decline;
         }
 
-        // ④ 以上都不成立（真的一手都放不进）⇒ 有意空着；但**自己转向**，别让朝向冻住
+        // ④ 候选一个都不剩（真的一手都放不进 / 放不出）⇒ 有意空着；但**自己转向**，别让朝向冻住
         //    （Hold 时引擎整 tick 都不跑，而转向本来是引擎在 tick 里做的；见战士那套的注释）
         if (s.target && s.target != s.bot)
             s.bot->SetFacingToObject(s.target);

@@ -3236,6 +3236,43 @@ uint32 stuckFightCleared = 0;
             return "?";
         }
 
+        // [2026-11-01 站长口径] 每轮开始把参与测量的 bot 的**血/蓝**拉回满值。
+        //   原来只清冷却、不清资源：实测每轮开局法力只有 26~34%（第一轮 90%+），
+        //   "开局蓝不一样"是这台测量台**最大的方差源**（同一套参数的 dps 能差 40%）。
+        //   · 血/蓝拉满：法系开局蓝必须 = 满蓝，否则测的是"上一轮剩多少"。
+        //   · 怒气/能量**不拉满**：战士该从 0 怒起手（上一轮攒的怒气带进来，等于白送一发斩杀）；
+        //     能量/符文这类按职业自然恢复，不在这里人为加满。
+        //   · 只清**有害**光环：`RemoveAllAuras()` 会把天赋/buff（奥术智慧、法师护甲、战斗怒吼…）
+        //     一起剥掉，反而把每轮开局的属性打散；debuff 才是会污染下一轮的残留。
+        //     判据用 `SpellAuraHolder::IsPositive()`（与核心同一份正负判定），被动光环一律保留。
+        void ResetDummyVitals(DummyRun& d, Player* bot)
+        {
+            if (!bot || !bot->IsInWorld())
+                return;
+
+            bot->SetHealthPercent(100.0f);
+            if (uint32 const maxMana = bot->GetMaxPower(POWER_MANA))
+                bot->SetPower(POWER_MANA, maxMana);
+            if (d.cls == CLASS_WARRIOR)
+                bot->SetPower(POWER_RAGE, 0);
+
+            // 有害光环：先收集 spellId 再删 —— `RemoveAurasDueToSpell` 会改 `m_spellAuraHolders`，
+            //   边遍历边删是未定义行为（迭代器失效）。
+            std::vector<uint32> harmful;
+            for (auto const& kv : bot->GetSpellAuraHolderMap())
+            {
+                SpellAuraHolder* holder = kv.second;
+                if (!holder || holder->IsPassive() || holder->IsPositive())
+                    continue;
+                harmful.push_back(kv.first);
+            }
+            for (uint32 id : harmful)
+                bot->RemoveAurasDueToSpell(id);
+
+            sLog.outError("[DUMMY] %s 已重置 血=100 蓝=%u",
+                bot->GetName(), bot->GetPower(POWER_MANA));
+        }
+
         // ---- 训练假人场景 ----------------------------------------------------
         // 把 bot 摆到测试点并强开专精策略（登录后调用一次）
         void ApplyDummySetup(DummyRun& d, Player* bot)
@@ -4514,6 +4551,10 @@ uint32 stuckFightCleared = 0;
                     //   以前只有单专精路径清，`arms`/`dummyall` 没有 ⇒ 2 分钟级大招（冰冷血脉/召唤水元素）
                     //   会从上一条臂继承，同一套参数跨批差 30%+。参数必须传 false 才真清服务端冷却。
                     bot->RemoveAllCooldowns(false);
+                    // [2026-11-01 站长口径] 每轮开跑前**把血/蓝拉满 + 清有害光环**（所有路径统一）
+                    //   —— 开局蓝量是最大方差源（实测 26~34% vs 90%+），必须在计时起点重置。
+                    //   这一处是"本轮真正的开始"（`d.startMs` 就在下面刷新），所以日志每轮恰好一条。
+                    ResetDummyVitals(d, bot);
                     // 基线改成"假人到手之后"，避免把传送前的动作算进来
                     d.dmg0 = bot->botDamageDealt;
                     d.pet0 = bot->botPetDamageDealt;
