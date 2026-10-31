@@ -109,6 +109,10 @@ namespace
         int  mode = 0;                  // [2026-10-31 S1] 本 tick 解析出的 DecisionMode（存 int：
                                         //   枚举声明在 BotMem 之后；TickPolicy 直接读它，不再二次读 conf）
         time_t lastBurst = 0;           // [2026-10-31 S2] 上次进入爆发的时间（"早用早 CD"的门）
+        // [2026-10-31 站长口径] 宠物（水元素/地狱火/猎人宠物/暗影魔…）是 17 个专精共用的输出单元：
+        //   召唤失败只打一条诊断（别每 tick 刷屏），换了 bot 对象（重登）才允许再打一条。
+        bool petLogDone = false;        // 宠物召唤失败的诊断只打一次
+        Player* petLogBot = nullptr;    // 上次打诊断时的 bot 对象（重登后指针会变 ⇒ 重置一次）
         uint32 engRuns = 0;
         uint32 dupDebuff = 0;       // [2026-10-30] 同类 debuff 已被更强/相等效果占住时仍施放的次数（互斥分析用）         // 引擎真正跑过的 tick 数（诊断白字缺口用）
         uint32 movTicks = 0;        // 在移动的 tick 数（移动会打断挥击）
@@ -138,6 +142,7 @@ namespace
     std::map<uint32, std::set<ObjectGuid>> s_scenarioTargets;   // guid → 这一轮"自己的"假人
     std::map<uint32, std::map<std::string, double>> s_overrides; // guid → 本轮参数覆盖（调优并发用）
     std::map<uint32, uint32> s_scenarioRun;                      // guid → 登记它的 runId
+    std::map<uint32, uint32> s_petLogAt;                         // [2026-10-31] guid → 上次打 [DPSFSM-PET] 周期日志的毫秒时刻
 
     std::mutex s_memMutex;
     std::unordered_map<uint32, std::unique_ptr<BotMem>> s_mem;
@@ -684,6 +689,137 @@ namespace
         if (!pet || !pet->IsAlive())
             return false;
         return CastChecked(ai, m, s, name, pet, nullptr);
+    }
+
+    // ==========================================================================
+    // [2026-10-31 站长口径] **宠物控制**：17 个专精共用的一份实现（水元素/地狱火/猎人宠物/
+    //   暗影魔/树人…）。以前每处各自 `GetPet()` 判空、判活着，召唤失败又静默 ⇒
+    //   实测冰法 `pet=0` 而日志里看不出是"施法被拒"还是"没学会这个技能"。
+    //   统一成三个入口：PetPresent（在不在场）/ CommandPetAttack（该不该重新下令）/
+    //   SummonPetIfNeeded（没有就召，失败留一条可区分的诊断）。
+    // ==========================================================================
+
+    // 宠物在场 = 有宠物 + 活着 + 和主人在同一张图（换图/副本传送后宠物会在别的地图，
+    //   这种"影子宠物"绝不能再给它下令，否则指令跨图）。
+    bool PetPresent(Snapshot& s)
+    {
+        if (!s.bot || !s.bot->IsInWorld())
+            return false;
+        Pet* pet = s.bot->GetPet();
+        if (!pet || !pet->IsAlive() || !pet->IsInWorld())
+            return false;
+        // [2026-10-29 崩溃修] 不在世界里的对象调 GetMap() 会触发核心断言
+        //   （CountHostilesNear 那条注释同一个坑），所以先过 IsInWorld 再比地图。
+        return pet->GetMap() == s.bot->GetMap();
+    }
+
+    // 每 tick 的"宠物事务"：宠物没在咬当前目标（换目标 / 掉队 / 刚召出来）就重新下令。
+    //   返回 true = 这一 tick 宠物事务已处理（已在打同一目标，或刚下完令）；
+    //   没有宠物 / 没目标 / 宠物被禁止行动时返回 false（调用方照常放技能）。
+    //   顺带每 10 秒打一条 [DPSFSM-PET]，用 WorldTimer 节流（和 [DPSFSM-HB] 的 hbLast 同一套写法，
+    //   不要每 tick time(nullptr)）。
+    bool CommandPetAttack(Snapshot& s)
+    {
+        if (!s.bot || !s.bot->IsInWorld())
+            return false;
+
+        Pet* pet = s.bot->GetPet();
+        bool const present = PetPresent(s);
+
+        bool logDue = false;
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32& last = s_petLogAt[s.bot->GetGUIDLow()];
+            if (!last || WorldTimer::getMSTimeDiff(last, nowMs ? nowMs : 1) >= 10000)
+            {
+                last = nowMs ? nowMs : 1;
+                logDue = true;
+            }
+        }
+        if (logDue)
+        {
+            Unit* petVictim = present ? pet->GetVictim() : nullptr;
+            float petDist = -1.0f;
+            if (present && s.target && s.target->IsInWorld() && s.target->GetMap() == pet->GetMap())
+                petDist = pet->GetDistance(s.target);
+            sLog.outError("[DPSFSM-PET] %s pet=%s victim=%s dist=%.1f tgt=%s",
+                s.bot->GetName(), present ? "有" : "无",
+                petVictim ? petVictim->GetName() : "-", petDist,
+                s.target ? s.target->GetName() : "-");
+        }
+
+        if (!present || !s.target)
+            return false;
+        if (!s.target->IsInWorld() || !s.target->IsAlive() || s.target->GetMap() != pet->GetMap())
+            return false;
+
+        // 已经在咬这个目标：无需下令，宠物事务算处理完
+        if (pet->GetVictim() == s.target)
+            return true;
+
+        // 宠物被禁止行动（支配/惊吓/临时禁手）时下不了令，交回调用方，下一 tick 再试
+        if (pet->HasActionsDisabled())
+            return false;
+
+        // 换目标 / 掉队：走 PetAI::AttackStart（它按宠物类型自己选近战还是远程，并开始追击）。
+        //   裸 Unit::Attack 也可以，但会把"远程宠物该不该冲上去"这种判断留给调用方。
+        if (pet->AI())
+            pet->AI()->AttackStart(s.target);
+        else
+            pet->Attack(s.target, false);
+        return true;
+    }
+
+    // 没有宠物就召一只（水元素/地狱火/暗影魔…）。返回 true = 本 tick 真的放了召唤（占掉 GCD）。
+    //   失败时**只打一条**可区分原因的诊断（前缀 [DPSFSM-PET]）：
+    //     not-learned  —— SpellId 取不到/没学会（天赋没点、技能名对不上）
+    //     cast-failed  —— 学会了但施法被拒（带上引擎给的结果码，便于分射程/资源/姿态）
+    //     no-pet       —— 施法成功但宠物没出来（core 侧把它实现成 guardian/临时召唤时要留意）
+    //   每只 bot 每次重登只打一次（BotMem::petLogDone；bot 对象换了就重置）。
+    bool SummonPetIfNeeded(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* spellName)
+    {
+        if (m->petLogBot != s.bot)
+        {
+            m->petLogBot = s.bot;
+            m->petLogDone = false;
+        }
+
+        if (PetPresent(s))
+            return false;                    // 宠物已经在场，不用召
+
+        uint32 const id = SpellId(ai, s.bot, m, spellName, false);
+        bool const learned = (id != 0);
+        // 召唤技一律对自己放（对敌目标会被 CanCastSpell 判 TARGET_ENEMY）
+        bool const cast = learned && TryCastSelf(ai, m, s, spellName);
+
+        if (PetPresent(s))
+            return cast;                     // 召出来了（或这一 tick 刚放出来）
+
+        if (m->petLogDone)
+            return cast;
+        m->petLogDone = true;
+
+        if (!learned)
+        {
+            sLog.outError("[DPSFSM-PET] %s 召唤失败 '%s' reason=not-learned（没学会这个技能：天赋没点或技能名对不上）",
+                s.bot->GetName(), spellName);
+            return cast;
+        }
+        if (!cast)
+        {
+            // 再问一次引擎要结果码：TryCastSelf 只回 true/false，日志里要能看出"被拒"的具体原因
+            SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+            bool const canNow = ai->CanCastSpell(id, s.bot, 0, false, nullptr, false, false, false, &res);
+            sLog.outError("[DPSFSM-PET] %s 召唤失败 '%s'(id=%u) reason=cast-failed res=%d ready=%d cancast=%d",
+                s.bot->GetName(), spellName, id, int(res),
+                s.bot->IsSpellReady(id) ? 1 : 0, canNow ? 1 : 0);
+            return cast;
+        }
+
+        sLog.outError("[DPSFSM-PET] %s 召唤成功 '%s'(id=%u) 但宠物仍未出场 reason=no-pet（core 侧可能按 guardian/临时召唤实现）",
+            s.bot->GetName(), spellName, id);
+        return cast;
     }
 
     // [2026-10-30 修] 地面目标技（暴风雪/烈焰风暴/飓风/箭雨/火雨）原来**不做任何校验**就直接
@@ -2465,6 +2601,9 @@ namespace ai
                 return false;               // 走位归引擎
 
             case State::Aoe:
+                // [2026-10-31 站长口径] 群伤也不能让宠物闲着：掉队/换目标就重新下令（每 tick 检查，
+                //   10 秒一条 [DPSFSM-PET] 状态日志）
+                CommandPetAttack(s);
                 if (TryCastAt(ai, m, s, "blizzard", s.target->GetPositionX(),
                         s.target->GetPositionY(), s.target->GetPositionZ()))
                     return true;
@@ -2477,12 +2616,20 @@ namespace ai
                 // [2026-10-31 站长口径] 无蓝职业（战/贼）的爆发消耗品 = 加速药水；有蓝的这里自动跳过
                 if (UseHastePotion(m, s))
                     return true;
-                if (!s.bot->GetPet() && CastFirst(ai, m, s, { "summon water elemental" }))
+                // [2026-10-31 站长口径] 水元素走统一入口：没有宠物才召，失败留一条可区分的
+                //   [DPSFSM-PET] 诊断（原来裸 CastFirst 失败是静默的 ⇒ 实测 pet=0 查不出原因）
+                if (SummonPetIfNeeded(ai, m, s, "summon water elemental"))
                     return true;
                 if (CastFirst(ai, m, s, { "icy veins" }))
                     return true;
                 if (CastFirst(ai, m, s, { "cold snap" }))
                     return true;
+                return CastFirst(ai, m, s, { "frostbolt" });
+
+            case State::Burn:
+                // [2026-10-31 站长口径] 单体常规输出每 tick 先确认宠物在咬当前目标
+                //   （宠物掉队/换目标时要重新指令），再照原样放寒冰箭
+                CommandPetAttack(s);
                 return CastFirst(ai, m, s, { "frostbolt" });
 
             case State::Idle:
