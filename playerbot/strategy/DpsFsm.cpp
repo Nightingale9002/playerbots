@@ -5,6 +5,8 @@
 #include "playerbot/strategy/actions/AttackAction.h"
 #include "Grids/CellImpl.h"
 #include "Maps/Map.h"
+#include "Entities/Pet.h"           // [2026-10-31 站长口径] 猎人宠物生命周期守卫要现场建宠物（Pet::Create）
+#include "Server/SQLStorages.h"     // sCreatureStorage：按 entry 取 CreatureInfo（hunter_pet_entry）
 
 #include <cmath>
 #include <ctime>
@@ -125,6 +127,13 @@ namespace
         //   召唤失败只打一条诊断（别每 tick 刷屏），换了 bot 对象（重登）才允许再打一条。
         bool petLogDone = false;        // 宠物召唤失败的诊断只打一次
         Player* petLogBot = nullptr;    // 上次打诊断时的 bot 对象（重登后指针会变 ⇒ 重置一次）
+        // [2026-10-31 站长口径] 猎人宠物生命周期守卫（mend/revive/call/create）的节流时间戳，
+        //   单位毫秒（WorldTimer）。以前"宠物在不在"根本不归状态机管：召唤/复活全靠引擎，
+        //   而假人场景引擎让位 ⇒ 猎人常常整场没有宠物（`[DUMMY] ... pet=0`）。
+        uint32 petMendAt = 0;           // 上次尝试 mend pet
+        uint32 petReviveAt = 0;         // 上次尝试 revive pet
+        uint32 petCallAt = 0;           // 上次尝试 call pet（没有可召唤的宠物时别每 tick 重试）
+        bool petCreateSkipLogged = false;   // skip-create(non-scenario) 只打一次
         // [2026-10-31] 猎人时间轴诊断只打一次：把 core 算出来的稳固读条/急速倍率留痕，
         //   方便判断"这一轮用的是 1500 回落值还是真实急速值"。
         bool steadyCastLogged = false;
@@ -949,12 +958,33 @@ namespace
         return pet->GetMap() == s.bot->GetMap();
     }
 
+    // [2026-10-31 站长口径] [DPSFSM-PET] 的 10 秒节流（CommandPetAttack 与猎人宠物生命周期守卫共用）：
+    //   守卫在状态机**之前**跑，所以猎人的周期日志由守卫统一打（带 action 字段）；
+    //   冰法的水元素没有守卫，仍然由 CommandPetAttack 自己打。
+    //   共用同一个 s_petLogAt 时间戳 ⇒ 每只 bot 每 10 秒只有一行，不会两边各打一条。
+    bool PetLogDue(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(s_disabledMutex);
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        uint32& last = s_petLogAt[guid];
+        if (!last || WorldTimer::getMSTimeDiff(last, safeNow) >= 10000)
+        {
+            last = safeNow;
+            return true;
+        }
+        return false;
+    }
+
     // 每 tick 的"宠物事务"：宠物没在咬当前目标（换目标 / 掉队 / 刚召出来）就重新下令。
     //   返回 true = 这一 tick 宠物事务已处理（已在打同一目标，或刚下完令）；
     //   没有宠物 / 没目标 / 宠物被禁止行动时返回 false（调用方照常放技能）。
     //   顺带每 10 秒打一条 [DPSFSM-PET]，用 WorldTimer 节流（和 [DPSFSM-HB] 的 hbLast 同一套写法，
     //   不要每 tick time(nullptr)）。
-    bool CommandPetAttack(Snapshot& s)
+    //   [2026-10-31 站长口径] `allowLog=false` 由**猎人宠物守卫**传进来：守卫每 tick 都先跑，
+    //   它自己要在同一 tick 结尾打一条带 action 的 [DPSFSM-PET]；如果这里也打，就成了
+    //   "旧的先吃掉 10 秒窗口、守卫那行永远打不出来"（实测第一次跑就是这样）。
+    bool CommandPetAttack(Snapshot& s, bool allowLog = true)
     {
         if (!s.bot || !s.bot->IsInWorld())
             return false;
@@ -962,18 +992,7 @@ namespace
         Pet* pet = s.bot->GetPet();
         bool const present = PetPresent(s);
 
-        bool logDue = false;
-        {
-            std::lock_guard<std::mutex> lock(s_disabledMutex);
-            uint32 const nowMs = WorldTimer::getMSTime();
-            uint32& last = s_petLogAt[s.bot->GetGUIDLow()];
-            if (!last || WorldTimer::getMSTimeDiff(last, nowMs ? nowMs : 1) >= 10000)
-            {
-                last = nowMs ? nowMs : 1;
-                logDue = true;
-            }
-        }
-        if (logDue)
+        if (allowLog && PetLogDue(s.bot->GetGUIDLow()))
         {
             Unit* petVictim = present ? pet->GetVictim() : nullptr;
             float petDist = -1.0f;
@@ -1056,6 +1075,213 @@ namespace
         sLog.outError("[DPSFSM-PET] %s 召唤成功 '%s'(id=%u) 但宠物仍未出场 reason=no-pet（core 侧可能按 guardian/临时召唤实现）",
             s.bot->GetName(), spellName, id);
         return cast;
+    }
+
+    // ==========================================================================
+    // [2026-10-31 站长口径] **猎人宠物生命周期守卫**（mend / revive / call / create）
+    //   起因（站长指出这是猎人最关键的问题）：假人场景 `[DUMMY] ... pet=0`（宠物伤害 0）。
+    //   兽王的杀戮命令（Kill Command 34026）**必须有宠物在场且在打**，兽王一半循环靠它；
+    //   宠物不在 ⇒ 兽王 dps 直接掉一半。
+    //
+    //   根因：宠物从来没人管"在不在"—— summon/revive 全靠引擎的策略（call pet / revive pet /
+    //   mend pet 触发器），而假人场景引擎让位（`SkipEngine` 为真）、bot 又被 TeleportTo 到 GM 岛，
+    //   `character_pet.current` 槽的宠物根本不会自己跟过来 ⇒ 整场 pet=0。
+    //   （排查证据见 dev/KNOWN_ISSUES 第 34 章：PlayerbotFactory::InitPet 只在 Randomize 里跑，
+    //     假人场景走的是 ApplyDummySetup，不调 InitPet，也不用引擎的 hunter pet 策略。）
+    //
+    //   顺序（每 tick 最多做一件；真的放了技能就返回 true，别和状态机抢同一个 GCD）：
+    //     ① 在场（活着 + 同图）且 hp < pet_mend_hp（默认 60%）→ mend pet
+    //     ② 在场但**死了**（尸体还在世界里）→ revive pet；复活成功后下一 tick 走 ③ 补召
+    //     ③ 完全没有宠物 → call pet（把 current 槽的宠物拉回主人身边）
+    //        call 之后**仍然没有**（= 没有可召唤的宠物）→ 假人场景 + hunter_pet_autocreate 才现场建一只
+    //     ④ 有宠物 → 每 tick CommandPetAttack（换目标/掉队就重新下令）
+    //
+    //   阈值全部走 TP()：pet_mend_hp / hunter_pet_autocreate / hunter_pet_entry。
+    //   **生产安全**：自动创建只在假人场景（SkipEngine）生效——真人 bot 建宠会往 character_pet
+    //   写行、污染数据库，非假人场景直接跳过并打 skip-create(non-scenario)。
+    // ==========================================================================
+
+    // 假人场景专用：宠物"天生没有"时现场建一只。
+    //   调用顺序照抄 `PlayerbotFactory::InitPet()`（那是本核心唯一被验证过的建宠路径），
+    //   区别只在 entry 由 `hunter_pet_entry` 指定（默认掠食者 Rip-Blade Ravager 22123）。
+    //   ⚠️ 本核心**没有** `Player::CreatePet` 这个 API（grep 全仓库无此符号），只有 `Pet::Create`，
+    //      签名 `bool Pet::Create(uint32 guidlow, CreatureCreatePos&, CreatureInfo const*, uint32 pet_number)`；
+    //      TBC 构建里 `MANGOSBOT_TWO` 未定义 ⇒ `CreatureCreatePos` 用 5 参构造（无 phase 形参）。
+    Pet* CreateScenarioHunterPet(Player* bot, uint32 entry)
+    {
+        if (!bot || !bot->IsInWorld() || bot->getClass() != CLASS_HUNTER)
+            return nullptr;
+        Map* const map = bot->GetMap();
+        if (!map)
+            return nullptr;
+
+        CreatureInfo const* co = sCreatureStorage.LookupEntry<CreatureInfo>(entry);
+        if (!co)
+        {
+            sLog.outError("[DPSFSM-PET] %s 创建宠物失败 entry=%u reason=no-template（creature_template 里没有这一条）",
+                bot->GetName(), entry);
+            return nullptr;
+        }
+
+        CreatureCreatePos pos(map, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+            bot->GetOrientation());
+        uint32 const guid = map->GenerateLocalLowGuid(HIGHGUID_PET);
+        uint32 const petNumber = sObjectMgr.GeneratePetNumber();
+
+        Pet* pet = new Pet(HUNTER_PET);
+        if (!pet->Create(guid, pos, co, petNumber))
+        {
+            delete pet;
+            sLog.outError("[DPSFSM-PET] %s 创建宠物失败 entry=%u reason=create-failed", bot->GetName(), entry);
+            return nullptr;
+        }
+
+        pet->SetOwnerGuid(bot->GetObjectGuid());
+        pet->SetGuidValue(UNIT_FIELD_CREATEDBY, bot->GetObjectGuid());
+        pet->setFaction(bot->GetFaction());
+        pet->SetLevel(bot->GetLevel());
+        pet->InitStatsForLevel(bot->GetLevel());
+#ifndef MANGOSBOT_TWO
+        pet->SetLoyaltyLevel(BEST_FRIEND);
+#endif
+        pet->SetPower(POWER_HAPPINESS, HAPPINESS_LEVEL_SIZE * 2);
+        pet->GetCharmInfo()->SetPetNumber(pet->GetObjectGuid().GetEntry(), true);
+        pet->GetMap()->Add((Creature*)pet);
+        pet->AIM_Initialize();
+        pet->AI()->SetReactState(REACT_DEFENSIVE);
+        // InitPetCreateSpells 会按 DBC 的 CreatureSpellData（22123 → 11568）学家族技能：
+        //   角刺 Gore（还有低吼/撕咬），这也是"掠食者"作为目标宠物的理由。
+        pet->InitPetCreateSpells();
+        pet->LearnPetPassives();
+        pet->CastPetAuras(true);
+        pet->CastOwnerTalentAuras();
+        pet->UpdateAllStats();
+        pet->SetHealth(pet->GetMaxHealth());
+        pet->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
+        bot->SetPet(pet);
+        bot->SetPetGuid(pet->GetObjectGuid());
+#ifdef MANGOSBOT_TWO
+        pet->SetUInt32Value(UNIT_CREATED_BY_SPELL, 13481);   // Tame Beast（WotLK 分支才需要）
+#endif
+        pet->SavePetToDB(PET_SAVE_AS_CURRENT, bot);
+        bot->PetSpellInitialize();
+
+        sLog.outError("[DPSFSM-PET] %s 创建宠物 entry=%u", bot->GetName(), entry);
+        return pet;
+    }
+
+    // 返回 true = 本 tick 宠物守卫**放了技能**（占了 GCD，调用方应当立刻返回 Acted）。
+    bool HunterPetGuard(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!ai || !m || !s.bot || !s.bot->IsInWorld() || s.bot->getClass() != CLASS_HUNTER)
+            return false;
+
+        Pet* const raw = s.bot->GetPet();
+        bool const present = PetPresent(s);
+        // "死了但尸体还在世界里"：核心的 Pet::Die 会保留尸体到 IsCorpseExpired，期间 GetPet() 仍返回它
+        bool const dead = raw && !raw->IsAlive() && raw->IsInWorld();
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        char const* action = "none";
+        bool acted = false;
+
+        if (present)
+        {
+            // ① 血量低于阈值就喂血（Mend Pet 是引导技：正在读条/引导时不要插，否则白断一次输出）
+            float const mendHp = float(TP(m, "pet_mend_hp", 60.0));
+            if (raw->GetHealthPercent() < mendHp && !s.casting
+                && (!m->petMendAt || WorldTimer::getMSTimeDiff(m->petMendAt, safeNow) >= 5000))
+            {
+                m->petMendAt = safeNow;
+                if (TryCastPet(ai, m, s, "mend pet"))
+                {
+                    action = "mend";
+                    acted = true;
+                }
+            }
+            // ④ 有宠物：每 tick 确保它在咬当前目标（内部已判"同一目标"就直接返回，不会重复下令）
+            CommandPetAttack(s, false);
+        }
+        else if (dead)
+        {
+            // ② 宠物尸体还在：复活（Revive Pet 982 = SPELL_EFFECT_SUMMON_DEAD_PET，
+            //   effect 内部自己 `GetPet()` 找尸体，所以对**自己**施法即可）
+            if (!m->petReviveAt || WorldTimer::getMSTimeDiff(m->petReviveAt, safeNow) >= 5000)
+            {
+                m->petReviveAt = safeNow;
+                if (TryCastSelf(ai, m, s, "revive pet"))
+                {
+                    action = "revive";
+                    acted = true;
+                }
+            }
+        }
+        else
+        {
+            // ③ 完全没有宠物：先 Call Pet（883 = SPELL_EFFECT_SUMMON_PET；核心按
+            //   `Pet::LoadPetFromDB(owner, ..., current=false)` 拉 character_pet 的 current 槽。
+            //   注意：**没有 current 行时施法本身仍会"成功"**（EffectSummonPet 里 delete 掉新 pet），
+            //   所以成败只能看"放完之后宠物到底有没有出来"，不能看施法返回值。）
+            bool callTried = false;
+            if (!m->petCallAt || WorldTimer::getMSTimeDiff(m->petCallAt, safeNow) >= 10000)
+            {
+                m->petCallAt = safeNow;
+                callTried = true;
+                TryCastSelf(ai, m, s, "call pet");
+                if (PetPresent(s))
+                {
+                    action = "call";
+                    CommandPetAttack(s, false);
+                }
+            }
+
+            if (!PetPresent(s) && callTried)
+            {
+                if (TP(m, "hunter_pet_autocreate", 1.0) < 1.0)
+                {
+                    // 关掉自动创建：什么都不做（日志行里 action=none 已经能看出"没有可召唤的宠物"）
+                }
+                else if (!ai::dpsfsm::SkipEngine(s.bot->GetGUIDLow()))
+                {
+                    // 非假人场景：绝不建（会往 character_pet 写行、污染数据库）
+                    if (!m->petCreateSkipLogged)
+                    {
+                        m->petCreateSkipLogged = true;
+                        sLog.outError("[DPSFSM-PET] %s skip-create(non-scenario)", s.bot->GetName());
+                    }
+                }
+                else
+                {
+                    uint32 const entry = uint32(TP(m, "hunter_pet_entry", 22123.0) + 0.5);
+                    if (CreateScenarioHunterPet(s.bot, entry))
+                    {
+                        action = "create";
+                        acted = true;
+                        CommandPetAttack(s, false);    // 刚建好就立刻下令咬当前目标
+                    }
+                }
+            }
+        }
+
+        // 诊断：每 10 秒一行，字段 = pet=<有/无> alive=<0/1> hp=<%> action=<mend/revive/call/create/none>
+        //   （外加原来的 victim/dist/tgt，保持既有日志解析脚本可用）
+        if (PetLogDue(s.bot->GetGUIDLow()))
+        {
+            Pet* const pet = s.bot->GetPet();
+            bool const nowPresent = PetPresent(s);
+            Unit* petVictim = (nowPresent && pet) ? pet->GetVictim() : nullptr;
+            float petDist = -1.0f;
+            if (nowPresent && pet && s.target && s.target->IsInWorld() && s.target->GetMap() == pet->GetMap())
+                petDist = pet->GetDistance(s.target);
+            sLog.outError("[DPSFSM-PET] %s pet=%s alive=%d hp=%.0f action=%s victim=%s dist=%.1f tgt=%s",
+                s.bot->GetName(), nowPresent ? "有" : "无",
+                (pet && pet->IsAlive()) ? 1 : 0,
+                pet ? pet->GetHealthPercent() : -1.0f,
+                action, petVictim ? petVictim->GetName() : "-", petDist,
+                s.target ? s.target->GetName() : "-");
+        }
+        return acted;
     }
 
     // [2026-10-30 修] 地面目标技（暴风雪/烈焰风暴/飓风/箭雨/火雨）原来**不做任何校验**就直接
@@ -3165,6 +3391,13 @@ namespace ai
     ai::dpsfsm::TickResult TickHunterFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         using ai::dpsfsm::TickResult;
+
+        // [2026-10-31 站长口径] **宠物生命周期守卫放在状态机之前**：宠物在不在，直接决定
+        //   兽王的杀戮命令能不能出现（`[DUMMY] ... pet=0` 就是这条链断了）。
+        //   守卫放了技能（mend/revive/call）时它已经占掉本 tick 的 GCD ⇒ 直接 Acted，不抢第二手；
+        //   创建宠物不占 GCD，但同一个 tick 里也不该再放技能（新宠物要时间上召），同样按 Acted 收尾。
+        if (HunterPetGuard(ai, m, s))
+            return TickResult::Acted;
 
         // 仇恨档位本 tick 只算一次（诊断日志在 EvalThreat 内部按 10 秒节流）
         ThreatLevel const threat = EvalThreat(m, s);
