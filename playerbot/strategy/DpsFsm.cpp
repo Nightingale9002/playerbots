@@ -45,6 +45,7 @@ namespace ai
                 case State::Weave:    return "Weave";
                 case State::Recover:  return "Recover";
                 case State::Maintain: return "Maintain";
+                case State::Execute:  return "Execute";
             }
             return "?";
         }
@@ -117,6 +118,8 @@ namespace
         bool holdThisTick = false;
         // [2026-10-31 站长口径] [DPSFSM-THREAT] 诊断的节流（WorldTimer 毫秒，10 秒一条）
         uint32 lastThreatLog = 0;
+        // [2026-10-31 站长口径] [DPSFSM-MELEE] 诊断的节流（战士/盗贼共用一个字段：一只 bot 只会是其中一种）
+        uint32 lastMeleeLog = 0;
         bool policyLogged = false;
         bool behindWarned = false;
         bool coverageLogged = false;    // 覆盖率断言只打一次
@@ -4130,6 +4133,409 @@ namespace ai
         return result;
     }
 
+    // ==========================================================================
+    // [2026-10-31 站长口径] 近战接进 mode=5：战士（武器/狂暴）+ 盗贼（刺杀/战斗/敏锐）。
+    //   legacy 的 `TickWarrior` / `TickRogue` **一个字节都不动**（mode=0 仍走它们），
+    //   这里只复用它们已经验证过的口径：
+    //     · 战士：怒气是"能不能放这一手"的唯一门槛，`rage_enter` / `rage_exit` 做滞回；
+    //       不够放关键技能时**有意空着等普攻回怒**（Hold）—— 交回引擎它就会插自己的技能，
+    //       把怒气换成非关键技能，节奏就散了；
+    //     · 盗贼：能量同理（`energy_enter` / `energy_exit`）。
+    //       满星但能量不够终结技时也 Hold：连击点上限 5，继续攒星全浪费，交回引擎更糟；
+    //     · 近战都要找背（`NeedsBehind` + `GetBehind`）：站背后不吃招架/躲闪，毁伤这类还**要求**背后。
+    //       走位不占 GCD，但既然这一手已经交给移动，就不再抢第二个动作 ⇒ 按 Acted 收尾。
+    //   阈值一律走 TP()：rage_enter/rage_exit/range_melee/execute_hp/cleave_rage/rage_reserve/
+    //   energy_enter/energy_exit/snd_refresh/snd_cp/fin_cp/fin_energy/aoe_pack/burst_interval/burst_window。
+    //   防护战不接管：`Spec::Protection` 在派发处就被排除，这里再兜一次 Decline（防御有另一套职责）。
+    // ==========================================================================
+
+    // [DPSFSM-MELEE] <bot> spec= state= rage= energy= combo= targetHp=：10 秒一条（节流，别每 tick 刷屏）。
+    //   字段固定，方便脚本直接切（站长口径的格式按这个念）。
+    void MeleeLogTick(BotMem* m, Snapshot& s, State st)
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (m->lastMeleeLog && WorldTimer::getMSTimeDiff(m->lastMeleeLog, safeNow) < 10000)
+            return;
+        m->lastMeleeLog = safeNow;
+        // 怒气按真实值打（战士的存储值 ×10，见 RageReal 的说明）；盗贼没有怒气恒为 0
+        int const rageShown = (s.bot && s.bot->getClass() == CLASS_WARRIOR) ? s.rage / 10 : s.rage;
+        sLog.outError("[DPSFSM-MELEE] %s spec=%s state=%s rage=%d energy=%d combo=%u targetHp=%.0f dist=%.1f pack10=%d",
+            s.bot ? s.bot->GetName() : "-", ai::dpsfsm::SpecName(m->spec), ai::dpsfsm::StateName(st),
+            rageShown, s.energy, uint32(s.combo), s.targetHp, s.dist, s.pack10);
+    }
+
+    // "学会了才放"：SpellId(warn=false) 不会往 unresolved 里塞噪音，也不会去试没学的技能。
+    bool MeleeLearned(PlayerbotAI* ai, Player* bot, BotMem* m, char const* name)
+    {
+        uint32 const id = SpellId(ai, bot, m, name, false);
+        return id != 0 && bot->HasSpell(id);
+    }
+
+    // [2026-10-31 站长口径] **怒气是"×10"存储的，阈值必须换算成真实怒气再比**。
+    //   本核心 `POWER_RAGE_DEFAULT = 1000`（Unit.h），怒气增益走
+    //   `Player::RewardRage()` → `ModifyPower(POWER_RAGE, addRage * 10)`，
+    //   所以 `Unit::GetPower(POWER_RAGE)` 给的是 0..1000 的**存储值**，而技能表里的消耗
+    //   （`SpellEntry->manaCost`：英勇 15 / 嗜血 30 / 致死 30）是**真实怒气**。
+    //   `Snapshot.rage` 直接存的是存储值 ⇒ 这里统一 /10 之后再跟 TP 的 10/30/60/75 比。
+    //   ⚠️ 不直接改 `Snapshot.rage` 本身：legacy `TickWarrior` 也读它，一动就把 mode=0 的行为
+    //      一起改了（何况它自己就是按 1/10 在比：`hs_rage=75` 实际只有 7.5 怒就泄英勇打击，
+    //      这就是它 40 秒刷 1000+ 次英勇、致死几乎放不出来的原因）。
+    //   实测印证（本修正前，mode=5 60 秒单目标）：fury 只有 1 次嗜血、78 次英勇打击、
+    //   怒气常年顶在 205（=20.5 真实怒气）；修正后见实测表。
+    int RageReal(Snapshot& s)
+    {
+        return s.rage / 10;
+    }
+
+    // --------------------------------------------------------------------------
+    // 战士：Idle → Recover（怒气 < enter，回到 exit）→ Aoe（pack10 + 近身）
+    //       → Burst（仇恨 Open + 间隔到）→ Execute（目标血 <= execute_hp）→ Approach → Maintain。
+    // --------------------------------------------------------------------------
+    State EvalWarrior(BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        // 怒气滞回：没滞回时会在 10 怒这条线上反复进出 Recover（每 tick 抖一次）
+        //   ⚠️ 单位：RageReal() 是真实怒气，TP 的 10/30 也是真实怒气（见 RageReal 的说明）
+        int const rageNow = RageReal(s);
+        int const rageEnter = int(TP(m, "rage_enter", 10.0));
+        int const rageExit = int(TP(m, "rage_exit", 30.0));
+        bool const alreadyRecover = (m->state == State::Recover);
+        if (alreadyRecover ? (rageNow < rageExit) : (rageNow < rageEnter))
+            return State::Recover;
+
+        float const meleeRange = float(TP(m, "range_melee", 6.5));
+        if (s.pack10 >= AoEPack(m) && s.dist <= meleeRange)
+            return State::Aoe;
+
+        // 爆发 = 仇恨放开 + 间隔到（早用早 CD）。窗口内保持 Burst，
+        //   让"饰品 → 死亡之愿 → 鲁莽 → 核心"跨几个 tick 依次放完（一个 GCD 只能放一个）。
+        time_t const now = time(nullptr);
+        if (now < m->burstUntil)
+            return State::Burst;
+        if (threat == ThreatLevel::Open
+            && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+            return State::Burst;
+
+        if (s.targetHp <= float(TP(m, "execute_hp", 20.0)))
+            return State::Execute;
+
+        if (s.dist > meleeRange)
+            return State::Approach;
+
+        return State::Maintain;
+    }
+
+    // Maintain 动作表（顺序，命中即停）：核心（武器=致死 / 狂暴=嗜血）→ 旋风斩 → 压制 → 猛击
+    //   → 英勇打击（怒气 >= rage_reserve 才泄怒；它是"下一次挥击附带"，用 TrySwing 防重复挂）。
+    ai::dpsfsm::TickResult TickWarriorMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        bool const fury = (m->spec == Spec::Fury);
+        char const* core = fury ? "bloodthirst" : "mortal strike";
+
+        if (CastFirst(ai, m, s, { core }))
+            return TickResult::Acted;
+        if (CastFirst(ai, m, s, { "whirlwind" }))
+            return TickResult::Acted;
+        if (CastFirst(ai, m, s, { "overpower" }))
+            return TickResult::Acted;
+        if (CastFirst(ai, m, s, { "slam" }))
+            return TickResult::Acted;
+        // 英勇打击会顶掉这次普攻（等于用普攻的怒换伤害）⇒ 只有怒气高出保留线才泄
+        //   （真实怒气 vs `rage_reserve`，见 RageReal 的说明）
+        if (RageReal(s) >= int(TP(m, "rage_reserve", 75.0)) && TrySwing(ai, m, s, "heroic strike"))
+            return TickResult::Acted;
+
+        return TickResult::Decline;
+    }
+
+    ai::dpsfsm::TickResult TickWarriorFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        if (m->spec == Spec::Protection)
+            return TickResult::Decline;     // 防御战不归 DPS 状态机
+
+        // 读条中（猛击有 1.5 秒读条）：一个技能都不插，否则会把这一发顶掉
+        if (s.casting)
+        {
+            MeleeLogTick(m, s, m->state);
+            return TickResult::Acted;
+        }
+
+        // [2026-10-31 站长口径] 近战**自己负责朝向**：Hold 时引擎整 tick 都不跑，
+        //   而引擎的 AttackAction/ChaseAction 正是每 tick 把 bot 转向目标的那个地方。
+        //   状态机一 Hold，朝向就冻结 ⇒ `Unit::AttackSwing()` 每发都判
+        //   SWING_ERROR_BAD_FACING，只把攻击计时器重置成 100ms、**既不产生伤害也不产生怒气**
+        //   ⇒ 战士永远攒不到怒、永远出不了 Recover（实测 40 秒 dmg=594、melee=1、swing 恒 100ms、
+        //   rage 只从 0 爬到 26）。所以这里自己转一次，和 CastChecked 里对施法目标转一次同理。
+        if (s.target && s.target != s.bot)
+            s.bot->SetFacingToObject(s.target);
+
+        // 仇恨档位本 tick 只算一次（诊断日志在 EvalThreat 内部按 10 秒节流）
+        ThreatLevel const threat = EvalThreat(m, s);
+        State const st = EvalWarrior(m, s, threat);
+
+        // 进入 Burst 的那一刻打点（不是每 tick 重置）：窗口才能跨 tick 放完整套爆发
+        if (st == State::Burst && m->state != State::Burst)
+        {
+            m->lastBurst = time(nullptr);
+            m->burstUntil = m->lastBurst + time_t(TP(m, "burst_window", 6.0));
+        }
+        m->state = st;
+
+        // 狂暴战必须在**狂暴姿态**：旋风斩只要狂暴姿态，实测默认战斗姿态时它整场 0 次
+        //   （见 legacy TickWarrior 的注释）。只占一个 GCD，开场切一次就一直保持。
+        if ((m->spec == Spec::Fury) && s.bot->GetShapeshiftForm() != FORM_BERSERKERSTANCE
+            && (st == State::Aoe || st == State::Burst || st == State::Execute || st == State::Maintain))
+        {
+            if (TryCastSelf(ai, m, s, "berserker stance"))
+            {
+                MeleeLogTick(m, s, st);
+                return TickResult::Acted;
+            }
+        }
+
+        TickResult result = TickResult::Decline;
+
+        // 找背：只放走位、不占 GCD，但这一 tick 已经交给移动 ⇒ 不再抢技能
+        bool const wantBehind = (st == State::Aoe || st == State::Burst
+            || st == State::Execute || st == State::Maintain);
+        if (wantBehind && NeedsBehind(s.bot) && GetBehind(ai, m, s))
+        {
+            result = TickResult::Acted;
+        }
+        else switch (st)
+        {
+            case State::Recover:
+                // 等怒气：什么都不放，而且**不让引擎插**（否则它会把怒气换成自己的技能）。
+                //   唯一例外是"没怒又够不着"：那就先让引擎把位置带过去，否则永远空等（0 怒 + 远距离 = 死锁）。
+                if (s.dist > float(TP(m, "range_melee", 6.5)))
+                    result = TickResult::Decline;
+                else
+                    result = TickResult::Hold;
+                break;
+
+            case State::Aoe:
+                // 横扫（战斗姿态）→ 旋风斩（狂暴姿态，武器战放不出就往下落）→ 顺劈（怒气够才用）
+                if (CastFirst(ai, m, s, { "sweeping strikes" }))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "whirlwind" }))
+                    result = TickResult::Acted;
+                else if (RageReal(s) >= int(TP(m, "cleave_rage", 60.0)) && TrySwing(ai, m, s, "cleave"))
+                    result = TickResult::Acted;
+                else
+                    result = TickWarriorMaintain(ai, m, s);
+                break;
+
+            case State::Burst:
+                // 饰品 → 死亡之愿（狂暴）→ 鲁莽（学会了才放；要狂暴姿态，放不出就落下一手）
+                //   → 核心（武器=致死 / 狂暴=嗜血）→ 都放完就回 Maintain 继续输出
+                if (UseTrinket(ai, m, s))
+                    result = TickResult::Acted;
+                else if (m->spec == Spec::Fury && CastFirst(ai, m, s, { "death wish" }))
+                    result = TickResult::Acted;
+                else if (MeleeLearned(ai, s.bot, m, "recklessness")
+                    && CastFirst(ai, m, s, { "recklessness" }))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { m->spec == Spec::Fury ? "bloodthirst" : "mortal strike" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickWarriorMaintain(ai, m, s);
+                break;
+
+            case State::Execute:
+                // 低血段：先打斩杀（核心对斩杀有 TargetAuraState=2 的门，只有目标 <20% 血才成立）。
+                //   放不出（怒气不够）就交回引擎 —— 这个窗口里别再拿怒气去换非斩杀技能。
+                if (CastFirst(ai, m, s, { "execute" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickResult::Decline;
+                break;
+
+            case State::Approach:
+                result = TickResult::Decline;   // 走位归引擎
+                break;
+
+            case State::Maintain:
+                result = TickWarriorMaintain(ai, m, s);
+                break;
+
+            case State::Idle:
+            default:
+                result = TickResult::Decline;
+                break;
+        }
+
+        MeleeLogTick(m, s, st);
+        return result;
+    }
+
+    // --------------------------------------------------------------------------
+    // 盗贼：Idle → Recover（能量 < enter，回到 exit）→ Aoe（pack10）→ Burst（仇恨 Open + 间隔到）
+    //       → Approach（够不着）→ Maintain。
+    //   TBC 盗贼没有真正的群伤（刀扇是 WLK）⇒ Aoe 就是把剑刃乱舞/冲动这两张 CD 技顶到最前，
+    //   之后完全复用单体表（与 legacy 同一口径）。
+    // --------------------------------------------------------------------------
+    State EvalRogue(BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        int const energyEnter = int(TP(m, "energy_enter", 20.0));
+        int const energyExit = int(TP(m, "energy_exit", 40.0));
+        bool const alreadyRecover = (m->state == State::Recover);
+        if (alreadyRecover ? (s.energy < energyExit) : (s.energy < energyEnter))
+            return State::Recover;
+
+        if (s.pack10 >= AoEPack(m))
+            return State::Aoe;
+
+        time_t const now = time(nullptr);
+        if (now < m->burstUntil)
+            return State::Burst;
+        if (threat == ThreatLevel::Open
+            && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+            return State::Burst;
+
+        if (s.dist > float(TP(m, "range_melee", 6.5)))
+            return State::Approach;
+
+        return State::Maintain;
+    }
+
+    // Maintain 动作表（顺序，命中即停）：
+    //   ① 切割（剩余 < snd_refresh 且星够 snd_cp）→ ② 满星且能量 >= fin_energy 放终结技
+    //   → ③ 满星但能量不够 ⇒ Hold（等能量、不攒星）→ ④ 攒星：刺杀毁伤 / 其他邪恶攻击。
+    ai::dpsfsm::TickResult TickRogueMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        bool const assassination = (m->spec == Spec::Assassination);
+
+        // ① 切割常驻：单位目标必须是**当前敌人** —— 核心对连击点法术要求
+        //   unitTarget == GetComboTargetGuid()，对自己放会判 NO_COMBO_POINTS(73)（legacy 实测切割整场 0 次）。
+        int const sndRefreshMs = int(TP(m, "snd_refresh", 3.0) * 1000.0);
+        int const sndCp = int(TP(m, "snd_cp", 4.0));
+        if (TryTable(ai, m, s, {
+                { "slice and dice", nullptr, nullptr, sndRefreshMs, nullptr, sndCp, 0 } }))
+            return TickResult::Acted;
+
+        int const finCp = int(TP(m, "fin_cp", 5.0));
+        int const finEnergy = int(TP(m, "fin_energy", 45.0));
+
+        // ② 星星满了：能量够就立刻泄；不够就**有意空着**（上限 5 星，再攒全浪费）
+        if (s.combo >= finCp)
+        {
+            if (s.energy >= finEnergy)
+            {
+                // 刺杀毒伤：核心要求目标身上有中毒状态（TargetAuraState=16），假人/没上毒的怪永远不成立
+                //   （legacy 实测 res=106）⇒ 放不出就剔骨兜底，别让满星烂在手里。
+                if (assassination ? CastFirst(ai, m, s, { "envenom", "eviscerate" })
+                                  : CastFirst(ai, m, s, { "eviscerate" }))
+                    return TickResult::Acted;
+                return TickResult::Decline;     // 不在射程/条件不满足 ⇒ 交回引擎走位
+            }
+            return TickResult::Hold;
+        }
+
+        // ③ 攒星：毁伤要求匕首 + 背后（随机 bot 经常不满足）⇒ 一定留邪恶攻击兜底，
+        //   否则整场 0 施法（legacy 实测 assassination 40 秒 casts=0）。
+        if (assassination ? CastFirst(ai, m, s, { "mutilate", "sinister strike" })
+                          : CastFirst(ai, m, s, { "sinister strike" }))
+            return TickResult::Acted;
+
+        return TickResult::Decline;
+    }
+
+    ai::dpsfsm::TickResult TickRogueFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        if (s.casting)
+        {
+            MeleeLogTick(m, s, m->state);
+            return TickResult::Acted;
+        }
+
+        // 朝向同上（战士那段注释）：Hold 时引擎不跑，没人替 bot 转向，普攻会全部 BAD_FACING
+        if (s.target && s.target != s.bot)
+            s.bot->SetFacingToObject(s.target);
+
+        ThreatLevel const threat = EvalThreat(m, s);
+        State const st = EvalRogue(m, s, threat);
+
+        if (st == State::Burst && m->state != State::Burst)
+        {
+            m->lastBurst = time(nullptr);
+            m->burstUntil = m->lastBurst + time_t(TP(m, "burst_window", 6.0));
+        }
+        m->state = st;
+
+        TickResult result = TickResult::Decline;
+
+        bool const wantBehind = (st == State::Aoe || st == State::Burst || st == State::Maintain);
+        if (wantBehind && NeedsBehind(s.bot) && GetBehind(ai, m, s))
+        {
+            result = TickResult::Acted;
+        }
+        else switch (st)
+        {
+            case State::Recover:
+                // 等能量：什么都不放、也不让引擎插（同战士的 Recover）；
+                //   够不着时例外（让引擎把位置带过去，别空等）。
+                if (s.dist > float(TP(m, "range_melee", 6.5)))
+                    result = TickResult::Decline;
+                else
+                    result = TickResult::Hold;
+                break;
+
+            case State::Aoe:
+                // 剑刃乱舞 → 冲动 → 落回单体表（TBC 盗贼"群伤"就这两张 CD 技）
+                if (CastFirst(ai, m, s, { "blade flurry" }))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "adrenaline rush" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickRogueMaintain(ai, m, s);
+                break;
+
+            case State::Burst:
+                // 饰品 → 冷血（刺杀）/ 冲动 → 剑刃乱舞 → 落回单体表
+                if (UseTrinket(ai, m, s))
+                    result = TickResult::Acted;
+                else if (m->spec == Spec::Assassination
+                    ? CastFirst(ai, m, s, { "cold blood" })
+                    : CastFirst(ai, m, s, { "adrenaline rush" }))
+                    result = TickResult::Acted;
+                else if (CastFirst(ai, m, s, { "blade flurry" }))
+                    result = TickResult::Acted;
+                else
+                    result = TickRogueMaintain(ai, m, s);
+                break;
+
+            case State::Approach:
+                result = TickResult::Decline;   // 走位归引擎
+                break;
+
+            case State::Maintain:
+                result = TickRogueMaintain(ai, m, s);
+                break;
+
+            case State::Idle:
+            default:
+                result = TickResult::Decline;
+                break;
+        }
+
+        MeleeLogTick(m, s, st);
+        return result;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -4277,10 +4683,16 @@ namespace ai
             }
 
             // [2026-10-31 S2] mode=5：显式状态图。冰法（试点）+ 猎人三系（兽王/射击/生存）
-            //   + [2026-10-31 站长口径] 奥法（蓝量驱动 + 3+3）。
+            //   + [2026-10-31 站长口径] 奥法（蓝量驱动 + 3+3）
+            //   + [2026-10-31 站长口径] 战士两系（武器/狂暴）+ 盗贼三系（刺杀/战斗/敏锐）。
+            //   **防护战不在名单里**（防御另有职责，继续走 legacy 的空转早退路径）。
             //   其它专精还没有图 ⇒ 继续往下走手写处理器，行为与 legacy 相同。
+            bool const warriorFsm = (m->spec == Spec::Arms || m->spec == Spec::Fury);
+            bool const rogueFsm = (m->spec == Spec::Combat || m->spec == Spec::Assassination
+                || m->spec == Spec::Subtlety);
             if (dmode == DecisionMode::Fsm
-                && (m->spec == Spec::Frost || m->spec == Spec::Arcane || IsHunterSpec(m->spec)))
+                && (m->spec == Spec::Frost || m->spec == Spec::Arcane || IsHunterSpec(m->spec)
+                    || warriorFsm || rogueFsm))
             {
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
@@ -4288,7 +4700,9 @@ namespace ai
                 //   Decline=我不处理，交回引擎（走位/追击/开怪/喝水）。
                 ai::dpsfsm::TickResult const fsmResult = (m->spec == Spec::Frost)
                     ? TickFrostFsm(ai, m, s)
-                    : (m->spec == Spec::Arcane ? TickArcaneFsm(ai, m, s) : TickHunterFsm(ai, m, s));
+                    : (m->spec == Spec::Arcane ? TickArcaneFsm(ai, m, s)
+                    : (IsHunterSpec(m->spec) ? TickHunterFsm(ai, m, s)
+                    : (warriorFsm ? TickWarriorFsm(ai, m, s) : TickRogueFsm(ai, m, s))));
                 // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）
                 ManaLogTick(m, bot);
                 switch (fsmResult)
