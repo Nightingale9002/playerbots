@@ -204,6 +204,9 @@ namespace
         // [2026-11-01 站长口径] [DPSFSM-FILL] 填充筛选日志的节流（WorldTimer 毫秒，10 秒一条）：
         //   要回答的是"这一手填充为什么是它"——窗口 W / 实际挑中 / 通过过滤的候选数。
         uint32 lastFillLog = 0;
+        // [2026-11-01 站长口径] `fill_dbg=1` 时候选读条日志的节流（1 秒一条，默认关）：
+        //   验收要看的是"寒冰箭 cast≈2500"（旧口径 3000，丢了 SPELLMOD_CASTING_TIME）。
+        uint32 lastFillDbg = 0;
     };
 
     std::mutex s_disabledMutex;
@@ -3712,11 +3715,12 @@ namespace ai
     uint32 const kArcaneBlastDebuff = 36032;    // 奥术冲击的叠层 debuff（TBC 独立 id）
 
     // [2026-10-31 站长口径] 某个法术在**当前急速下**的实际读条毫秒数（奥法预算排程要用的那个数）。
-    //   ⚠️ `GetSpellCastTime(entry, bot)` 不传 Spell 对象时**不套** UNIT_MOD_CAST_SPEED，
-    //      而冰脉/饰品/英雄正是通过这个字段加速；奥冲/寒冰箭都是普通法术（非 IS_ABILITY），
-    //      真实路径会乘它 —— 这里按核心同一条件补上，否则"当前急速"这一层就丢了。
-    //      （装备的法术急速走 SPELLMOD_CASTING_TIME，需要 Spell 对象才拿得到；缺口由
-    //       `fill_margin` / `iv_tail_margin` 覆盖。）
+    //   [2026-11-01 站长口径] **全部候选（含 frostbolt / scorch / 奥冲）统一走这一份**，不再分口径：
+    //     ① `GetSpellCastTime(entry, bot)`（不传 Spell 对象）**不含** `SPELLMOD_CASTING_TIME`
+    //        —— 改良寒冰箭 −0.5 秒这类天赋修正只有核心带 Spell 对象时才套得上，所以自动值会偏高
+    //        （实测寒冰箭 3000ms，真实 2500ms）⇒ 这里直接调 `Player::ApplySpellMod`
+    //        （与 `GetSpellCastTime` 内部同一个函数、同一条判据，`finalUse=false` 不消耗一次性充能）；
+    //     ② 再乘 `UNIT_MOD_CAST_SPEED`（冰脉/饰品/英勇走这个字段；核心只在"普通法术"上乘它）。
     //   fallback：拿不到模板、或读条异常（瞬发 / 数据缺失）时的回落值。
     int CastMsWithMod(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, int fallback)
     {
@@ -3726,6 +3730,15 @@ namespace ai
             return fallback;
 
         int castMs = int(GetSpellCastTime(entry, s.bot));
+        // 天赋/装备的 SPELLMOD_CASTING_TIME（改良寒冰箭、强化灼烧…）：核心在
+        //   `GetSpellCastTime` 里只对"带 Spell 对象"的调用套这一层，本模块没有 Spell 对象 ⇒ 自己补。
+        if (castMs > 0 && s.bot)
+        {
+            int32 modded = castMs;
+            s.bot->ApplySpellMod(id, SPELLMOD_CASTING_TIME, modded, false);
+            if (modded > 0)
+                castMs = modded;
+        }
         if (castMs > 0
             && !entry->HasAttribute(SPELL_ATTR_IS_ABILITY)
             && !entry->HasAttribute(SPELL_ATTR_IS_TRADESKILL)
@@ -3784,6 +3797,18 @@ namespace ai
         bool frozenOnly = true; // `ice_lance_frozen_only`：0 ⇒ 冰枪不看冻结（A/B 兜底）
     };
 
+    // 候选读条（**统一口径**：[2026-11-01 站长口径] 全部候选都走 `CastMsWithMod`，
+    //   含天赋的 SPELLMOD_CASTING_TIME + 当前急速；瞬发返回 0，没学会返回 -1）。
+    //   旧的 `c.castMs` 只当"表里的基准值/兜底值"用，不再直接参与窗口判定。
+    int CandCastMs(PlayerbotAI* ai, BotMem* m, Snapshot& s, FillCand const& c)
+    {
+        if (c.castMs <= 0)
+            return 0;                        // 瞬发：没有读条
+        if (!SpellId(ai, s.bot, m, c.name, false))
+            return -1;                       // 没学会 / 本体没有这个法术
+        return CastMsWithMod(ai, m, s, c.name, c.castMs);
+    }
+
     // 这个候选现在能不能用：通用过滤 + 额外门槛 + 窗口。返回实际读条毫秒；不能放返回 -1。
     int FillCastMs(PlayerbotAI* ai, BotMem* m, Snapshot& s, FillCand const& c, int windowMs, FillGateCtx const& g)
     {
@@ -3822,8 +3847,10 @@ namespace ai
                 return -1;                   // 普通目标打冰枪 = 极低伤害 + 白占 GCD
         }
 
-        // 瞬发恒过窗口；读条技能按**当前急速**的实际读条判"这一发塞不塞得进 W"。
-        int const castMs = (c.castMs > 0) ? CastMsWithMod(ai, m, s, c.name, c.castMs) : 0;
+        // 瞬发恒过窗口；读条技能按**当前急速 + 天赋修**的实际读条判"这一发塞不塞得进 W"。
+        int const castMs = CandCastMs(ai, m, s, c);
+        if (castMs < 0)
+            return -1;
         if (castMs > windowMs)
             return -1;
         return castMs;
@@ -4052,12 +4079,11 @@ namespace ai
         if (m->planStep < 3)
             m->planStep = 3;
 
-        // ---- 窗口预算：这一发读条要多久（当前急速）+ 填充余量 ----
+        // ---- 窗口预算：这一发读条要多久（当前急速 + 天赋修）+ 填充余量 ----
         //   余量的意义：读条的最后 `fill_margin` 毫秒里 debuff 已经掉光也不亏（寒冰箭本来就不吃叠层），
         //   留这点余量是为了容忍"读条开始到服务器结算"的那点时间差，别把一发读条截在尾巴上。
-        //   ⚠️ `GetSpellCastTime` **不含天赋/装备的 SPELLMOD_CASTING_TIME**（改良寒冰箭 −0.5 秒这类
-        //    只有拿到 Spell 对象才套得上），所以自动值会**偏高**（实测 3000ms，真实约 2500ms）。
-        //    偏高 ⇒ 规则①提前收手、规则③的窄带很难命中 ⇒ 可以用 `fb_cast_ms` 手工钉住真实读条做 A/B。
+        //   [2026-11-01 站长口径] `CastMsWithMod` 现在**含 SPELLMOD_CASTING_TIME**（改良寒冰箭 −0.5 秒），
+        //    自动值已贴近真实读条（寒冰箭 ≈2500、灼烧 ≈1500），`fb_cast_ms` 只剩"手工钉死做 A/B"的用途。
         int const fillMargin = int(TP(m, "fill_margin", 200.0));
         int const fbCastCfg = int(TP(m, "fb_cast_ms", 0.0));
         int const fbCast = (fbCastCfg >= 300 && fbCastCfg <= 6000)
@@ -4080,6 +4106,23 @@ namespace ai
 
         FillCand cands[6];
         int const candCount = ArcaneFillCands(m, cands);
+
+        // [2026-11-01 站长口径] `fill_dbg=1`（默认关）：把每个候选的**当前读条**打一条，
+        //   用来验收"读条口径统一走 SPELLMOD"——寒冰箭应 ≈2500（旧口径 3000），灼烧 ≈1500。
+        //   1 秒节流：窗口判定每 tick 都算，日志不能每 tick 刷。
+        if (TP(m, "fill_dbg", 0.0) >= 0.5)
+        {
+            uint32 const dbgNow = WorldTimer::getMSTime();
+            uint32 const dbgSafe = dbgNow ? dbgNow : 1;
+            if (!m->lastFillDbg || WorldTimer::getMSTimeDiff(m->lastFillDbg, dbgSafe) >= 1000)
+            {
+                m->lastFillDbg = dbgSafe;
+                for (int i = 0; i < candCount; ++i)
+                    sLog.outError("[DPSFSM-FILL] %s cand=%s cast=%d",
+                        s.bot->GetName(), cands[i].name, CandCastMs(ai, m, s, cands[i]));
+            }
+        }
+
         char const* picks[6];
         int const pickCount = PickFill(ai, m, s, cands, candCount, windowMs, g, picks, 6);
 

@@ -3236,12 +3236,14 @@ uint32 stuckFightCleared = 0;
             return "?";
         }
 
-        // [2026-11-01 站长口径] 每轮开始把参与测量的 bot 的**血/蓝**拉回满值。
+        // [2026-11-01 站长口径] 每轮开始把参与测量的 bot 的**血/蓝/能量**拉回满值。
         //   原来只清冷却、不清资源：实测每轮开局法力只有 26~34%（第一轮 90%+），
         //   "开局蓝不一样"是这台测量台**最大的方差源**（同一套参数的 dps 能差 40%）。
-        //   · 血/蓝拉满：法系开局蓝必须 = 满蓝，否则测的是"上一轮剩多少"。
-        //   · 怒气/能量**不拉满**：战士该从 0 怒起手（上一轮攒的怒气带进来，等于白送一发斩杀）；
-        //     能量/符文这类按职业自然恢复，不在这里人为加满。
+        //   · 血/蓝/能量拉满：法系开局蓝必须 = 满蓝，否则测的是"上一轮剩多少"；
+        //     盗贼/猫德的能量同理 —— 能量是**自然回满**的资源，开场给 0 等于白罚几秒
+        //     （第一发毒伤/背刺要干等回能，那段空窗会被算进 dps，是纯测量误差）。
+        //   · 怒气**归零**：战士该从 0 怒起手（上一轮攒的怒气带进来，等于白送一发斩杀）；
+        //     怒气是"打出来的"资源，和能量不是一回事。
         //   · 只清**有害**光环：`RemoveAllAuras()` 会把天赋/buff（奥术智慧、法师护甲、战斗怒吼…）
         //     一起剥掉，反而把每轮开局的属性打散；debuff 才是会污染下一轮的残留。
         //     判据用 `SpellAuraHolder::IsPositive()`（与核心同一份正负判定），被动光环一律保留。
@@ -3253,6 +3255,12 @@ uint32 stuckFightCleared = 0;
             bot->SetHealthPercent(100.0f);
             if (uint32 const maxMana = bot->GetMaxPower(POWER_MANA))
                 bot->SetPower(POWER_MANA, maxMana);
+            // [2026-11-01 站长口径] 能量开局必须满（盗贼 / 猫德）：能量本来就自然回满，
+            //   给 0 只会让开场白等几秒 —— 那是测量误差，不是这个专精的输出能力。
+            //   注意：本核心给**所有职业**都建了能量条（法师读出来也是 100），但只有
+            //   盗贼/猫德会消耗它，所以这一行对其余职业没有实际行为影响。
+            if (uint32 const maxEnergy = bot->GetMaxPower(POWER_ENERGY))
+                bot->SetPower(POWER_ENERGY, maxEnergy);
             if (d.cls == CLASS_WARRIOR)
                 bot->SetPower(POWER_RAGE, 0);
 
@@ -3269,8 +3277,9 @@ uint32 stuckFightCleared = 0;
             for (uint32 id : harmful)
                 bot->RemoveAurasDueToSpell(id);
 
-            sLog.outError("[DUMMY] %s 已重置 血=100 蓝=%u",
-                bot->GetName(), bot->GetPower(POWER_MANA));
+            sLog.outError("[DUMMY] %s 已重置 血=100 蓝=%u 能量=%u 怒=%u",
+                bot->GetName(), bot->GetPower(POWER_MANA), bot->GetPower(POWER_ENERGY),
+                bot->GetPower(POWER_RAGE));
         }
 
         // ---- 训练假人场景 ----------------------------------------------------
