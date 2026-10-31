@@ -229,6 +229,14 @@ namespace
         uint32 dotPrevAt = 0;
         int dotLastLifeSec = -1;
         float wlManaGap = 0.0f;   // 本 tick 的原始法力缺口（max - cur），[DPSFSM-WARLOCK] 与 life tap 共用
+        // [2026-11-01 站长口径] 术士·痛苦/恶魔（mode=5，与毁灭共用 TickWarlockFsmCore）专用：
+        //   wlDots    —— 当前目标身上这套 DoT/诅咒已挂几个（[DPSFSM-WARLOCK] 的 dots=，只统计不决策）。
+        //   wlMulti   —— 本 tick 参与多目标铺场的敌人数（multidot_max 截断后；单目标恒 1，日志 multi=）。
+        //   demoPetAt —— 宠物**第一次被看见在场**的毫秒时刻：恶魔牺牲的"不是刚召唤的"门用它，
+        //                宠物不在场就归零（重召后从头计时，不会把召唤的 GCD 白扔）。
+        int wlDots = 0;
+        int wlMulti = 1;
+        uint32 demoPetAt = 0;
         // [2026-11-01 站长口径] 法师·火法（mode=5）专用（详见 DpsFsm.cpp 的“法师·火法”一节）：
         //   fireFbSinceScorch —— 自上次补灼烧以来**放出的火球数**：维护节奏的**主**判据
         //                        （叠满后每 scorch_refresh_fireballs(8) 发火球补一次 ≈ 24 秒）；
@@ -718,7 +726,37 @@ namespace
         return total;
     }
 
-    int CountHostilesNear(PlayerbotAI* ai, Player* bot, float range)
+    // [2026-11-01 站长口径] **目标身上**某个 DoT/诅咒的剩余时间（毫秒），任意 rank。
+    //   与 AuraRemain() 的区别：那个只看施法者**自己**身上的 buff；DoT 续期判据要的是**目标**的
+    //   剩余时间 —— "剩余 < refresh_dot 就补"，而不是"没挂才补"。旧口径（AuraStacks()==0 才补）
+    //   会让 DoT 断档：到期的那一刻才想补，读条时间 + 反应延迟里目标身上是空的。
+    //   0 = 没挂（或没学会该法术）；999999 = 永久 debuff。
+    //   按法术链遍历的理由与 AuraStacks() 相同：bot 身上的 rank 与目标身上挂着的 rank 未必一致。
+    int TargetAuraRemain(PlayerbotAI* ai, Player* bot, BotMem* m, char const* name, Unit* u)
+    {
+        if (!u)
+            return 0;
+        uint32 id = SpellId(ai, bot, m, name, false);
+        if (!id)
+            return 0;
+        int best = 0;
+        uint32 first = sSpellMgr.GetFirstSpellInChain(id);
+        for (uint32 cur = first ? first : id; cur; cur = sSpellMgr.GetNextSpellInChain(cur))
+        {
+            SpellAuraHolder* holder = u->GetSpellAuraHolder(cur);
+            if (!holder)
+                continue;
+            int const dur = holder->GetAuraDuration();
+            int const remain = dur < 0 ? 999999 : dur;   // 永久 debuff
+            if (remain > best)
+                best = remain;
+        }
+        return best;
+    }
+
+    // [2026-11-01 站长口径] `out`（可选）= 同一份过滤口径下的**敌人列表**（痛苦术多目标铺腐蚀要用）。
+    //   传 nullptr 时行为与以前逐字节一致（只数个数），所以 pack10/pack30 的调用点一个都没动。
+    int CountHostilesNear(PlayerbotAI* ai, Player* bot, float range, std::vector<Unit*>* out = nullptr)
     {
         // [2026-10-29 崩溃修] 不在世界里的 bot 调 GetMap() 会触发核心断言 m_currMap 直接关服
         if (!bot || !bot->IsInWorld())
@@ -748,6 +786,8 @@ namespace
                 continue;
             if (!scenario.empty() && !scenario.count(u->GetObjectGuid()))
                 continue;
+            if (out)
+                out->push_back(u);
             ++n;
         }
         return n;
@@ -3362,6 +3402,12 @@ namespace ai
             m->dotTarget = ObjectGuid();
             m->dotPrevAt = 0;
             m->dotLastLifeSec = -1;
+            // [2026-11-01 站长口径] 痛苦/恶魔：多目标铺场计数与"宠物在场计时"必须跨轮清零 ——
+            //   上一轮的 wlMulti 会让新一轮的日志继续报旧的 multi 值，demoPetAt 更是直接骗过
+            //   "不是刚召唤的"那一道门（重开一轮 = 干净开局，宠物还没召）。
+            m->wlDots = 0;
+            m->wlMulti = 1;
+            m->demoPetAt = 0;
             // [2026-11-01 站长口径] 法师·火法：火球计数 / 灼烧记账 / 爆发轮次必须跨轮清零 ——
             //   否则上一轮已经开过起手轮（fireBurstDone & 1），下一轮的起手爆发直接哑掉；
             //   火球计数也会带着上一轮的尾巴，开局就补灼烧。
@@ -5262,6 +5308,232 @@ namespace ai
         return State::Maintain;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] 术士 · 痛苦（Affliction）+ 恶魔（Demonology）
+    //   两系**复用毁灭的骨架**（同一份 TickWarlockFsmCore / 同一套 TP 键 / 同一条日志前缀），
+    //   只把"单体输出表"换成 DoT 续期表、把群架档换个打法：
+    //
+    //   痛苦：**没有心爆式锚点 ⇒ 不需要时间轮**
+    //     DoT 到期续期（剩余 < refresh_dot 就补）+ 剩余 GCD 用 drain life / shadow bolt 填。
+    //     顺序：诅咒位（无诅咒 ⇒ 元素诅咒）→ 腐蚀 → 吸血（siphon life）→ 痛苦无常（UA）→ 填充。
+    //     每条 DoT 都要过"每 GCD 预期收益 > 填充技"的简化判据：目标预期存活 > dot_min_lifetime(8s)
+    //     （存活用血量斜率估，读不到就当长命）。生命分流 = 资源填充。
+    //     多目标：先给 30 码内**血量最多的前 multidot_max(5) 个**都铺上腐蚀，再谈单体；超过 5 个不扩。
+    //
+    //   恶魔：复杂度介于毁灭与痛苦之间
+    //     Prep：恶魔护甲（缺则补）+ 召唤恶魔卫士（未学会退小鬼）—— 与毁灭共用同一段 Prep；
+    //     Maintain：诅咒位 → 腐蚀 → 暗影箭填充；宠物持续咬当前目标（CommandPetAttack）；
+    //     爆发：饰品 + 恶魔牺牲（学会了、且宠物不是刚召唤的）或直接暗影箭；回蓝同样靠生命分流。
+    // ==========================================================================
+
+    // [DPSFSM-WARLOCK] 的 spec= 标签（验收脚本按它切日志）。
+    char const* WarlockSpecTag(Spec sp)
+    {
+        switch (sp)
+        {
+            case Spec::Affliction:  return "aff";
+            case Spec::Demonology:  return "demo";
+            case Spec::Destruction: return "destro";
+            default:                return "?";
+        }
+    }
+
+    // 目标身上"术士这一套"的 DoT/诅咒已挂几个（只给日志 dots= 用，不参与任何决策）。
+    int WarlockDotCount(PlayerbotAI* ai, Player* bot, BotMem* m, Unit* u)
+    {
+        if (!u)
+            return 0;
+        static char const* kDots[] = {
+            "corruption", "siphon life", "unstable affliction", "immolate",
+            "curse of the elements", "curse of shadows", "curse of agony", "curse of doom",
+        };
+        int n = 0;
+        for (char const* d : kDots)
+            if (AuraStacks(ai, bot, m, d, u) > 0)
+                ++n;
+        return n;
+    }
+
+    // [2026-11-01 站长口径] 痛苦·多目标：`NearbyEnemy` 里**血量最多的前 multidot_max(5) 个**才铺，
+    //   超过 5 个不扩。取列表用的是快照侧已有的 `possible targets`，与 CountHostilesNear() 同一份过滤
+    //   （敌对 + 存活 + 射程内 + 假人场景只数自己这一轮声明的目标），所以副本里也用同一套"看得见的敌人"。
+    //   排序用**当前绝对血量**降序：血最多的死得最慢 ⇒ 铺上去的腐蚀跳得最多。
+    //   返回 true = 本 tick 真的铺出一颗（占掉 GCD）；outCount = 参与铺场的敌人数（日志 multi=）。
+    bool WarlockMultiCorruption(PlayerbotAI* ai, BotMem* m, Snapshot& s, int& outCount)
+    {
+        outCount = 1;
+        int const cap = int(TP(m, "multidot_max", 5.0));
+        int const minTargets = int(TP(m, "multidot_min_targets", 2.0));
+        if (cap <= 1 || minTargets <= 1 || s.pack30 < minTargets)
+            return false;
+
+        std::vector<Unit*> list;
+        CountHostilesNear(ai, s.bot, float(TP(m, "range_caster", 30.0)), &list);
+        if (int(list.size()) < minTargets)
+            return false;
+        std::sort(list.begin(), list.end(), [](Unit* a, Unit* b)
+        {
+            if (a->GetHealth() != b->GetHealth())
+                return a->GetHealth() > b->GetHealth();
+            return a->GetObjectGuid() < b->GetObjectGuid();
+        });
+        if (int(list.size()) > cap)
+            list.resize(size_t(cap));
+        outCount = int(list.size());
+
+        // 每个目标只铺一颗：残留 > refresh_dot 的不动（同一目标重复铺会顶掉上一颗 ⇒ 白读一个 GCD）
+        int const refreshMs = int(TP(m, "refresh_dot", 3000.0));
+        for (Unit* u : list)
+        {
+            if (TargetAuraRemain(ai, s.bot, m, "corruption", u) > refreshMs)
+                continue;
+            if (TryCast(ai, m, s, "corruption", u))
+                return true;
+        }
+        return false;
+    }
+
+    // [2026-11-01 站长口径] 恶魔牺牲（demonic sacrifice 18788）的"能不能交"判据：
+    //   ① 学会了（SpellId 为 0 就静默跳过，不打"没有可用技能"的错日志）；
+    //   ② 增益还没在身上（重复交只是白杀一只宠物）；
+    //   ③ 宠物在场，而且**不是刚召唤的**（demo_pet_min_ms 默认 8 秒）—— 刚召出来就牺牲等于把
+    //      召唤那个 GCD 白扔；④ 开关 demo_sacrifice（默认 1）便于 A/B。
+    //   ⚠️ 这个法术的目标是**自己的恶魔**（对着自己放会 BAD_TARGETS）⇒ 必须走 TryCastPet()。
+    bool WarlockCanSacrifice(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 safeNow)
+    {
+        if (TP(m, "demo_sacrifice", 1.0) < 1.0)
+            return false;
+        if (!SpellId(ai, s.bot, m, "demonic sacrifice", false))
+            return false;
+        if (AuraStacks(ai, s.bot, m, "demonic sacrifice", s.bot) > 0)
+            return false;
+        if (!PetPresent(s) || !m->demoPetAt)
+            return false;
+        return WorldTimer::getMSTimeDiff(m->demoPetAt, safeNow)
+            >= uint32(TP(m, "demo_pet_min_ms", 8000.0));
+    }
+
+    // [2026-11-01 站长口径] 痛苦 / 恶魔的状态转移（骨架与 EvalWarlock 同构，只差两处）：
+    //   ① 痛苦的**群架不单开 Aoe 档**：多目标 = "多铺腐蚀"，落在 Maintain 里按血量前 5 铺，
+    //      铺满自然回单体表 ⇒ 状态表上少一档、少一处会漂移的分支；
+    //   ② 恶魔照旧用 Aoe（种子 + 暗影箭）：它的重心在宠物与暗影箭，不是铺 DoT。
+    //   其余（Prep 的护甲/宠物、Recover 的换蓝、Burst 的碎裂预判）与毁灭共用同一份判据与 TP 键。
+    State EvalWarlockDots(PlayerbotAI* ai, BotMem* m, Snapshot& s, ThreatLevel threat)
+    {
+        if (!s.target)
+            return State::Idle;
+
+        // ⓪ 开打前准备：恶魔护甲（没学会就不算"缺"）或宠物不在场
+        bool const needArmor = SpellId(ai, s.bot, m, "fel armor", false)
+            && AuraRemain(ai, m, s, "fel armor") == 0;
+        bool const needPet = !PetPresent(s);
+        if (needArmor || needPet)
+            return State::Prep;
+
+        // ① 资源：蓝见底 ⇒ Recover（life tap 是资源填充，见动作表）
+        if (s.power < float(TP(m, "recover_power", 12.0)))
+            return State::Recover;
+
+        // ② 群架（只有恶魔单开这一档，理由见函数头）
+        if (m->spec == Spec::Demonology && s.pack30 >= AoEPack(m))
+            return State::Aoe;
+
+        // ③ 射程：先到位再谈爆发
+        if (s.dist > float(TP(m, "range_caster", 30.0)))
+            return State::Approach;
+
+        // ④ 爆发：与毁灭同一份判据（仇恨贴着 0.95 上限跑 + burst_interval 到）
+        time_t const now = time(nullptr);
+        if (now < m->burstUntil)
+            return State::Burst;
+        if (threat != ThreatLevel::Wait && WarlockThreatOk(m, s)
+            && now - m->lastBurst >= time_t(TP(m, "burst_interval", 120.0)))
+            return State::Burst;
+
+        return State::Maintain;
+    }
+
+    // [2026-11-01 站长口径] 痛苦 / 恶魔的**单体输出表**（两系共用一份骨架，只差 DoT 清单与填充技）：
+    //   痛苦：诅咒位 → 腐蚀 → 吸血 → 痛苦无常 → drain life 填充（shadow bolt 兜底）；
+    //   恶魔：诅咒位 → 腐蚀 → 暗影箭填充。
+    //   每条 DoT 走**同一个续期判据**：`TargetAuraRemain() < refresh_dot(3000ms)` 就补，
+    //   不是"没挂才补"—— 这才是站长要的"到期续期"，旧口径会让 DoT 在到期的那一刻才想起来补。
+    ai::dpsfsm::TickResult TickWarlockDotsMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+
+        // 宠物：掉队/换目标就重新下令（宠物仇恨不算在 bot 头上）
+        CommandPetAttack(s);
+
+        bool const aff = (m->spec == Spec::Affliction);
+
+        // ① 诅咒位：目标身上没有任何诅咒 ⇒ 元素诅咒（与毁灭同一份判据）
+        if (AuraStacks(ai, s.bot, m, "curse of the elements", s.target) == 0
+            && AuraStacks(ai, s.bot, m, "curse of shadows", s.target) == 0
+            && AuraStacks(ai, s.bot, m, "curse of agony", s.target) == 0
+            && AuraStacks(ai, s.bot, m, "curse of doom", s.target) == 0
+            && TryCast(ai, m, s, "curse of the elements", nullptr))
+            return TickResult::Acted;
+
+        // ② 多目标（痛苦）：先把血量最多的前 multidot_max 个都铺上腐蚀，再谈单体；
+        //    multi 只用于日志（铺满之后仍报"这一场有几个目标"）。
+        m->wlMulti = 1;
+        if (aff)
+        {
+            int multi = 1;
+            bool const spread = WarlockMultiCorruption(ai, m, s, multi);
+            m->wlMulti = multi;
+            if (spread)
+            {
+                m->wlDots = WarlockDotCount(ai, s.bot, m, s.target);
+                return TickResult::Acted;
+            }
+        }
+
+        // ③ DoT 续期：只有"目标预期存活 > dot_min_lifetime"才值得花一个 GCD
+        int const lifeSec = WarlockDotLifetimeSec(m, s);
+        bool const dotWorth = (lifeSec < 0) || (float(lifeSec) > float(TP(m, "dot_min_lifetime", 8.0)));
+        int const refreshMs = int(TP(m, "refresh_dot", 3000.0));
+
+        if (dotWorth)
+        {
+            struct DotEntry { char const* name; bool affOnly; };
+            static DotEntry const kDots[] = {
+                { "corruption",          false },   // 两系都要
+                { "siphon life",         true  },   // 痛苦专属
+                { "unstable affliction", true  },   // 痛苦专属
+            };
+            for (DotEntry const& d : kDots)
+            {
+                if (d.affOnly && !aff)
+                    continue;
+                if (!SpellId(ai, s.bot, m, d.name, false))
+                    continue;                     // 没学会（天赋没点）：跳过，不刷"没有可用技能"
+                if (TargetAuraRemain(ai, s.bot, m, d.name, s.target) > refreshMs)
+                    continue;
+                if (TryCast(ai, m, s, d.name, nullptr))
+                {
+                    m->wlDots = WarlockDotCount(ai, s.bot, m, s.target);
+                    return TickResult::Acted;
+                }
+            }
+        }
+
+        // ④ 资源填充：填充技都放不起时，用一个 GCD 换蓝（血够 + 蓝缺口 > 阈值）
+        char const* fill = aff ? "drain life" : "shadow bolt";
+        if (!AffordSpell(ai, m, s, fill)
+            && m->wlManaGap > float(TP(m, "lifetap_deficit", 2000.0))
+            && s.selfHp > float(TP(m, "lifetap_hp", 55.0))
+            && TryCastSelf(ai, m, s, "life tap"))
+            return TickResult::Acted;
+
+        // ⑤ 填充：痛苦用吸取生命（引导，顺带回血），恶魔用暗影箭
+        m->wlDots = WarlockDotCount(ai, s.bot, m, s.target);
+        if (aff)
+            return FsmResult(CastFirst(ai, m, s, { "drain life", "shadow bolt" }));
+        return FsmResult(CastFirst(ai, m, s, { "shadow bolt" }));
+    }
+
     // 单体输出表（全部施法前都过 Ready()/射程，由 CastChecked 统一判）。
     ai::dpsfsm::TickResult TickWarlockMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
@@ -5309,7 +5581,11 @@ namespace ai
         return FsmResult(CastFirst(ai, m, s, { "shadow bolt" }));
     }
 
-    ai::dpsfsm::TickResult TickWarlockFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    // [2026-11-01 站长口径] 术士三系共用**同一份骨架**（`dotSpec=false` = 毁灭，`true` = 痛苦/恶魔）：
+    //   差别只有三处 —— ①Eval（EvalWarlock / EvalWarlockDots）；②群架档（种子 vs 多铺腐蚀）；
+    //   ③单体表（TickWarlockMaintain / TickWarlockDotsMaintain）+ 恶魔爆发里的"恶魔牺牲"一张牌。
+    //   毁灭（dotSpec=false）的每一次判断、每一个 TP 键、日志里的每个数值都与引入本次改动之前一致。
+    ai::dpsfsm::TickResult TickWarlockFsmCore(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool dotSpec)
     {
         using ai::dpsfsm::TickResult;
 
@@ -5324,6 +5600,18 @@ namespace ai
         uint32 const maxMana = s.bot->GetMaxPower(POWER_MANA);
         m->wlManaGap = maxMana ? float(maxMana) - float(s.bot->GetPower(POWER_MANA)) : 0.0f;
 
+        // [2026-11-01 站长口径] 恶魔牺牲的"不是刚召唤的"门：记宠物**第一次被看见在场**的时刻。
+        //   不在场 ⇒ 归零（换目标/宠物死/被牺牲都会走到这里，重召之后从头计时）。
+        if (PetPresent(s))
+        {
+            if (!m->demoPetAt)
+                m->demoPetAt = safeNow;
+        }
+        else
+        {
+            m->demoPetAt = 0;
+        }
+
         // 交战计时：有目标就开始计（换目标不重计，这是"这一场战斗"）；没目标 ⇒ 清场
         if (s.target)
         {
@@ -5337,7 +5625,7 @@ namespace ai
         }
 
         ThreatLevel const threat = EvalThreat(m, s);
-        State const st = EvalWarlock(ai, m, s, threat);
+        State const st = dotSpec ? EvalWarlockDots(ai, m, s, threat) : EvalWarlock(ai, m, s, threat);
 
         // 进入 Burst 的那一刻打点（不是每 tick 重置）：窗口才能跨 tick 放完"碎裂 → 饰品 → 暗影灼烧"
         if (st == State::Burst && m->state != State::Burst)
@@ -5367,7 +5655,8 @@ namespace ai
                     else if (SummonPetIfNeeded(ai, m, s, "summon imp"))
                         acted = true;
                 }
-                result = acted ? TickResult::Acted : TickWarlockMaintain(ai, m, s);
+                result = acted ? TickResult::Acted
+                    : (dotSpec ? TickWarlockDotsMaintain(ai, m, s) : TickWarlockMaintain(ai, m, s));
                 break;
             }
 
@@ -5381,7 +5670,7 @@ namespace ai
                 else if (UseManaPotion(m, s))
                     result = TickResult::Acted;
                 else if (s.power >= float(TP(m, "recover_power", 12.0)))
-                    result = TickWarlockMaintain(ai, m, s);   // 蓝还够打：别把 GCD 空成 0 DPS
+                    result = dotSpec ? TickWarlockDotsMaintain(ai, m, s) : TickWarlockMaintain(ai, m, s);   // 蓝还够打：别把 GCD 空成 0 DPS
                 else
                     result = TickResult::Hold;                // 蓝血都见底：等回蓝（不吃药就别动这一手）
                 break;
@@ -5391,6 +5680,19 @@ namespace ai
                 // [2026-11-01 站长口径] 群伤先做**单体版**：种子（每个目标只种一颗，重复种会顶掉
                 //   上一颗 ⇒ 白读一个 GCD）+ 暗影箭兜底。
                 CommandPetAttack(s);
+                // [2026-11-01 站长口径] 痛苦进不了这一档（EvalWarlockDots 不给它 Aoe），这里只是防御：
+                //   真的走到就把"前 multidot_max 个铺腐蚀"当群架，铺完用吸取生命填充。
+                if (dotSpec && m->spec == Spec::Affliction)
+                {
+                    int multi = 1;
+                    bool const spread = WarlockMultiCorruption(ai, m, s, multi);
+                    m->wlMulti = multi;
+                    if (spread)
+                        result = TickResult::Acted;
+                    else
+                        result = FsmResult(CastFirst(ai, m, s, { "drain life", "shadow bolt" }));
+                    break;
+                }
                 if (SpellId(ai, s.bot, m, "seed of corruption", false)
                     && AuraStacks(ai, s.bot, m, "seed of corruption", s.target) == 0
                     && TryCast(ai, m, s, "seed of corruption", nullptr))
@@ -5435,10 +5737,13 @@ namespace ai
                     }
                 }
 
-                // 饰品 → 暗影灼烧（学会了才放，且仇恨越线时收起）→ 暗影箭
+                // 饰品 → 恶魔牺牲（恶魔，宠物不是刚召唤的）→ 暗影灼烧（毁灭）→ 暗影箭
                 if (TP(m, "burst_trinket", 1.0) >= 1.0 && UseTrinket(ai, m, s))
                     result = TickResult::Acted;
-                else if (threatOk && SpellId(ai, s.bot, m, "shadowburn", false)
+                else if (dotSpec && m->spec == Spec::Demonology && WarlockCanSacrifice(ai, m, s, safeNow)
+                    && TryCastPet(ai, m, s, "demonic sacrifice"))
+                    result = TickResult::Acted;
+                else if (!dotSpec && threatOk && SpellId(ai, s.bot, m, "shadowburn", false)
                     && TryCast(ai, m, s, "shadowburn", nullptr))
                     result = TickResult::Acted;
                 else
@@ -5451,7 +5756,7 @@ namespace ai
                 break;
 
             case State::Maintain:
-                result = TickWarlockMaintain(ai, m, s);
+                result = dotSpec ? TickWarlockDotsMaintain(ai, m, s) : TickWarlockMaintain(ai, m, s);
                 break;
 
             case State::Idle:
@@ -5462,19 +5767,34 @@ namespace ai
 
         // [2026-11-01 站长口径] 每 10 秒一条状态日志（WorldTimer 节流）：
         //   state / threat=自己/坦克 / mana / hp / shatter(0/1) / last=上一手成功施放的法术
+        //   [2026-11-01 追加] spec=（aff/demo/destro，验收脚本按它切日志）、
+        //   dots=（当前目标已挂的 DoT/诅咒数，证明"到期真的续了"）、multi=（本 tick 铺场的敌人数）。
         if (!m->lastWarlockLog || WorldTimer::getMSTimeDiff(m->lastWarlockLog, safeNow) >= 10000)
         {
             m->lastWarlockLog = safeNow;
+            m->wlDots = WarlockDotCount(ai, s.bot, m, s.target);
             char const* last = "-";
             if (m->lastCastId)
                 if (SpellEntry const* e = sServerFacade.LookupSpellInfo(m->lastCastId))
                     last = e->SpellName[0];
-            sLog.outError("[DPSFSM-WARLOCK] %s state=%s threat=%.0f/%.0f mana=%.0f hp=%.0f shatter=%d last=%s",
-                s.bot->GetName(), ai::dpsfsm::StateName(st), s.myThreat, s.tankThreat,
-                s.power, s.selfHp, m->shatterUsed ? 1 : 0, last);
+            sLog.outError("[DPSFSM-WARLOCK] %s spec=%s state=%s threat=%.0f/%.0f mana=%.0f hp=%.0f shatter=%d dots=%d multi=%d last=%s",
+                s.bot->GetName(), WarlockSpecTag(m->spec), ai::dpsfsm::StateName(st), s.myThreat, s.tankThreat,
+                s.power, s.selfHp, m->shatterUsed ? 1 : 0, m->wlDots, m->wlMulti, last);
         }
 
         return result;
+    }
+
+    // [2026-11-01 站长口径] 三个入口（派发处按专精选）：
+    //   毁灭 → TickWarlockFsm()；痛苦 / 恶魔 → TickWarlockDotsFsm()（同一份骨架，dotSpec=true）。
+    ai::dpsfsm::TickResult TickWarlockFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        return TickWarlockFsmCore(ai, m, s, false);
+    }
+
+    ai::dpsfsm::TickResult TickWarlockDotsFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        return TickWarlockFsmCore(ai, m, s, true);
     }
 
     // ==========================================================================
@@ -7281,9 +7601,11 @@ namespace ai
             bool const warriorFsm = (m->spec == Spec::Arms || m->spec == Spec::Fury);
             bool const rogueFsm = (m->spec == Spec::Combat || m->spec == Spec::Assassination
                 || m->spec == Spec::Subtlety);
-            // [2026-11-01 站长口径] 术士只接**毁灭**（三系里最简单：主输出只有暗影箭）；
-            //   Affliction / Demonology 继续走 legacy `TickWarlock`（保持 Decline ⇒ 不改变任何行为）。
-            bool const warlockFsm = (m->spec == Spec::Destruction);
+            // [2026-11-01 站长口径] 术士**三系全部进图**：毁灭 → TickWarlockFsm()，
+            //   痛苦 / 恶魔 → TickWarlockDotsFsm()（共用 TickWarlockFsmCore 的骨架）。
+            //   mode=0/1/2/3/4 与 legacy `TickWarlock` **一个字节都不动**。
+            bool const warlockFsm = (m->spec == Spec::Destruction
+                || m->spec == Spec::Affliction || m->spec == Spec::Demonology);
             // [2026-11-01 站长口径] 火法接进 mode=5（第六张职业图）：`TickFireFsm`。
             //   mode=0/1/2/3/4 的火法照旧走 legacy `TickMage`，这条判断只影响 mode=5。
             bool const mageFsm = (m->spec == Spec::Frost || m->spec == Spec::Arcane
@@ -7324,7 +7646,8 @@ namespace ai
                 else if (shamanFsm)
                     fsmResult = TickShamanFsm(ai, m, s);
                 else
-                    fsmResult = TickWarlockFsm(ai, m, s);
+                    fsmResult = (m->spec == Spec::Destruction)
+                        ? TickWarlockFsm(ai, m, s) : TickWarlockDotsFsm(ai, m, s);
                 // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）
                 ManaLogTick(m, bot);
                 switch (fsmResult)

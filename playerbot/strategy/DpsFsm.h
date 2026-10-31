@@ -165,7 +165,10 @@ namespace ai
 
         // [2026-11-01 站长口径] mode=5（显式状态图）当前覆盖的专精：
         //   法师 冰/奥/火 · 猎人 兽王/射击/生存 · 战士 武器/狂暴 · 盗贼 战斗/刺杀/敏锐
-        //   · 术士 毁灭 · 圣骑士 惩戒 · **萨满 元素/增强**（第八张图：DpsFsm.cpp → TickShamanFsm()）。
+        //   · 术士 毁灭/**痛苦/恶魔** · 圣骑士 惩戒 · 萨满 元素/增强
+        //   （术士三系共用 `DpsFsm.cpp → TickWarlockFsmCore()`：毁灭走 `TickWarlockFsm()`，
+        //     痛苦/恶魔走 `TickWarlockDotsFsm()`，只换单体表与群架档；
+        //     痛苦 DoT 续期用 `TargetAuraRemain() < refresh_dot`，多目标铺前 `multidot_max` 个腐蚀）。
         //   萨满·恢复（Restoration）**不做 DPS** ⇒ 不进图，继续走 legacy TickShaman（治疗以后单独做）。
         //   萨满状态表（细节见 DpsFsm.cpp 的"萨满"一节）：
         //     元素：Idle / Prep(闪电盾缺失) / Approach(>range_cast) / Recover(蓝<recover_power)
