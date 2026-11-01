@@ -9539,7 +9539,10 @@ namespace ai
         uint32 const maxMana = bot->GetMaxPower(POWER_MANA);
         int const curMana = int(bot->GetPower(POWER_MANA));
         int const manaAfter = curMana - shiftCost;
-        int const shiftGatePct = int(TP(m, "powershift_min_mana_pct", 35.0));
+        // [2026-11-01 长局实测修正] 默认 **0**（=不限蓝，付不起就等自然回能）：gate=0 在 150 秒长局里
+        //   775.2 dps，比 gate=35（636.4）高 21.8%、比 gate=50（641.5）高 20.8%。机理：变身 18~22 次
+        //   ⇒ 撕碎 22→31 发、白字 114→129；蓝见底（6~12%）但没停手（casts 76 vs 54）。参数保留供 A/B。
+        int const shiftGatePct = int(TP(m, "powershift_min_mana_pct", 0.0));
         float const manaAfterPct = (maxMana && manaAfter > 0)
             ? 100.0f * float(manaAfter) / float(maxMana) : 0.0f;
         bool const manaShiftOk = maxMana && manaAfter >= 0
