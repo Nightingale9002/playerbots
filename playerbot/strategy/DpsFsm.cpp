@@ -12433,7 +12433,86 @@ namespace ai
         return acted ? TickResult::Acted : TickResult::Decline;
     }
 
-    bool Tick(PlayerbotAI* ai)
+    // ==========================================================================
+    // [2026-11-01 站长口径] **状态机独占施法权（mode=5 的战斗里）**
+    //   口径：`mode=5` 且**处于战斗**（IsInCombat 或 有 victim）⇒ 引擎不得施法，
+    //         无论状态机这一 tick 出手与否；脱战仍放行（补 buff / 喝水 / 上马 / 治疗 / 复活 / 拾取）。
+    //   为什么落在 Tick() 的**返回值**上：PlayerbotAI::UpdateAIInternal 里
+    //       `fsmHandled = dpsfsm::Tick(this)`  →  `fsmOwnsBot = fsmHandled`
+    //       `m_fsmCastLock = fsmOwnsBot && (bot->IsInCombat() || bot->GetVictim())`
+    //   返回 true 只合上**施法**闸门（动作层 EngineCastGuardListener + 出口层 CastSpell），
+    //   引擎这一 tick 照跑 DoNextAction ⇒ 走位/追击/平砍/上马/拾取/交易全不受影响（不用 Hold）。
+    //   mode=0~4 **一个字节不改**：返回 `handled && SkipEngine()`，与 dd09509d 之前完全一致
+    //   （副本里 SkipEngine 恒假 ⇒ 引擎照常施法；假人场景里照旧由状态机独占）。
+    //   参数（tune 文件，逐 bot 可覆盖）：
+    //     fsm_own_cast_combat = 1（默认）0 ⇒ 战斗中也按旧行为（引擎可施法）
+    //     fsm_own_cast_ooc    = 0（默认）1 ⇒ 脱战也占闸（⚠ 目前 PlayerbotAI 的闸门只在
+    //         `inCombat||victim` 时合上，所以 1 在这里**不会**真的挡住脱战施法；要生效需在
+    //         PlayerbotAI::UpdateAIInternal 的闸门条件里补一个 dpsfsm 的脱战问询，属另一个文件）
+    //   统计：`[FSM-CAST] bot=.. fsm=.. engine=.. blocked=.. inCombat=..`（每 bot 30 秒一条）
+    //     fsm     = 状态机本段成功施法次数（BotMem::castCount 差值）
+    //     engine  = 本段总成功施法（Player::botSpellCounts 求和差值）− fsm（引擎侧实放，近似）
+    //     blocked = 闸门合上且状态机本 tick 没出手的 tick 数（= 引擎被拒掉施法机会的次数；
+    //               真实的"被拒尝试次数"记在 PlayerbotAI.cpp 的静态计数里，本文件读不到）
+    // ==========================================================================
+    namespace
+    {
+        struct OwnCastStat
+        {
+            uint32 lastMs = 0;      // 上次打印时刻（0 = 首次登记）
+            uint64 fsmSeen = 0;     // 上次采样 BotMem::castCount
+            uint64 totalSeen = 0;   // 上次采样 botSpellCounts 总和
+            uint32 gatedSeen = 0;   // 本段"闸合上且状态机没出手"的 tick 数
+        };
+    }
+
+    static uint64 TotalBotSpellCasts(Player* bot)
+    {
+        uint64 n = 0;
+        for (std::map<uint32, uint64>::const_iterator it = bot->botSpellCounts.begin();
+            it != bot->botSpellCounts.end(); ++it)
+            n += it->second;
+        return n;
+    }
+
+    static void NoteOwnCastTick(PlayerbotAI* ai, BotMem* m, bool owns, bool fsmCast, bool inCombat)
+    {
+        Player* bot = ai->GetBot();
+        if (!bot)
+            return;
+        uint32 const guid = bot->GetGUIDLow();
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint64 const total = TotalBotSpellCasts(bot);
+
+        static std::mutex s_mutex;
+        static std::unordered_map<uint32, OwnCastStat> s_stat;
+        std::lock_guard<std::mutex> lock(s_mutex);
+        OwnCastStat& st = s_stat[guid];
+        if (owns && !fsmCast)
+            ++st.gatedSeen;
+        if (!st.lastMs)
+        {
+            st.lastMs = nowMs ? nowMs : 1;
+            st.fsmSeen = m->castCount;
+            st.totalSeen = total;
+            return;
+        }
+        if (WorldTimer::getMSTimeDiff(st.lastMs, nowMs ? nowMs : 1) < 30000)
+            return;
+
+        uint64 const fsmCasts = (m->castCount > st.fsmSeen) ? (m->castCount - st.fsmSeen) : 0;
+        uint64 const dTotal = (total > st.totalSeen) ? (total - st.totalSeen) : 0;
+        uint64 const engineCasts = (dTotal > fsmCasts) ? (dTotal - fsmCasts) : 0;
+        sLog.outError("[FSM-CAST] bot=%s fsm=%u engine=%u blocked=%u inCombat=%d",
+            bot->GetName(), uint32(fsmCasts), uint32(engineCasts), st.gatedSeen, inCombat ? 1 : 0);
+
+        st.lastMs = nowMs ? nowMs : 1;
+        st.fsmSeen = m->castCount;
+        st.totalSeen = total;
+        st.gatedSeen = 0;
+    }
+
+    static bool TickInner(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
                 return false;
@@ -12943,5 +13022,54 @@ namespace ai
                     bot->GetName(), SpecName(m->spec));
             return false;
         }
+
+    // [2026-11-01 站长口径] Tick() 的对外语义（见本函数上面的长注释）：
+    //   返回值 = "这一 tick 谁占着**施法闸门**"，不等于"我放了技能"（后者是 DidCastThisTick）。
+    bool Tick(PlayerbotAI* ai)
+    {
+        bool const handled = TickInner(ai);
+        if (!ai || !ai->GetBot())
+            return handled;
+
+        Player* bot = ai->GetBot();
+        uint32 const guid = bot->GetGUIDLow();
+        BotMem* m = Mem(guid);
+
+        bool derived = false;
+        DecisionMode const mode = ResolveMode(m, derived);
+        m->mode = int(mode);
+
+        bool const inCombat = bot->IsInCombat() || bot->GetVictim();
+        bool const fsmCast = DidCastThisTick(guid);
+        bool const scenario = SkipEngine(guid);
+
+        bool owns = false;
+        if (mode == DecisionMode::Fsm)
+        {
+            // 死/不在世界/被关掉的 bot：状态机自己都不跑，闸门必须放开（否则引擎也动不了）
+            bool eligible = bot->IsInWorld() && bot->IsAlive();
+            if (eligible)
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                eligible = s_disabled.count(guid) == 0;
+            }
+            bool const gateCombat = TP(m, "fsm_own_cast_combat", 1.0) >= 1.0;
+            bool const gateOoc = TP(m, "fsm_own_cast_ooc", 0.0) >= 1.0;
+            if (eligible && inCombat)
+                owns = gateCombat ? true : (handled && scenario);
+            else
+                owns = handled && (scenario || (eligible && gateOoc));
+        }
+        else
+        {
+            // mode=0~4：与 dd09509d 之前完全一致（副本里 SkipEngine 恒假 ⇒ 引擎全权）
+            owns = handled && scenario;
+        }
+
+        // [FSM-CAST] 只给 mode=5 出账：mode=0~4 与 legacy 连日志都不许多一条
+        if (mode == DecisionMode::Fsm)
+            NoteOwnCastTick(ai, m, owns, fsmCast, inCombat);
+        return owns;
+    }
     }
 }

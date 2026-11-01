@@ -337,6 +337,16 @@ namespace ai
         //     Survival : divine protection → holy shield；`tank_surv_emerg` 第二档 lay on hands
         //   ⚠ 惩戒骑（`Spec::Retribution`）走 `TickRetFsm()`，与这里**互斥**（派发处按职业+专精这一对判）。
         //   ⚠ 走位/拉怪路线/波次/boss 换嘲**不归 FSM**（DESIGN §14.3：只消费，不重造）。
+        // [2026-11-01 站长口径] **状态机独占施法权（mode=5）**：`Tick()` 的返回值 = "这一 tick
+        //   谁占着施法闸门"，不再等于"我放了技能"（后者看 DidCastThisTick）。规则：
+        //     · mode=5 且**战斗中**（IsInCombat 或 有 victim）：无论本 tick 出手与否都占闸
+        //       ⇒ 引擎不得施法（但照常走位/追击/平砍/上马/拾取/交易，没有用 Hold）；
+        //     · 脱战：放行（补 buff / 喝水 / 上马 / 治疗 / 复活 / 拾取 交给引擎）；
+        //     · mode=0~4：返回 `handled && SkipEngine()`，与 dd09509d 之前**完全一致**。
+        //   参数（tune 文件）：`fsm_own_cast_combat`（默认 1，0 = 回到旧行为）、
+        //     `fsm_own_cast_ooc`（默认 0；⚠ 置 1 目前不会真的挡住脱战施法 —— 闸门在
+        //     PlayerbotAI::UpdateAIInternal 里只于 inCombat||victim 时合上，需要那边配合）。
+        //   统计日志：`[FSM-CAST] bot=%s fsm=%u engine=%u blocked=%u inCombat=%d`（每 bot 30 秒）。
         bool Tick(PlayerbotAI* ai);
     }
 }
