@@ -400,6 +400,9 @@ namespace
         uint32 lsCastAt = 0;           // 上一次补闪电盾的时刻（防"引擎水盾 ↔ 我方闪电盾"互顶时紧着补）
         uint32 shEarthShocks = 0;      // 本场地震击次数（层数达标才震）
         uint32 shTotemCasts = 0;       // 本场补图腾次数（验收"图腾真的在补"）
+        // [2026-11-01 站长口径] A. **脱战准备阶段**补过的图腾次数（`[DPSFSM-SH-PREP]` 的 #n）：
+        //   开打前插了几个，就看正式计时前有几条 PREP 行 —— 这是 prep_seconds A/B 的直接证据。
+        uint32 shPrepCasts = 0;
         // 本场（= 同一个目标）的一次性开手：Aoe 起手只放一次火元素新星；开门准备只做一次
         bool   shAoeNova = false;
         ObjectGuid shTarget;
@@ -437,6 +440,11 @@ namespace
         //   1 = 变完还剩 >= 该比例（允许变身）/ 0 = 会被蓝量门挡住（这次改成等一跳）。
         //   只用于 `[DPSFSM-DRUID] ... shiftGate=` 的 A/B 取证，不参与别的决策。
         int    drShiftGate = 0;
+        // [2026-11-01 站长口径] B. 猫德**主动回蓝**的验收计数（只写日志与报告，不参与决策）：
+        //   drPotions    —— 本轮喝法力药水次数（`mana_potion_pct` 阈值）；
+        //   drInnervates —— 本轮给自己放激活次数（`innervate_pct` 阈值）。
+        uint32 drPotions = 0;
+        uint32 drInnervates = 0;
         // [2026-11-01 站长口径] **治疗（HealCore，四治疗共用）** —— 只装"病人状态 + 统计"，
         //   配置（技能名/阈值）在 HealCfgFor() 那张表里，不在这里。
         //   healWatch   —— guid → 受伤速率窗口（预读的唯一输入，见 HealWatch 注释）；
@@ -547,6 +555,10 @@ namespace
     // [2026-11-01 站长口径] 坦克场景标记：guid 这一轮按**坦克图**跑（熊德靠它区分"猫/熊"）。
     //   与 s_scenarioTargets 独立：坦克可能这一轮还没有敌对目标（Prep 补姿态/变熊）。
     std::set<uint32> s_scenarioTank;
+    // [2026-11-01 站长口径] **准备窗口**（`prep_seconds`）：guid → 窗口结束的绝对毫秒
+    //   （`WorldTimer::getMSTime()` 口径）。窗口内状态机不接战、只跑 Prep（萨满 = 四槽图腾）。
+    //   只有 SimScenario 会登记 ⇒ 副本里恒空，行为与以前完全一致。
+    std::map<uint32, uint32> s_scenarioPrep;
     std::map<uint32, uint32> s_petLogAt;                         // [2026-10-31] guid → 上次打 [DPSFSM-PET] 周期日志的毫秒时刻
     std::map<uint32, uint32> s_petStuckAt;                       // [2026-10-31] guid → "在追但贴不上且没在动"的起始毫秒时刻
 
@@ -2765,8 +2777,10 @@ namespace
         return true;
     }
 
-    // 法力药水（实现见下方 UseManaPotion）：法师的 Recover 也要用，先声明
-    bool UseManaPotion(BotMem* m, Snapshot& s);
+    // 法力药水（实现见下方 UseManaPotion）：法师的 Recover 也要用，先声明。
+    //   `pctOverride` >= 0 = 按**这个蓝量百分比**喝（猫德 `mana_potion_pct` 用），
+    //   不传 = 沿用旧口径（按 `potion_mana_deficit` 的蓝缺口）。
+    bool UseManaPotion(BotMem* m, Snapshot& s, double pctOverride = -1.0);
 
     // ============================ 法师 ============================
     bool TickMage(PlayerbotAI* ai, BotMem* m)
@@ -2998,15 +3012,24 @@ namespace
     //   蓝低于阈值就喝（核心的 CastItemUseSpell 会正常消耗物品并应用效果）。
     //   注意：不用 ai->DoSpecificAction("mana potion")，那个动作的 isUseful 依赖 AI 自己的战斗状态，
     //   假人场景里会被判成"不 useful"，实测一次都没喝到。
-    bool UseManaPotion(BotMem* m, Snapshot& s)
+    bool UseManaPotion(BotMem* m, Snapshot& s, double pctOverride)
     {
         // [2026-10-31 站长口径] 改成按**蓝缺口**判断：缺得超过 `potion_mana_deficit`（默认 3000）就喝。
         //   比按百分比准——不同职业/装备的蓝上限差很多，35% 对 8000 蓝的号是缺 5200、对 14000 蓝的号是缺 9100。
         //   `potion_mana` 保留为兜底（没有蓝上限信息时按百分比）。
+        // [2026-11-01 站长口径] B. 猫德：`mana_potion_pct`(默认 40%) 这道新阈值经 `pctOverride` 传进来，
+        //   走**同一段扫包/施放代码**，只换判据（不再看 3000 点的蓝缺口）。
         uint32 const maxMana = s.bot->GetMaxPower(POWER_MANA);
         int32 const deficit = int32(maxMana) - int32(s.bot->GetPower(POWER_MANA));
-        bool const byDeficit = maxMana > 0 && deficit > int32(TP(m, "potion_mana_deficit", 3000.0));
-        bool const byPct = maxMana == 0 && s.power <= float(TP(m, "potion_mana", 35.0));
+        bool byDeficit = false;
+        bool byPct = false;
+        if (pctOverride >= 0.0)
+            byPct = (maxMana > 0 && s.power <= float(pctOverride));
+        else
+        {
+            byDeficit = maxMana > 0 && deficit > int32(TP(m, "potion_mana_deficit", 3000.0));
+            byPct = maxMana == 0 && s.power <= float(TP(m, "potion_mana", 35.0));
+        }
         if (!byDeficit && !byPct)
             return false;
 
@@ -4336,6 +4359,7 @@ namespace ai
             m->lsCastAt = 0;
             m->shEarthShocks = 0;
             m->shTotemCasts = 0;
+            m->shPrepCasts = 0;
             m->shAoeNova = false;
             m->shTarget = ObjectGuid();
             m->shEngagedAt = 0;
@@ -4373,6 +4397,9 @@ namespace ai
             m->drShiftAt = 0;
             m->drTarget = ObjectGuid();
             m->drEngagedAt = 0;
+            // [2026-11-01 站长口径] B. 猫德回蓝计数同样跨轮清零（A/B 要的是**本轮**的 potion/innerv）
+            m->drPotions = 0;
+            m->drInnervates = 0;
             // [2026-11-01 站长口径] 治疗侧：速率窗口/待结算治疗/统计也必须跨轮清零 ——
             //   上一轮的 healWatch 会把"还在流血"的旧斜率带进来（预读会凭空提前），
             //   统计不清则 [DPSFSM-HPS] 的第一条窗口把上一轮的数字算进这一轮。
@@ -4452,6 +4479,34 @@ namespace ai
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), who) || who.empty())
                 who = "guid=" + std::to_string(guid);
             DmgLogLines(m, who.c_str(), true);
+        }
+
+        // [2026-11-01 站长口径] A. **准备窗口**（`prep_seconds`）：见 DpsFsm.h 的说明。
+        //   只在 SimScenario 里登记；副本/现有测法不登记 ⇒ 恒空 ⇒ 行为不变。
+        //   另外这四行刻意放在 `s_disabledMutex` 之外：它们只做一次 map 读写，不进 Mem()。
+        void SetScenarioPrep(uint32 guid, uint32 untilMs)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            if (!untilMs)
+                s_scenarioPrep.erase(guid);
+            else
+                s_scenarioPrep[guid] = untilMs;
+        }
+
+        void ClearScenarioPrep(uint32 guid)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            s_scenarioPrep.erase(guid);
+        }
+
+        bool InScenarioPrep(uint32 guid, uint32& untilMs)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            auto it = s_scenarioPrep.find(guid);
+            if (it == s_scenarioPrep.end())
+                return false;
+            untilMs = it->second;
+            return true;
         }
 
         // [2026-11-01 站长口径] 治疗场景的目标分配：见 DpsFsm.h → SetScenarioHealTargets()。
@@ -8391,6 +8446,41 @@ namespace ai
             m->shLightningShield, m->shEarthShocks, m->twistPhase, m->wfProcs);
     }
 
+    // [2026-11-01 站长口径] A. **图腾属于准备阶段**：脱战（准备窗口 / 开打前）就把四槽插满。
+    //   战斗里只按 `ShTotemNeed()` 的四条判据补（到期 / 走远 / 换图腾组），不重铺。
+    //   与战斗循环**共用同一份记账**（totemCastAt/totemEntry/totemExpireAt/totemPos + ShTotemNeed），
+    //   这里只补一个"脱战上下文"：没有群架口径 ⇒ 一律按单体图腾组（inAoe=false）。
+    //   三系口径仍然是 `ShDesiredTotem()` 那一张表：
+    //     元素 = 石肤 / 愤怒(没有则灼热) / 法力之泉 / 空气之怒；增强 = 大地之力 / 灼热(群=熔岩) /
+    //     法力之泉 / 风怒；恢复（治疗侧）走 HealTickTotems，同一份子系统。
+    bool ShTickTotemsPrep(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (m->spec != Spec::Elemental && m->spec != Spec::Enhancement)
+            return false;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        ShTotemCtx c;
+        c.elemental = (m->spec == Spec::Elemental);
+        c.enhance   = (m->spec == Spec::Enhancement);
+        c.inAoe     = false;
+        c.twist     = ShTwistEnabled(ai, m, s, c.enhance);
+        if (!ShTickTotems(ai, m, s, c, safeNow))
+            return false;
+        // [2026-11-01 站长口径] 验收要能**数清**"开打前插了几个"：每成功一次打一条
+        //   `[DPSFSM-SH-PREP]`（只在脱战跑 Prep 时出现，量很小）。有了它，
+        //   `prep_seconds=4` 与 `=0` 两臂的区别就是"正式计时前有几条 PREP 行"。
+        ++m->shPrepCasts;
+        int registered = 0;
+        for (int i = 0; i < MAX_TOTEM_SLOT; ++i)
+            if (m->totemEntry[i] && (!m->totemExpireAt[i] || m->totemExpireAt[i] > safeNow))
+                ++registered;
+        sLog.outError("[DPSFSM-SH-PREP] %s 脱战补图腾 #%u totems=%d/%d mana=%.0f",
+            s.bot ? s.bot->GetName() : "-", m->shPrepCasts, registered, int(MAX_TOTEM_SLOT), s.power);
+        // [DPSFSM-SH] 每 10 秒一条：准备阶段也能看到 `totems=<已登记槽数>` 爬满
+        ShLogTick(m, s, c.elemental, c.twist);
+        return true;
+    }
+
     ai::dpsfsm::TickResult TickShamanFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         using ai::dpsfsm::TickResult;
@@ -9408,9 +9498,9 @@ namespace ai
         {
             // [2026-11-01 实测] `shiftGate=` = `powershift_min_mana_pct` 这道门的本 tick 判定
             //   （1 = 变完还剩够用的蓝、允许变身；0 = 蓝量门把变身挡住了，改走"等一跳"）。
-            sLog.outError("[DPSFSM-DRUID] %s spec=feral state=%s energy=%d tick=%d combo=%u powershifts=%u mana=%.0f shiftGate=%d",
+            sLog.outError("[DPSFSM-DRUID] %s spec=feral state=%s energy=%d tick=%d combo=%u powershifts=%u mana=%.0f shiftGate=%d potion=%d innerv=%d",
                 s.bot->GetName(), StateName(st), s.energy, p.remainMs, uint32(s.combo), m->drShifts, s.power,
-                m->drShiftGate);
+                m->drShiftGate, m->drPotions ? 1 : 0, m->drInnervates ? 1 : 0);
         }
         else
         {
@@ -9423,6 +9513,62 @@ namespace ai
             sLog.outError("[DPSFSM-DRUID] %s spec=balance state=%s dots=%d mana=%.0f",
                 s.bot->GetName(), StateName(st), dots, s.power);
         }
+    }
+
+    // [2026-11-01 站长口径] B. 猫德**主动回蓝**（两条都做，顺序：药水 → 激活 → 等自然回能）。
+    //   为什么需要：原实现只有"付不起变身费就等自然回能"——长局（150 秒）里蓝被变身抽干之后
+    //   只能干等，撕碎/变身都停。这里在进入能量轮之前先试两个主动手段：
+    //     · 法力药水：`mana < mana_potion_pct`(默认 40%) 且药水 CD 可用 ⇒ 喝
+    //       （复用 `UseManaPotion()` 的扫包/施放逻辑，只把判据换成这个新键的百分比）；
+    //     · 激活给自己：`mana < innervate_pct`(默认 30%) 且学会了 `innervate` ⇒ `TryCastSelf()`
+    //       （⚠ 站长确认猫德有激活：不要因为"那是恢复系天赋"跳过，按 `SpellId()` 能否解析为准；
+    //        解析不到就静默跳过；已经在激活 buff 里就不重复放，否则每 tick 空吃 GCD）。
+    //   两个都做不了 ⇒ 返回 false，落回原来的"等自然回能"行为（一点没变）。
+    bool DrManaRecover(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool& potion, bool& innerv)
+    {
+        potion = false;
+        innerv = false;
+        Player* bot = s.bot;
+        uint32 const maxMana = bot->GetMaxPower(POWER_MANA);
+        if (!maxMana)
+            return false;
+
+        double const potionPct = TP(m, "mana_potion_pct", 40.0);
+        if (potionPct > 0.0 && s.power < float(potionPct) && UseManaPotion(m, s, potionPct))
+        {
+            potion = true;
+            ++m->drPotions;
+            return true;
+        }
+
+        double const innervPct = TP(m, "innervate_pct", 30.0);
+        if (innervPct > 0.0 && s.power < float(innervPct))
+        {
+            uint32 const id = SpellId(ai, bot, m, "innervate", false);
+            if (!id || !bot->HasSpell(id))
+                return false;                          // 没学会 / 解析不到：静默跳过
+            if (DrHasAuraByName(bot, "innervate"))
+                return false;                          // 已经在自己身上：不重复放（白吃 GCD）
+            // [2026-11-01 实测] **激活不能在猫形态里放**：本服 `spell_template` 里
+            //   29166 Innervate 的 `Attributes` 含 `SPELL_ATTR_NOT_SHAPESHIFT`(0x10000) ⇒
+            //   核心 `GetErrorAtShapeshiftedCast()` 对猫形态直接返回
+            //   `SPELL_FAILED_NOT_SHAPESHIFT(64)`（实测 TryCastSelf 一次都没成功，日志 innerv=0）。
+            //   所以走与变身同一条"摘→放"原子路径：先摘形态、再放激活；
+            //   下一 tick 由 Prep（猫形态）把形态补回来 —— 变身费约 590 蓝，激活回的是上千蓝。
+            if (bot->GetShapeshiftForm() != FORM_NONE)
+            {
+                if (!Ready(bot, id) || GcdActive(bot, id))
+                    return false;                      // 形态 1 秒冷却 / GCD 没转完：这一手先不放
+                bot->RemoveSpellsCausingAura(SPELL_AURA_MOD_SHAPESHIFT);
+            }
+            if (TryCastSelf(ai, m, s, "innervate"))
+            {
+                innerv = true;
+                ++m->drInnervates;
+                return true;
+            }
+        }
+        return false;
     }
 
     ai::dpsfsm::TickResult TickFeralFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
@@ -9520,6 +9666,24 @@ namespace ai
             m->drFurorLoggedPeriod = m->drTickPeriod;
             sLog.outError("[DPSFSM-DRUID] %s furor=%d tickPeriod=%dms energy=%d tick=%dms mana=%.0f",
                 bot->GetName(), m->drFuror ? 1 : 0, m->drTickPeriod, p.energy, p.remainMs, s.power);
+        }
+
+        // [2026-11-01 站长口径] B. **猫德主动回蓝**（药水 → 激活 → 等自然回能）：
+        //   放在能量轮之前 —— 蓝见底时先补蓝（这也是"变身流"能持续 150 秒的前提），
+        //   两个手段都用不了才落回原来的"等一跳 / 等自然回能"。占一个 GCD，本 tick 返回 Acted。
+        {
+            bool potion = false;
+            bool innerv = false;
+            if (DrManaRecover(ai, m, s, potion, innerv))
+            {
+                sLog.outError("[DPSFSM-DRUID] %s mana-recover potion=%d innerv=%d mana=%.0f "
+                    "potions=%u innervates=%u",
+                    bot->GetName(), potion ? 1 : 0, innerv ? 1 : 0, s.power,
+                    m->drPotions, m->drInnervates);
+                LogTransition(ai, m, s, State::Recover);
+                DrLogTick(ai, m, s, State::Recover, p);
+                return TickResult::Acted;
+            }
         }
 
         // ---- 资源/距离 ----
@@ -12131,6 +12295,43 @@ namespace ai
             }
 
             // ==================================================================
+            // [2026-11-01 站长口径] A. **准备窗口（`prep_seconds`，假人场景专用）**
+            //   站长口径：图腾属于**准备阶段**（脱战插满四槽），战斗中只在"到期 / 走远 / 换组"
+            //   时补。SimScenario 的假人场景一 spawn 就接战 ⇒ 图腾只能在战斗里补，开打前
+            //   4 个 GCD 全花在插图腾上。这里给一个"开局先脱战"的窗口：
+            //     · 窗口内**不接战**（不跑 EngageScenarioTarget、不跑战斗图），只跑 Prep；
+            //     · 到点由 SimScenario 清掉窗口、重置基线并开始正式计时（这几秒不算 dps）。
+            //   只在 mode=5 且 SimScenario 登记过窗口时生效：副本/其它模式一个字节不变。
+            // ==================================================================
+            {
+                uint32 prepUntil = 0;
+                if (ai::dpsfsm::InScenarioPrep(bot->GetGUIDLow(), prepUntil))
+                {
+                    uint32 const prepNowMs = WorldTimer::getMSTime();
+                    uint32 const prepSafeNow = prepNowMs ? prepNowMs : 1;
+                    if (prepUntil && prepSafeNow >= prepUntil)
+                        ai::dpsfsm::ClearScenarioPrep(bot->GetGUIDLow());   // 到点：落回正常战斗派发
+                    else
+                    {
+                        bool prepDerived = false;
+                        if (ResolveMode(m, prepDerived) == DecisionMode::Fsm)
+                        {
+                            m->mode = int(DecisionMode::Fsm);
+                            if (!bot->IsStandState())
+                                bot->SetStandState(UNIT_STAND_STATE_STAND);
+                            Snapshot ps;
+                            BuildSnapshot(ai, m, ps);
+                            // 萨满 = 四槽图腾（三系口径见 ShDesiredTotem）；别的职业这一窗口只让位
+                            if (ShTickTotemsPrep(ai, m, ps))
+                                return true;
+                        }
+                        NoteBail(bot, "scenario-prep");
+                        return false;
+                    }
+                }
+            }
+
+            // ==================================================================
             // [2026-11-01 站长口径] **治疗派发（mode=5 · HealCore）**
             //   放在三道门之前：
             //     ① `no-victim`（治疗者没有敌人也要工作）；
@@ -12247,6 +12448,25 @@ namespace ai
                                 return false;
                         }
                     }
+                }
+            }
+
+            // [2026-11-01 站长口径] A. **图腾属于准备阶段**：脱战（开打前 / 假人场景的准备窗口）
+            //   就先把四槽插满，战斗中只按 `ShTotemNeed()` 的四条判据补。
+            //   放在 `no-victim` 门之前 —— 脱战时状态机本来整轮让路，但"准备动作"必须照做。
+            //   只在 mode=5 的萨满·元素/增强上生效：mode=1/2/3/4 与 legacy 一个字节不变。
+            if (bot->getClass() == CLASS_SHAMAN && !bot->IsInCombat() && !bot->GetVictim())
+            {
+                bool prepDerived = false;
+                if (ResolveMode(m, prepDerived) == DecisionMode::Fsm)
+                {
+                    m->mode = int(DecisionMode::Fsm);
+                    if (!bot->IsStandState())
+                        bot->SetStandState(UNIT_STAND_STATE_STAND);
+                    Snapshot ps;
+                    BuildSnapshot(ai, m, ps);
+                    if (ShTickTotemsPrep(ai, m, ps))
+                        return true;
                 }
             }
 

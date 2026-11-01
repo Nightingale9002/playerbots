@@ -331,6 +331,14 @@ uint32 stuckFightCleared = 0;
             //   （实测第 1/2 轮 `taunts=0 pickups=0`，而 victim 全程只有 tank）。防骑的
             //   `righteous defense` 还要求"被打的是友方玩家" ⇒ 必须真的让怪先咬 DPS。
             bool   tankRivalEngaged = false;
+            // [2026-11-01 站长口径] A. **准备窗口**（臂参数 `prep_seconds`，默认 0 = 关）。
+            //   为什么需要：图腾属于准备阶段（脱战插满四槽），而这条假人通道一 spawn 就接战
+            //   ⇒ 图腾永远只能在战斗中补。这里开一个"开局先脱战"的窗口：
+            //     prepMs      —— 窗口长度（0 = 保持现状，现有 DPS 测法一个字节不变）；
+            //     prepUntilMs —— 窗口结束的绝对毫秒（0 = 不在窗口里）；到点后才重置基线、
+            //                    开始正式计时（45/150 秒**不含**这几秒）。
+            uint32 prepMs = 0;
+            uint32 prepUntilMs = 0;
         };
 
         std::vector<DummyRun> s_dummies;
@@ -3822,6 +3830,21 @@ uint32 stuckFightCleared = 0;
                         bot->StoreNewItemInBestSlots(22832, 20);   // 超级法力药水 x20
                         sLog.outError("[DUMMY] id=%u spec=%s 已发法力药水 x20", d.id, d.spec.c_str());
                     }
+                    // [2026-11-01 站长口径] B. **猫德主动回蓝**的测试前提：法力药水得在背包里
+                    //   （`UseManaPotion()` 只扫背包，没药水就喝不到）。野性德被上面的 `caster`
+                    //   排除（那里的口径同时决定命中/装备，不能动），这里单独发 20 瓶；
+                    //   本臂把 `mana_potion_pct` 显式设成 0（旧行为对照）时**不发**。
+                    if (d.cls == CLASS_DRUID && d.spec == "feral")
+                    {
+                        auto const ppit = d.overrides.find("mana_potion_pct");
+                        double const pct = (ppit != d.overrides.end()) ? ppit->second : 40.0;
+                        if (pct > 0.0)
+                        {
+                            bot->StoreNewItemInBestSlots(22832, 20);   // 超级法力药水 x20
+                            sLog.outError("[DUMMY] id=%u spec=%s 已发法力药水 x20（猫德回蓝通道）",
+                                d.id, d.spec.c_str());
+                        }
+                    }
                     sLog.outError("[DUMMY] id=%u spec=%s 换装完成：sp=%d ap=%d（GS %.0f）",
                         d.id, d.spec.c_str(),
                         int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
@@ -4283,6 +4306,14 @@ uint32 stuckFightCleared = 0;
                         d.overrides[arm.key] = arm.value;
                     }
 
+                // [2026-11-01 站长口径] A. **准备窗口**：`prep_seconds=4` ⇒ 开局先脱战跑 Prep
+                //   （萨满 = 四槽图腾），4 秒后才开始正式计时。默认 0 = 保持现状。
+                {
+                    auto const pit = d.overrides.find("prep_seconds");
+                    if (pit != d.overrides.end())
+                        d.prepMs = uint32(pit->second > 0.0 ? pit->second * 1000.0 : 0.0);
+                }
+
                 // [2026-11-01 站长口径] **治疗臂**：`holy:heal_test=1,heal_dps=500`。
                 //   治疗不需要木桩堆（DPS 那套木桩没有伤害来源，治疗无从触发）⇒ 走
                 //   "一个稳定掉血的主坦 + 一个治疗者"的通道；`heal_test` 默认关，
@@ -4709,6 +4740,7 @@ uint32 stuckFightCleared = 0;
             dpsfsm::ClearScenarioTargets(d.guid, d.id);
             dpsfsm::ClearScenarioHealTargets(d.guid, d.id);
             dpsfsm::ClearScenarioTank(d.guid);
+            dpsfsm::ClearScenarioPrep(d.guid);       // [2026-11-01 站长口径] 准备窗口不能跨轮残留
             dpsfsm::ClearParamOverrides(d.guid);
             // 收尾：撤假人 + 停手
             if (bot && bot->IsInWorld())
@@ -5616,7 +5648,20 @@ uint32 stuckFightCleared = 0;
                     d.casts0 = bot->botCasts;
                     d.spells0 = bot->botSpellCounts;
                     d.startMs = now;
-                    sLog.outError("[DUMMY] id=%u spec=%s 假人已就位 %u 个，开始计时", d.id, d.spec.c_str(), (uint32)d.dummies.size());
+                    // [2026-11-01 站长口径] A. **准备窗口**（`prep_seconds`，默认 0 = 关）：
+                    //   先把场景目标登记好（runId 变化会清掉上一轮的图腾账本 = 干净开局），
+                    //   然后**不接战**，让状态机在脱战状态跑 Prep（萨满 = 四槽图腾）；
+                    //   窗口到点才重置基线、正式开始计时（45/150 秒**不含**这几秒）。
+                    if (d.prepMs)
+                    {
+                        dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);
+                        d.prepUntilMs = now + d.prepMs;
+                        dpsfsm::SetScenarioPrep(d.guid, d.prepUntilMs);
+                        sLog.outError("[DUMMY] id=%u spec=%s prep=%us 准备窗口开始（脱战，不计入计时）",
+                            d.id, d.spec.c_str(), d.prepMs / 1000);
+                    }
+                    else
+                        sLog.outError("[DUMMY] id=%u spec=%s 假人已就位 %u 个，开始计时", d.id, d.spec.c_str(), (uint32)d.dummies.size());
 
                     // [2026-10-31 根因修复] 落点网格 `y = SPOT_Y + 14*((id/3)%2)` 的第二排（row1）
                     //   与自己的假人之间被 **vmap 地形挡住视线** ⇒ 核心 `Spell::CheckCast` 对所有
@@ -5656,25 +5701,64 @@ uint32 stuckFightCleared = 0;
                     //   之前 SetScenarioTargets 在 dummies 还空时也被调用过；空目标集会让
                     //   EngageScenarioTarget 直接返回 ⇒ GetVictim() 一直为空 ⇒
                     //   状态机在 "no-victim" 处整轮让路（实测约 1/3 轮次 0 伤害，旧路径同样复现）。
-                    dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);
-                    if (!d.dummies.empty())
+                    // [2026-11-01 站长口径] 有准备窗口时**不在这里接战**：目标已在上面登记过，
+                    //   窗口结束后由下面的"准备窗口收尾"重新登记并接战。
+                    if (!d.prepMs)
                     {
-                        if (Creature* d0 = bot->GetMap() ? bot->GetMap()->GetCreature(d.dummies[0]) : nullptr)
+                        dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);
+                        if (!d.dummies.empty())
                         {
-                            if (d0->IsAlive() && !bot->GetVictim())
+                            if (Creature* d0 = bot->GetMap() ? bot->GetMap()->GetCreature(d.dummies[0]) : nullptr)
                             {
-                                if (d0->GetCombatManager().IsInEvadeMode())
+                                if (d0->IsAlive() && !bot->GetVictim())
                                 {
-                                    d0->GetCombatManager().SetEvadeState(EVADE_NONE);
-                                    d0->GetCombatManager().StopEvade();
+                                    if (d0->GetCombatManager().IsInEvadeMode())
+                                    {
+                                        d0->GetCombatManager().SetEvadeState(EVADE_NONE);
+                                        d0->GetCombatManager().StopEvade();
+                                    }
+                                    bot->CombatStopWithPets(true);
+                                    bot->Attack(d0, d.meleeSpec);
+                                    sLog.outError("[DUMMY] id=%u 召唤完成后强制接战：victim=%s",
+                                        d.id, bot->GetVictim() ? bot->GetVictim()->GetName() : "-");
                                 }
-                                bot->CombatStopWithPets(true);
-                                bot->Attack(d0, d.meleeSpec);
-                                sLog.outError("[DUMMY] id=%u 召唤完成后强制接战：victim=%s",
-                                    d.id, bot->GetVictim() ? bot->GetVictim()->GetName() : "-");
                             }
                         }
+                    }   // if (!d.prepMs)：准备窗口里不接战，等窗口收尾
+                }
+
+                // [2026-11-01 站长口径] A. **准备窗口进行中：不接战，只让状态机跑 Prep**。
+                //   假人不还手，只要没 attacker 就不会进战斗；万一引擎/上一轮残留把 bot 拽进战斗，
+                //   这里每 tick 清掉（否则图腾就要在"战斗中"补，等于没改）。
+                if (d.prepUntilMs)
+                {
+                    if (now < d.prepUntilMs)
+                    {
+                        if (bot->GetVictim())
+                            bot->AttackStop();
+                        if (bot->IsInCombat())
+                            bot->CombatStopWithPets(true);
+                        ++it;
+                        continue;
                     }
+                    // 窗口到点 ⇒ 正式计时从这一刻起算（清掉准备期间的伤害/施法基线）
+                    d.prepUntilMs = 0;
+                    dpsfsm::ClearScenarioPrep(d.guid);
+                    ResetDummyVitals(d, bot);
+                    d.dmg0 = bot->botDamageDealt;
+                    d.pet0 = bot->botPetDamageDealt;
+                    d.melee0 = bot->botMeleeHits;
+                    d.casts0 = bot->botCasts;
+                    d.spells0 = bot->botSpellCounts;
+                    d.startMs = now;
+                    d.lastWinMs = 0;
+                    d.lastWinDmg = 0;
+                    d.probed3s = false;
+                    d.lastPulseMs = 0;
+                    // 重新登记一次场景目标（同一 runId ⇒ 不重置 FSM 记忆，图腾账本保住 = 战斗里不用重铺）
+                    dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);
+                    sLog.outError("[DUMMY] id=%u bot=%s spec=%s prep=%us 结束，开始计时",
+                        d.id, bot->GetName(), d.spec.c_str(), d.prepMs / 1000);
                 }
 
                 // 每 2 秒把人拽回来 + 重新咬住假人（假人不还手，bot 自己容易脱战）

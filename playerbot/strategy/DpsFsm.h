@@ -168,6 +168,18 @@ namespace ai
         // 只清自己那一轮（同一只 bot 被复用时，上一轮的收尾不能把新一轮的目标集清掉）
         void ClearScenarioTargets(uint32 guid, uint32 runId = 0);
 
+        // [2026-11-01 站长口径] **准备窗口（prep_seconds，假人场景专用）**：图腾属于准备阶段。
+        //   为什么需要：SimScenario 现在一 spawn 就接战 ⇒ 图腾只能在**战斗里**补，开打前 4 个 GCD
+        //   全花在插图腾上。这里给一个"开局先脱战"的窗口：
+        //     · 窗口内状态机**不接战**（不跑 EngageScenarioTarget、不跑战斗图），只跑 Prep
+        //       （萨满 = `ShTickTotemsPrep()` 把四槽插满）；
+        //     · 窗口到点后由 SimScenario 重置基线并开始正式计时（准备这几秒**不计入** dps 窗口）。
+        //   `untilMs` 用 `WorldTimer::getMSTime()` 口径的绝对毫秒。0 / 未登记 = 没有窗口
+        //   ⇒ 副本与现有 DPS 测法一个字节不变（`prep_seconds` 默认 0）。
+        void SetScenarioPrep(uint32 guid, uint32 untilMs);
+        void ClearScenarioPrep(uint32 guid);
+        bool InScenarioPrep(uint32 guid, uint32& untilMs);
+
         // [2026-11-01 站长口径] **治疗场景的目标分配**（假人实测用；副本里走 Group 成员）。
         //   为什么单独一张表：治疗者的"病人"不是敌对目标，`SetScenarioTargets()` 那套是给
         //   "我要打谁"用的（pack 统计 / 自动咬上去）；治疗这边要的是"我要治谁 + 谁是主坦"。
