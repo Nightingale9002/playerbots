@@ -3476,7 +3476,7 @@ namespace
         if (!s.target) { LogTransition(ai, m, s, State::Idle); return false; }   // 交回引擎重选目标
         if (s.casting) return true;
 
-        bool const mm = (m->spec == Spec::Marksmanship);
+        
 
         // 8 码内是猎人死角：移动交给引擎（它现在会按射程停住，见 GetRange("attack")），
         //   状态机这里只判断"能不能打"。
@@ -3573,7 +3573,7 @@ namespace
                 if (UseTrinket(ai, m, s)) break;
                 if (CastFirst(ai, m, s, { "bestial wrath" })) break;
                 if (CastFirst(ai, m, s, { "kill command" })) break;
-                if (mm && canAimed && CastFirst(ai, m, s, { "aimed shot" })) break;
+                if (canAimed && CastFirst(ai, m, s, { "aimed shot" })) break;
                 if (canSteady && CastFirst(ai, m, s, { "steady shot" })) break;
                 st = State::Weave;
                 break;
@@ -3588,7 +3588,7 @@ namespace
                     && CastFirst(ai, m, s, { "hunter's mark" })) break;
                 if (canInstant && AuraStacks(ai, s.bot, m, "serpent sting", s.target) == 0
                     && CastFirst(ai, m, s, { "serpent sting" })) break;
-                if (mm && canAimed && CastFirst(ai, m, s, { "aimed shot" })) break;
+                if (canAimed && CastFirst(ai, m, s, { "aimed shot" })) break;
                 if (canSteady && CastFirst(ai, m, s, { "steady shot" })) break;
                 if (canInstant && CastFirst(ai, m, s, { "multi-shot" })) break;
                 if (canInstant && CastFirst(ai, m, s, { "arcane shot" })) break;
@@ -5834,7 +5834,7 @@ namespace ai
         CommandPetAttack(s);
 
         // 1) 杀戮命令：GCD 外、最高优先（只有兽王点得出来，且必须有宠物在打）
-        if (m->spec == Spec::BeastMastery && s.killCommandReady && PetPresent(s)
+        if (s.killCommandReady && PetPresent(s)
             && TryCast(ai, m, s, "kill command", s.target))
             return TickResult::Acted;
 
@@ -5982,9 +5982,10 @@ namespace ai
                     : (result == TickResult::Hold ? "hold" : "decline");
                 int const land = int(float(TP(m, "autoshot_land_ms", 500.0))
                     * HunterRangedSpeedMod(s.bot) + 0.5f);
-                sLog.outError("[DPSFSM-HUNTER-DIAG] %s state=%s auto=%dms land=%d win=%d steady=%d "
+                sLog.outError("[DPSFSM-HUNTER-DIAG] %s spec=%s state=%s auto=%dms land=%d win=%d steady=%d "
                     "rawTimer=%ums interval=%ums autoRepeat=%d moving=%d mult=%d arc=%d kc=%d res=%s",
-                    s.bot->GetName(), ai::dpsfsm::StateName(m->state), s.autoRemainMs, land,
+                    s.bot->GetName(), ai::dpsfsm::SpecName(m->spec),
+                    ai::dpsfsm::StateName(m->state), s.autoRemainMs, land,
                     s.steadyCastMs + land, s.steadyCastMs,
                     s.bot->getAttackTimer(RANGED_ATTACK), m->autoShotInterval,
                     s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) ? 1 : 0,

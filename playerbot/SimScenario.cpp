@@ -378,6 +378,10 @@ uint32 stuckFightCleared = 0;
             // hunter: 0=兽王 1=射击 2=生存 | warlock: 0=痛苦 1=恶魔 2=毁灭
             { "bm",           CLASS_HUNTER,  "beast mastery", "marksmanship",  "survival",     0, "pve dps bm" },
             { "marks",        CLASS_HUNTER,  "marksmanship",  "beast mastery", "survival",     1, "pve dps mm" },
+            // [2026-11-01 站长口径] 猎人三系（兽王/射击/生存）**同一套循环**，so surv 也进表。
+            //   premade 取 conf 里真实存在的那一行：`AiPlayerbot.PremadeSpecName.3.2 = pve survival`
+            //   （没有 `pve dps surv` 这个条目；`pve dps surv (max agi)` 是 pvp 系，不用）。
+            { "surv",         CLASS_HUNTER,  "survival",      "beast mastery", "marksmanship", 2, "pve survival" },
             { "affliction",   CLASS_WARLOCK, "affliction",    "demonology",    "destruction",  0, "pve dps affli" },
             { "destro",       CLASS_WARLOCK, "destruction",   "affliction",    "demonology",   2, "pve dps destro" },
             // shaman: 0=元素 1=增强 2=恢复 | druid: 0=平衡 1=野性 2=恢复
@@ -418,6 +422,11 @@ uint32 stuckFightCleared = 0;
             { 16286.0f, 16360.0f, 27.8f, 1.2217f, 28.3f },  // assassination
             { 16242.0f, 16342.0f, 14.9f, 0.9163f, 16.8f },  // bm
             { 16210.0f, 16322.0f, 17.8f, 3.0543f, 17.6f },  // marks
+            // surv：**与 marks 共用同一堆**（不是新坐标）。场地只有 17 个堆心、两两最小
+            //   34.1 码，岛上的窄带塞不下第 18 个；三系循环已统一，dummyall 里再挂一个
+            //   一模一样的臂没有信息量 ⇒ 见 dummyall 的"堆坐标重复就跳过"。单跑
+            //   `.rndbot sim dummy surv` 不占堆（走 DUMMY_SPOT），照常能跑。
+            { 16210.0f, 16322.0f, 17.8f, 3.0543f, 17.6f },  // surv(共享 marks 堆)
             { 16186.0f, 16294.0f, 13.8f, 1.8326f, 12.5f },  // affliction
             { 16222.0f, 16272.0f, 12.9f, 3.3161f, 12.9f },  // destro
             { 16210.0f, 16238.0f,  8.2f, 4.3633f,  7.5f },  // enhance
@@ -4628,10 +4637,26 @@ uint32 stuckFightCleared = 0;
             uint32 started = 0;
             std::string skipped;
 
+            // [2026-11-01 站长口径] 猎人三系循环统一后，`surv` 与 `marks` **共用同一堆**
+            //   （场地只有 17 个堆心，见 s_specPiles 注释）。两个臂叠在一堆上会互相当
+            //   对方的 AoE 目标 ⇒ 堆坐标重复的专精直接跳过（这是设计，不是丢臂）。
+            std::vector<std::pair<float, float>> takenPiles;
+
             for (uint32 i = 0; i < n; ++i)
             {
                 SpecKey const& spec = s_specKeys[i];
                 SpecPileSpot const& spot = s_specPiles[i];
+                bool pileTaken = false;
+                for (auto const& pp : takenPiles)
+                    if (pp.first == spot.x && pp.second == spot.y) { pileTaken = true; break; }
+                if (pileTaken)
+                {
+                    skipped += std::string(skipped.empty() ? "" : ",") + spec.key;
+                    sLog.outError("[DUMMYALL] %s 与前面的专精共用同一堆(x=%.1f y=%.1f) ⇒ 跳过"
+                        "（三系循环已统一，重复臂没有信息量）", spec.key, spot.x, spot.y);
+                    continue;
+                }
+                takenPiles.push_back(std::make_pair(spot.x, spot.y));
                 Player* bot = FindOnlineBotOfClass(spec.cls, used);
                 uint32 loginGuid = 0;
                 if (!bot)
