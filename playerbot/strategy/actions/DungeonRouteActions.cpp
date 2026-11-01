@@ -8,7 +8,40 @@
 #include "MotionGenerators/WaypointManager.h"        // [2026-10-26] 巡逻怪按路径推演
 #include "MotionGenerators/WaypointMovementGenerator.h"
 
+#include <cfloat>
+
 using namespace ai;
+
+// [2026-11-02] 与 DungeonTankEngageTrigger 同一套取舍（两个文件各自持有常量，不改头文件）：
+//   ① 30 码外的怪不接手 —— 坦克跑过去会丢当前波的仇恨，实测是连锁开怪的放大器；
+//   ② 队友 ≤35% 血时放开距离（FLT_MAX），被怪咬的队友必须救；
+//   ③ ai_playerbot_avoid_mob（无敌/击飞类）不接手。
+static float const kEngageRadius = 30.0f;
+static float const kPanicHealthPct = 35.0f;
+
+static bool TeammateInDanger(Group* grp)
+{
+    if (!grp)
+        return false;
+    for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* m = ref->getSource();
+        if (!m || !m->IsInWorld() || !m->IsAlive())
+            continue;
+        if (m->GetHealthPercent() <= kPanicHealthPct)
+            return true;
+    }
+    return false;
+}
+
+// [2026-11-02] 只读已加载的路由缓存（MapRoute::avoidEntries），不查库。
+static bool IsAvoidMob(Player* bot, Creature* c)
+{
+    if (!bot || !c)
+        return false;
+    dungeonroute::MapRoute const* route = dungeonroute::GetMapRoute(bot->GetMapId());
+    return route && route->avoidEntries.count(c->GetEntry()) > 0;
+}
 
 namespace dungeonroute
 {
@@ -1851,14 +1884,20 @@ bool DungeonTankEngageAction::Execute(Event& event)
     if (!grp)
         return false;
 
+    // [2026-11-02] 与 Trigger 同一套取舍：默认 30 码内才接手；队友 ≤35% 血时放开。
+    float const engageRadius = TeammateInDanger(grp) ? FLT_MAX : kEngageRadius;
+
     // [2026-10-25 站长口径] **坦克优先锁集火目标**（priority5 > 低血精英），
     //   其它怪只维持"基础仇恨"：治疗仇恨接近(≥pct%)就补一次。
     {
+        // [2026-11-02] 超距 / avoid_mob 的怪不许追（MovePoint 过去=丢当前波仇恨）
         Creature* focus = dungeonroute::FindTankFocusTarget(bot);
-        if (focus && (!bot->GetVictim() || bot->GetVictim()->GetObjectGuid() != focus->GetObjectGuid()))
+        if (focus && bot->GetDistance(focus) <= engageRadius && !IsAvoidMob(bot, focus) &&
+            (!bot->GetVictim() || bot->GetVictim()->GetObjectGuid() != focus->GetObjectGuid()))
             bot->Attack(focus, true);
         Creature* pressure = dungeonroute::FindHealerThreatPressure(bot);
-        if (pressure && (!bot->GetVictim() || bot->GetVictim()->GetObjectGuid() != pressure->GetObjectGuid()))
+        if (pressure && bot->GetDistance(pressure) <= engageRadius && !IsAvoidMob(bot, pressure) &&
+            (!bot->GetVictim() || bot->GetVictim()->GetObjectGuid() != pressure->GetObjectGuid()))
         {
             bot->Attack(pressure, true);
             sLog.outError("[BASET] %s 补基础仇恨：%s(entry=%u) 的治疗仇恨已接近坦克",
@@ -1880,6 +1919,11 @@ bool DungeonTankEngageAction::Execute(Event& event)
             Creature* c = static_cast<Creature*>(a);
             if (c->IsCritter() || !bot->CanAttack(c))
                 continue;
+            // [2026-11-02] 超距不接手（坦克到怪，不是队友到怪）；avoid_mob 不接手。
+            if (bot->GetDistance(c) > engageRadius)
+                continue;
+            if (IsAvoidMob(bot, c))
+                continue;
             // [2026-10-26 站长口径] 不再因为"坦克已经把它设为目标"就跳过 —— 实测那种情况坦克站在
             //   23 码外不动（有目标但不近战），怪照样在砍队友。改成：只要它在砍队友就得接手，
             //   下面 ① 分支（victim != bot）里的"近战砍队友 ⇒ 上去接"会处理。
@@ -1897,6 +1941,11 @@ bool DungeonTankEngageAction::Execute(Event& event)
         }
     }
     if (!best)
+        return false;
+
+    // [2026-11-02] 选定目标仍超距 ⇒ 放弃本次（不 MovePoint 追）。交给路线推进/站位逻辑，
+    //   坦克不被几十码外的怪拉走，就不会把自己正在打的那波仇恨掉光。
+    if (bot->GetDistance(best) > engageRadius)
         return false;
 
     // ① 它不朝坦克走（victim 不是坦克）

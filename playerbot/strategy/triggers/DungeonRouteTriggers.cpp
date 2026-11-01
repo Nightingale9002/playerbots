@@ -3,7 +3,45 @@
 #include "playerbot/DungeonRoute.h"
 #include "DungeonRouteTriggers.h"
 
+#include <cfloat>
+
 using namespace ai;
+
+// [2026-11-02] 坦克"接手"的硬上限（码）：超过这个距离的怪不接手。
+//   原逻辑只要队友被某只怪咬着就接管，没有距离过滤 ⇒ 坦克会为另一个房间里的怪掉头，
+//   把自己正在打的那波的仇恨丢掉、越打越多（实测是连锁开怪的放大器）。
+//   代价：30 码外的怪暂时不管，等队伍推进到附近（或队友血量兜底）再接。
+static float const kEngageRadius = 30.0f;
+
+// [2026-11-02] 安全兜底阈值：任何队友血量 ≤ 35% ⇒ 距离过滤全部失效（被怪咬的队友必须救）。
+static float const kPanicHealthPct = 35.0f;
+
+// [2026-11-02] 有没有队友快死了。有 ⇒ 调用方把半径放大到 FLT_MAX，行为回到改动前。
+static bool TeammateInDanger(Group* grp)
+{
+    if (!grp)
+        return false;
+    for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* m = ref->getSource();
+        if (!m || !m->IsInWorld() || !m->IsAlive())
+            continue;
+        if (m->GetHealthPercent() <= kPanicHealthPct)
+            return true;
+    }
+    return false;
+}
+
+// [2026-11-02] ai_playerbot_avoid_mob 里的怪（无敌 + 击飞类）不接手：拉它没有意义，
+//   交给引擎的 avoid specific creatures 链路去躲。容器就是 MapRoute::avoidEntries
+//   （LoadMapRoute 时一次加载、随路由缓存），这里不查库、没有每 tick 的 SQL。
+static bool IsAvoidMob(Player* bot, Creature* c)
+{
+    if (!bot || !c)
+        return false;
+    dungeonroute::MapRoute const* route = dungeonroute::GetMapRoute(bot->GetMapId());
+    return route && route->avoidEntries.count(c->GetEntry()) > 0;
+}
 
 // [2026-10-18 站长口径] "打完最近的一波之后就不会继续推进"：
 //   如果当前波**没有任何可打目标**（友好 NPC / 小动物 / 怪全在远处没加载），
@@ -264,6 +302,9 @@ bool DungeonTankEngageTrigger::IsActive()
     if (!grp)
         return false;
 
+    // [2026-11-02] 队友 ≤35% 血 ⇒ 不看距离（FLT_MAX = 不过滤），被咬的人必须救。
+    float const engageRadius = TeammateInDanger(grp) ? FLT_MAX : kEngageRadius;
+
     Creature* victimOfTeammate = nullptr;
     uint32 worstDeficit = 0;
     for (GroupReference* ref = grp->GetFirstMember(); ref; ref = ref->next())
@@ -280,6 +321,13 @@ bool DungeonTankEngageTrigger::IsActive()
                 continue;
             // 已经在打它了就不算"需要救场"（避免每 tick 抢断自己的攻击）
             if (bot->GetVictim() && bot->GetVictim()->GetObjectGuid() == c->GetObjectGuid())
+                continue;
+            // [2026-11-02] 超距不接手：坦克跑过去会丢当前波的仇恨，实测是连锁开怪的放大器。
+            //   用 tank 到怪的距离（不是队友到怪），因为要跑过去的是坦克。
+            if (bot->GetDistance(c) > engageRadius)
+                continue;
+            // [2026-11-02] avoid_mob（无敌/击飞类）不接手
+            if (IsAvoidMob(bot, c))
                 continue;
             // 只处理"坦克没拉住"的：坦克在这只怪上的仇恨要显著低于被打的那个人
             float selfThreat = c->getThreatManager().getThreat(bot);
