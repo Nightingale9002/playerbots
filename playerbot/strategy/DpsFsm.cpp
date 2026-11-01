@@ -1822,7 +1822,11 @@ namespace
                 s.autoRemainMs = 0;
             else
             {
-                uint32 const interval = m->autoShotInterval ? m->autoShotInterval : 2000;
+                // [2026-11-02 站长口径] **自动射击节奏 = 远程武器速度**（不是固定 2000ms，也不是观测值）：
+                //   核心 GetAttackTime(RANGED_ATTACK) 就是当前远程攻击间隔（含急速）⇒ 直接用它；
+                //   观测值只在核心读不到时兜底（实测某只射击猎被观测成 500ms，把稳固窗口永远判死）。
+                uint32 const weaponSpeed = uint32(s.bot->GetAttackTime(RANGED_ATTACK));
+                uint32 const interval = weaponSpeed ? weaponSpeed : (m->autoShotInterval ? m->autoShotInterval : 2000);
                 int const elapsed = int(WorldTimer::getMSTimeDiff(m->autoShotAt, safeNow));
                 int remain = int(interval) - elapsed;
                 s.autoRemainMs = remain > 0 ? (remain < int(interval) ? remain : int(interval)) : 0;
@@ -13130,13 +13134,15 @@ namespace ai
             }
             if (!TryCastSelf(ai, m, s, item))
             {
-                m->prepFailAt[item] = now;
-                // 瞬时未就绪（res=NOT_READY）不算故障：不计数、不长鸣，下一 tick 重试
+                // [2026-11-02 站长口径] **瞬时未就绪（GCD 差一点）不能退避**：
+                //   原来先写 prepFailAt 再判瞬时 ⇒ 明明是"下 tick 就能放"，却被 5 秒退避挡住，
+                //   表现成"形态一直放不出来"。顺序改成：先判瞬时 ⇒ 记 cooldown、不写退避、下 tick 立刻重试。
                 if (PrepFailureTransient(ai, bot, SpellId(ai, bot, m, item, false)))
                 {
                     prepLog(item, "cooldown");
                     return false;
                 }
+                m->prepFailAt[item] = now;
                 uint32 const fails = ++m->prepFails[item];
                 PrepLogCastFail(ai, m, s, item, fails, State::Prep);
                 prepLog(item, "castfailed");
