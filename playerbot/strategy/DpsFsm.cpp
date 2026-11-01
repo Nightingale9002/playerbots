@@ -302,6 +302,7 @@ namespace
         // [2026-11-01 实测修正] 诅咒位的重放保护：放出去但读不到目标 debuff 时累计次数，
         //   连续 2 次仍读不到就退避 30 秒（实测一轮 18 次诅咒空转、dps 205、dots 恒 0）。
         int wlCurseTries = 0;
+        int drFormFails = 0;   // [2026-11-02] 鸟德枭兽形态连续失败次数（>=3 放弃形态）
         uint32 wlCurseSkipUntil = 0;
         // [2026-11-01 站长口径] 牧师·暗影（mode=5，**GCD 时间轮**）专用：
         //   spBeat / spBeatAt —— 拍钟：`spBeat` 是"现在是第几拍"，`spBeatAt` 是**下一拍开始**的毫秒时刻。
@@ -3758,7 +3759,9 @@ namespace
         //   窗口不够就进 Weave 等一发（Weave 是本状态机的正式状态，不是"卡住"）。
         int constexpr STEADY_CAST_MS = 1500;
         int constexpr AIMED_CAST_MS = 3000;
-        uint32 const autoRemainMs = s.bot->getAttackTimer(RANGED_ATTACK);
+        // [2026-11-02 实测修] 不能用 getAttackTimer(RANGED_ATTACK)：本核心该计时器不递减，实测恒 ~198ms
+        //   ⇒ canSteady 永远为假 ⇒ 每拍 Weave/Hold ⇒ 射击猎只放奥术/多重（无 34120/75），dps 285。
+        uint32 const autoRemainMs = uint32(s.autoRemainMs > 0 ? s.autoRemainMs : 0);
         // 自动射击没起手时计时器是 0，只按"窗口够不够"判会永远进 Weave（实测 marks 整场 casts=0）。
         // [2026-10-29 实测] 自动射击不是普通法术：必须走引擎的 "auto shot" 动作
         //   （CastAutoShotAction 会登记 CURRENT_AUTOREPEAT_SPELL）。而且**不能只看计时器**：
@@ -10498,16 +10501,31 @@ namespace ai
         // ---- Prep：枭兽形态（没这个天赋的 bot 就在法师形态打，循环照旧） ----
         if (SpellId(ai, bot, m, "moonkin form", false) && bot->GetShapeshiftForm() != FORM_MOONKIN)
         {
-            if (DrHasAuraByName(bot, "moonkin form"))
+            // [2026-11-02 实测修] 两个死循环都在这段：
+            //   ① "有 moonkin form 光环但形态不是枭兽"直接 Decline ⇒ 整场死在 Prep（casts=0）；
+            //   ② 形态放不出来也每 tick Decline ⇒ 闸门把引擎一起关了 ⇒ 整场 0 输出。
+            //   新规则：成功=Acted；连续失败 3 次=放弃枭兽形态按人形打（月火/虫群/星火不依赖形态）；其它才 Decline。
+            bool const ok = TryCastSelf(ai, m, s, "moonkin form");
+            if (ok)
+            {
+                m->drFormFails = 0;
+                LogTransition(ai, m, s, State::Prep);
+                DrLogTick(ai, m, s, State::Prep, p);
+                return TickResult::Acted;
+            }
+            if (++m->drFormFails >= 3)
+            {
+                if (m->drFormFails == 3)
+                    sLog.outError("[DPSFSM-DRUID] %s 枭兽形态连续 3 次放不出 ⇒ 改按人形循环输出", bot->GetName());
+                LogTransition(ai, m, s, State::Maintain);
+                DrLogTick(ai, m, s, State::Maintain, p);
+            }
+            else
             {
                 LogTransition(ai, m, s, State::Prep);
                 DrLogTick(ai, m, s, State::Prep, p);
                 return TickResult::Decline;
             }
-            bool const ok = TryCastSelf(ai, m, s, "moonkin form");
-            LogTransition(ai, m, s, State::Prep);
-            DrLogTick(ai, m, s, State::Prep, p);
-            return ok ? TickResult::Acted : TickResult::Decline;
         }
 
         ThreatLevel const threat = EvalThreat(m, s);
