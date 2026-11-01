@@ -792,6 +792,17 @@ namespace
     }
 
     int   AoEPack(BotMem* m)  { return int(TP(m, "aoe_pack", 3.0)); }
+    // [2026-11-02 修·副本拉整间房] AoE 判据读哪一列：
+    //   `aoe_require_engaged`（默认 1）= 只数**已进战**；设 0 = 回旧行为（pack，含站桩怪）。
+    //   诊断日志仍然打 pack10/pack30 原值，不混用。
+    int AoeCount10(Snapshot const& s, BotMem* m)
+    {
+        return (TP(m, "aoe_require_engaged", 1.0) >= 1.0) ? s.engaged10 : s.pack10;
+    }
+    int AoeCount30(Snapshot const& s, BotMem* m)
+    {
+        return (TP(m, "aoe_require_engaged", 1.0) >= 1.0) ? s.engaged30 : s.pack30;
+    }
     float AoERange(BotMem* m) { return float(TP(m, "aoe_range", 11.0)); }
     float BurstHp(BotMem* m)  { return float(TP(m, "burst_hp", 20.0)); }
 
@@ -1095,7 +1106,21 @@ namespace
 
     // [2026-11-01 站长口径] `out`（可选）= 同一份过滤口径下的**敌人列表**（痛苦术多目标铺腐蚀要用）。
     //   传 nullptr 时行为与以前逐字节一致（只数个数），所以 pack10/pack30 的调用点一个都没动。
-    int CountHostilesNear(PlayerbotAI* ai, Player* bot, float range, std::vector<Unit*>* out = nullptr)
+    // [2026-11-02 修·副本拉整间房] 一只怪是不是"已经进战"：
+    //   · 自己身上带 UNIT_FLAG_IN_COMBAT（被打了 / 正在打人）；
+    //   · 或者已经有 victim（在追着谁打）。
+    //   站桩不动、没进战的怪**不算** —— 这就是把整间房拉过来的根源。
+    bool IsEngagedHostile(Unit* u)
+    {
+        if (!u)
+            return false;
+        if (u->IsInCombat())
+            return true;
+        return u->GetVictim() != nullptr;
+    }
+
+    int CountHostilesNear(PlayerbotAI* ai, Player* bot, float range, std::vector<Unit*>* out = nullptr,
+                          bool engagedOnly = false)
     {
         // [2026-10-29 崩溃修] 不在世界里的 bot 调 GetMap() 会触发核心断言 m_currMap 直接关服
         if (!bot || !bot->IsInWorld())
@@ -1123,6 +1148,11 @@ namespace
                 continue;
             if (!sServerFacade.IsHostileTo(bot, u))
                 continue;
+            // [2026-11-02 修] engagedOnly = 只数"已经进战"的怪。假人场景
+            //   （scenario 非空 = 本轮声明的目标）照旧全算 —— 假人不还手，
+            //   按 IsInCombat 过滤会把声明的目标全数成 0（把 17 专精测试打废）。
+            if (engagedOnly && scenario.empty() && !IsEngagedHostile(u))
+                continue;
             if (!scenario.empty() && !scenario.count(u->GetObjectGuid()))
                 continue;
             if (out)
@@ -1130,6 +1160,13 @@ namespace
             ++n;
         }
         return n;
+    }
+
+    // [2026-11-02 修·副本拉整间房] 只数"已经进战"的敌对（AoE 判据专用）。
+    //   假人场景仍按声明目标算（见 CountHostilesNear 的 scenario 口径）。
+    int CountEngagedHostilesNear(PlayerbotAI* ai, Player* bot, float range)
+    {
+        return CountHostilesNear(ai, bot, range, nullptr, true);
     }
 
     // ==========================================================================
@@ -1412,6 +1449,12 @@ namespace
 
         s.pack10 = CountHostilesNear(ai, bot, 10.0f);
         s.pack30 = CountHostilesNear(ai, bot, 30.0f);
+        // [2026-11-02 修] "已进战"计数（仅 AoE 判据用；参数关掉时不跑这两条扫描）。
+        if (TP(m, "aoe_require_engaged", 1.0) >= 1.0)
+        {
+            s.engaged10 = CountEngagedHostilesNear(ai, bot, 10.0f);
+            s.engaged30 = CountEngagedHostilesNear(ai, bot, 30.0f);
+        }
 
         // [2026-10-31 站长口径] 仇恨三档的输入：自己 / 坦克对**同一个目标**的威胁值。
         //   坦克认定直接复用 PlayerbotAI::IsTank（与 AttackAction 同一份口径），不自己按职业/天赋猜；
@@ -2832,7 +2875,7 @@ namespace
         else if (st == State::Recover && s.power > lowMana + 20.0f)
             st = State::Burn;
 
-        if (st != State::Recover && s.pack30 >= AoEPack(m))
+        if (st != State::Recover && AoeCount30(s, m) >= AoEPack(m))
             st = State::Aoe;
         else if (st == State::Aoe)
             st = State::Burn;
@@ -3282,7 +3325,7 @@ namespace
         bool const executeWindow = s.targetHp <= BurstHp(m);
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
-        if (s.pack10 >= AoEPack(m) && inRange)
+        if (AoeCount10(s, m) >= AoEPack(m) && inRange)
             st = State::Aoe;
         else if (st == State::Aoe)
             st = State::Burn;
@@ -3383,7 +3426,7 @@ namespace
         //   群战里跟单体一模一样。TBC 盗贼没有真正的群体技（刀扇 Fan of Knives 是 WLK 才有），
         //   群战能做的只有：剑刃乱舞（额外打一个目标 + 20% 攻速）和冲动，其余照常攒星泄星。
         //   所以这里补一个 Aoe 状态，把这两张 CD 技顶到最前面，后面的循环完全复用单体表。
-        bool const aoe = (s.pack10 >= AoEPack(m));
+        bool const aoe = (AoeCount10(s, m) >= AoEPack(m));
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
         if (!inRange)
@@ -3529,7 +3572,7 @@ namespace
         bool const canInstant = !s.moving && (autoRemainMs == 0 || autoRemainMs > 700);
 
         State st = (m->state == State::Idle) ? State::Burn : m->state;
-        if (s.pack30 >= AoEPack(m))
+        if (AoeCount30(s, m) >= AoEPack(m))
             st = State::Aoe;
         else if (st == State::Aoe)
             st = State::Burn;
@@ -3633,7 +3676,7 @@ namespace
         else if (st == State::Recover && s.power > 40.0f)
             st = State::Burn;
 
-        if (st != State::Recover && s.pack30 >= AoEPack(m))
+        if (st != State::Recover && AoeCount30(s, m) >= AoEPack(m))
             st = State::Aoe;
         else if (st == State::Aoe)
             st = State::Burn;
@@ -3752,9 +3795,9 @@ namespace
             st = State::Recover;
         else if (st == State::Recover && s.power > 30.0f)
             st = State::Burn;
-        if (st != State::Recover && s.pack10 >= AoEPack(m) && enhance)
+        if (st != State::Recover && AoeCount10(s, m) >= AoEPack(m) && enhance)
             st = State::Aoe;
-        else if (st == State::Aoe && !(s.pack10 >= AoEPack(m) && enhance))
+        else if (st == State::Aoe && !(AoeCount10(s, m) >= AoEPack(m) && enhance))
             st = State::Burn;
         if (st == State::Burn && executeWindow)
             st = State::Burst;
@@ -3909,7 +3952,7 @@ namespace
             st = State::Recover;
         else if (st == State::Recover && s.power > 30.0f)
             st = State::Burn;
-        if (st != State::Recover && s.pack30 >= AoEPack(m))
+        if (st != State::Recover && AoeCount30(s, m) >= AoEPack(m))
             st = State::Aoe;
         else if (st == State::Aoe)
             st = State::Burn;
@@ -4968,7 +5011,7 @@ namespace ai
             return State::Flee;
 
         if (s.power < float(TP(m, "recover_enter", 8.0)))  return State::Recover;
-        if (s.pack30 >= AoEPack(m))                        return State::Aoe;
+        if (AoeCount30(s, m) >= AoEPack(m))                        return State::Aoe;
 
         // [2026-10-31 站长口径] 爆发 = 仇恨稳定后**立刻开**、早用早 CD（不再等目标血量低）。
         //   单 bot 用时间间隔当"CD 门"，`burst_interval` 可调（越小越激进）。
@@ -5384,7 +5427,7 @@ namespace ai
         if (alreadyRecover ? (s.power < recoverExit) : (s.power < recoverEnter))
             return State::Recover;
 
-        if (s.pack30 >= AoEPack(m))
+        if (AoeCount30(s, m) >= AoEPack(m))
             return State::Aoe;
 
         // 爆发：仇恨 Open 且间隔到了就开；进入后 `burst_window` 秒内保持 Burst，
@@ -5805,7 +5848,7 @@ namespace ai
         if (alreadyRecover ? (s.power < recoverExit) : (s.power < recoverEnter))
             return State::Recover;
 
-        if (s.pack30 >= AoEPack(m))
+        if (AoeCount30(s, m) >= AoEPack(m))
             return State::Aoe;
 
         // 爆发：仇恨 Open 且间隔到了就开；进入后 burst_window 秒内保持 Burst，
@@ -6156,7 +6199,7 @@ namespace ai
             return State::Recover;
 
         float const meleeRange = float(TP(m, "range_melee", 6.5));
-        if (s.pack10 >= AoEPack(m) && s.dist <= meleeRange)
+        if (AoeCount10(s, m) >= AoEPack(m) && s.dist <= meleeRange)
             return State::Aoe;
 
         // 爆发 = 仇恨放开 + 间隔到（早用早 CD）。窗口内保持 Burst，
@@ -6424,7 +6467,7 @@ namespace ai
         if (alreadyRecover ? (s.energy < energyExit) : (s.energy < energyEnter))
             return State::Recover;
 
-        if (s.pack10 >= AoEPack(m))
+        if (AoeCount10(s, m) >= AoEPack(m))
             return State::Aoe;
 
         time_t const now = time(nullptr);
@@ -6666,7 +6709,7 @@ namespace ai
             return State::Recover;
 
         // ② 群架
-        if (s.pack30 >= AoEPack(m))
+        if (AoeCount30(s, m) >= AoEPack(m))
             return State::Aoe;
 
         // ③ 射程：先到位再谈爆发
@@ -6822,7 +6865,7 @@ namespace ai
             return State::Recover;
 
         // ② 群架（只有恶魔单开这一档，理由见函数头）
-        if (m->spec == Spec::Demonology && s.pack30 >= AoEPack(m))
+        if (m->spec == Spec::Demonology && AoeCount30(s, m) >= AoEPack(m))
             return State::Aoe;
 
         // ③ 射程：先到位再谈爆发
@@ -7572,7 +7615,7 @@ namespace ai
 
         // ③ 群架：火法**没有减仇恨手段** ⇒ 只有 `EvalThreat == Open` 才许开 AoE。
         //    Throttle/Wait 时继续单点：替坦克把怪拉过来，比多打几发烈焰风暴亏得多。
-        if (s.pack30 >= AoEPack(m) && threat == ThreatLevel::Open)
+        if (AoeCount30(s, m) >= AoEPack(m) && threat == ThreatLevel::Open)
             return State::Aoe;
 
         // ④ 爆发窗口（`TickFireFsm` 在调用本函数之前已经点好火）
@@ -8015,7 +8058,7 @@ namespace ai
         if (s.power < float(TP(m, "recover_mana", 20.0)))
             return State::Recover;
 
-        if (s.pack10 >= int(TP(m, "aoe_targets", 3.0)))
+        if (AoeCount10(s, m) >= int(TP(m, "aoe_targets", 3.0)))
             return State::Aoe;
 
         if (s.targetHp <= float(TP(m, "execute_hp", 20.0)))
@@ -8762,7 +8805,7 @@ namespace ai
         ShTotemCtx c;
         c.elemental = elemental;
         c.enhance = enhance;
-        c.inAoe = (s.pack10 >= int(TP(m, "aoe_pack", 3.0)));
+        c.inAoe = (AoeCount10(s, m) >= int(TP(m, "aoe_pack", 3.0)));
         c.twist = ShTwistEnabled(ai, m, s, enhance);
         m->shClOk = elemental && (s.power >= float(TP(m, "cl_mana_min", 60.0)));
 
@@ -9436,7 +9479,7 @@ namespace ai
             return State::Recover;
         if (s.dist > float(TP(m, "range_caster", 30.0)))
             return State::Approach;
-        if (s.pack30 >= AoEPack(m))
+        if (AoeCount30(s, m) >= AoEPack(m))
             return State::Aoe;
         if (s.targetHp <= BurstHp(m) && threat != ThreatLevel::Wait)
             return State::Burst;
@@ -10030,7 +10073,7 @@ namespace ai
             st = State::Approach;
         else if (m->drFuror && !manaShiftOk && s.energy < shredCost)
             st = State::Recover;          // 蓝低到连一次变身都不够，且能量打不出下一手
-        else if (s.pack10 >= AoEPack(m))
+        else if (AoeCount10(s, m) >= AoEPack(m))
             st = State::Aoe;
 
         TickResult result = TickResult::Decline;
@@ -10254,7 +10297,7 @@ namespace ai
             st = State::Approach;
         else if (s.power < float(TP(m, "recover_power", 10.0)))
             st = State::Recover;
-        else if (s.pack30 >= AoEPack(m))
+        else if (AoeCount30(s, m) >= AoEPack(m))
             st = State::Aoe;
         else if (burstWindow && threat != ThreatLevel::Wait)
             st = State::Burst;
@@ -12221,10 +12264,16 @@ namespace ai
         std::vector<Unit*> adds;
         CountHostilesNear(ai, bot, float(TP(m, "tank_scan_range", 30.0)), &adds);
 
+        // [2026-11-02 修·副本加怪接管] `tank_pickup_adds`（默认 1）：
+        //   除了"零仇恨的新怪"，fresh），也要接管"正在打队友、但不在我身上"的怪（rescue）。
+        //   实测 onme=3 / adds=12 时另外 9 只在打队友，坦克却只盯零仇恨的站桩怪 ⇒ 队友被打死。
+        //   设 0 = 回旧行为（只接管 fresh），便于 A/B。
+        double const tankPickupAdds = TP(m, "tank_pickup_adds", 1.0);
         int onMe = 0;
         Unit* lost = nullptr;       // 已经有我的仇恨、但 victim 确实在打别人（丢仇恨）
         Unit* fresh = nullptr;      // 全新目标：我还没有任何威胁（加怪接管）
-        float lostDist = 1.0e9f, freshDist = 1.0e9f;
+        Unit* rescue = nullptr;     // 正在打队友、却不在我身上的怪（优先接管）
+        float lostDist = 1.0e9f, freshDist = 1.0e9f, rescueDist = 1.0e9f;
         for (Unit* u : adds)
         {
             if (!u || !u->IsAlive())
@@ -12237,6 +12286,17 @@ namespace ai
             // 读法见 TankLead() 的注释：威胁表挂在"被威胁的那一方"身上。
             float const mine = u->getThreatManager().getThreat(bot);
             float const d = bot->GetDistance(u);
+            // [2026-11-02 修] victim 是队友（友方玩家）且不是我 ⇒ 这只怪正在打队友。
+            if (tankPickupAdds >= 1.0)
+            {
+                Unit* const v = u->GetVictim();
+                Player* const pv = (v && v->GetTypeId() == TYPEID_PLAYER) ? static_cast<Player*>(v) : nullptr;
+                if (pv && pv != bot && bot->IsFriend(pv) && d < rescueDist)
+                {
+                    rescueDist = d;
+                    rescue = u;
+                }
+            }
             if (mine > 0.0f)
             {
                 if (d < lostDist) { lostDist = d; lost = u; }
@@ -12270,7 +12330,7 @@ namespace ai
             st = State::Prep;
         else if (expectedDying || veryLow)
             st = State::Survival;
-        else if (fresh)
+        else if (fresh || (tankPickupAdds >= 1.0 && rescue))
             st = State::Pickup;
         else if (lost)
             st = State::Taunt;
@@ -12355,19 +12415,26 @@ namespace ai
                 break;
 
             case State::Pickup:
-                if (!fresh)
+            {
+                // [2026-11-02 修·副本加怪接管] 优先接管"正在打队友"的怪（rescue），
+                //   其次才是零仇恨的新怪（fresh，可能只是站着没动的）。
+                //   为什么：实测 onme=3 / adds=12 时剩下 9 只在打队友，坦克只盯最近的零仇恨怪
+                //   ⇒ 队友先死；而去拉站桩怪又会把旁边整间房拉过来。
+                Unit* const pick = (tankPickupAdds >= 1.0 && rescue) ? rescue : fresh;
+                float const pickDist = (pick && pick == rescue) ? rescueDist : freshDist;
+                if (!pick)
                 {
                     st = State::Maintain;
                     break;
                 }
-                // ① 新怪已经在打别人（DPS 先手/加怪）⇒ 嘲讽最快
-                if (freshDist <= float(TP(m, "tank_taunt_range", 28.0)) && fresh->GetVictim())
+                // ① 怪已经在打别人（DPS 先手/加怪）⇒ 嘲讽最快
+                if (pickDist <= float(TP(m, "tank_taunt_range", 28.0)) && pick->GetVictim())
                 {
                     // [2026-11-01 站长口径] 防骑没有 taunt/growl：走 `PalTaunt()` 的三档（rd 优先）
                     if (kind == TankKind::PaladinProt)
                     {
                         char const* tsrc = nullptr;
-                        if (PalTaunt(ai, m, s, fresh, &tsrc))
+                        if (PalTaunt(ai, m, s, pick, &tsrc))
                         {
                             ++m->tankTaunts;
                             ++m->tankPickups;
@@ -12375,7 +12442,7 @@ namespace ai
                             break;
                         }
                     }
-                    else if (CastFirst(ai, m, s, { tauntName }, fresh))
+                    else if (CastFirst(ai, m, s, { tauntName }, pick))
                     {
                         ++m->tankTaunts;
                         ++m->tankPickups;
@@ -12388,18 +12455,19 @@ namespace ai
                 //    CD 中就审判（10 秒、不吃蓝），再不行回落到嘲讽（上面 ① 已经试过一次）。
                 if (kind == TankKind::WarriorProt)
                 {
-                    if (CastFirst(ai, m, s, { "shoot", "throw" }, fresh)) { ++m->tankPickups; acted = true; }
+                    if (CastFirst(ai, m, s, { "shoot", "throw" }, pick)) { ++m->tankPickups; acted = true; }
                 }
                 else if (kind == TankKind::PaladinProt)
                 {
-                    if (CastFirst(ai, m, s, { "avenger's shield" }, fresh)) { ++m->tankPickups; acted = true; }
-                    else if (CastFirst(ai, m, s, { "judgement" }, fresh)) { ++m->tankPickups; acted = true; }
+                    if (CastFirst(ai, m, s, { "avenger's shield" }, pick)) { ++m->tankPickups; acted = true; }
+                    else if (CastFirst(ai, m, s, { "judgement" }, pick)) { ++m->tankPickups; acted = true; }
                 }
-                else if (CastFirst(ai, m, s, { "faerie fire (feral)" }, fresh)) { ++m->tankPickups; acted = true; }
+                else if (CastFirst(ai, m, s, { "faerie fire (feral)" }, pick)) { ++m->tankPickups; acted = true; }
                 // ③ 拉不到（没远程/够不着）：按常规仇恨打，交给上层走位去接触
                 if (!acted)
                     st = State::Maintain;
                 break;
+            }
 
             case State::Taunt:
                 if (!lost)
@@ -12451,7 +12519,8 @@ namespace ai
             }
 
             int const aoePack = int(TP(m, "tank_aoe_pack", 2.0));
-            bool const aoe = (s.pack10 >= aoePack) || (int(adds.size()) >= aoePack);
+            // [2026-11-02 修] 群拉判据同样只看"已进战"（原来 adds.size() 把站桩怪也算进来）。
+            bool const aoe = (AoeCount10(s, m) >= aoePack) || (AoeCount30(s, m) >= aoePack);
             int const rage = s.rage;
 
             if (kind == TankKind::WarriorProt)
@@ -12534,10 +12603,12 @@ namespace ai
             int nAdds = 0;
             float worstLead = 0.0f, minMine = 0.0f;
             TankLead(bot, adds, nAdds, worstLead, minMine);
-            sLog.outError("[DPSFSM-TANK] %s state=%s kind=%s taunt=%s adds=%d onme=%d lead=%.2f hp=%.0f inc=%.0f",
+            // [2026-11-02 修·只加不改] 新增 `engaged=30 码内已进战数`，用来证明
+            //   "adds 很大但真正进战的很少"；旧字段位置不动，旧脚本照旧能切。
+            sLog.outError("[DPSFSM-TANK] %s state=%s kind=%s taunt=%s adds=%d onme=%d lead=%.2f hp=%.0f inc=%.0f engaged=%d",
                 bot->GetName(), ai::dpsfsm::StateName(m->state), TankKindName(kind), m->tankLastTauntSrc,
                 nAdds, onMe, double(worstLead),
-                double(bot->GetHealthPercent()), double(m->tankDmgRate));
+                double(bot->GetHealthPercent()), double(m->tankDmgRate), s.engaged30);
             (void)minMine;      // 只做诊断预留（"最少的那只怪有多少仇恨"），不进日志格式
         }
 

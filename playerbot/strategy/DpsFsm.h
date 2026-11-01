@@ -106,6 +106,13 @@ namespace ai
             bool silenced = false;
             int pack10 = 0;     // 10 码内敌对（近身群伤判断）
             int pack30 = 0;     // 30 码内敌对（"这一坨是不是群架"）
+            // [2026-11-02 修·副本拉整间房] 只数**已经进战**的敌对（`IsInCombat()` / 有 victim）。
+            //   副本实测：AoE 判据用 pack10/pack30 会把"站着没动"的怪也算进来
+            //   ⇒ 只有 1 只进战、旁边 11 只站桩时就放 AoE / 群拉，把整间房拉过来
+            //   （实测 adds=12 / onme=3 / hp 16%）。pack10/pack30 保持原义（诊断用），
+            //   AoE 判据改读这两个字段（参数 `aoe_require_engaged`，默认 1；设 0 回旧行为 A/B）。
+            int engaged10 = 0;  // 10 码内**已进战**敌对
+            int engaged30 = 0;  // 30 码内**已进战**敌对
             // [2026-10-31 站长口径] 仇恨三档的输入：自己 / 坦克对**同一个 target** 的威胁值。
             //   坦克 = 组队成员里第一个 PlayerbotAI::IsTank() 的人；没有队伍或没有坦克
             //   ⇒ tankAlive=false、tankThreat=0 ⇒ EvalThreat 恒 Open（假人场景绝不掉 DPS）。
