@@ -570,6 +570,7 @@ namespace
     std::map<uint32, uint32> s_scenarioPrep;
     std::map<uint32, uint32> s_petLogAt;                         // [2026-10-31] guid → 上次打 [DPSFSM-PET] 周期日志的毫秒时刻
     std::map<uint32, uint32> s_petStuckAt;                       // [2026-10-31] guid → "在追但贴不上且没在动"的起始毫秒时刻
+    std::map<uint32, uint32> s_armsDiagAt;                       // [2026-11-01] guid → [DPSFSM-ARMS-DIAG] 的 10 秒节流
 
     std::mutex s_memMutex;
     std::unordered_map<uint32, std::unique_ptr<BotMem>> s_mem;
@@ -6141,8 +6142,15 @@ namespace ai
         // 怒气滞回：没滞回时会在 10 怒这条线上反复进出 Recover（每 tick 抖一次）
         //   ⚠️ 单位：RageReal() 是真实怒气，TP 的 10/30 也是真实怒气（见 RageReal 的说明）
         int const rageNow = RageReal(s);
-        int const rageEnter = int(TP(m, "rage_enter", 10.0));
-        int const rageExit = int(TP(m, "rage_exit", 30.0));
+        // [2026-11-01 站长口径·C] **武器战的滞回线必须比狂暴战低**（只影响 Arms，Fury 一字不动）：
+        //   武器战的怒气收入≈4.5/秒、核心致死是 **CD 绑定**（6 秒 CD ⇒ 45 秒最多 7 手，实测 6 手），
+        //   所以"等怒气"等不到任何东西，只会把 GCD 空掉。实测 mode=5 45 秒：
+        //   Recover 档位占了绝大半（HB 行 res=2~28 反复），casts 只有 13、猛击 0 次。
+        //   10/30 那组线是"攒够一发致死(30)才动"，而致死根本不在等怒 —— 它在等 CD。
+        //   ⇒ 武器战 5/15：只要够 15（猛击/英勇的价码）就回 Maintain，让动作表自己按价码挑。
+        bool const armsLowLine = (m->spec == Spec::Arms);
+        int const rageEnter = int(TP(m, "rage_enter", armsLowLine ? 5.0 : 10.0));
+        int const rageExit = int(TP(m, "rage_exit", armsLowLine ? 15.0 : 30.0));
         bool const alreadyRecover = (m->state == State::Recover);
         if (alreadyRecover ? (rageNow < rageExit) : (rageNow < rageEnter))
             return State::Recover;
@@ -6198,9 +6206,42 @@ namespace ai
         //   狂暴战保持 `use_slam=0`：它的白字是双持/高攻速流，读条压白字更疼。
         int const coreCost = SpellCost(ai, m, core);
         int const slamCost = SpellCost(ai, m, "slam");
+        // [2026-11-01 站长口径·C] 武器战填充技诊断：10 秒一条，直接看"为什么一手猛击都没放"。
+        //   slamId/msId = 已学会的最高 rank；ready=IsSpellReady（含 GCD）；cost = 模板 manaCost（战士=真实怒气）。
+        if (m->spec == Spec::Arms)
+        {
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32 const safeNow = nowMs ? nowMs : 1;
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            uint32& last = s_armsDiagAt[s.bot->GetGUIDLow()];
+            if (!last || WorldTimer::getMSTimeDiff(last, safeNow) >= 10000)
+            {
+                last = safeNow;
+                uint32 const slamId = SpellId(ai, s.bot, m, "slam", false);
+                uint32 const msId = SpellId(ai, s.bot, m, core, false);
+                sLog.outError("[DPSFSM-ARMS-DIAG] %s state=%s rage=%d coreCost=%d slamCost=%d slamId=%u msId=%u "
+                    "slamReady=%d msReady=%d swing=%d gcd=%d",
+                    s.bot->GetName(), ai::dpsfsm::StateName(m->state), RageReal(s), coreCost, slamCost,
+                    slamId, msId,
+                    (slamId && s.bot->IsSpellReady(slamId)) ? 1 : 0,
+                    (msId && s.bot->IsSpellReady(msId)) ? 1 : 0,
+                    s.bot->GetCurrentSpell(CURRENT_MELEE_SPELL) ? 1 : 0,
+                    s.gcd ? 1 : 0);
+            }
+        }
         double const slamDefault = fury ? 0.0 : 1.0;
+        // [2026-11-01 站长口径·C] 武器战猛击的门（狂暴战仍用旧门且 `use_slam=0`，行为不变）。
+        //   沿革：45(coreCost+slamCost) → 25 → 15，前两档实测猛击**整场 0 次**（mode=5 45 秒 casts 只有 13/9），
+        //   同二进制 legacy mode=3 有 8 手猛击、casts=23 ⇒ 差的全是填充技。
+        //   [2026-11-01 站长口径·C3] **`SpellCost()` 给的是"存储怒气"（×10），必须再 /10 才和 `RageReal()` 同单位。**
+        //   实测 [DPSFSM-ARMS-DIAG]：`coreCost=300 slamCost=150`（= 致死 30 / 猛击 15 真实怒气 ×10）。
+        //   ⇒ 旧的两道门 `RageReal >= 45` / `>= 25` 其实分别是 450 / 250 存储怒 = **45 / 25 真实怒的十倍**，
+        //   武器战 rage 采样只有 15~51 ⇒ 猛击整场 0 次、casts 只有 13，全是这一处单位错。
+        //   legacy `TickWarrior` 之所以"能放"是**同一个 bug 的巧合**：它拿存储值 `s.rage` 直接比 `slamCost`
+        //   （150 存储 = 15 真实），正好是正确价码 —— 所以 legacy 有 8 手猛击，而 mode=5 两手都错。
+        int const slamReserve = fury ? (coreCost + slamCost) / 10 : slamCost / 10;
         if (TP(m, "use_slam", slamDefault) >= 1.0
-            && RageReal(s) >= coreCost + slamCost
+            && RageReal(s) >= slamReserve
             && CastFirst(ai, m, s, { "slam" }))
             return TickResult::Acted;
         // 英勇打击会顶掉这次普攻（等于用普攻的怒换伤害）⇒ 只有怒气高出保留线才泄
