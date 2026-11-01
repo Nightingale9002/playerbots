@@ -398,6 +398,14 @@ namespace
         bool   shClOk = false;         // 这一手是否走"闪电链优先"（蓝 ≥ cl_mana_min）
         int    shLightningShield = 0;  // 闪电盾层数（AuraStacks/charge 取大，见 ShLightningShieldStacks）
         uint32 lsCastAt = 0;           // 上一次补闪电盾的时刻（防"引擎水盾 ↔ 我方闪电盾"互顶时紧着补）
+        // [2026-11-01 实测] **护盾归状态机**（`sh_ls_own`，方案 A）的两个验收计数：
+        //   shLsCasts —— 本场真补上去的闪电盾次数（成功施法，含 Prep 里的第一次）；
+        //   shLsGated —— 本场**占住施法闸门**的 tick 数（返回 Acted 但没施法 ⇒ 引擎的
+        //                `m_fsmCastLock` 合上）：既含"盾没了、GCD 正锁着"的 tick，
+        //                也含 ③-1 那条通用的"交回引擎前先占住闸门"。
+        //   正式计数见 `[DPSFSM-SH-LS]`，不参与决策。
+        uint32 shLsCasts = 0;
+        uint32 shLsGated = 0;
         uint32 shEarthShocks = 0;      // 本场地震击次数（层数达标才震）
         uint32 shTotemCasts = 0;       // 本场补图腾次数（验收"图腾真的在补"）
         // [2026-11-01 站长口径] A. **脱战准备阶段**补过的图腾次数（`[DPSFSM-SH-PREP]` 的 #n）：
@@ -8444,6 +8452,11 @@ namespace ai
             m->totemEntry[TOTEM_SLOT_AIR], int(m->totemExpireAt[TOTEM_SLOT_AIR] > safeNow
                 ? (m->totemExpireAt[TOTEM_SLOT_AIR] - safeNow) / 1000 : 0),
             m->shLightningShield, m->shEarthShocks, m->twistPhase, m->wfProcs);
+        // [2026-11-01 实测] 护盾归属的验收：`lsown=<真补上去的闪电盾>/<占住闸门的 tick>`。
+        //   方案 A 生效时它应该"补得少（1~3 次）、闸门占得多"，而 `top=` 里 33736 归零。
+        sLog.outError("[DPSFSM-SH-LS] %s lsown=%u/%u lsrecast_ms=%d",
+            s.bot ? s.bot->GetName() : "-", m->shLsCasts, m->shLsGated,
+            int(TP(m, "ls_recast_ms", 5000.0)));
     }
 
     // [2026-11-01 站长口径] A. **图腾属于准备阶段**：脱战（准备窗口 / 开打前）就把四槽插满。
@@ -8487,6 +8500,12 @@ namespace ai
 
         bool const elemental = (m->spec == Spec::Elemental);
         bool const enhance   = (m->spec == Spec::Enhancement);
+        // [2026-11-01 实测] **护盾归状态机**的归属开关（A/B 用）：
+        //   `sh_ls_own=1`（默认）= 方案 A：元素萨只认闪电盾，FSM 最高优先补，并且用
+        //   "占住施法闸门"把引擎自己补 `water shield`(33736) 的路堵死；
+        //   `sh_ls_own=0` = **改前行为**（只在 Prep 里按 `ls_recast_ms` 补，闸门不管），
+        //   对照臂用它跑，一行代码不用回滚。
+        bool const lsOwn = elemental && TP(m, "sh_ls_own", 1.0) >= 1.0;
         // 恢复（Restoration）不做 DPS：不接管，交回引擎
         if (!elemental && !enhance)
             return TickResult::Decline;
@@ -8574,13 +8593,52 @@ namespace ai
         // ------------------------------------------------------------------
         // ③ 各状态动作（一 tick 一个 GCD，放成就返回 Acted）
         // ------------------------------------------------------------------
-        if (result == TickResult::Decline && st == State::Prep)
+        // ------------------------------------------------------------------
+        // ③-0 [2026-11-01 实测] **护盾归状态机**（方案 A，`sh_ls_own=1` 默认）
+        //
+        //   病根（上一轮实测暴露）：状态机返 `Decline` 的那一 tick，引擎照跑它自己的萨满
+        //   buff —— 实测插 `water shield`(33736)，把我们的 `lightning shield`(25472) 顶掉；
+        //   下一 tick 状态机又补闪电盾 ⇒ **两个盾互顶**，元素萨长时间卡在 Prep、
+        //   假人 150 秒 dps 区间垮到 270~1006（同一份二进制、同一份装备）。
+        //   `ls_recast_ms`(5s) 只能把互顶的**代价**封顶，堵不住引擎那一手。
+        //
+        //   为什么改"占住闸门"而不是"给闪电盾加更长的退避"：
+        //   引擎那条路只在**状态机没出手**（`Decline` ⇒ `fsmHandled=false`）时才开，
+        //   而"没出手"的 tick 恰恰是 GCD 正锁着、谁都放不出的那一拍。所以这里
+        //   **放不出也返回 Acted**：`fsmHandled=true` 让引擎这一 tick 的施法闸合上
+        //   （`PlayerbotAI::UpdateAIInternal` 的 `m_fsmCastLock = fsmOwnsBot && (inCombat||victim)`），
+        //   而 `castThisTick=false` ⇒ `DidCastThisTick` 仍是 false ⇒ **走位/追击照旧归引擎**，
+        //   不会被"Hold"那种整 tick 停摆拖住。与治疗派发那次"Decline 也报接管"是同一个思路，
+        //   区别是这里还要求"护盾真的没了"，不是把整张专精图都钉死。
+        //
+        //   只在 `st != Recover` 时接管：低蓝时正在喝水/等蓝，抢这一手会打断回蓝，
+        //   而这两个盾都费蓝，互顶本身也不是这一拍的主要矛盾。
+        // ------------------------------------------------------------------
+        if (lsOwn && m->shLightningShield <= 0 && st != State::Recover)
         {
-            // 元素开场：闪电盾（earth shock 靠它叠层，也是减伤）。
+            if (TryCastSelf(ai, m, s, "lightning shield"))
+            {
+                m->lsCastAt = safeNow;
+                ++m->shLsCasts;
+                result = TickResult::Acted;
+            }
+            else if (GcdLocked(s))
+            {
+                // 盾没了、GCD 正转（刚放完图腾/输出）：**占住闸门**，引擎这一拍别想补水盾。
+                ++m->shLsGated;
+                result = TickResult::Acted;
+            }
+            // 其余情况（没学会 / 没蓝 / GCD 已空却仍放不出）**不占闸门**：
+            //   硬钉在这里会变成"整轮 0 施法"的老坑，还不如把这一手还给引擎。
+        }
+        else if (result == TickResult::Decline && st == State::Prep && !lsOwn)
+        {
+            // 改前行为（`sh_ls_own=0` 的 A/B 对照臂，逐字保留）：
+            //   元素开场：闪电盾（earth shock 靠它叠层，也是减伤）。
             //   ⚠️ 被顶掉时**别紧着补**：本核心的引擎在"状态机 Decline 的 tick"仍会跑它自己的
             //   萨满 buff（实测插 Water Shield 33736），两个盾互顶 ⇒ 45 秒里闪电盾放 7 次、
             //   水盾放 7 次，元素萨 dps 从 900 掉到 450。这里 `ls_recast_ms`(5 秒) 内补过就等一轮，
-            //   把互顶的代价封顶；真要根治得把"自身护盾"也收进 FSM 并让引擎闭嘴（后续）。
+            //   把互顶的代价封顶；根治见上面 ③-0 的"护盾归状态机"。
             uint32 const lsGap = uint32(std::max(0, int(TP(m, "ls_recast_ms", 5000.0))));
             if (elemental
                 && (!m->lsCastAt || WorldTimer::getMSTimeDiff(m->lsCastAt, safeNow) >= lsGap)
@@ -8682,6 +8740,33 @@ namespace ai
                     //   这一手放别的会把下一次震击预算打乱，等 CD 比硬放值。
                     result = HoldWait(m, "shock-cd-wait");
             }
+        }
+
+        // ------------------------------------------------------------------
+        // ③-1 [2026-11-01 实测·第一轮 A/B 的反证] **元素萨"交回引擎"的 tick 也要占住闸门**
+        //
+        //   第一版只堵"盾没了"的那几拍的闸门（见 ③-0），实测 150 秒里
+        //   `25472`(闪电盾) 16 次 / `33736`(水盾) **仍然是 16 次** —— 互顶一次没少。
+        //   根因不是"补盾的时机"，而是**引擎那条补水盾的路开在别的 tick 上**：
+        //   引擎的判据是"我身上没有 water shield"（跟我们有没有闪电盾无关），而它只在
+        //   `Decline` 的 tick 里有施法权。元素萨在战斗里 Declined 的 tick 很多（GCD 刚转、
+        //   读条中、震击 CD、走位），于是它每 ~9 秒就把水盾顶上来一次，我们下一 tick 再补闪电盾。
+        //   ⇒ 只在"盾没了"才占闸门等于没堵：那时水盾**已经**顶完了。
+        //
+        //   所以这里把口径补全：**元素萨在"已经开打"时不再 Decline**，一律返回
+        //   `Acted` 但**不施法**（`castThisTick=false`）⇒ `fsmHandled=true` ⇒ 引擎这一拍
+        //   的施法闸合上（`m_fsmCastLock`），而 `DidCastThisTick=false` 让 `DoNextAction`
+        //   照常跑 —— **走位/追击/平砍一个字节不变**（这是它与 `Hold` 的关键区别：
+        //   Hold 会把 `holdThisTick` 打开、整 tick 挡死引擎）。
+        //   生产环境无感：`m_fsmCastLock` 还要求 `SkipEngine()`（假人/治疗场景登记），
+        //   副本里恒假 ⇒ 闸门永远不合，行为与改造前一致。
+        //
+        //   `sh_ls_own=0` 的对照臂整段跳过，行为**逐字**回到改前。
+        // ------------------------------------------------------------------
+        if (result == TickResult::Decline && lsOwn && (bot->IsInCombat() || bot->GetVictim()))
+        {
+            ++m->shLsGated;
+            result = TickResult::Acted;
         }
 
         // ------------------------------------------------------------------
