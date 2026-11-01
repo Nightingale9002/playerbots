@@ -58,6 +58,10 @@ namespace ai
                 case State::Emergency: return "Emergency";
                 case State::Tank:      return "Tank";
                 case State::Raid:      return "Raid";
+                // [2026-11-01 站长口径] 坦克三状态（第 1 层）
+                case State::Survival:  return "Survival";
+                case State::Pickup:    return "Pickup";
+                case State::Taunt:     return "Taunt";
             }
             return "?";
         }
@@ -442,6 +446,19 @@ namespace
         uint32 lastHealLog = 0;
         uint32 lastHpsLog = 0;
         uint32 healTargetGuid = 0;
+        // [2026-11-01 站长口径] **坦克（第 1 层：仇恨/生存/嘲讽/加怪）** 专用记忆。
+        //   Survival 的输入是**受伤速率**，不是当前血量 ⇒ 自己按血量差做速率估计：
+        //     tankHpAt / tankHp —— 上一次采样的毫秒时刻与血量；
+        //     tankDmgRate       —— 观察到掉血的速率（HP 点/秒，2 秒时间常数的 EMA：
+        //                          停手/被加血后 2 秒内自然衰减，不会被一次尖刺钉死）。
+        //   其余都是验收计数（只写日志与报告，不参与决策）。
+        uint32 tankHpAt = 0;
+        uint32 tankHp = 0;
+        float  tankDmgRate = 0.0f;
+        uint32 tankLastLog = 0;         // [DPSFSM-TANK] 10 秒节流
+        uint32 tankTaunts = 0;
+        uint32 tankPickups = 0;
+        uint32 tankSurvivals = 0;
     };
 
     std::mutex s_disabledMutex;
@@ -460,6 +477,9 @@ namespace
     std::map<uint32, std::set<ObjectGuid>> s_healTargets;
     std::map<uint32, uint32> s_healTank;
     std::map<uint32, uint32> s_healRun;
+    // [2026-11-01 站长口径] 坦克场景标记：guid 这一轮按**坦克图**跑（熊德靠它区分"猫/熊"）。
+    //   与 s_scenarioTargets 独立：坦克可能这一轮还没有敌对目标（Prep 补姿态/变熊）。
+    std::set<uint32> s_scenarioTank;
     std::map<uint32, uint32> s_petLogAt;                         // [2026-10-31] guid → 上次打 [DPSFSM-PET] 周期日志的毫秒时刻
     std::map<uint32, uint32> s_petStuckAt;                       // [2026-10-31] guid → "在追但贴不上且没在动"的起始毫秒时刻
 
@@ -3851,6 +3871,61 @@ namespace ai
             if (!bot || !bot->GetPlayerbotAI())
                 return 0;
             return CountHostilesNear(bot->GetPlayerbotAI(), bot, range);
+        }
+
+        // [2026-11-01 站长口径] 坦克场景标记：见 DpsFsm.h → SetScenarioTank()。
+        //   只影响 `Tick()` 的派发（熊德"这一轮按坦克图跑"），不动任何技能表/阈值。
+        //   ⚠ 开局把**上一轮的坦克计数器/受伤速率窗口**清干净（`s_mem` 是 per-guid 常驻的）：
+        //     不清的话 `fsmTaunts`/`pickups` 会跨轮累加，报告里就分不清"这一轮嘲讽了几次"
+        //     （实测第 3 轮开局就显示 fsmTaunts=4，那其实是前两轮的总和）。
+        void SetScenarioTank(uint32 guid, bool on)
+        {
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                if (on)
+                    s_scenarioTank.insert(guid);
+                else
+                    s_scenarioTank.erase(guid);
+            }
+            if (!on)
+                return;
+            // 只在锁外拿 Mem()（它自己拿 s_memMutex，别把两把锁叠在一起）
+            BotMem* m = Mem(guid);
+            if (!m)
+                return;
+            m->tankTaunts = 0;
+            m->tankPickups = 0;
+            m->tankSurvivals = 0;
+            m->tankHpAt = 0;
+            m->tankHp = 0;
+            m->tankDmgRate = 0.0f;
+            m->tankLastLog = 0;
+        }
+
+        bool IsScenarioTank(uint32 guid)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            return s_scenarioTank.count(guid) != 0;
+        }
+
+        void ClearScenarioTank(uint32 guid)
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            s_scenarioTank.erase(guid);
+        }
+
+        // [2026-11-01 站长口径] 坦克验收计数：见 DpsFsm.h → GetTankStats()。
+        //   放在这里（而不是 SimScenario 侧自己数）是因为"真的放出去了"只有 FSM 知道
+        //   （施法被拒、CD 未好都不算）。
+        void GetTankStats(uint32 guid, TankStats& out)
+        {
+            std::lock_guard<std::mutex> lock(s_memMutex);
+            auto it = s_mem.find(guid);
+            if (it == s_mem.end() || !it->second)
+                return;
+            out.taunts = it->second->tankTaunts;
+            out.pickups = it->second->tankPickups;
+            out.survivals = it->second->tankSurvivals;
         }
 
         void SetBotForceDps(uint32 guid, bool on)
@@ -9829,6 +9904,396 @@ namespace ai
         return TickResult::Decline;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] **坦克第 1 层：仇恨 / 生存 / 嘲讽 / 加怪**
+    //
+    //   口径来源：`dev/DESIGN_dps_fsm_graphs.md` §14（2026-11-01 站长确认）。
+    //     · 威胁：**能打多少打多少**（不压着打）；"领先够用"只是下限，不是目标。
+    //     · 多目标：**每只怪都要有仇恨余量** ⇒ 群拉优先顺劈/横扫/雷霆，不把仇恨全堆主目标。
+    //     · Survival **按"预期受到伤害"触发**（用受伤速率外推下一段窗口会掉多少），**不是**当前血量；
+    //       ⚠ 熊坦**绝不默认开树皮**（树皮把人形变回来，熊形态的护甲/生命/仇恨全丢）。
+    //     · 嘲讽只对"victim 不是我"的目标用；对已经在自己身上的目标嘲讽 = 白交 CD
+    //       ⇒ **不做预防性嘲讽**。
+    //     · 第 2/3 层（拉怪路线、波次、boss 换嘲、躲地面）**不归这里**（§14.3：只消费不重造）。
+    //
+    //   复用（不重新发明）：`TickResult` / `CastFirst` / `TryCast` / `TryCastSelf` / `SpellId` /
+    //     `TP` / `HoldWait` / `GcdLocked` / `SetStandState` 兜底 / `EngageScenarioTarget` /
+    //     `AuraStacks` / `CountHostilesNear`（与 pack 统计同一份过滤 + 同一份"场景目标"）。
+    //   威胁数据与 DPS 侧**同一份**：`Unit::getThreatManager().getThreat()`（即 Snapshot 的
+    //     `myThreat`/`tankThreat` 来源，见 BuildSnapshot），不另建一套威胁模型。
+    //
+    //   为什么**防骑留到后面**（第一层只做防护战 + 熊德）：
+    //     ① TBC 圣骑士**没有战士那种嘲讽**（`taunt` 是战士技能）。防骑的"接怪"是
+    //        `righteous defense`：要先选**队友**、再把他身上的 3 只怪转过来，是"双目标的换嘲"，
+    //        语义比"对一只怪 taunt"复杂得多，先把单目标路径做扎实；
+    //     ② 防骑的核心仇恨是**地面 AoE**（`consecration` 落点）+ `avenger's shield` 弹射，
+    //        落点/弹射目标属于"选位置/选目标"（§14.3 第 3 层），当前这层只有单体 target + 自身中心技；
+    //     ③ 防骑的 `righteous fury` + `holy shield` 是"先开姿态再叠盾"的耦合，验收口径也不同
+    //        （仇恨来源以神圣伤害为主），等前两个纯近战坦克的威胁/生存口径跑通后再接。
+    // ==========================================================================
+    enum class TankKind
+    {
+        None = 0,
+        WarriorProt,    // 战士 · 防护（Spec::Protection + CLASS_WARRIOR）
+        Bear            // 德鲁伊 · 野性且熊形态（Spec::Feral 里猫/熊共用，用形态区分）
+    };
+
+    // [2026-11-01 实测修] 70 级的熊是**巨熊形态**（`FORM_DIREBEAR = 0x08`），不是 `FORM_BEAR = 0x05`。
+    //   只判 FORM_BEAR 会让坦克图永远认为"还没变熊" ⇒ 卡在 Prep、一次仇恨技都不放
+    //   （实测 3 轮全是 `state=Prep`、25 次 Dire Bear Form、0 嘲讽、主坦每轮死 4 次）。
+    bool TankIsBearForm(Player* bot)
+    {
+        if (!bot)
+            return false;
+        uint8 const form = bot->GetShapeshiftForm();
+        return form == FORM_BEAR || form == FORM_DIREBEAR;
+    }
+
+    // 这一 tick 该不该按坦克图跑（`Spec` 里 Protection 同时是战士/圣骑士 ⇒ 必须看职业）。
+    TankKind TankKindOf(PlayerbotAI* ai, BotMem* m)
+    {
+        Player* bot = ai ? ai->GetBot() : nullptr;
+        if (!bot || !m)
+            return TankKind::None;
+        if (bot->getClass() == CLASS_WARRIOR && m->spec == Spec::Protection)
+            return TankKind::WarriorProt;
+        // 野性只有一个 Spec 值（猫/熊共用 Feral）⇒ 按"当前是不是熊形态"区分（站长口径）：
+        //   不为熊新造 Spec，也不另写一套 FSM。场景/副本里开打前可能还在人形（要先变熊）
+        //   ⇒ `IsScenarioTank()` 让这一轮直接按坦克图跑，由 Prep 负责变熊。
+        if (bot->getClass() == CLASS_DRUID && m->spec == Spec::Feral
+            && (TankIsBearForm(bot) || IsScenarioTank(bot->GetGUIDLow())))
+            return TankKind::Bear;
+        return TankKind::None;
+    }
+
+    // 受伤速率（HP 点/秒，EMA）。Survival 的唯一输入 —— 口径是"下一段窗口会掉多少"，
+    //   所以必须能**衰减**：停手/被治疗 2 秒后速率掉到三成，不会因为一次尖刺一直交 CD。
+    void TankSampleTaken(BotMem* m, Player* bot, uint32 now)
+    {
+        if (!m || !bot)
+            return;
+        uint32 const hp = bot->GetHealth();
+        if (!m->tankHpAt)
+        {
+            m->tankHpAt = now;
+            m->tankHp = hp;
+            return;
+        }
+        uint32 const dt = WorldTimer::getMSTimeDiff(m->tankHpAt, now);
+        if (dt < 200)              // 采样粒度：同一毫秒级的 tick 不重复算
+            return;
+        int32 const loss = int32(m->tankHp) - int32(hp);
+        // 只累计"掉血"：被治疗抬起来的血不算受伤，否则治疗量会把速率算歪。
+        float const inst = (loss > 0) ? float(loss) * 1000.0f / float(dt) : 0.0f;
+        float const decay = float(std::exp(-double(dt) / 2000.0));
+        m->tankDmgRate = m->tankDmgRate * decay + inst * (1.0f - decay);
+        if (m->tankDmgRate < 0.5f)
+            m->tankDmgRate = 0.0f;
+        m->tankHpAt = now;
+        m->tankHp = hp;
+    }
+
+    // 多目标时的"仇恨余量"：lead = 我的威胁 / 最高竞争威胁，取**最危险的那只**。
+    //   为什么取最小：站长口径是"每只怪都要有仇恨余量"，最差的那只才代表达标与否。
+    //   竞争威胁 = 同地图 40 码内其它玩家的威胁（队友 DPS / 假人场景里的对照 DPS bot 都算），
+    //   没有竞争者时记 99（"没人抢"）。只在 10 秒一条的诊断里算，不进决策路径。
+    //   ⚠ 读法（与 `AttackAction::WaitingForTankThreat` 同一条，别搞反方向）：
+    //     威胁表挂在**被威胁的那一方**身上 ⇒ "我对这只怪的仇恨" = `add->getThreatManager().getThreat(我)`。
+    //     （`bot->getThreatManager().getThreat(add)` 读到的是"这只怪对我的仇恨"，玩家的表上基本恒 0。）
+    void TankLead(Player* bot, std::vector<Unit*> const& adds,
+                  int& outAdds, float& outWorstLead, float& outMinMine)
+    {
+        outAdds = 0;
+        outWorstLead = 0.0f;
+        outMinMine = 0.0f;
+        if (!bot || !bot->GetMap())
+            return;
+        Map::PlayerList const& players = bot->GetMap()->GetPlayers();
+        for (Unit* u : adds)
+        {
+            if (!u || !u->IsAlive())
+                continue;
+            float const mine = u->getThreatManager().getThreat(bot);
+            float rival = 0.0f;
+            for (auto it = players.begin(); it != players.end(); ++it)
+            {
+                Player* p = it->getSource();
+                if (!p || p == bot || !p->IsAlive())
+                    continue;
+                if (bot->GetDistance(p) > 40.0f)
+                    continue;
+                float const t = u->getThreatManager().getThreat(p);
+                if (t > rival)
+                    rival = t;
+            }
+            ++outAdds;
+            float const lead = (rival > 0.0f) ? (mine / rival) : (mine > 0.0f ? 99.0f : 0.0f);
+            if (outAdds == 1 || lead < outWorstLead)
+                outWorstLead = lead;
+            if (outAdds == 1 || mine < outMinMine)
+                outMinMine = mine;
+        }
+    }
+
+    ai::dpsfsm::TickResult TickTankFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        Player* bot = s.bot;
+        TankKind const kind = TankKindOf(ai, m);
+        if (kind == TankKind::None)
+            return TickResult::Decline;
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const now = nowMs ? nowMs : 1;
+        TankSampleTaken(m, bot, now);
+
+        // 敌人列表与 pack 统计/场景目标同一份过滤：假人场景只有"声明过的假人"，
+        //   副本里退回"附近可攻击目标"（不改变原行为）。
+        std::vector<Unit*> adds;
+        CountHostilesNear(ai, bot, float(TP(m, "tank_scan_range", 30.0)), &adds);
+
+        int onMe = 0;
+        Unit* lost = nullptr;       // 已经有我的仇恨、但 victim 确实在打别人（丢仇恨）
+        Unit* fresh = nullptr;      // 全新目标：我还没有任何威胁（加怪接管）
+        float lostDist = 1.0e9f, freshDist = 1.0e9f;
+        for (Unit* u : adds)
+        {
+            if (!u || !u->IsAlive())
+                continue;
+            if (u->GetVictim() == bot)
+            {
+                ++onMe;
+                continue;
+            }
+            // 读法见 TankLead() 的注释：威胁表挂在"被威胁的那一方"身上。
+            float const mine = u->getThreatManager().getThreat(bot);
+            float const d = bot->GetDistance(u);
+            if (mine > 0.0f)
+            {
+                if (d < lostDist) { lostDist = d; lost = u; }
+            }
+            else if (d < freshDist) { freshDist = d; fresh = u; }
+        }
+
+        // ---- ① Prep：姿态 / 形态（没有敌人也要补，开打前先站对）----
+        bool needPrep = false;
+        if (kind == TankKind::WarriorProt)
+            needPrep = (bot->GetShapeshiftForm() != FORM_DEFENSIVESTANCE);
+        else
+            needPrep = !TankIsBearForm(bot);
+
+        // ---- ② Survival：按"预期受到伤害"触发（受伤速率 × 下一段窗口），不是当前血量 ----
+        double const windowSec = TP(m, "tank_surv_window", 4.0);
+        double const projected = double(bot->GetHealth()) - double(m->tankDmgRate) * windowSec;
+        double const floorHp = double(bot->GetMaxHealth()) * TP(m, "tank_surv_floor", 35.0) / 100.0;
+        bool const expectedDying = (m->tankDmgRate > 0.0f && projected <= floorHp);
+        bool const veryLow = (bot->GetHealthPercent() <= float(TP(m, "tank_surv_emerg", 20.0)));
+
+        State st = State::Maintain;
+        if (adds.empty())
+            st = State::Idle;
+        else if (needPrep)
+            st = State::Prep;
+        else if (expectedDying || veryLow)
+            st = State::Survival;
+        else if (fresh)
+            st = State::Pickup;
+        else if (lost)
+            st = State::Taunt;
+
+        char const* tauntName = (kind == TankKind::WarriorProt) ? "taunt" : "growl";
+        bool acted = false;
+
+        switch (st)
+        {
+            case State::Idle:
+                break;
+
+            case State::Prep:
+                if (kind == TankKind::WarriorProt)
+                {
+                    acted = TryCastSelf(ai, m, s, "defensive stance");
+                }
+                else
+                {
+                    // 已经挂着变形光环却仍判"不在熊形态"时别再刷（与猫德同一条防刷保护）
+                    if (AuraStacks(ai, s.bot, m, "dire bear form", s.bot) > 0
+                        || AuraStacks(ai, s.bot, m, "bear form", s.bot) > 0)
+                        break;
+                    acted = TryCastSelf(ai, m, s, "dire bear form")
+                        || TryCastSelf(ai, m, s, "bear form");
+                }
+                if (!acted)
+                    st = (adds.empty() ? State::Idle : State::Maintain);   // 补不上就照常仇恨
+                break;
+
+            case State::Survival:
+                // 战士：盾墙 → 破釜（都是"预期要被打死"才交，CD 3~5 分钟）
+                // 熊：狂暴回复 → 生存本能；⚠ **不默认开树皮**（会变回人形，丢熊形态的护甲/生命/仇恨）
+                if (kind == TankKind::WarriorProt)
+                {
+                    if (CastFirst(ai, m, s, { "shield wall" })) { ++m->tankSurvivals; acted = true; }
+                    else if (CastFirst(ai, m, s, { "last stand" })) { ++m->tankSurvivals; acted = true; }
+                }
+                else
+                {
+                    if (CastFirst(ai, m, s, { "frenzied regeneration" })) { ++m->tankSurvivals; acted = true; }
+                    else if (CastFirst(ai, m, s, { "survival instincts" })) { ++m->tankSurvivals; acted = true; }
+                }
+                // CD 都在转：保命交给治疗/走位（不归这层），仇恨照打（不站桩）
+                if (!acted)
+                    st = State::Maintain;
+                break;
+
+            case State::Pickup:
+                if (!fresh)
+                {
+                    st = State::Maintain;
+                    break;
+                }
+                // ① 新怪已经在打别人（DPS 先手/加怪）⇒ 嘲讽最快
+                if (freshDist <= float(TP(m, "tank_taunt_range", 28.0)) && fresh->GetVictim())
+                {
+                    if (CastFirst(ai, m, s, { tauntName }, fresh))
+                    {
+                        ++m->tankTaunts;
+                        ++m->tankPickups;
+                        acted = true;
+                        break;
+                    }
+                }
+                // ② 远程拉：战士 投掷/射击；熊 精灵之火（凶猛）—— 拉进近战位再叠仇恨
+                if (kind == TankKind::WarriorProt)
+                {
+                    if (CastFirst(ai, m, s, { "shoot", "throw" }, fresh)) { ++m->tankPickups; acted = true; }
+                }
+                else if (CastFirst(ai, m, s, { "faerie fire (feral)" }, fresh)) { ++m->tankPickups; acted = true; }
+                // ③ 拉不到（没远程/够不着）：按常规仇恨打，交给上层走位去接触
+                if (!acted)
+                    st = State::Maintain;
+                break;
+
+            case State::Taunt:
+                if (!lost)
+                {
+                    st = State::Maintain;
+                    break;
+                }
+                // **只对"确实在打别人"的目标嘲讽**（站点口径：对已经在自己身上的目标无效）
+                if (lostDist <= float(TP(m, "tank_taunt_range", 28.0))
+                    && CastFirst(ai, m, s, { tauntName }, lost))
+                {
+                    ++m->tankTaunts;
+                    acted = true;
+                    break;
+                }
+                // 嘲讽在 CD / 没学会：继续把仇恨打上去（嘲讽不是唯一手段）
+                st = State::Maintain;
+                break;
+
+            case State::Maintain:
+            default:
+                break;
+        }
+
+        // ---- ③ Maintain：仇恨循环（"其余"那一档；多目标优先群体仇恨）----
+        if (st == State::Maintain && !acted)
+        {
+            if (s.casting)
+            {
+                m->state = State::Maintain;
+                return HoldWait(m, "tanking");
+            }
+
+            int const aoePack = int(TP(m, "tank_aoe_pack", 2.0));
+            bool const aoe = (s.pack10 >= aoePack) || (int(adds.size()) >= aoePack);
+            int const rage = s.rage;
+
+            if (kind == TankKind::WarriorProt)
+            {
+                // 群拉优先：顺劈/雷霆让**每只怪**都吃到仇恨（站长口径），而不是只堆主目标
+                if (aoe && rage >= SpellCost(ai, m, "cleave") && CastFirst(ai, m, s, { "cleave" }))
+                    acted = true;
+                else if (aoe && TP(m, "tank_thunder_clap", 1.0) >= 1.0
+                    && rage >= SpellCost(ai, m, "thunder clap") && CastFirst(ai, m, s, { "thunder clap" }))
+                    acted = true;
+                // 单体仇恨：盾猛(6s) → 复仇(5s) → 盾牌格挡(提高格挡/复仇触发) → 破甲/毁灭打击
+                else if (CastFirst(ai, m, s, { "shield slam" }))
+                    acted = true;
+                else if (CastFirst(ai, m, s, { "revenge" }))
+                    acted = true;
+                else if (TP(m, "tank_shield_block", 1.0) >= 1.0 && CastFirst(ai, m, s, { "shield block" }))
+                    acted = true;
+                else
+                {
+                    // 破甲没叠满就先用便宜的破甲；叠满 5 层后改打毁灭打击（同族技能、伤害更高），
+                    //   叠满后继续打也是纯仇恨收益（站长口径"能打多少打多少"，不压着打）。
+                    int const want = int(TP(m, "tank_sunder_stack", 5.0));
+                    int const stacks = AuraStacks(ai, s.bot, m, "sunder armor", s.target);
+                    if (stacks < want)
+                    {
+                        if (CastFirst(ai, m, s, { "sunder armor", "devastate" }))
+                            acted = true;
+                    }
+                    else if (CastFirst(ai, m, s, { "devastate", "sunder armor" }))
+                        acted = true;
+                }
+            }
+            else
+            {
+                // 熊：横扫（多目标）→ 裂伤(6s) → 割伤(叠 5) → 割伤/槌击填充
+                if (aoe && CastFirst(ai, m, s, { "swipe (bear)", "swipe" }))
+                    acted = true;
+                // [2026-11-01 实测修] 裂伤**只能用 `mangle (bear)`**：本服还存着一个同名的
+                //   33917 "Mangle"（Category 0 / RecoveryTime 0 / StartRecoveryTime 0 ⇒ 无 CD 无 GCD），
+                //   `SpellId()` 的名字兜底一旦命中它，就变成每 tick 都放得出来
+                //   （实测熊坦 45 秒 mangle 373 次、casts=393）。绝不加 "mangle" 这个名字兜底。
+                else if (CastFirst(ai, m, s, { "mangle (bear)" }))
+                    acted = true;
+                else
+                {
+                    // 割伤叠满 `tank_lacerate_stack` 之后改用槌击（下一次平砍附带、没 GCD），
+                    //   仍然是"能打多少打多少"；怒气不够就继续割伤。
+                    int const want = int(TP(m, "tank_lacerate_stack", 5.0));
+                    int const stacks = AuraStacks(ai, s.bot, m, "lacerate", s.target);
+                    if (stacks < want)
+                    {
+                        if (CastFirst(ai, m, s, { "lacerate" }))
+                            acted = true;
+                    }
+                    else if (rage >= 10 && CastFirst(ai, m, s, { "maul" }))
+                        acted = true;
+                    else if (CastFirst(ai, m, s, { "lacerate" }))
+                        acted = true;
+                }
+            }
+        }
+
+        LogTransition(ai, m, s, st);
+
+        // ---- ④ 验收日志：每 10 秒一条（字段固定，脚本可直接切）----
+        if (!m->tankLastLog || WorldTimer::getMSTimeDiff(m->tankLastLog, now) >= 10000)
+        {
+            m->tankLastLog = now;
+            int nAdds = 0;
+            float worstLead = 0.0f, minMine = 0.0f;
+            TankLead(bot, adds, nAdds, worstLead, minMine);
+            sLog.outError("[DPSFSM-TANK] %s state=%s adds=%d onme=%d lead=%.2f hp=%.0f inc=%.0f",
+                bot->GetName(), ai::dpsfsm::StateName(m->state), nAdds, onMe, double(worstLead),
+                double(bot->GetHealthPercent()), double(m->tankDmgRate));
+            (void)minMine;      // 只做诊断预留（"最少的那只怪有多少仇恨"），不进日志格式
+        }
+
+        // [2026-11-01 实测] **已在近战位、这一手没技能可放**时，把这一手留给状态机（Hold）而不是
+        //   交回引擎：坦克站在怪堆里等 CD/怒气时，引擎会拿这一手去切姿态（实测一轮
+        //   `Defensive Stance` 15 次 + `Battle Stance` 15 次来回顶，等于 30 个 GCD 全废）。
+        //   只在"已经在近战范围"时才 Hold：够不着/要拉怪时仍然 Decline，让引擎去走位（§14.3 走位不归 FSM）。
+        if (!acted && st == State::Maintain && onMe > 0 && bot->GetVictim()
+            && bot->CanReachWithMeleeAttack(bot->GetVictim()))
+            return HoldWait(m, "tank-gcd-wait");
+
+        return acted ? TickResult::Acted : TickResult::Decline;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -9914,6 +10379,60 @@ namespace ai
                         case ai::dpsfsm::TickResult::Decline:
                         default:
                             return false;
+                    }
+                }
+            }
+
+            // ==================================================================
+            // [2026-11-01 站长口径] **坦克派发（mode=5 · 防护战 / 熊德 · 第 1 层）**
+            //   放在三道门**之前**，理由与治疗派发同一组：
+            //     ① `no-victim`：坦克常常在开打前就要补姿态/变熊（Prep），加怪接管也要在
+            //        "自己没有 victim" 时先嘲讽/远程拉（Pickup）；
+            //     ② `stunned/rooted`：被控时核心自己处理，坦克的保命/嘲讽没有额外语义；
+            //     ③ `坦/奶让位`：那道门本来就把所有坦克挡在 DPS 状态机外 —— 坦克图必须排在它之前。
+            //   **只接防护战 + 熊德**：圣骑士 `Spec::Protection`（防骑）不在这张图里 ⇒ 继续 Decline
+            //   （legacy `TickPaladin` 对非惩戒直接返回 false）。mode != 5 ⇒ 原样落回 legacy。
+            // ==================================================================
+            if ((bot->getClass() == CLASS_WARRIOR && m->spec == Spec::Protection)
+                || (bot->getClass() == CLASS_DRUID && m->spec == Spec::Feral))
+            {
+                TankKind const tk = TankKindOf(ai, m);
+                if (tk != TankKind::None)
+                {
+                    bool tankDerived = false;
+                    DecisionMode const tankMode = ResolveMode(m, tankDerived);
+                    if (tankMode == DecisionMode::Fsm)
+                    {
+                        m->mode = int(tankMode);
+                        if (!m->modeLogged)
+                        {
+                            m->modeLogged = true;
+                            sLog.outError("[DPSFSM-MODE] %s spec=%s mode=%d(%s) tank=1",
+                                bot->GetName(), SpecName(m->spec), int(tankMode), DecisionModeName(tankMode));
+                        }
+                        // 坐姿兜底（与 DPS 侧同一条）：上一轮结束会坐下，而核心 CheckCast 第一关就是
+                        //   SPELL_FAILED_NOT_STANDING。变熊/姿态切换本身不占 GCD，放这里无条件。
+                        if (!bot->IsStandState())
+                            bot->SetStandState(UNIT_STAND_STATE_STAND);
+                        // 没有 victim：假人场景自己咬上去（与 DPS 侧**同一个入口**，不另造选目标逻辑）
+                        if (!bot->GetVictim())
+                            EngageScenarioTarget(ai);
+                        ++m->tickCount;
+                        Snapshot ts;
+                        BuildSnapshot(ai, m, ts);
+                        ai::dpsfsm::TickResult const tr = TickTankFsm(ai, m, ts);
+                        ManaLogTick(m, bot);
+                        switch (tr)
+                        {
+                            case ai::dpsfsm::TickResult::Acted:
+                                return true;
+                            case ai::dpsfsm::TickResult::Hold:
+                                m->holdThisTick = true;
+                                return true;
+                            case ai::dpsfsm::TickResult::Decline:
+                            default:
+                                return false;
+                        }
                     }
                 }
             }

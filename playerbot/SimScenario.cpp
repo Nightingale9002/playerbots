@@ -304,6 +304,26 @@ uint32 stuckFightCleared = 0;
             uint64 heal0 = 0;               // 基线：healer->botHealingDone
             uint32 healTankHp0 = 0;         // 主坦起始血量（报告用）
             bool   healInCombatDone = false;
+            // [2026-11-01 站长口径] **坦克实测通道（tank_test=1，默认关）**。
+            //   要解决的问题：DPS 那套木桩不会打人 ⇒ 坦克的仇恨/生存/嘲讽完全无从触发。
+            //   做法 = 复用 heal_test 的那套"同一块平地 + 真组队 + 周期性场景钩子"通道，只换内容：
+            //     ① 召唤 N 只**敌对会打人**的假人（默认 2 只），持续攻击主坦（= 本臂的 bot 自己）；
+            //     ② 可选再起一只 DPS bot 抢仇恨（tank_test_dps=1）⇒ 嘲讽/加怪接管才有得测；
+            //     ③ 每 10 秒一条断言日志：每只怪的 victim / 每只怪我的威胁 / 嘲讽次数 / 主坦血量/死亡。
+            //   ⚠ 坦克 FSM 只消费不重造（DESIGN §14.3）：这里只造"敌人 + 竞争仇恨"，不碰拉怪路线/走位。
+            bool   tankTest = false;
+            uint32 tankAdds = 2;            // 召唤几只敌对假人（tank_test_adds）
+            // 每只假人每次平砍的**名义**伤害（tank_test_dmg）。⚠ 核心会对造物伤害按等级/护甲折算：
+            //   实测 1500 的名义值到手约 190 点/次（≈1/8，主坦护甲+等级减免+模板系数），
+            //   所以默认 1400 ≈ 每只怪 ~85 点/秒、两只 ~175 点/秒 —— 45 秒能把满血主坦压到
+            //   `tank_surv_floor`(35%) 附近 ⇒ Survival 通道真的会被触发，但打不死。
+            double tankAddDmg = 1400.0;
+            bool   tankDpsRival = false;    // 再起一只 DPS bot 抢仇恨（tank_test_dps）
+            uint32 tankRivalGuid = 0;       // 抢仇恨的 DPS bot
+            uint32 tankDeaths = 0;          // 主坦死亡次数（死后原地复活，整轮可跑满）
+            uint32 tankDiagAt = 0;          // [TANK-TEST-DIAG] 10 秒节流
+            bool   tankSetupDone = false;   // 假人/竞争 bot 是否已就位
+            uint32 tankTauntBase = 0;       // 嘲讽次数的基线（按法术 id 计，两种 mode 都可比）
         };
 
         std::vector<DummyRun> s_dummies;
@@ -399,6 +419,27 @@ uint32 stuckFightCleared = 0;
             { "holy", CLASS_PRIEST, "holy", "discipline", "shadow", 1, "pve heal holy" },
         };
 
+        // [2026-11-01 站长口径] **坦克专精单独一张表**（理由与治疗那张一样）：
+        //   不塞进 `s_specKeys` —— 那张表与 17 个堆心一一对应，`dummyall` 按长度校验，
+        //   而且坦克不需要"一堆木桩"，需要的是"会打人的敌人 + 仇恨竞争"。
+        //   第一层只做这两个（站长口径）：**防护战** + **熊德**；防骑留到后面（理由见 DpsFsm.cpp
+        //   → TickTankFsm() 上面的说明：TBC 防骑没有真嘲讽、核心仇恨是地面 AoE）。
+        //   enable = 让 DetectSpec 认出来的策略名（德鲁伊用 "bear"，其 Spec 仍是 Feral，
+        //   坦克/猫由**当前形态**区分；premade = 配置里的 `AiPlayerbot.PremadeSpecName.<cls>.<n>`）。
+        SpecKey const s_tankSpecKeys[] =
+        {
+            { "prot", CLASS_WARRIOR, "protection", "arms", "fury", 2, "pve prot" },
+            { "bear", CLASS_DRUID,   "bear",       "balance", "restoration", 1, "pve dps feral tank" },
+        };
+
+        bool IsTankSpecKey(std::string const& key)
+        {
+            for (auto const& k : s_tankSpecKeys)
+                if (key == k.key)
+                    return true;
+            return false;
+        }
+
         bool IsHealSpecKey(std::string const& key)
         {
             for (auto const& k : s_healSpecKeys)
@@ -423,6 +464,9 @@ uint32 stuckFightCleared = 0;
                 if (key == k.key)
                     return &k;
             for (auto const& k : s_healSpecKeys)
+                if (key == k.key)
+                    return &k;
+            for (auto const& k : s_tankSpecKeys)
                 if (key == k.key)
                     return &k;
             return nullptr;
@@ -3746,6 +3790,14 @@ uint32 stuckFightCleared = 0;
                     "文件里写 holy:heal_test=1,heal_dps=500（默认 mode=5；对照 legacy 用 mode=3）");
                 return false;
             }
+            // [2026-11-01 站长口径] 坦克同理：DPS 木桩不还手 ⇒ 单木桩场景测不了坦克
+            if (IsTankSpecKey(key))
+            {
+                messages.push_back("dummy: '" + key + "' 是坦克专精，请用 armsfile 的坦克通道："
+                    "文件里写 prot:tank_test=1,tank_test_adds=2[,tank_test_dps=1][,mode=5|3]"
+                    "（bear 同理；默认 mode=5，对照 legacy 用 mode=3）");
+                return false;
+            }
 
             if (targets < 1) targets = 1;
             if (targets > 5) targets = 5;
@@ -4101,15 +4153,44 @@ uint32 stuckFightCleared = 0;
                     }
                 }
 
+                // [2026-11-01 站长口径] **坦克臂**：`prot:tank_test=1,tank_test_adds=2,tank_test_dps=1`。
+                //   坦克不需要木桩堆（DPS 木桩不还手 ⇒ 仇恨/嘲讽/生存全都触发不了）⇒ 走
+                //   "会打人的敌人 + 可选 DPS 竞争者"的通道。`tank_test` 默认关：不带它的臂
+                //   仍然是原来的 DPS 臂，行为一个字节不变。专精键（prot/bear）本身也算开着，
+                //   这样 `.rndbot sim armsfile` 里写 `prot:tank_test=1` 与 `prot:@` 都能跑。
+                {
+                    bool const wantTank = IsTankSpecKey(arm.spec->key);
+                    if (wantTank)
+                    {
+                        d.tankTest = true;
+                        d.meleeSpec = true;
+                        d.standDist = 3.0f;
+                        auto const addsIt = d.overrides.find("tank_test_adds");
+                        if (addsIt != d.overrides.end())
+                            d.tankAdds = uint32(addsIt->second < 1.0 ? 1.0 : addsIt->second);
+                        auto const dmgIt = d.overrides.find("tank_test_dmg");
+                        if (dmgIt != d.overrides.end())
+                            d.tankAddDmg = dmgIt->second;
+                        auto const dpsIt2 = d.overrides.find("tank_test_dps");
+                        if (dpsIt2 != d.overrides.end())
+                            d.tankDpsRival = (dpsIt2->second >= 1.0);
+                        // 固定站位：与治疗通道同一块已知平地（只铺"会打人的敌人"，不铺木桩）
+                        d.x = DUMMY_SPOT_X;
+                        d.y = DUMMY_SPOT_Y;
+                        d.z = DUMMY_SPOT_Z;
+                        d.pileSet = true;
+                    }
+                }
+
                 // 自己一堆（与 dummyall 同一张场地表）：假人摆在 pileX/pileY，
                 //   bot 站到 standAngle 方向 standDist 码处，z 用实测地面高度。
-                SpecPileSpot const* spot = d.healTest ? nullptr : PileSpotForSpec(arm.spec->key);
-                if (!spot && !d.healTest)
+                SpecPileSpot const* spot = (d.healTest || d.tankTest) ? nullptr : PileSpotForSpec(arm.spec->key);
+                if (!spot && !d.healTest && !d.tankTest)
                 {
                     skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
                     continue;
                 }
-                if (!d.healTest)
+                if (!d.healTest && !d.tankTest)
                 {
                     d.centerPile = true;
                     d.sharedPile = false;
@@ -4345,6 +4426,10 @@ uint32 stuckFightCleared = 0;
             return !d.dummies.empty();
         }
 
+        // [2026-11-01 站长口径] 坦克实测的嘲讽计数（按法术 id，见下方 TankTauntCasts 的实现）：
+        //   ReportDummy 在它定义之前就要用 ⇒ 先声明。**不需要** DummyRun 的完整定义（只用引用）。
+        uint64 TankTauntCasts(Player* bot, DummyRun const& d);
+
         void ReportDummy(DummyRun& d, Player* bot, char const* result)
         {
             if (d.reported)
@@ -4430,6 +4515,23 @@ uint32 stuckFightCleared = 0;
                         extra += " tankHp=" + std::to_string(uint32(tk->GetHealthPercent())) + "%";
                     extra += " mode=" + std::to_string(d.overrides.count("mode") ? int(d.overrides["mode"]) : -1);
                 }
+                // [2026-11-01 站长口径] 坦克实测的收尾数字（验收指标见 DESIGN §14.2）：
+                //   主坦收尾血量 / 死亡次数 / 嘲讽次数（按法术 id，mode=5 与 mode=3 同一把尺子）/
+                //   FSM 自己的嘲讽·加怪·保命次数（只有 mode=5 会有值）。
+                if (d.tankTest)
+                {
+                    dpsfsm::TankStats ts;
+                    dpsfsm::GetTankStats(d.guid, ts);
+                    extra += " tankguid=" + std::to_string(d.guid);
+                    extra += " tankHp=" + std::to_string(uint32(bot->GetHealthPercent())) + "%";
+                    extra += " taunts=" + std::to_string((unsigned long long)TankTauntCasts(bot, d));
+                    extra += " fsmTaunts=" + std::to_string(ts.taunts);
+                    extra += " pickups=" + std::to_string(ts.pickups);
+                    extra += " surv=" + std::to_string(ts.survivals);
+                    extra += " deaths=" + std::to_string(d.tankDeaths);
+                    extra += " adds=" + std::to_string((uint32)d.dummies.size());
+                    extra += " mode=" + std::to_string(d.overrides.count("mode") ? int(d.overrides["mode"]) : -1);
+                }
             }
             double const sec = d.durationMs / 1000.0;
             double const total = double(dmg + pet);
@@ -4441,6 +4543,7 @@ uint32 stuckFightCleared = 0;
 
             dpsfsm::ClearScenarioTargets(d.guid, d.id);
             dpsfsm::ClearScenarioHealTargets(d.guid, d.id);
+            dpsfsm::ClearScenarioTank(d.guid);
             dpsfsm::ClearParamOverrides(d.guid);
             // 收尾：撤假人 + 停手
             if (bot && bot->IsInWorld())
@@ -4695,6 +4798,276 @@ uint32 stuckFightCleared = 0;
             return false;
         }
 
+        // ==========================================================================
+        // [2026-11-01 站长口径] **坦克实测通道**（`prot:tank_test=1` / `bear:tank_test=1`）
+        //
+        //   要解决的是"DPS 木桩不会打人"：坦克的仇恨/生存/嘲讽在木桩场景里全都触发不了。
+        //   做法 = 复用 heal_test 那条已跑通的通道（同一块已知平地、同一套场景钩子），只换内容：
+        //     ① 召唤 N 只**敌对且会打人**的假人（`tank_test_adds`，默认 2）持续攻击主坦
+        //        —— 主坦 = 本臂的 bot 自己（不再像治疗那样另找第二只）；
+        //     ② 可选再起一只 DPS bot 抢仇恨（`tank_test_dps=1`）：
+        //        它只咬**最后一只**假人 ⇒ 那只怪的 victim 会离开主坦 ⇒ 恰好把
+        //        `Pickup`（加怪接管）/`Taunt`（丢仇恨）两条路径都逼出来；
+        //     ③ 每 10 秒一条 `[TANK-TEST-DIAG]`：每只怪的 victim、每只怪的仇恨余量、
+        //        嘲讽次数（按法术 id 计，mode=5 与 mode=3 可比）、主坦血量/死亡次数。
+        //   ⚠ 这里只造"敌人 + 仇恨竞争"，**不碰拉怪路线/走位/波次**（DESIGN §14.3）。
+        // ==========================================================================
+        // 嘲讽类法术的固定 TBC id（355 Taunt / 6795 Growl / 5209 Challenging Roar）。
+        //   按 id 数而不是按 FSM 自己的计数器：legacy（mode=3）是**引擎**放的嘲讽，
+        //   FSM 计数器恒 0 ⇒ 只有按法术 id 数，两种 mode 的"嘲讽次数"才是同一把尺子。
+        static uint32 const s_tankTauntIds[] = { 355, 6795, 5209 };
+
+        uint64 TankTauntCasts(Player* bot, DummyRun const& d)
+        {
+            if (!bot)
+                return 0;
+            uint64 n = 0;
+            for (uint32 id : s_tankTauntIds)
+            {
+                auto const it = bot->botSpellCounts.find(id);
+                if (it == bot->botSpellCounts.end())
+                    continue;
+                auto const it0 = d.spells0.find(id);
+                uint64 const before = (it0 == d.spells0.end()) ? 0 : it0->second;
+                if (it->second > before)
+                    n += it->second - before;
+            }
+            return n;
+        }
+
+        // 抢仇恨的对照 DPS：优先远程（站位不抢近战位），没有就退到近战职业。
+        //   [2026-11-01 实测] 只找"已经在线的"不够：仿真启动时随机 bot 默认不自动登录，
+        //   一条批里只有坦克自己上线 ⇒ 永远没有仇恨竞争、嘲讽/加怪接管测不到（实测第 1 轮
+        //   `tank_test_dps=1` 但 "没有可用的 DPS bot"）。所以**没有在线的就从候选池拉一个上线**
+        //   （与 StartArms 给坦克登录走同一条路 `sRandomPlayerbotMgr.AddPlayerBot()`）。
+        uint32 PickTankRivalGuid(Player* tank)
+        {
+            static uint32 const kCls[] = { CLASS_MAGE, CLASS_WARLOCK, CLASS_HUNTER,
+                                           CLASS_ROGUE, CLASS_SHAMAN, CLASS_PRIEST };
+            std::set<uint32> used;
+            if (tank)
+                used.insert(tank->GetGUIDLow());
+            for (uint32 cls : kCls)
+                if (Player* p = FindOnlineBotOfClass(cls, used))
+                    return p->GetGUIDLow();
+            std::vector<Candidate> pool = LoadCandidates(60, {});
+            for (uint32 cls : kCls)
+            {
+                for (auto const& c : pool)
+                {
+                    if (c.cls != cls || (tank && c.guid == tank->GetGUIDLow()))
+                        continue;
+                    uint32 const accountId = sObjectMgr.GetPlayerAccountIdByGUID(GuidOf(c.guid));
+                    if (!accountId)
+                        continue;
+                    sRandomPlayerbotMgr.AddPlayerBot(c.guid, accountId);
+                    return c.guid;
+                }
+            }
+            return 0;
+        }
+
+        // 返回 true = 这一轮已结束（已经 ReportDummy，调用方负责从 s_dummies 里摘掉）。
+        bool TickTankTest(DummyRun& d, Player* bot, uint32 now)
+        {
+            Player* tank = bot;
+            if (!tank || !tank->IsInWorld())
+                return false;
+            Map* map = tank->GetMap();
+            if (!map)
+                return false;
+
+            // ---- 首次就位：站位 / 召唤会打人的敌人 / 登记坦克场景 ----
+            if (!d.tankSetupDone)
+            {
+                d.tankSetupDone = true;
+                if (tank->IsMounted())
+                    tank->Unmount();
+                if (tank->GetMapId() != d.mapId)
+                    tank->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
+                tank->CombatStopWithPets(true);
+                tank->TeleportTo(d.mapId, d.x, d.y, d.z, 3.14f);
+                tank->SetHealthPercent(100.0f);
+                if (uint32 const mr = tank->GetMaxPower(POWER_RAGE))
+                    tank->SetPower(POWER_RAGE, mr);
+
+                d.dummies.clear();
+                for (uint32 i = 0; i < d.tankAdds; ++i)
+                {
+                    // 围在主坦 3 码外散开（都在近战范围，但互不重叠）
+                    float const ang = 3.14159265358979f * (0.35f + 1.3f * float(i));
+                    float const px = d.x + cos(ang) * 3.0f;
+                    float const py = d.y + sin(ang) * 3.0f;
+                    Creature* c = tank->SummonCreature(190014, px, py, d.z, 0.0f,
+                        TEMPSPAWN_TIMED_OR_DEAD_DESPAWN, d.durationMs + 120000, false, false, 0, 14);
+                    if (!c)
+                    {
+                        sLog.outError("[TANK-TEST] id=%u 召唤会打人的假人失败（entry=190014 模板不存在？）", d.id);
+                        break;
+                    }
+                    c->setFaction(14);      // 敌对：否则主坦/状态机都打不了
+                    c->GetCombatManager().SetEvadeState(EVADE_NONE);
+                    c->GetCombatManager().StopEvade();
+                    // [2026-11-01 站长口径] 与 DPS 木桩**相反**：这里必须**会动、会打**，
+                    //   否则没有威胁来源、也没有"怪在打别人"可测。模板侧的 STUNNED|PACIFIED 要摘掉。
+                    c->RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_STUNNED | UNIT_FLAG_PACIFIED);
+                    // 血量拉满：45 秒的主坦伤害打不死它，整轮稳定（模板本身 100 万，这里再兜一次）
+                    c->SetMaxHealth(5000000);
+                    c->SetHealth(c->GetMaxHealth());
+                    // 模板 190014 的 MinMeleeDmg/MaxMeleeDmg 都是 0（它是"不还手"的训练假人）
+                    //   ⇒ 伤害必须在运行期补：直接给主手伤害的 BASE_VALUE 再重算物理伤害。
+                    //   这是"按点/次的伤害源"，与 heal_test 的 ModifyHealth 速率等价但走真平砍。
+                    c->SetModifierValue(UNIT_MOD_DAMAGE_MAINHAND, BASE_VALUE, float(d.tankAddDmg));
+                    c->UpdateDamagePhysical(BASE_ATTACK);
+                    if (c->AI())
+                        c->AI()->AttackStart(tank);
+                    c->SetInCombatWith(tank);
+                    d.dummies.push_back(c->GetObjectGuid());
+                    sLog.outError("[TANK-TEST] id=%u 加怪 #%u entry=190014 dmg=%.0f/次 hp=%u（会攻击主坦）",
+                        d.id, i + 1, d.tankAddDmg, c->GetMaxHealth());
+                }
+                if (d.dummies.empty())
+                {
+                    ReportDummy(d, bot, "aborted(no-adds)");
+                    return true;
+                }
+
+                // 这一轮按**坦克图**跑（熊德靠它区分猫/熊；战士不依赖但语义一致），
+                //   同时把敌人登记成"场景目标"：EngageScenarioTarget / pack 统计 / 引擎让位
+                //   全都吃同一份登记（与 DPS 侧同一个入口，不另造一套选目标逻辑）。
+                dpsfsm::SetScenarioTank(d.guid, true);
+                dpsfsm::SetScenarioTargets(d.guid, d.dummies, d.id);
+
+                // 可选：再起一只 DPS bot 抢仇恨（只咬最后一只 ⇒ 那只怪的 victim 会离开主坦）
+                if (d.tankDpsRival)
+                {
+                    d.tankRivalGuid = PickTankRivalGuid(tank);
+                    if (d.tankRivalGuid)
+                    {
+                        Player* rival = FindPlayerAny(d.tankRivalGuid);
+                        if (rival && rival->IsInWorld())
+                        {
+                            if (rival->IsMounted())
+                                rival->Unmount();
+                            rival->CombatStopWithPets(true);
+                            rival->TeleportTo(d.mapId, d.x + 8.0f, d.y, d.z, 3.14f);
+                            sLog.outError("[TANK-TEST] id=%u 仇恨竞争 DPS = %s(guid=%u)",
+                                d.id, rival->GetName(), d.tankRivalGuid);
+                        }
+                        else
+                            sLog.outError("[TANK-TEST] id=%u 仇恨竞争 DPS guid=%u 登录中（到位后自动开咬）",
+                                d.id, d.tankRivalGuid);
+                    }
+                    else
+                        sLog.outError("[TANK-TEST] id=%u tank_test_dps=1 但没有可用的 DPS bot ⇒ 本轮没有仇恨竞争",
+                            d.id);
+                }
+
+                d.dmg0 = tank->botDamageDealt;
+                d.pet0 = tank->botPetDamageDealt;
+                d.melee0 = tank->botMeleeHits;
+                d.casts0 = tank->botCasts;
+                d.spells0 = tank->botSpellCounts;
+                d.startMs = now;
+                sLog.outError("[TANK-TEST] id=%u 开跑：tank=%s(tab=%u premade=[%s]) maxHp=%u 加怪=%u "
+                    "每只伤害=%.0f/次 竞争=%d 时长=%us mode=%.0f",
+                    d.id, tank->GetName(), uint32(d.tab), d.premade.c_str(), tank->GetMaxHealth(),
+                    (uint32)d.dummies.size(), d.tankAddDmg, d.tankDpsRival ? 1 : 0,
+                    d.durationMs / 1000, d.overrides.count("mode") ? d.overrides["mode"] : 0.0);
+                return false;
+            }
+
+            // ---- 每 tick：敌人不会自己"忘掉"主坦（没 victim / 目标死了才补咬）----
+            for (ObjectGuid const& g : d.dummies)
+            {
+                Creature* c = map->GetCreature(g);
+                if (!c || !c->IsAlive())
+                    continue;
+                if (c->GetCombatManager().IsInEvadeMode())
+                {
+                    c->GetCombatManager().SetEvadeState(EVADE_NONE);
+                    c->GetCombatManager().StopEvade();
+                }
+                Unit* v = c->GetVictim();
+                // ⚠ 正在打别人（DPS bot / 其它人）时**不要碰** —— 那正是要测的"丢仇恨/加怪"
+                if (!v || !v->IsAlive())
+                    if (c->AI())
+                        c->AI()->AttackStart(tank);
+            }
+
+            // ---- 可选：仇恨竞争 DPS 一直咬最后一只怪 ----
+            Player* rival = d.tankRivalGuid ? FindPlayerAny(d.tankRivalGuid) : nullptr;
+            if (rival && (!rival->IsInWorld() || !rival->IsAlive()))
+                rival = nullptr;
+            if (rival)
+            {
+                if (!rival->IsWithinDist3d(d.x + 8.0f, d.y, d.z, 25.0f))
+                    rival->TeleportTo(d.mapId, d.x + 8.0f, d.y, d.z, 3.14f);
+                Unit* rv = rival->GetVictim();
+                if ((!rv || !rv->IsAlive() || rv == tank) && !d.dummies.empty())
+                {
+                    if (Creature* c = map->GetCreature(d.dummies.back()))
+                    {
+                        // 远程职业必须传 melee=false（否则会走进近战位平砍、还会把怪的位置带乱）
+                        bool const rivalMelee = (rival->getClass() == CLASS_ROGUE
+                            || rival->getClass() == CLASS_SHAMAN);
+                        if (c->IsAlive() && rival->GetVictim() != c)
+                            rival->Attack(c, rivalMelee);
+                    }
+                }
+            }
+
+            // 主坦被拖走就拉回来（走位不归坦克 FSM；这里只保证场景变量可控）
+            if (!tank->IsWithinDist3d(d.x, d.y, d.z, 12.0f))
+                tank->TeleportTo(d.mapId, d.x, d.y, d.z, 3.14f);
+
+            // ---- 每 10 秒一条断言日志 ----
+            if (!d.tankDiagAt || WorldTimer::getMSTimeDiff(d.tankDiagAt, now) >= 10000)
+            {
+                d.tankDiagAt = now;
+                int onMe = 0;
+                int nAdds = 0;
+                float worstLead = 0.0f;
+                std::string victims;
+                for (ObjectGuid const& g : d.dummies)
+                {
+                    Creature* c = map->GetCreature(g);
+                    if (!c || !c->IsAlive())
+                    {
+                        victims += " dead";
+                        continue;
+                    }
+                    ++nAdds;
+                    Unit* v = c->GetVictim();
+                    bool const isTank = (v == tank);
+                    if (isTank)
+                        ++onMe;
+                    victims += isTank ? " tank" : (v ? std::string(" ") + v->GetName() : std::string(" none"));
+                    float const mine = c->getThreatManager().getThreat(tank);
+                    float const rt = rival ? c->getThreatManager().getThreat(rival) : 0.0f;
+                    float const lead = (rt > 0.0f) ? (mine / rt) : (mine > 0.0f ? 99.0f : 0.0f);
+                    if (nAdds == 1 || lead < worstLead)
+                        worstLead = lead;
+                }
+                dpsfsm::TankStats ts;
+                dpsfsm::GetTankStats(d.guid, ts);
+                sLog.outError("[TANK-TEST-DIAG] id=%u tank=%s hp=%u/%u(%.0f%%) mode=%d adds=%d onme=%d "
+                    "taunts=%llu fsmTaunts=%u pickups=%u surv=%u deaths=%u lead=%.2f victims=[%s ]",
+                    d.id, tank->GetName(), tank->GetHealth(), tank->GetMaxHealth(),
+                    double(tank->GetHealthPercent()),
+                    d.overrides.count("mode") ? int(d.overrides["mode"]) : -1,
+                    nAdds, onMe, (unsigned long long)TankTauntCasts(tank, d), ts.taunts,
+                    ts.pickups, ts.survivals, d.tankDeaths, double(worstLead), victims.c_str());
+            }
+
+            if (now - d.startMs >= d.durationMs)
+            {
+                ReportDummy(d, bot, "done");
+                return true;
+            }
+            return false;
+        }
+
         void TickDummies(uint32 now)
         {
             for (auto it = s_dummies.begin(); it != s_dummies.end();)
@@ -4718,6 +5091,19 @@ uint32 stuckFightCleared = 0;
                 //   这时做 Unmount/TeleportTo/GetMap 会触发核心断言 "GetMap(): m_currMap" 直接关服。
                 if (!bot->IsInWorld() || !bot->IsAlive())
                 {
+                    // [2026-11-01 站长口径] **坦克实测：主坦被打死要计数并原地复活**。
+                    //   否则这条 run 再也不会被 tick（这道门直接 continue）⇒ 整轮永远收不了尾，
+                    //   `主坦死亡数` 也永远读不到。
+                    if (d.tankTest && bot->IsInWorld() && !bot->IsAlive())
+                    {
+                        ++d.tankDeaths;
+                        bot->ResurrectPlayer(1.0f);
+                        bot->SetHealthPercent(100.0f);
+                        if (uint32 const mr = bot->GetMaxPower(POWER_RAGE))
+                            bot->SetPower(POWER_RAGE, mr);
+                        sLog.outError("[TANK-TEST] id=%u 主坦 %s 死亡（累计 %u 次）⇒ 原地复活继续本轮",
+                            d.id, bot->GetName(), d.tankDeaths);
+                    }
                     ++it;
                     continue;
                 }
@@ -4734,6 +5120,26 @@ uint32 stuckFightCleared = 0;
                     {
                         dpsfsm::ClearScenarioHealTargets(d.guid, d.id);
                         dpsfsm::ClearParamOverrides(d.guid);
+                        it = s_dummies.erase(it);
+                        continue;
+                    }
+                    ++it;
+                    continue;
+                }
+
+                // [2026-11-01 站长口径] 坦克通道：同样**不走木桩堆**（木桩不还手），
+                //   改成"会打人的敌人 + 可选 DPS 竞争"。收尾由 TickTankTest 自己 Report。
+                if (d.tankTest)
+                {
+                    bool const finished = TickTankTest(d, bot, now);
+                    if (finished)
+                    {
+                        dpsfsm::ClearScenarioTank(d.guid);
+                        dpsfsm::ClearScenarioTargets(d.guid, d.id);
+                        dpsfsm::ClearParamOverrides(d.guid);
+                        if (Player* rival = d.tankRivalGuid ? FindPlayerAny(d.tankRivalGuid) : nullptr)
+                            if (rival->IsInWorld())
+                                rival->CombatStopWithPets(true);
                         it = s_dummies.erase(it);
                         continue;
                     }
@@ -5601,7 +6007,8 @@ uint32 stuckFightCleared = 0;
             {
                 messages.push_back("用法：.rndbot sim armsfile <targets> <seconds> <file>"
                     "（文件每行一个 spec:key=value,... 或 spec:@，# 开头为注释；"
-                    "治疗实测写 holy:heal_test=1,heal_dps=500[,mode=5|3]）");
+                    "治疗实测写 holy:heal_test=1,heal_dps=500[,mode=5|3]；"
+                    "坦克实测写 prot:tank_test=1,tank_test_adds=2[,tank_test_dps=1][,mode=5|3]，熊德写 bear:…）");
                 return messages;
             }
             uint32 targets = uint32(atoi(args[1].c_str()));

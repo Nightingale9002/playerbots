@@ -35,7 +35,15 @@ namespace ai
             //   Tank      —— 只盯**分配的主坦**：renew 常驻 → 低级强效维持 → 预判尖刺用高级强效
             //   Raid      —— 其余队友：血量最低者优先 / 小队集中掉血用群体治疗
             //   另有 Recover（蓝 < recover_mana：只放最省的）与 Prep（自身 buff）沿用既有状态。
-            Dispel, Emergency, Tank, Raid
+            Dispel, Emergency, Tank, Raid,
+            // [2026-11-01 站长口径] 坦克（第 1 层：仇恨/生存/嘲讽/加怪；见 DESIGN §14）：
+            //   Survival —— **按"预期受到伤害"触发**（受伤速率 × 下一段窗口），不是当前血量阈值；
+            //               战士 盾墙/破釜；熊 狂暴回复/生存本能。⚠ 熊坦不默认开树皮（会变人形）。
+            //   Pickup   —— 附近的新怪不在我身上（加怪接管）：嘲讽 / 远程拉（投掷、精灵之火）。
+            //   Taunt    —— 已经有我仇恨、但 victim **确实在打别人**（丢仇恨）：只这时才嘲讽；
+            //               对已经在自己身上的目标嘲讽是白交 CD（绝不预防性嘲讽）。
+            //   仇恨循环本身复用 Maintain（"其余"那一档）。
+            Survival, Pickup, Taunt
         };
 
         enum class Spec
@@ -141,6 +149,25 @@ namespace ai
                                     uint32 mainTankGuid, uint32 runId = 0);
         void ClearScenarioHealTargets(uint32 healerGuid, uint32 runId = 0);
 
+        // [2026-11-01 站长口径] **坦克场景标记**（假人实测 + 副本）。
+        //   为什么需要：德鲁伊的 `Spec` 里野性只有一个值（猫/熊共用 `Feral`），
+        //   "这一轮按坦克图跑"和"按猫德图跑"只能靠**当前形态**区分（`GetShapeshiftForm()==FORM_BEAR`）；
+        //   而熊坦开打前往往还在人形（要先变熊）⇒ 单看形态会在第一 tick 判成猫德。
+        //   这个标记只影响派发（走 `TickTankFsm()`），不改变任何技能表/阈值。
+        void SetScenarioTank(uint32 guid, bool on);
+        bool IsScenarioTank(uint32 guid);
+        void ClearScenarioTank(uint32 guid);
+
+        // [2026-11-01 站长口径] 坦克验收计数（嘲讽 / 加怪接管 / 保命次数）。
+        //   只写进日志与报告，不参与任何决策；由假人场景每 10 秒取一次。
+        struct TankStats
+        {
+            uint32 taunts = 0;      // 真的放出去的嘲讽次数（对"在打别人"的目标）
+            uint32 pickups = 0;     // 加怪接管次数（嘲讽或远程拉成功）
+            uint32 survivals = 0;   // 保命技（盾墙/破釜/狂暴回复/生存本能）放出去次数
+        };
+        void GetTankStats(uint32 guid, TankStats& out);
+
         // [2026-11-01 站长口径] 新一轮假人场景开始 ⇒ 把上一轮残留的 FSM 记忆清干净。
         //   根因：`s_mem` 是 per-guid 常驻的（SimScenario 只重置 HP/蓝），状态机自己的记忆没人管 ——
         //   上一轮可能停在 planStep=5（寒冰箭相位）或刚打完爆发的 lastBurst/burstUntil，
@@ -224,6 +251,12 @@ namespace ai
         //   四治疗只差"配置表"（DpsFsm.cpp → HealCfgFor()），戒律/神圣骑/恢复萨/恢复德仍是 Decline。
         //   派发在"必须进战斗 / 必须有 victim / 坦奶让位"三道门**之前**：治疗者没有敌人也要工作。
         //   见 DpsFsm.cpp → TickHealFsm() / HealCfgFor()。
+        //
+        // [2026-11-01 站长口径] **坦克侧（第 1 层：仇恨/生存/嘲讽/加怪）**：`mode=5` 目前只接
+        //   **防护战（战士 · `Spec::Protection`）** 与 **熊德（德鲁伊 · `Spec::Feral` 且熊形态/坦克场景）**。
+        //   状态：Idle → Prep(防御姿态/熊形态) → Survival(按预期伤害) → Pickup(加怪) → Taunt(丢仇恨) → Maintain。
+        //   防骑（圣骑士 · `Spec::Protection`）继续 Decline —— 理由见 DpsFsm.cpp → TickTankFsm() 上面的说明。
+        //   ⚠ 走位/拉怪路线/波次/boss 换嘲**不归 FSM**（DESIGN §14.3：只消费，不重造）。
         bool Tick(PlayerbotAI* ai);
     }
 }
