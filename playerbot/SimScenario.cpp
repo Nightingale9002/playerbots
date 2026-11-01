@@ -264,6 +264,9 @@ uint32 stuckFightCleared = 0;
             bool pileSet = false;     // 堆心是否已确定（单组场景在第一次 Setup 时按"bot 东侧"算出）
             std::map<std::string, double> overrides;   // 本 bot 的参数覆盖（调优并发用）
             std::string armLabel;                      // 例如 "burst_hp=10" 或 "baseline"
+            // [2026-11-01 站长口径·并行 A/B] 本臂独占的那堆木桩的**桩基名**（s_specKeys[*].key，
+            //   例如同专精第二个臂会用 "fire"）：只用于日志归组，不影响打法。
+            std::string pileTag;
             std::vector<std::pair<uint8, uint32>> bisPending;   // 静态 BIS：还没穿上的 (slot,item)
             std::map<uint32, int> bisRetry;                     // 每个 itemId 已重试次数
             bool probed3s = false;      // [2026-10-31] 开跑 3 秒的"是否已开打"探针只打一次
@@ -483,14 +486,17 @@ uint32 stuckFightCleared = 0;
             return false;
         }
 
-        SpecPileSpot const* PileSpotForSpec(std::string const& key)
+        // [2026-11-01 站长口径·并行 A/B] 场地表的下标（-1 = 这个专精没有自己的堆，如治疗/坦克）。
+        //   多臂分配木桩时用下标而不是指针：`arms` 会把同一专精的第二个臂放到**别的空闲堆**上，
+        //   所以"臂 → 堆"必须是一张显式的分配表，不能再用"按专精查"。
+        int PileSpotIndexForSpec(std::string const& key)
         {
             uint32 const n = uint32(sizeof(s_specKeys) / sizeof(s_specKeys[0]));
             uint32 const m = uint32(sizeof(s_specPiles) / sizeof(s_specPiles[0]));
             for (uint32 i = 0; i < n && i < m; ++i)
                 if (key == s_specKeys[i].key)
-                    return &s_specPiles[i];
-            return nullptr;
+                    return int(i);
+            return -1;
         }
 
         SpecKey const* FindSpecKey(std::string const& key)
@@ -3950,7 +3956,9 @@ uint32 stuckFightCleared = 0;
             dpsfsm::SetBotEnabled(d.guid, d.useFsm);
             dpsfsm::SetBotForceDps(d.guid, true);   // 假人场景：坦/奶也按 DPS 打，测的是输出能力
             if (!d.armLabel.empty())
-                sLog.outError("[DUMMY] id=%u spec=%s arm=%s", d.id, d.spec.c_str(), d.armLabel.c_str());
+                sLog.outError("[DUMMY] id=%u spec=%s arm=%s pile=%s pileAt=(%.1f,%.1f) bot=%s targets=%u",
+                    d.id, d.spec.c_str(), d.armLabel.c_str(),
+                    d.pileTag.empty() ? "-" : d.pileTag.c_str(), d.pileX, d.pileY, bot->GetName(), d.targets);
             sLog.outError("[DUMMY] id=%u spec=%s bot=%s 已就位（策略 +%s -%s -%s，fsm=%d）",
                 d.id, d.spec.c_str(), bot->GetName(), d.enable.c_str(), d.disable1.c_str(), d.disable2.c_str(),
                 d.useFsm ? 1 : 0);
@@ -4129,6 +4137,15 @@ uint32 stuckFightCleared = 0;
         // [2026-10-29 站长口径] 一轮里同时跑多组不同参数（A/B 并发）：
         //   每个 "spec:key=value" 是一臂，各用**不同 bot**。
         //   "spec:@" 表示该专精的基线（不覆盖任何参数）。
+        // [2026-11-01 站长口径·并行 A/B] **同一专精允许开多个臂**（同批并行、各占一堆木桩）：
+        //   候选与基线在同一 tick、同一场景下比较 ⇒ 45s×3 轮 8~12% 的漂移被抵消，速度也 ×N。
+        //   语法（armsfile 每行一条；`.rndbot sim arms` 的参数同一套解析）：
+        //     `spec:k=v,...`             老写法：**标签 = 整串参数**（与以前逐字节一致）
+        //     `spec:label:k=v,...`       ★标签写在第二个冒号后面
+        //     `spec:k=v,...,label=xxx`   ★或者把 label 当参数写（label 是字符串，不传给 FSM）
+        //     `spec:@` / `spec:label:@`  基线（不覆盖任何参数；没标签时标签仍叫 baseline）
+        //   批级选项（单独一行，或作为 arms 的参数）：`arms_max=N`（同批臂数上限）、
+        //     `same_spec_max=M`（同专精臂数上限，默认 4）。
         // [2026-10-31 站长口径·测量台] 每臂**独占一堆木桩**（场地表 s_specPiles），
         //   不再共用一堆：共用时多臂抢同一批木桩、AoE 跨臂重叠 ⇒ 数字不可用。
         //   pins 可选：按臂顺序给"固定 bot guid"（0=自动挑），同专精跨批用同一个 bot
@@ -4141,6 +4158,19 @@ uint32 stuckFightCleared = 0;
             if (targets > 5) targets = 5;
             if (seconds < 20) seconds = 20;
 
+            uint32 const spotCount = uint32(sizeof(s_specPiles) / sizeof(s_specPiles[0]));
+            // 批级上限：默认 = 场地堆数（一批最多 17 个臂，多的没桩可站）；同专精默认 4。
+            uint32 armsMax = spotCount;
+            uint32 sameSpecMax = 4;
+
+            auto trim = [](std::string s) -> std::string
+            {
+                size_t const b = s.find_first_not_of(" \t");
+                if (b == std::string::npos) return std::string();
+                size_t const e = s.find_last_not_of(" \t");
+                return s.substr(b, e - b + 1);
+            };
+
             struct Arm
             {
                 SpecKey const* spec = nullptr;
@@ -4151,14 +4181,33 @@ uint32 stuckFightCleared = 0;
                 std::vector<std::pair<std::string, double>> kv;
                 bool baseline = false;
                 std::string label;
+                std::string raw;       // 原始文本（日志/排错用）
+                int spotIdx = -1;      // 分配到的堆下标（-1 = 治疗/坦克臂，不占场地堆）
+                bool healArm = false;
+                bool tankArm = false;
+                uint32 pin = 0;        // [2026-11-01] 固定 bot guid（按原始臂顺序给；过滤后不会错位）
             };
             std::vector<Arm> parsed;
-            for (auto const& a : arms)
+            for (size_t ai0 = 0; ai0 < arms.size(); ++ai0)
             {
+                std::string const& a = arms[ai0];
                 size_t const colon = a.find(':');
                 if (colon == std::string::npos)
+                {
+                    // 批级选项（老代码遇到没有冒号的行是**直接跳过**，所以加上这个不会破坏旧文件）
+                    if (a.compare(0, 9, "arms_max=") == 0)
+                    {
+                        int const v = atoi(a.c_str() + 9);
+                        armsMax = v > 0 ? uint32(v) : 1u;
+                    }
+                    else if (a.compare(0, 14, "same_spec_max=") == 0)
+                    {
+                        int const v = atoi(a.c_str() + 14);
+                        sameSpecMax = v > 0 ? uint32(v) : 1u;
+                    }
                     continue;
-                std::string const specKey = a.substr(0, colon);
+                }
+                std::string const specKey = trim(a.substr(0, colon));
                 std::string const rest = a.substr(colon + 1);
                 SpecKey const* spec = FindSpecKey(specKey);
                 if (!spec)
@@ -4168,19 +4217,34 @@ uint32 stuckFightCleared = 0;
                 }
                 Arm arm;
                 arm.spec = spec;
-                if (rest == "@")
+                arm.raw = a;
+                arm.pin = (ai0 < pins.size()) ? pins[ai0] : 0;
+                // `spec:label:...`：第二个冒号出现在第一个 '=' 之前 ⇒ 那就是标签。
+                std::string params = rest;
+                std::string label;
+                {
+                    size_t const eqPos = rest.find('=');
+                    size_t const colon2 = rest.find(':');
+                    if (colon2 != std::string::npos && (eqPos == std::string::npos || colon2 < eqPos))
+                    {
+                        label = trim(rest.substr(0, colon2));
+                        params = rest.substr(colon2 + 1);
+                    }
+                }
+                if (params == "@")
                 {
                     arm.baseline = true;
-                    arm.label = "baseline";
+                    if (label.empty())
+                        label = "baseline";
                 }
                 else
                 {
-                    size_t const eq = rest.find('=');
+                    size_t const eq = params.find('=');
                     if (eq == std::string::npos)
                         continue;
-                    // 逗号分隔的多组：k1=v1,k2=v2,...
+                    // 逗号分隔的多组：k1=v1,k2=v2,...（`label=xxx` 单独拎出来，不当数值参数）
                     {
-                        std::string rest2 = rest;
+                        std::string const rest2 = params;
                         size_t start = 0;
                         while (start <= rest2.size())
                         {
@@ -4190,13 +4254,22 @@ uint32 stuckFightCleared = 0;
                             size_t const e2 = piece.find('=');
                             if (e2 != std::string::npos)
                             {
-                                std::string const kk = piece.substr(0, e2);
-                                double const vv = atof(piece.substr(e2 + 1).c_str());
-                                arm.kv.push_back(std::make_pair(kk, vv));
-                                if (arm.key.empty())
+                                std::string const kk = trim(piece.substr(0, e2));
+                                std::string const vv = trim(piece.substr(e2 + 1));
+                                if (!kk.empty() && kk == "label")
                                 {
-                                    arm.key = kk;
-                                    arm.value = vv;
+                                    if (label.empty())
+                                        label = vv;
+                                }
+                                else if (!kk.empty())
+                                {
+                                    double const val = atof(vv.c_str());
+                                    arm.kv.push_back(std::make_pair(kk, val));
+                                    if (arm.key.empty())
+                                    {
+                                        arm.key = kk;
+                                        arm.value = val;
+                                    }
                                 }
                             }
                             if (comma == std::string::npos)
@@ -4204,13 +4277,24 @@ uint32 stuckFightCleared = 0;
                             start = comma + 1;
                         }
                     }
-                    arm.label = rest;
+                }
+                // 老语法：没显式标签时，标签仍然是整串参数（下游靠 `arm=` 归组，不能变）
+                if (label.empty())
+                    label = rest;
+                arm.label = label;
+                arm.healArm = IsHealSpecKey(spec->key);
+                arm.tankArm = IsTankSpecKey(spec->key);
+                for (auto const& p : arm.kv)
+                {
+                    if (p.first == "heal_test" && p.second >= 1.0) arm.healArm = true;
+                    if (p.first == "tank_test" && p.second >= 1.0) arm.tankArm = true;
                 }
                 parsed.push_back(arm);
             }
             if (parsed.empty())
             {
-                messages.push_back("arms: 没有可跑的臂（格式 spec:key=value 或 spec:@）");
+                messages.push_back("arms: 没有可跑的臂（格式 spec:key=value 或 spec:@；"
+                    "多臂带标签写 spec:label:key=value；批级选项 arms_max=N / same_spec_max=M）");
                 return;
             }
 
@@ -4221,30 +4305,90 @@ uint32 stuckFightCleared = 0;
                 for (uint32 g : r.guids)
                     used.insert(g);
 
-            // [2026-10-31 修] 每个臂**自己一堆**（用 s_specPiles 的专精场地），不再共用一堆。
-            //   共用一堆时多个臂抢同一批木桩：AoE 跨臂重叠、伤害互相抢 ⇒ 数字不可用
-            //   （就是 dummyall 已被证伪的那个坑）。场地只有 17 堆 ⇒
-            //   **一批里每个专精只能有一个臂**；重复的臂直接跳过并报出来。
+            // [2026-11-01 站长口径·并行 A/B] 上限：同批 ≤ arms_max、同专精 ≤ same_spec_max。
+            //   老行为（同专精重复直接跳过）在这里退化成 same_spec_max=1，所以调这个参数就能回到旧语义。
             std::map<std::string, uint32> specCount;
+            std::vector<Arm> active;
+            std::string skipped;     // 超上限 / 没桩
+            std::string capped;      // 撞同专精上限的标签
             for (auto const& arm : parsed)
-                ++specCount[arm.spec->key];
-
-            uint32 started = 0;
-            std::string skipped;
-            std::string dupSpecs;
-            for (size_t ai = 0; ai < parsed.size(); ++ai)
             {
-                Arm const& arm = parsed[ai];
-                if (specCount[arm.spec->key] > 1)
+                if (active.size() >= armsMax)
                 {
-                    if (dupSpecs.find(arm.spec->key) == std::string::npos)
-                        dupSpecs += std::string(dupSpecs.empty() ? "" : ",") + arm.spec->key;
-                    skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
+                    skipped += std::string(skipped.empty() ? "" : ",") + arm.label + "(arms_max)";
                     continue;
                 }
+                uint32& cnt = specCount[arm.spec->key];
+                if (cnt >= sameSpecMax)
+                {
+                    skipped += std::string(skipped.empty() ? "" : ",") + arm.label + "(same_spec_max)";
+                    if (capped.find(arm.spec->key) == std::string::npos)
+                        capped += std::string(capped.empty() ? "" : ",") + arm.spec->key;
+                    continue;
+                }
+                ++cnt;
+                active.push_back(arm);
+            }
+
+            // [2026-11-01 站长口径·并行 A/B] **木桩堆按臂分配**（不再按专精）：
+            //   ① 先每个臂拿"自己专精的那堆"（老路径：一专精一臂时坐标与以前完全一样）；
+            //   ② 剩下的臂（同专精的第 2/3/4 个）拿**离自己专精场地最近**的空闲堆。
+            //   场地表 17 个堆心两两 ≥34.1 码 ⇒ 各臂木桩互不进 AoE 范围。
+            //   治疗/坦克臂不占场地堆（它们用固定单人场地，见下面的通道）。
+            std::vector<int> spotArm(spotCount, -1);
+            for (size_t i = 0; i < active.size(); ++i)
+            {
+                if (active[i].healArm || active[i].tankArm)
+                    continue;
+                int const own = PileSpotIndexForSpec(active[i].spec->key);
+                if (own >= 0 && spotArm[own] < 0)
+                {
+                    spotArm[own] = int(i);
+                    active[i].spotIdx = own;
+                }
+            }
+            for (size_t i = 0; i < active.size(); ++i)
+            {
+                if (active[i].healArm || active[i].tankArm || active[i].spotIdx >= 0)
+                    continue;
+                int const own = PileSpotIndexForSpec(active[i].spec->key);
+                int best = -1;
+                float bestD = 1.0e9f;
+                for (uint32 s = 0; s < spotCount; ++s)
+                {
+                    if (spotArm[s] >= 0)
+                        continue;
+                    float d = 0.0f;
+                    if (own >= 0)
+                    {
+                        float const dx = s_specPiles[s].x - s_specPiles[own].x;
+                        float const dy = s_specPiles[s].y - s_specPiles[own].y;
+                        d = dx * dx + dy * dy;
+                    }
+                    else
+                        d = float(s);   // 专精不在场地表里（理论上不会发生）⇒ 按顺序取
+                    if (d < bestD)
+                    {
+                        bestD = d;
+                        best = int(s);
+                    }
+                }
+                if (best >= 0)
+                {
+                    spotArm[best] = int(i);
+                    active[i].spotIdx = best;
+                }
+            }
+
+            // [2026-11-01 站长口径·并行 A/B] 已经按 arms_max / same_spec_max 过滤成 `active`，
+            //   每臂的堆（spotIdx）也分配好了；这里只负责逐个建 run。
+            uint32 started = 0;
+            for (size_t ai = 0; ai < active.size(); ++ai)
+            {
+                Arm const& arm = active[ai];
                 // 固定 bot（调参用）：仍然是这个 guid 就直接用，省掉重天赋/换装，也去掉个体差异
                 Player* bot = nullptr;
-                uint32 const pin = (ai < pins.size()) ? pins[ai] : 0;
+                uint32 const pin = arm.pin;
                 if (pin)
                 {
                     bot = FindPlayerAny(pin);
@@ -4378,18 +4522,21 @@ uint32 stuckFightCleared = 0;
                     }
                 }
 
-                // 自己一堆（与 dummyall 同一张场地表）：假人摆在 pileX/pileY，
-                //   bot 站到 standAngle 方向 standDist 码处，z 用实测地面高度。
-                SpecPileSpot const* spot = (d.healTest || d.tankTest) ? nullptr : PileSpotForSpec(arm.spec->key);
+                // [2026-11-01 站长口径·并行 A/B] 用**分配表**里的堆（spotIdx），不再按专精查：
+                //   同专精的第 2/3/4 个臂会被分到别的空闲堆上，各自的假人互不重叠。
+                SpecPileSpot const* spot =
+                    (!d.healTest && !d.tankTest && arm.spotIdx >= 0 && arm.spotIdx < int(spotCount))
+                        ? &s_specPiles[arm.spotIdx] : nullptr;
                 if (!spot && !d.healTest && !d.tankTest)
                 {
-                    skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
+                    skipped += std::string(skipped.empty() ? "" : ",") + arm.label + "(no-pile)";
                     continue;
                 }
                 if (!d.healTest && !d.tankTest)
                 {
                     d.centerPile = true;
                     d.sharedPile = false;
+                    d.pileTag = s_specKeys[arm.spotIdx].key;   // 桩基名（日志/证据用）
                     d.pileX = spot->x;
                     d.pileY = spot->y;
                     d.pileZ = spot->z;
@@ -4416,14 +4563,45 @@ uint32 stuckFightCleared = 0;
                 ++started;
             }
 
+            // [2026-11-01 站长口径·并行 A/B] 臂 → 堆的分配表（解析/归组用这一行）。
+            std::string alloc;
+            for (auto const& arm : active)
+            {
+                if (!alloc.empty()) alloc += " ";
+                alloc += arm.label + "->";
+                if (arm.spotIdx >= 0)
+                    alloc += std::string(s_specKeys[arm.spotIdx].key) + "("
+                        + std::to_string(int(s_specPiles[arm.spotIdx].x)) + ","
+                        + std::to_string(int(s_specPiles[arm.spotIdx].y)) + ")";
+                else if (arm.healArm)
+                    alloc += "heal_spot";
+                else
+                    alloc += "tank_spot";
+            }
+            sLog.outError("[ARMS] 臂数=%u 同专精最大=%u 堆=%s", started, sameSpecMax,
+                alloc.empty() ? "-" : alloc.c_str());
             sLog.outError("[DUMMY] arms 开跑：%u 臂（每臂独立一堆，每堆 %u 个木桩）、%u 秒、"
-                "跳过=[%s]、重复专精被跳过=[%s]",
-                started, targets, seconds, skipped.c_str(), dupSpecs.c_str());
-            if (!dupSpecs.empty())
-                messages.push_back("arms: 一批里每专精只能一个臂（场地只有 17 堆），已跳过重复专精："
-                    + dupSpecs);
+                "上限=arms_max:%u/same_spec_max:%u、跳过=[%s]",
+                started, targets, seconds, armsMax, sameSpecMax, skipped.c_str());
+            if (!capped.empty())
+                messages.push_back("arms: 同专精超过 " + std::to_string(sameSpecMax)
+                    + " 个臂的部分已跳过（" + capped + "）");
+            if (!skipped.empty())
+                messages.push_back("arms: 已跳过 " + skipped);
             messages.push_back("参数并发开跑：" + std::to_string(started) + " 臂（各自独立木桩 × "
                 + std::to_string(targets) + " 个）× " + std::to_string(seconds) + " 秒");
+            // 治疗/坦克臂没有独立场地（用固定单人场地），同批多个会重叠 ⇒ 明确报出来，不假装隔离
+            {
+                uint32 healN = 0, tankN = 0;
+                for (auto const& arm : active)
+                {
+                    if (arm.healArm) ++healN;
+                    if (arm.tankArm) ++tankN;
+                }
+                if (healN > 1 || tankN > 1)
+                    messages.push_back("arms: ⚠ 同批有多个治疗/坦克臂，它们共用固定单人场地（不做隔离），"
+                        "横向比较请一次只放一个");
+            }
         }
 
         void StartDummyAll(std::list<std::string>& messages, uint32 targets, uint32 seconds)
@@ -4659,7 +4837,16 @@ uint32 stuckFightCleared = 0;
 
             std::string extra = "";
             if (!d.armLabel.empty())
+            {
                 extra += "arm=" + d.armLabel + " ";   // 参数并发调优靠这个字段归组
+                // [2026-11-01 站长口径·并行 A/B] 本臂用的是哪一堆（桩基名 + 堆心）：
+                //   同专精多臂时对照 `[DUMMY] ... arm= pile= dummies=[...]` 就能确认互不串堆。
+                if (!d.pileTag.empty())
+                {
+                    extra += "pile=" + d.pileTag;
+                    extra += "(" + std::to_string(int(d.pileX)) + "," + std::to_string(int(d.pileY)) + ") ";
+                }
+            }
             if (bot)
             {
                 // 属性：用来判断这一轮到底是不是"毕业装"（法伤 / 攻强）
@@ -4697,6 +4884,8 @@ uint32 stuckFightCleared = 0;
                 extra += bot->IsInCombat() ? "1" : "0";
                 extra += " victim=";
                 extra += (bot->GetVictim() ? bot->GetVictim()->GetName() : "-");
+                // [2026-11-01 站长口径·并行 A/B] victim 的 guid（木桩同名，只有 guid 能证明"打的是自己那堆"）
+                extra += " victimGuid=" + std::to_string(bot->GetVictim() ? bot->GetVictim()->GetGUIDLow() : 0);
                 // [2026-11-01 站长口径] 治疗实测的收尾数字：有效治疗量以核心 `botHealingDone`
                 //   （`Unit::DealHeal` 的 gain，即**真实有效量**）为准，与 FSM 自己的估算值分开报。
                 if (d.healTest)
@@ -5633,6 +5822,19 @@ uint32 stuckFightCleared = 0;
                         it = s_dummies.erase(it);
                         continue;
                     }
+                    // [2026-11-01 站长口径·并行 A/B] 每臂一行列出**自己那堆**木桩的 guid：
+                    //   收尾行里另有 victimGuid=，两者对照就能证明"各臂只打自己的堆"。
+                    {
+                        std::string gl;
+                        for (ObjectGuid const& g : d.dummies)
+                        {
+                            if (!gl.empty()) gl += ",";
+                            gl += std::to_string(g.GetCounter());
+                        }
+                        sLog.outError("[DUMMY] id=%u spec=%s arm=%s pile=%s dummies=[%s]",
+                            d.id, d.spec.c_str(), d.armLabel.empty() ? "-" : d.armLabel.c_str(),
+                            d.pileTag.empty() ? "-" : d.pileTag.c_str(), gl.c_str());
+                    }
                     // [2026-10-31 站长口径·测量台] 每轮开跑前**清冷却**（所有路径统一）。
                     //   以前只有单专精路径清，`arms`/`dummyall` 没有 ⇒ 2 分钟级大招（冰冷血脉/召唤水元素）
                     //   会从上一条臂继承，同一套参数跨批差 30%+。参数必须传 false 才真清服务端冷却。
@@ -6331,7 +6533,8 @@ uint32 stuckFightCleared = 0;
         {
             if (args.size() < 4)
             {
-                messages.push_back("用法：.rndbot sim arms <targets> <seconds> <spec:key=value|spec:@> [...]");
+                messages.push_back("用法：.rndbot sim arms <targets> <seconds> <spec[:label]:key=value|spec[@]> [...]"
+                    "（同专精可开多个臂，各占一堆、同批并行；批级选项 arms_max=N / same_spec_max=M）");
                 return messages;
             }
             uint32 targets = uint32(atoi(args[1].c_str()));
@@ -6350,7 +6553,9 @@ uint32 stuckFightCleared = 0;
             if (args.size() < 4)
             {
                 messages.push_back("用法：.rndbot sim armsfile <targets> <seconds> <file>"
-                    "（文件每行一个 spec:key=value,... 或 spec:@，# 开头为注释；"
+                    "（文件每行一个 spec:key=value,... 或 spec:@；带标签写 spec:label:k=v,...（同名专精可多臂），"
+                    "或写成 spec:k=v,...,label=xxx；批级选项单独一行：arms_max=N / same_spec_max=M（默认 4）；"
+                    "# 开头为注释；"
                     "治疗实测写 holy:heal_test=1,heal_dps=500[,mode=5|3]；"
                     "坦克实测写 prot:tank_test=1,tank_test_adds=2[,tank_test_dps=1][,mode=5|3]，熊德写 bear:…）");
                 return messages;
