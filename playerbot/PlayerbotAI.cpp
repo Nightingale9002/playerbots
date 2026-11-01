@@ -2037,7 +2037,13 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     //   其余 tick 引擎照常跑（追击/站位都归它）。远程职业被拉进近战的问题，
     //   在**引擎侧**修（见 PlayerbotAI::GetRange("attack")）。
     uint32 const guid = bot->GetGUIDLow();
-    bool const fsmOwnsBot = fsmHandled && dpsfsm::SkipEngine(guid);
+    // [2026-11-01 站长口径] 状态机接入**战斗系统**：以前只有"假人场景登记过"的 bot 才让它接管
+    //   （SkipEngine = s_scenarioTargets 命中），线上 bot 永远走引擎。现在只要 Tick() 真的处理了
+    //   这一 tick（= AiPlayerbot.DpsFsm 打开、且它不是坦/奶/被控/无目标等早退情形），就由状态机接管
+    //   施法：引擎这一 tick 仍会跑（走位/追击/平砍归它），但它的施法被 m_fsmCastLock 拦掉；
+    //   状态机本 tick 已经放出技能时再整 tick 让位（skipEngine），避免抢 GCD。
+    //   Tick() 自己早退 ⇒ fsmHandled=false ⇒ 这里不接管，引擎全权负责（这就是回退路径）。
+    bool const fsmOwnsBot = fsmHandled;
     bool const skipEngine = fsmOwnsBot && dpsfsm::DidCastThisTick(guid);
     if (!skipEngine)
     {
