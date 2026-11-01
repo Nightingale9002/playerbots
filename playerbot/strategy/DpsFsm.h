@@ -125,6 +125,35 @@ namespace ai
             bool multiReady = false;
             bool arcaneReady = false;
             bool killCommandReady = false;
+
+            // [2026-11-01 站长口径] **B. NearbyEnemy 列表**（多目标 DoT / AoE 选牌的输入）。
+            //   以前多目标只能靠 `pack10/pack30` 的**个数**，缺"每只怪的血量/仇恨/DoT 剩余"这三样：
+            //     · 血量（绝对值优先）：选"能跳满 DoT"的目标要看还剩多少血，百分比在 1,000,000 血的
+            //       假人身上完全分不出 60% 和 59% 的差别；
+            //     · 仇恨（双方）：怪身上的威胁表里"我 / 坦克"各多少 —— 仇恨档位不是 Open 的目标
+            //       不给新 DoT（给一只马上要 OT 的怪铺 DoT = 把仇恨再顶高一截）；
+            //     · DoT 剩余：已经满 DoT 的目标不该再花一个 GCD（重复铺会顶掉上一颗，白费）。
+            //   ⚠️ **只在需要多目标的专精里填**（暗牧/痛苦术/鸟德/元素萨/火法），其它专精保持空表
+            //     ⇒ 不增加任何每 tick 开销（`BuildNearbyEnemies()` 第一行就 return）。
+            //   ⚠️ 过滤口径复用现成的 `possible targets`（敌对 + 存活 + 射程内 + 假人场景只数本轮
+            //     声明的目标），不再新造一套扫描（见 DpsFsm.cpp → CountHostilesNear()）。
+            enum { kNearbyDotMax = 3 };     // 每个专精最多记 3 个"关键 DoT"
+            struct NearbyEnemy
+            {
+                ObjectGuid guid;            // 这只怪
+                uint32 hp = 0;              // **绝对血量**（选"能跳满 DoT"的目标用它）
+                float hpPct = 0.0f;         // 血量百分比（只给日志/人看）
+                float dist = 0.0f;          // 距离
+                float myThreat = 0.0f;      // 从**怪的**威胁表读：`target->getThreatManager().getThreat(bot)`
+                float tankThreat = 0.0f;    // 同上，读队伍主坦（没有坦克 = 0）
+                bool  tankAlive = false;    // 队伍里有没有坦克（没有 ⇒ 仇恨档位恒 Open）
+                int   dots = 0;             // 关键 DoT 已挂几个
+                int   dotRemain[kNearbyDotMax] = { 0, 0, 0 };   // 每个关键 DoT 的剩余毫秒（0=没挂）
+                bool  dotFull = false;      // 关键 DoT 全满（多目标铺场要跳过）
+                bool  threatOpen = true;    // 这只怪的仇恨档位是不是 Open（不是 ⇒ 不给新 DoT）
+            };
+            // 上限 `nearby_max`(默认 8)，按**绝对血量降序**（血最多的死得最慢 ⇒ DoT 跳得最多）。
+            std::vector<NearbyEnemy> nearby;
         };
 
         Spec DetectSpec(PlayerbotAI* ai);

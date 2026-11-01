@@ -145,6 +145,19 @@ namespace
         float  hp0Pct = 0.0f;   // 施法开始时的血量百分比
     };
 
+    // [2026-11-01 站长口径] **A. per-spell 伤害账本**（见 DmgSync / DmgLogTick 的说明）：
+    //   一条"预计会让 botDamageDealt 增长的伤害事件"。发生时按 atMs 先后归因到 spellId。
+    //   为什么需要"预计"：核心只给**累计总量**（`Player::botDamageDealt`，见 Unit.cpp → DealDamage
+    //   里那段 `++bot->botDamageDealt`），没有逐技能伤害；而每次伤害落地都对应一个我们**自己排的**
+    //   事件（直伤 = 读条结束即落地；DoT = 按 period 每 3 秒一跳）⇒ 用"事件时刻"把总量切开。
+    struct DmgExpect
+    {
+        uint32 spellId = 0;
+        uint32 atMs = 0;        // 预计落地时刻（WorldTimer 毫秒，1 起）
+        DmgExpect() = default;
+        DmgExpect(uint32 id, uint32 at) : spellId(id), atMs(at) {}
+    };
+
     struct BotMem
     {
         uint32 guid = 0;
@@ -493,6 +506,26 @@ namespace
         // 防护骑保命技"为什么没放出去"的节流（**按法术 id 分**：DP 与圣疗同一 tick 都会失败，
         //   共用一个时间戳会把第二条说明吞掉 —— 实测圣疗的失败原因一次都没打出来过）。
         std::map<uint32, uint32> tankSurvLogAt;
+
+        // ---- [2026-11-01 站长口径] A. per-spell 伤害账本 ----
+        //   数据来源（**真值**）：`Player::botDamageDealt`（核心 Unit.cpp → DealDamage 里对 bot 的
+        //   累计伤害），`Player::botMeleeHits`（免伤事件里"没有 spellInfo"的那一部分 = 白字/无模板）。
+        //   拆分方式（**估算**）：按下面 `dmgExpect` 里自己排的落地事件把总量切开 ——
+        //   直伤在"读条结束"落地，DoT 按 period 每跳一次。归因不上的部分单列 `dmgUnattributed`，
+        //   所以 `pct` 之和 + 白字 + unattributed = 100（绝不把差额平摊给某个技能）。
+        uint64 dmgSeenTotal = 0;                    // 上次采样到的 botDamageDealt
+        uint64 dmgSeenMelee = 0;                    // 上次采样到的 botMeleeHits
+        uint32 dmgSeenAt = 0;                       // 上次采样时刻（毫秒；0 = 还没采过，需要对齐基线）
+        std::map<uint32, uint64> spellCountsSeen;   // botSpellCounts 的快照（id → 成功次数）
+        std::map<uint32, uint64> dmgBySpell;        // spellId → 已归因伤害（id=0 = 白字/无模板）
+        std::map<uint32, uint64> hitsBySpell;       // spellId → 已归因的伤害事件数（DoT 按"跳"计）
+        uint64 dmgUnattributed = 0;                 // 归因不上的伤害（触发/饰品/别人的来源）
+        uint32 dmgSoft = 0;                         // 软归因次数（预测时刻偏了，见 DmgSync ⑤）
+        uint32 dmgSoftMaxGap = 0;                   // 软归因里最大的一次偏差（毫秒，只用于判断精度）
+        std::vector<DmgExpect> dmgExpect;           // 待落地的伤害事件（不保证有序，入队时按需排序）
+        uint32 lastDmgLog = 0;                      // [DPSFSM-DMG] 的 10 秒节流
+        // ---- [2026-11-01 站长口径] B. NearbyEnemy 的日志节流 ----
+        uint32 lastNearLog = 0;                     // [DPSFSM-NEAR] 的 10 秒节流
     };
 
     std::mutex s_disabledMutex;
@@ -1078,6 +1111,186 @@ namespace
     }
 
     // ==========================================================================
+    // [2026-11-01 站长口径] **B. NearbyEnemy 列表**（多目标 DoT / AoE 选牌的底层数据）
+    // --------------------------------------------------------------------------
+    // 只给"真的需要多目标"的专精算：暗牧 / 痛苦术 / 鸟德 / 元素萨 / 火法。
+    //   其它专精 `BuildNearbyEnemies()` 第一行就 return ⇒ 空表、**零每 tick 开销**。
+    // 过滤口径**复用**现成的 `possible targets`（`CountHostilesNear`：敌对 + 存活 + 射程内 +
+    //   假人场景只数自己这一轮声明的目标），不新造一套扫描。
+    // 排序 = **绝对血量降序**（血最多的死得最慢 ⇒ 铺上去的 DoT 跳得最多），取前 `nearby_max`(8)。
+    // ==========================================================================
+    bool IsNearbySpec(Spec sp)
+    {
+        switch (sp)
+        {
+            case Spec::Shadow:
+            case Spec::Affliction:
+            case Spec::Balance:
+            case Spec::Elemental:
+            case Spec::Fire:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // 这个专精的"关键 DoT"（最多 3 个）；`dots` / `dotRemain` / `dotFull` 都按这份表算。
+    int NearbyDotNames(Spec sp, char const* out[Snapshot::kNearbyDotMax])
+    {
+        for (int i = 0; i < Snapshot::kNearbyDotMax; ++i)
+            out[i] = nullptr;
+        switch (sp)
+        {
+            case Spec::Shadow:
+                out[0] = "shadow word: pain";
+                out[1] = "vampiric touch";
+                return 2;
+            case Spec::Affliction:
+                out[0] = "corruption";
+                out[1] = "siphon life";
+                out[2] = "unstable affliction";
+                return 3;
+            case Spec::Balance:
+                out[0] = "moonfire";
+                out[1] = "insect swarm";
+                return 2;
+            case Spec::Elemental:
+                out[0] = "flame shock";
+                return 1;
+            case Spec::Fire:
+                // 火法没有"能读到剩余时间"的 DoT（点燃不是 aura）⇒ 这张表只用来选 AoE 牌。
+                return 0;
+            default:
+                return 0;
+        }
+    }
+
+    // 队伍主坦（与 BuildSnapshot 里那段同一判据：第一个 `PlayerbotAI::IsTank()` 的队员）。
+    Player* GroupTankOf(Player* bot)
+    {
+        if (!bot)
+            return nullptr;
+        Group* group = bot->GetGroup();
+        if (!group)
+            return nullptr;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->getSource();
+            if (member && member != bot && sServerFacade.IsAlive(member) && PlayerbotAI::IsTank(member))
+                return member;
+        }
+        return nullptr;
+    }
+
+    // 这只怪的仇恨档位是不是 Open —— 与 EvalThreat 同一份三档口径，只是换成"这只怪"的威胁值。
+    //   没有坦克 / 不在副本 / 假人场景独占 ⇒ 恒 Open（绝不因为"没仇恨"把铺场卡住）。
+    bool NearbyThreatOpen(BotMem* m, Snapshot& s, float myThreat, float tankThreat, bool tankAlive)
+    {
+        if (!tankAlive || tankThreat <= 0.0f)
+            return true;
+        if (!s.bot || !s.bot->GetMap())
+            return true;
+        if (!s.bot->GetMap()->IsDungeon() && !s.bot->GetMap()->IsRaid())
+            return true;
+        if (dpsfsm::SkipEngine(s.bot->GetGUIDLow()))
+            return true;
+        return myThreat < tankThreat * float(TP(m, "threat_throttle", 0.80));
+    }
+
+    void BuildNearbyEnemies(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        // 三道门，缺一不可：
+        //   ① 只给 mode=5（显式状态图）填 —— mode=1/2/3/4 与 legacy 连**日志**都不许多一条
+        //      （硬要求：不改它们的可观察行为。实测漏了这条时 fire:mode=3 也会打 [DPSFSM-NEAR]）；
+        //   ② 只在需要多目标的专精里填；
+        //   ③ 世界/地图正常。
+        if (!m || m->mode != int(DecisionMode::Fsm) || !IsNearbySpec(m->spec))
+            return;
+        if (!ai || !s.bot || !s.bot->IsInWorld())
+            return;
+        int const cap = int(TP(m, "nearby_max", 8.0));
+        if (cap <= 0)
+            return;
+        std::vector<Unit*> list;
+        CountHostilesNear(ai, s.bot, float(TP(m, "nearby_range", 30.0)), &list);
+        if (list.empty())
+            return;
+        std::sort(list.begin(), list.end(), [](Unit* a, Unit* b)
+        {
+            if (!a || !b)
+                return b != nullptr;            // 空指针排到最后，绝不因为一只坏对象崩掉排序
+            if (a->GetHealth() != b->GetHealth())
+                return a->GetHealth() > b->GetHealth();     // 绝对血量降序
+            return a->GetObjectGuid() < b->GetObjectGuid();
+        });
+        if (int(list.size()) > cap)
+            list.resize(size_t(cap));
+
+        char const* dotNames[Snapshot::kNearbyDotMax] = { nullptr, nullptr, nullptr };
+        int const nNames = NearbyDotNames(m->spec, dotNames);
+        Player* tank = GroupTankOf(s.bot);
+
+        s.nearby.reserve(list.size());
+        for (Unit* u : list)
+        {
+            if (!u || !u->IsAlive())
+                continue;
+            Snapshot::NearbyEnemy e;
+            e.guid = u->GetObjectGuid();
+            e.hp = u->GetHealth();
+            e.hpPct = u->GetHealthPercent();
+            e.dist = s.bot->GetDistance(u);
+            // 双方仇恨都从**怪的**威胁表读（读 bot 自己那张表恒 0，见 BuildSnapshot 的修正注释）
+            e.myThreat = u->getThreatManager().getThreat(s.bot);
+            e.tankAlive = (tank != nullptr);
+            e.tankThreat = tank ? u->getThreatManager().getThreat(tank) : 0.0f;
+            int learned = 0;
+            int present = 0;
+            for (int i = 0; i < nNames; ++i)
+            {
+                if (!dotNames[i] || !SpellId(ai, s.bot, m, dotNames[i], false))
+                    continue;                   // 没学会（天赋没点）⇒ 这个 DoT 不参与"满没满"
+                ++learned;
+                int const remain = TargetAuraRemain(ai, s.bot, m, dotNames[i], u);
+                e.dotRemain[i] = remain > 0 ? remain : 0;
+                if (remain > 0)
+                    ++present;
+            }
+            e.dots = present;
+            e.dotFull = (learned > 0 && present >= learned);
+            e.threatOpen = NearbyThreatOpen(m, s, e.myThreat, e.tankThreat, e.tankAlive);
+            s.nearby.push_back(e);
+        }
+    }
+
+    // [DPSFSM-NEAR] <bot> n=<数量> top=<guid:hp%:myThreat/tankThreat,...>（前 3 个即可）
+    //   10 秒一条；只在 `nearby` 非空（= 多目标专精且视野里有敌人）时打。
+    void NearbyLogTick(BotMem* m, Snapshot& s)
+    {
+        if (!m || !s.bot || s.nearby.empty())
+            return;
+        uint32 nowMs = WorldTimer::getMSTime();
+        if (!nowMs)
+            nowMs = 1;
+        if (m->lastNearLog && WorldTimer::getMSTimeDiff(m->lastNearLog, nowMs) < 10000)
+            return;
+        m->lastNearLog = nowMs;
+        int const n = int(s.nearby.size());
+        int const top = n < 3 ? n : 3;
+        std::string sTop;
+        char buf[96];
+        for (int i = 0; i < top; ++i)
+        {
+            Snapshot::NearbyEnemy const& e = s.nearby[size_t(i)];
+            snprintf(buf, sizeof(buf), "%s%u:%.0f:%.0f/%.0f",
+                i ? "," : "", e.guid.GetCounter(), double(e.hpPct),
+                double(e.myThreat), double(e.tankThreat));
+            sTop += buf;
+        }
+        sLog.outError("[DPSFSM-NEAR] %s n=%d top=%s", s.bot->GetName(), n, sTop.c_str());
+    }
+
+    // ==========================================================================
     // [2026-10-31 站长口径] 猎人时间轴（平射计时器模型）的**取数**：
     //   平射隐藏施法 0.5s（受急速）｜平射独立冷却 (武器速度−0.5)s（受急速）
     //   ｜GCD 1.5s（不受急速）｜稳固读条 1.5s 基础、**受急速**。
@@ -1278,6 +1491,12 @@ namespace
                     s.multiReady ? 1 : 0, s.arcaneReady ? 1 : 0, s.killCommandReady ? 1 : 0, s.dist);
             }
         }
+
+        // [2026-11-01 站长口径] **B. NearbyEnemy**：只在多目标专精里填（别的专精第一行就 return），
+        //   紧随其后打 [DPSFSM-NEAR]（10 秒节流、前 3 只）。放在快照的最后，是为了让"填表"与
+        //   "用表"看到**同一份**局面（多目标铺场直接读 s.nearby，不再自己去扫一遍）。
+        BuildNearbyEnemies(ai, m, s);
+        NearbyLogTick(m, s);
     }
 
     void LogTransition(PlayerbotAI* ai, BotMem* m, Snapshot& s, State next)
@@ -1353,6 +1572,364 @@ namespace
         m->lastManaSpent = m->manaSpent;
         sLog.outError("[DPSFSM-MANA] %s spent=%llu pct=%.0f",
             bot->GetName(), (unsigned long long)m->manaSpent, bot->GetPowerPercent());
+    }
+
+    // ==========================================================================
+    // [2026-11-01 站长口径] A. per-spell 伤害日志（BIS 的"套装占比 × 提升"要用**真实占比**）
+    // --------------------------------------------------------------------------
+    // 核心给的是**累计总量**，没有逐技能伤害：唯一写入点是 `Unit.cpp → Unit::DealDamage()`
+    //   里那段 `static_cast<Player*>(dealer)->botDamageDealt += damage;`
+    //   （`botSpellCounts` 只有**次数**，这也是 `[DUMMY] top=id:次数` 只有次数的原因）。
+    //   所以这里做两件事：
+    //   ① **真值**：每 tick 采 `botDamageDealt` 的增量 —— 真的是这个 bot 本体打出的伤害
+    //      （含直伤/DoT/触发；**不含宠物/图腾**：它们走 `botPetDamageDealt` 另一本账，故意不混）；
+    //   ② **拆分（估算）**：施法成功时自己排"落地时刻"（直伤 = 读条结束即落地；DoT = 每 period
+    //      一跳），增量到了就归因给**最早到点**的那条事件。
+    //   ⇒ 每个技能的 `dmg` 是它自己的真伤害，`pct` 的分母是**同一个**总量，所以同一轮里
+    //      `Σpct(技能) + white_pct + unattributed_pct ≈ 100`（汇总行见 DmgLogLines 的 total= 行）。
+    //   已知误差（不掩饰、也不平摊）：
+    //     · 同一 tick 里有两条事件同时落地（例如白字 + 瞬发技）⇒ 这块增量整块记给其中一条；
+    //     · DoT 落地时刻按 `dot_tick_ms`(3000) 排，读条/延迟会让实际跳点漂移 ±几百毫秒
+    //       （容差 `dmg_attr_tol`，默认 1200ms 内算命中）；
+    //     · 触发/饰品/来源不明的伤害没有事件 ⇒ 进 `unattributed`，绝不平摊到某个技能上。
+    // ==========================================================================
+
+    // 这个法术会不会**直接**造成伤害（只用来决定"要不要排落地事件"；buff/姿态/诅咒不排）。
+    bool SpellHasDirectDamage(SpellEntry const* e)
+    {
+        if (!e)
+            return false;
+        return IsSpellHaveEffect(e, SPELL_EFFECT_SCHOOL_DAMAGE)
+            || IsSpellHaveEffect(e, SPELL_EFFECT_WEAPON_DAMAGE)
+            || IsSpellHaveEffect(e, SPELL_EFFECT_WEAPON_PERCENT_DAMAGE)
+            || IsSpellHaveEffect(e, SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL)
+            || IsSpellHaveEffect(e, SPELL_EFFECT_NORMALIZED_WEAPON_DMG)
+            || IsSpellHaveEffect(e, SPELL_EFFECT_HEALTH_LEECH)
+            || IsSpellHaveEffect(e, SPELL_EFFECT_POWER_DRAIN);
+    }
+
+    // 这个法术会不会挂**周期性伤害**（痛/触/腐蚀/献祭/月火/烈焰震击…）。
+    bool SpellHasPeriodicDamage(SpellEntry const* e)
+    {
+        if (!e)
+            return false;
+        for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            if (e->Effect[i] != SPELL_EFFECT_APPLY_AURA)
+                continue;
+            uint32 const aura = e->EffectApplyAuraName[i];
+            if (aura == SPELL_AURA_PERIODIC_DAMAGE || aura == SPELL_AURA_PERIODIC_DAMAGE_PERCENT
+                || aura == SPELL_AURA_PERIODIC_LEECH)
+                return true;
+        }
+        return false;
+    }
+
+    // 预测读条（毫秒）—— 只用来排"落地时刻"，不参与任何决策。
+    //   ⚠️ `GetSpellCastTime(entry, nullptr)` 返回的是**基础**读条：核心只在有 `Spell` 对象的路径上
+    //   才应用 `SPELLMOD_CASTING_TIME`（天赋减读条）与 `UNIT_MOD_CAST_SPEED`（急速）。不补这两层，
+    //   排出来的落地时刻会**系统性偏晚**（实测奥法带急速的奥冲差到 1 秒以上，几乎每次都要靠软归因兜）。
+    int PredictedCastMs(Player* bot, uint32 spellId, SpellEntry const* e)
+    {
+        if (!e)
+            return 0;
+        int32 t = int32(GetSpellCastTime(e, nullptr));
+        if (t <= 0)
+            return 0;
+        if (bot)
+        {
+            if (Player* modOwner = bot->GetSpellModOwner())
+                modOwner->ApplySpellMod(spellId, SPELLMOD_CASTING_TIME, t);
+            float const speed = bot->GetFloatValue(UNIT_MOD_CAST_SPEED);
+            if (speed > 0.1f && speed < 3.0f)
+                t = int32(float(t) * speed);
+        }
+        if (t < 0)
+            t = 0;
+        if (t > 10000)
+            t = 10000;
+        return int(t);
+    }
+
+    // 排一条（DoT 是若干条）"预计在 atMs 让 botDamageDealt 增长"的事件。
+    void DmgPushExpect(BotMem* m, Player* bot, uint32 spellId, uint32 nowMs)
+    {
+        if (!m || !spellId)
+            return;
+        SpellEntry const* e = sServerFacade.LookupSpellInfo(spellId);
+        if (!e)
+            return;
+        bool const direct = SpellHasDirectDamage(e);
+        bool const periodic = SpellHasPeriodicDamage(e);
+        if (!direct && !periodic)
+            return;             // 纯 buff/姿态/诅咒：不排事件，免得抢走别人的伤害增量
+        uint32 const castMs = uint32(PredictedCastMs(bot, spellId, e));
+        uint32 const landMs = nowMs + castMs;
+        if (direct)
+            m->dmgExpect.push_back(DmgExpect{ spellId, landMs });
+        if (periodic)
+        {
+            int const fallback = int(TP(m, "dot_tick_ms", 3000.0));
+            int const fallbackPer = fallback > 0 ? fallback : 3000;
+            int32 const dur = GetSpellDuration(e);
+            int const full = dur > 0 ? int(dur) : 0;
+            bool const channeled = IsChanneledSpell(e);
+            for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+            {
+                if (e->Effect[i] != SPELL_EFFECT_APPLY_AURA)
+                    continue;
+                uint32 const aura = e->EffectApplyAuraName[i];
+                if (aura != SPELL_AURA_PERIODIC_DAMAGE && aura != SPELL_AURA_PERIODIC_DAMAGE_PERCENT
+                    && aura != SPELL_AURA_PERIODIC_LEECH)
+                    continue;
+                // 真实跳间隔 = DBC 的 `EffectAmplitude`（核心 `SetModifier(..., spellproto->EffectAmplitude[eff])`
+                //   直接把它写进 `Modifier::periodictime`）—— 不要用固定 3000：
+                //   引导技（鞭笞/吸取生命）是 **1000ms**，用 3000 排会把三跳全排晚 ⇒ 全落进 unattributed。
+                int const per = e->EffectAmplitude[i] ? int(e->EffectAmplitude[i]) : fallbackPer;
+                int const fullMs = full > 0 ? full : (channeled ? per : 12000);
+                // ⚠️ 引导法术从**引导开始**就跳（读条时间本身就是引导时长），所以基准 = now；
+                //   普通 DoT（无常/献祭这类读条技）要等读条结束才挂上 ⇒ 基准 = now + 读条。
+                uint32 const base = channeled ? nowMs : landMs;
+                int ticks = fullMs / per;
+                if (ticks < 1) ticks = 1;
+                if (ticks > 40) ticks = 40;     // 上限：防止永久 DoT 排一长串
+                for (int k = 1; k <= ticks; ++k)
+                    m->dmgExpect.push_back(DmgExpect{ spellId, base + uint32(k * per) });
+            }
+        }
+        // 上限：排了但没落地的事件（目标死了/被驱散/抵抗）只会过期；这里再兜一刀防无界增长。
+        if (m->dmgExpect.size() > 256)
+            m->dmgExpect.erase(m->dmgExpect.begin(), m->dmgExpect.begin() + 128);
+    }
+
+    // 每 tick 结算一次：新施法 → 排队；伤害增量 → 归因。
+    void DmgSync(BotMem* m, Player* bot)
+    {
+        if (!m || !bot)
+            return;
+        uint32 nowMs = WorldTimer::getMSTime();
+        if (!nowMs)
+            nowMs = 1;
+        uint64 const total = bot->botDamageDealt;
+        uint64 const melee = bot->botMeleeHits;
+
+        // ① 基线：第一次采样 / 距上次采样太久（脱战、卡 tick、换图）/ 计数被重置（重登）
+        //    ⇒ 只对齐基线、清掉旧事件，**不归因**（否则这段空档的伤害会落到一个不相干的技能上）。
+        if (!m->dmgSeenAt || WorldTimer::getMSTimeDiff(m->dmgSeenAt, nowMs) > 3000
+            || total < m->dmgSeenTotal)
+        {
+            m->dmgSeenTotal = total;
+            m->dmgSeenMelee = melee;
+            m->dmgSeenAt = nowMs;
+            m->dmgExpect.clear();
+            m->spellCountsSeen = bot->botSpellCounts;
+            return;
+        }
+
+        // ② 新成功的施法 ⇒ 排落地事件。结算口径与 SyncManaSpent 完全相同（按 `botSpellCounts`
+        //    的次数差）：mode=5 的 CastChecked/CastSelfCentered/CastIdAt 与 legacy 路径都会经过
+        //    `PlayerbotAI::RecordSpellCast`，一处结算就全盖住。
+        for (std::map<uint32, uint64>::const_iterator it = bot->botSpellCounts.begin();
+            it != bot->botSpellCounts.end(); ++it)
+        {
+            uint32 const id = it->first;
+            uint64 const nowCount = it->second;
+            uint64& seen = m->spellCountsSeen[id];
+            if (nowCount == seen)
+                continue;
+            if (nowCount < seen)            // 计数被重置 ⇒ 重新对齐，不补差额
+            {
+                seen = nowCount;
+                continue;
+            }
+            uint64 const fresh = nowCount - seen;
+            seen = nowCount;
+            // 同一 tick 里重复施放同一技能极少（GCD 1.5s）；真有也只补 3 条，别把误差放大。
+            uint64 const push = fresh > 3 ? 3 : fresh;
+            for (uint64 i = 0; i < push; ++i)
+                DmgPushExpect(m, bot, id, nowMs);
+        }
+
+        // ③ 清掉过期事件（排了但一直没落地：目标死了/被驱散/抵抗）
+        //   ⚠️ 这里**必须用有符号比较**：`WorldTimer::getMSTimeDiff(a,b)` 算的是 `b-a`，
+        //      对未来时刻会回绕成一个巨大的数 —— 曾经写成 `getMSTimeDiff(e.atMs, nowMs) < 5000`
+        //      ⇒ 把**所有还没到的** DoT 跳点当场删光，实测暗牧 5 目标有 52% 伤害落进 unattributed。
+        if (!m->dmgExpect.empty())
+        {
+            std::vector<DmgExpect> keep;
+            keep.reserve(m->dmgExpect.size());
+            for (DmgExpect const& e : m->dmgExpect)
+            {
+                if ((long long)e.atMs + 5000 >= (long long)nowMs)   // 未来 / 过去不到 5 秒
+                    keep.push_back(e);
+            }
+            if (keep.size() != m->dmgExpect.size())
+                m->dmgExpect.swap(keep);
+        }
+
+        // ④ 增量归因
+        uint64 const dTotal = total > m->dmgSeenTotal ? total - m->dmgSeenTotal : 0;
+        uint64 const dMelee = melee > m->dmgSeenMelee ? melee - m->dmgSeenMelee : 0;
+        m->dmgSeenTotal = total;
+        m->dmgSeenMelee = melee;
+        m->dmgSeenAt = nowMs;
+        if (!dTotal)
+            return;
+
+        // 选"已经到点（容差内）"的事件里**离现在最近**的那条：优先刚落地的那一跳（`d<=0`），
+        //   未来 `dmg_attr_tol` 内提前几毫秒到账的排程也够格，但优先级更低。
+        //   同 tick 多条落地时先记给最近的一条，下一条增量再归到下一条事件 ——
+        //   核心没有逐事件伤害接口，这是能拿到的最好近似。
+        uint32 const tolMs = uint32(TP(m, "dmg_attr_tol", 1200.0));
+        int pick = -1;
+        long long bestScore = 0;
+        for (size_t i = 0; i < m->dmgExpect.size(); ++i)
+        {
+            DmgExpect const& e = m->dmgExpect[i];
+            long long const d = (long long)e.atMs - (long long)nowMs;
+            if (d > (long long)tolMs)
+                continue;               // 还没到点
+            if (d < -(long long)(tolMs * 2))
+                continue;               // 迟到太多（上面③已经清过一轮，这里再兜一刀）
+            long long const score = (d >= 0) ? (d + 1000000) : (-d);
+            if (pick < 0 || score < bestScore)
+            {
+                pick = int(i);
+                bestScore = score;
+            }
+        }
+        if (pick >= 0)
+        {
+            uint32 const spellId = m->dmgExpect[size_t(pick)].spellId;
+            m->dmgExpect.erase(m->dmgExpect.begin() + pick);
+            m->dmgBySpell[spellId] += dTotal;
+            ++m->hitsBySpell[spellId];
+        }
+        else if (dMelee)
+        {
+            // 没有到点的法术事件，但白字计数涨了 ⇒ 这段增量就是白字（id=0）
+            m->dmgBySpell[0] += dTotal;
+            ++m->hitsBySpell[0];
+        }
+        else
+        {
+            // ⑤ 软归因：**预测时刻略微偏了**（急速、服务器拍、读条被打断重放）时，把增量记给
+            //   队列里"离现在最近"的那条事件（|d| ≤ `dmg_attr_soft_ms`，默认 2500）。
+            //   这不是凭空的平摊：候选仍然必须是"我们自己排的、还没被消耗的伤害事件"；
+            //   真的一条都挨不上（触发/饰品/来源不明）才进 `unattributed`。
+            //   `dmg_attr_soft_ms=0` 可整段关掉（A/B 用）。
+            uint32 const softMs = uint32(TP(m, "dmg_attr_soft_ms", 2500.0));
+            int soft = -1;
+            long long softGap = 0;
+            if (softMs)
+            {
+                for (size_t i = 0; i < m->dmgExpect.size(); ++i)
+                {
+                    long long const d = (long long)m->dmgExpect[i].atMs - (long long)nowMs;
+                    long long const gap = d >= 0 ? d : -d;
+                    if (gap > (long long)softMs)
+                        continue;
+                    if (soft < 0 || gap < softGap)
+                    {
+                        soft = int(i);
+                        softGap = gap;
+                    }
+                }
+            }
+            if (soft >= 0)
+            {
+                uint32 const spellId = m->dmgExpect[size_t(soft)].spellId;
+                m->dmgExpect.erase(m->dmgExpect.begin() + soft);
+                m->dmgBySpell[spellId] += dTotal;
+                ++m->hitsBySpell[spellId];
+                ++m->dmgSoft;
+                if (softGap > int64(m->dmgSoftMaxGap))
+                    m->dmgSoftMaxGap = uint32(softGap);
+            }
+            else
+                m->dmgUnattributed += dTotal;   // 触发/饰品/来源不明：单列，不平摊
+        }
+    }
+
+    // 打印这轮到目前为止的 per-spell 账（每 10 秒一条 + 轮末一条；轮末 final=1）。
+    void DmgLogLines(BotMem* m, char const* who, bool final)
+    {
+        if (!m || !who || !*who)
+            return;
+        uint64 total = m->dmgUnattributed;
+        for (std::map<uint32, uint64>::const_iterator it = m->dmgBySpell.begin();
+            it != m->dmgBySpell.end(); ++it)
+            total += it->second;
+        if (!total)
+        {
+            if (final)
+                sLog.outError("[DPSFSM-DMG] %s total=0 final=1", who);
+            return;
+        }
+
+        // 按伤害降序（脚本和人眼都先看大的）
+        std::vector<std::pair<uint64, uint32>> rows;
+        rows.reserve(m->dmgBySpell.size());
+        for (std::map<uint32, uint64>::const_iterator it = m->dmgBySpell.begin();
+            it != m->dmgBySpell.end(); ++it)
+        {
+            if (it->second)
+                rows.push_back(std::make_pair(it->second, it->first));
+        }
+        std::sort(rows.begin(), rows.end(),
+            [](std::pair<uint64, uint32> const& a, std::pair<uint64, uint32> const& b)
+        {
+            if (a.first != b.first)
+                return a.first > b.first;
+            return a.second < b.second;
+        });
+
+        double pctSpells = 0.0;
+        for (auto const& row : rows)
+        {
+            uint32 const id = row.second;
+            uint64 const dmg = row.first;
+            uint64 const hits = m->hitsBySpell.count(id) ? m->hitsBySpell[id] : 0;
+            double const pct = 100.0 * double(dmg) / double(total);
+            pctSpells += pct;
+            char const* name = nullptr;
+            if (id)
+            {
+                SpellEntry const* e = sServerFacade.LookupSpellInfo(id);
+                if (e && e->SpellName[0] && *e->SpellName[0])
+                    name = e->SpellName[0];
+            }
+            else
+                name = "white/melee";
+            sLog.outError("[DPSFSM-DMG] %s spell=%u name=%s hits=%llu dmg=%llu pct=%.1f%s",
+                who, id, name ? name : "?", (unsigned long long)hits, (unsigned long long)dmg,
+                pct, final ? " final=1" : "");
+        }
+        uint64 const white = m->dmgBySpell.count(0) ? m->dmgBySpell[0] : 0;
+        sLog.outError("[DPSFSM-DMG] %s total=%llu spells_pct=%.1f white_pct=%.1f "
+            "unattributed=%llu unattributed_pct=%.1f soft=%u soft_maxgap=%ums%s",
+            who, (unsigned long long)total, pctSpells,
+            100.0 * double(white) / double(total), (unsigned long long)m->dmgUnattributed,
+            100.0 * double(m->dmgUnattributed) / double(total),
+            m->dmgSoft, m->dmgSoftMaxGap, final ? " final=1" : "");
+    }
+
+    // [DPSFSM-DMG] 的 10 秒节流。**只给 mode=5 出账**：mode=1/2/3/4 的日志保持原样（硬要求）。
+    void DmgLogTick(BotMem* m, Player* bot)
+    {
+        if (!m || !bot)
+            return;
+        if (m->mode != int(DecisionMode::Fsm))
+            return;
+        uint32 nowMs = WorldTimer::getMSTime();
+        if (!nowMs)
+            nowMs = 1;
+        if (m->lastDmgLog && WorldTimer::getMSTimeDiff(m->lastDmgLog, nowMs) < 10000)
+            return;
+        m->lastDmgLog = nowMs;
+        if (m->dmgBySpell.empty() && !m->dmgUnattributed)
+            return;
+        DmgLogLines(m, bot->GetName(), false);
     }
 
     // [2026-10-29 诊断结论] 原来只判 IsSpellReady 就放，失败也照样每 tick 重试（怒气不够、目标闪避条件、
@@ -3678,6 +4255,20 @@ namespace ai
             m->lastArcLog = 0;
             m->lastFillLog = 0;
             m->lastThreatLog = 0;
+            // [2026-11-01 站长口径] A. per-spell 伤害账本：新一轮从零记 —— `dmgSeenAt=0` 会让下一次
+            //   `DmgSync()` 只对齐基线（不归因），所以上一轮的尾巴绝不会算进这一轮。
+            m->dmgBySpell.clear();
+            m->hitsBySpell.clear();
+            m->dmgUnattributed = 0;
+            m->dmgSoft = 0;
+            m->dmgSoftMaxGap = 0;
+            m->dmgExpect.clear();
+            m->dmgSeenAt = 0;
+            m->dmgSeenTotal = 0;
+            m->dmgSeenMelee = 0;
+            m->lastDmgLog = 0;
+            // [2026-11-01 站长口径] B. [DPSFSM-NEAR] 的 10 秒节流也跨轮清零
+            m->lastNearLog = 0;
             m->state = State::Idle;
             m->holdThisTick = false;
             // 诊断窗口计数一并归零：这样每一轮的 [DPSFSM-ARC] 只报**本轮**的 holds/casts
@@ -3835,14 +4426,32 @@ namespace ai
 
         void ClearScenarioTargets(uint32 guid, uint32 runId)
         {
-            std::lock_guard<std::mutex> lock(s_disabledMutex);
-            auto it = s_scenarioRun.find(guid);
-            if (it == s_scenarioRun.end())
+            bool cleared = false;
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                auto it = s_scenarioRun.find(guid);
+                if (it == s_scenarioRun.end())
+                    return;
+                if (runId && it->second != runId)
+                    return;      // 这条是新一轮登记的，别动
+                s_scenarioTargets.erase(guid);
+                s_scenarioRun.erase(guid);
+                cleared = true;
+            }
+            // [2026-11-01 站长口径] **轮末一条 [DPSFSM-DMG]**（`final=1`，供脚本抓真实占比）。
+            //   这里是一轮结束**唯一稳定**的收尾点（SimScenario 每轮收尾都会调一次），放在
+            //   `s_disabledMutex` 之外：DmgLogLines 要查 SpellEntry / sObjectMgr，不该持着锁做。
+            if (!cleared)
                 return;
-            if (runId && it->second != runId)
-                return;      // 这条是新一轮登记的，别动
-            s_scenarioTargets.erase(guid);
-            s_scenarioRun.erase(guid);
+            BotMem* m = Mem(guid);
+            if (!m || m->mode != int(DecisionMode::Fsm))
+                return;
+            if (m->dmgBySpell.empty() && !m->dmgUnattributed)
+                return;
+            std::string who;
+            if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), who) || who.empty())
+                who = "guid=" + std::to_string(guid);
+            DmgLogLines(m, who.c_str(), true);
         }
 
         // [2026-11-01 站长口径] 治疗场景的目标分配：见 DpsFsm.h → SetScenarioHealTargets()。
@@ -5835,10 +6444,13 @@ namespace ai
         return n;
     }
 
-    // [2026-11-01 站长口径] 痛苦·多目标：`NearbyEnemy` 里**血量最多的前 multidot_max(5) 个**才铺，
-    //   超过 5 个不扩。取列表用的是快照侧已有的 `possible targets`，与 CountHostilesNear() 同一份过滤
-    //   （敌对 + 存活 + 射程内 + 假人场景只数自己这一轮声明的目标），所以副本里也用同一套"看得见的敌人"。
+    // [2026-11-01 站长口径] 痛苦·多目标：**按 `Snapshot::NearbyEnemy` 列表执行**，
+    //   取**血量最高的前 multidot_max(5) 个**才铺（超过 5 个不扩）。列表来自快照侧现成的
+    //   `possible targets`（与 CountHostilesNear 同一份过滤：敌对 + 存活 + 射程内 + 假人场景
+    //   只数自己这一轮声明的目标），所以副本里也用同一套"看得见的敌人"。
     //   排序用**当前绝对血量**降序：血最多的死得最慢 ⇒ 铺上去的腐蚀跳得最多。
+    //   跳过：① 当前目标交给单体表；② 腐蚀剩余 > `refresh_dot` 的（重复铺会顶掉上一颗）；
+    //         ③ **仇恨档位不是 Open** 的（给马上要 OT 的怪补 DoT = 把仇恨再顶高一截）。
     //   返回 true = 本 tick 真的铺出一颗（占掉 GCD）；outCount = 参与铺场的敌人数（日志 multi=）。
     bool WarlockMultiCorruption(PlayerbotAI* ai, BotMem* m, Snapshot& s, int& outCount)
     {
@@ -5847,30 +6459,36 @@ namespace ai
         int const minTargets = int(TP(m, "multidot_min_targets", 2.0));
         if (cap <= 1 || minTargets <= 1 || s.pack30 < minTargets)
             return false;
-
-        std::vector<Unit*> list;
-        CountHostilesNear(ai, s.bot, float(TP(m, "range_caster", 30.0)), &list);
-        if (int(list.size()) < minTargets)
+        if (s.nearby.empty())           // 没有列表（非多目标专精/视野里没敌人）⇒ 不做
             return false;
-        std::sort(list.begin(), list.end(), [](Unit* a, Unit* b)
-        {
-            if (a->GetHealth() != b->GetHealth())
-                return a->GetHealth() > b->GetHealth();
-            return a->GetObjectGuid() < b->GetObjectGuid();
-        });
-        if (int(list.size()) > cap)
-            list.resize(size_t(cap));
-        outCount = int(list.size());
 
-        // 每个目标只铺一颗：残留 > refresh_dot 的不动（同一目标重复铺会顶掉上一颗 ⇒ 白读一个 GCD）
         int const refreshMs = int(TP(m, "refresh_dot", 3000.0));
-        for (Unit* u : list)
+        int placed = 0;
+        int seen = 0;
+        for (Snapshot::NearbyEnemy const& e : s.nearby)
         {
+            if (placed >= cap)
+                break;
+            ++placed;
+            ++seen;
+            if (s.target && e.guid == s.target->GetObjectGuid())
+                continue;               // 当前目标交给单体 DoT 表（那里有续期判据）
+            if (!e.threatOpen)
+                continue;               // 仇恨档位不是 Open ⇒ 不给新 DoT
+            if (e.dotFull)
+                continue;               // 已经满 DoT ⇒ 跳过
+            Unit* u = s.bot->GetMap() ? s.bot->GetMap()->GetUnit(e.guid) : nullptr;
+            if (!u || !u->IsAlive())
+                continue;               // 列表是快照，目标可能已经死了/走了
             if (TargetAuraRemain(ai, s.bot, m, "corruption", u) > refreshMs)
-                continue;
+                continue;               // 还早 ⇒ 不动（同一目标重复铺会顶掉上一颗）
             if (TryCast(ai, m, s, "corruption", u))
+            {
+                outCount = seen;
                 return true;
+            }
         }
+        outCount = seen ? seen : 1;
         return false;
     }
 
@@ -8217,9 +8835,13 @@ namespace ai
         return remain / period;
     }
 
-    // [2026-11-01 站长口径] 暗牧·多目标：`possible targets` 里**血量最多的前 multidot_max(5) 个**，
-    //   超过 5 个不再扩（回头集火血量最高的）。排序用**绝对血量降序**：血最多的死得最慢 ⇒ DoT 跳得最多。
-    //   铺不铺走**每 GCD 收益**判据（站长原话：剩余跳数 × 单跳 ÷ 占用 GCD > 填充技收益）。
+    // [2026-11-01 站长口径] 暗牧·多目标：**按 `Snapshot::NearbyEnemy` 列表执行**（不再是"临时扫一遍
+    //   再排序"）：列表已经在快照里按**绝对血量降序**取好（`nearby_max` 上限），这里只取前
+    //   `multidot_max`(5) 个。三个跳过条件：
+    //     ① 当前目标 ——— 交给 GCD 时间轮（那里有撞车/到期判据），这里只照顾别人；
+    //     ② 关键 DoT 已满（`dotFull`）—— 再铺一个 GCD 只会顶掉上一颗；
+    //     ③ 仇恨档位不是 Open（`threatOpen`）—— 给一只马上要 OT 的怪铺 DoT = 把仇恨再顶高一截。
+    //   铺不铺仍走**每 GCD 收益**判据（站长原话：剩余跳数 × 单跳 ÷ 占用 GCD > 填充技收益）。
     //   ⚠️ 记录这里的取舍（不编数字）：DoT 的单跳伤害能从目标身上的 aura 读到（`Modifier::m_amount`，
     //      含法伤），但**填充技**（心爆/鞭/灭）的"每 GCD 实际伤害"本模块读不到 ——
     //      没有伤害事件接口，只有施法次数（`botCasts`）。拿模板基础值去比含法伤的 DoT 每跳会
@@ -8234,24 +8856,24 @@ namespace ai
             return false;
         if (s.pack30 < 2)               // 单目标不谈多目标：那条路归时间轮
             return false;
-
-        std::vector<Unit*> list;
-        CountHostilesNear(ai, s.bot, float(TP(m, "range_caster", 30.0)), &list);
-        if (list.size() < 2)
+        if (s.nearby.empty())           // 没有列表（非多目标专精/视野里没敌人）⇒ 不做
             return false;
-        std::sort(list.begin(), list.end(), [](Unit* a, Unit* b)
-        {
-            if (a->GetHealth() != b->GetHealth())
-                return a->GetHealth() > b->GetHealth();
-            return a->GetObjectGuid() < b->GetObjectGuid();
-        });
-        if (int(list.size()) > cap)
-            list.resize(size_t(cap));
 
-        for (Unit* u : list)
+        int placed = 0;
+        for (Snapshot::NearbyEnemy const& e : s.nearby)
         {
-            if (!u || u == s.target || !u->IsAlive())
-                continue;               // 当前目标交给轮（那里有撞车/到期判据），这里只照顾别人
+            if (placed >= cap)          // 只看血量最高的前 cap 个
+                break;
+            ++placed;
+            if (e.guid == s.target->GetObjectGuid())
+                continue;               // 当前目标交给轮
+            if (!e.threatOpen)
+                continue;               // 仇恨档位不是 Open ⇒ 不给新 DoT
+            if (e.dotFull)
+                continue;               // 已经满 DoT ⇒ 跳过（重复铺会顶掉，白读一个 GCD）
+            Unit* u = s.bot->GetMap() ? s.bot->GetMap()->GetUnit(e.guid) : nullptr;
+            if (!u || !u->IsAlive())
+                continue;               // 列表是快照，目标可能已经死了/走了
             for (int kind = 0; kind < 2; ++kind)
             {
                 char const* name = kind ? "vampiric touch" : "shadow word: pain";
@@ -11481,6 +12103,12 @@ namespace ai
             //   Tick() 的兜底读它（见派发处"Hold 的通用兜底"）。
             m->holdIntent = nullptr;
             ReloadTune();
+
+            // [2026-11-01 站长口径] A. **per-spell 伤害账本**（每 tick 结算一次，10 秒出一次账）：
+            //   放在所有早退门之前 —— 脱战/坐地/没目标时也可能有 DoT 在跳，账不能漏。
+            //   只读 `botDamageDealt`/`botMeleeHits`/`botSpellCounts` 三个已有计数，不改任何决策。
+            DmgSync(m, bot);
+            DmgLogTick(m, bot);
 
             uint32 const hbNow = WorldTimer::getMSTime();
             bool const hbDue = (!m->hbLast || WorldTimer::getMSTimeDiff(m->hbLast, hbNow ? hbNow : 1) >= 10000);
