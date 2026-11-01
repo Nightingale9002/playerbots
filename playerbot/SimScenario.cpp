@@ -5963,6 +5963,16 @@ uint32 stuckFightCleared = 0;
                         d.id, bot->GetName(), d.spec.c_str(), d.prepMs / 1000);
                 }
 
+                // [2026-11-01 站长口径·A] **每个 tick 校一次"打的是不是自己这堆木桩"**。
+                //   病根（实测 `[DUMMY] id=22 spec=arcane`）：引擎在状态机 Decline 的 tick 里自己挑目标，
+                //   把 victim 换成了同场的另一只仿真 bot（`victim=Nenrus victimGuid=51`），之后 90 秒
+                //   `[DPS-WIN] dps=0.0`，整轮 dps=326.8 / casts=18；而同批 frost=829.7、arcane 另两轮 856~1022。
+                //   多臂同批（5~17 只 bot 站在同一条 GM 岛上）就是这个坑的高发场景。
+                //   放在"每 1 秒拽回"之前、**每 tick** 做：只读一次 GetVictim + set 查表，零额外开销；
+                //   非场景 bot 里它第一行就返回 false（副本/线上一个字节不变）。
+                if (d.gearReady && !d.dummies.empty())
+                    dpsfsm::EnforceScenarioVictim(bot->GetPlayerbotAI());
+
                 // 每 2 秒把人拽回来 + 重新咬住假人（假人不还手，bot 自己容易脱战）
                 if (now - d.lastAttackMs > 1000)
                 {

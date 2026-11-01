@@ -225,6 +225,7 @@ namespace
         uint32 movTicks = 0;        // 在移动的 tick 数（移动会打断挥击）
         uint32 skipTicks = 0;       // 因为状态机放了技能而让位给状态机的 tick 数      // "需要背后但没站好"只记一次      // [2026-10-30] "策略里点名但没学会"的日志只打一次             // 本 tick 状态机是否真的放出了技能
         time_t lastEngageLog = 0;              // "咬不上去"日志节流
+        time_t lastForeignVictimLog = 0;       // [2026-11-01·A] "打到了别人"（场景外目标）日志节流
         time_t lastBehindTry = 0;              // 上一次尝试绕背的时间（别每 tick 都动）
         time_t lastCloseTry = 0;               // 上一次"真够不着就贴上去"的时间
         time_t lastConsLog = 0;                // "自身中心 AoE 放不出"日志节流
@@ -4183,11 +4184,8 @@ namespace ai
         bool EngageScenarioTarget(PlayerbotAI* ai)
         {
             Player* bot = ai ? ai->GetBot() : nullptr;
-            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetVictim())
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive())
                 return false;
-            // 骑乘状态 Unit::Attack 直接 false（猎人整场 0 输出的根因）
-            if (bot->IsMounted())
-                bot->Unmount();
 
             std::set<ObjectGuid> scenario;
             {
@@ -4197,6 +4195,22 @@ namespace ai
                     return false;      // 没声明场景 ⇒ 副本里照旧，不自动开怪
                 scenario = it->second;
             }
+
+            // [2026-11-01 站长口径·A] 原判据是 `bot->GetVictim()` 有值就整段让路。
+            //   那只保证"有目标就不再开怪"，**保证不了目标是对的** —— 实测 `[DUMMY] id=22 spec=arcane`
+            //   的 victim 被引擎换成同场的另一只 bot（`victim=Nenrus victimGuid=51`）之后，
+            //   这条早退让状态机 90 秒都咬着自己的木桩之外的东西（dps 从 1000+ 掉到 326.8）。
+            //   现在改成：victim **在本轮场景目标里**才算"已经接好战"，否则先停手再重新咬自己的。
+            if (Unit* cur = bot->GetVictim())
+            {
+                if (scenario.count(cur->GetObjectGuid()))
+                    return false;
+                bot->CombatStopWithPets(true);
+            }
+
+            // 骑乘状态 Unit::Attack 直接 false（猎人整场 0 输出的根因）
+            if (bot->IsMounted())
+                bot->Unmount();
 
             Map* map = bot->GetMap();
             if (!map)
@@ -4251,6 +4265,56 @@ namespace ai
                 return true;
             }
             return false;
+        }
+
+        // [2026-11-01 站长口径·A] **场景目标守卫**：每 tick 校验"打的是不是自己那堆木桩"。
+        //   为什么必须有这一层：`SkipEngine()` 只在状态机**本 tick 真的出手**时才让引擎闭嘴
+        //   （`skipEngine = fsmOwns && DidCastThisTick`），引擎在状态机 Decline 的 tick 里仍然
+        //   自己挑目标。多臂同批（多只 bot 站在同一条 GM 岛上）时，引擎会把 victim 换成
+        //   **另一只仿真 bot**，而原来的 `EngageScenarioTarget()` 见到"已有 victim"就整段让路
+        //   ⇒ 一旦换错就再也换不回来。实测 `[DUMMY] id=22 spec=arcane`：
+        //     t≈35s 起 `victim=Nenrus victimGuid=51`，之后每 10 秒窗口 dps 恒 0，
+        //     整轮 dps=326.8 / casts=18（同批 frost 829.7 / arcane 另两轮 856~1022）。
+        //   口径：victim 不在本轮 `s_scenarioTargets` 里 ⇒ 先 `CombatStop`，再走同一个
+        //         `EngageScenarioTarget()` 咬回自己的木桩（不新造选目标逻辑）。
+        //   非场景 bot（副本/线上）在这里第一行就返回 false，行为一个字节不变。
+        bool EnforceScenarioVictim(PlayerbotAI* ai)
+        {
+            Player* bot = ai ? ai->GetBot() : nullptr;
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive())
+                return false;
+
+            std::set<ObjectGuid> scenario;
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                auto it = s_scenarioTargets.find(bot->GetGUIDLow());
+                if (it == s_scenarioTargets.end() || it->second.empty())
+                    return false;
+                scenario = it->second;
+            }
+
+            Unit* victim = bot->GetVictim();
+            if (!victim)
+                return false;                      // 没目标：交给调用方/EngageScenarioTarget
+            if (scenario.count(victim->GetObjectGuid()))
+                return false;                      // 合法：打的就是自己的木桩
+
+            // 换错了：把现场抄下来（10 秒节流，别每题刷屏），然后停手重咬。
+            {
+                BotMem* mem = Mem(bot->GetGUIDLow());
+                time_t const now = time(nullptr);
+                if (!mem->lastForeignVictimLog || now - mem->lastForeignVictimLog >= 10)
+                {
+                    mem->lastForeignVictimLog = now;
+                    sLog.outError("[DUMMY-VICTIM] bot=%s spec=%s 目标不是自己这堆木桩：victim=%s guid=%u"
+                        "（自己 %u 个）⇒ 停手重新接战",
+                        bot->GetName(), SpecName(mem->spec), victim->GetName(), victim->GetGUIDLow(),
+                        uint32(scenario.size()));
+                }
+            }
+            bot->CombatStopWithPets(true);
+            EngageScenarioTarget(ai);
+            return true;
         }
 
         // [2026-11-01 站长口径] 轮间重置：见 DpsFsm.h → ResetScenarioState() 的说明。
@@ -6029,7 +6093,7 @@ namespace ai
 
     // Maintain 动作表（顺序，命中即停）：核心（武器=致死 / 狂暴=嗜血）→ 旋风斩 → 压制 → 猛击(*)
     //   → 英勇打击（怒气 >= `rage_reserve` 才泄怒；它是"下一次挥击附带"，用 TrySwing 防重复挂）。
-    //   (*) 猛击默认关：`use_slam`（默认 0）—— 见下面的实测注释。
+    //   (*) 猛击**分专精**默认：狂暴战 0（关）、武器战 1（开，且要求"怒气 ≥ 致死 + 猛击"）—— 见下面的实测注释。
     ai::dpsfsm::TickResult TickWarriorMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         using ai::dpsfsm::TickResult;
@@ -6046,13 +6110,31 @@ namespace ai
         // [2026-10-31 站长口径] 猛击默认**不读**（`use_slam` 默认 0）：实测它的 1.5 秒读条会把白字压掉
         //   （melee 40 → 63、每轮还要放 8~14 次），读条期间不能挥击 ⇒ 白字和怒气两头亏。
         //   代码路径保留（`use_slam=1` 可开）就是为了 A/B —— 别把这条删了，否则拿不出对照。
-        if (TP(m, "use_slam", 0.0) >= 1.0 && CastFirst(ai, m, s, { "slam" }))
+        // [2026-11-01 站长口径·B] **分专精给默认值**（狂暴战继续关，武器战默认开）：
+        //   实测（同 bot 同轮，120 秒，mode=5）：武器战 `top=30330:18,29707:4`、casts=22、dps=344.3,
+        //   而 legacy mode=3 是 `top=25242:24,29707:16,25225:14,30330:5`、casts=61、dps=408.9
+        //   —— 差距全在**填充技**：致死吃光怒气之后 mode=5 一手都不放。
+        //   武器战的怒气≈4.5/秒，猛击 15 怒的**每怒伤害高于英勇打击**（且不顶掉白字的那一下，
+        //   只占 1.5 秒读条），所以武器战默认开猛击；但必须给下一发致死留够怒（`coreCost + slamCost`），
+        //   否则就是上一版实测的"猛击吃光怒气、致死 18 次掉到 9 次"。
+        //   狂暴战保持 `use_slam=0`：它的白字是双持/高攻速流，读条压白字更疼。
+        int const coreCost = SpellCost(ai, m, core);
+        int const slamCost = SpellCost(ai, m, "slam");
+        double const slamDefault = fury ? 0.0 : 1.0;
+        if (TP(m, "use_slam", slamDefault) >= 1.0
+            && RageReal(s) >= coreCost + slamCost
+            && CastFirst(ai, m, s, { "slam" }))
             return TickResult::Acted;
         // 英勇打击会顶掉这次普攻（等于用普攻的怒换伤害）⇒ 只有怒气高出保留线才泄
         //   （真实怒气 vs `rage_reserve`，见 RageReal 的说明）
         //   [2026-10-31 站长口径] 保留线默认 75 → **45**：上一轮 A/B 落在噪声里（方向是"敢花"），
         //   怒气压着不用就是手上没有伤害，所以照方向把默认值调下来。
-        if (RageReal(s) >= int(TP(m, "rage_reserve", 45.0)) && TrySwing(ai, m, s, "heroic strike"))
+        //   [2026-11-01 站长口径·B] 再按专精分：武器战怒气收入只有狂暴战的一半（单持 2H、没有嗜血的
+        //   额外转化），45 这条线它几乎永远够不到（实测 4 次/120 秒）。改为 **30**：
+        //   实测 `top=29707:16,30330:16`、casts=32、dps=377.5（同一 bot 同轮，比 45 的 344.3 高 9.6%），
+        //   而白字 melee=30（与 45 时的 32 基本不变）⇒ 没有饿到白字。
+        double const hsDefault = fury ? 45.0 : 30.0;
+        if (RageReal(s) >= int(TP(m, "rage_reserve", hsDefault)) && TrySwing(ai, m, s, "heroic strike"))
             return TickResult::Acted;
 
         return TickResult::Decline;
@@ -6095,8 +6177,15 @@ namespace ai
 
         // 狂暴战必须在**狂暴姿态**：旋风斩只要狂暴姿态，实测默认战斗姿态时它整场 0 次
         //   （见 legacy TickWarrior 的注释）。只占一个 GCD，开场切一次就一直保持。
-        if ((m->spec == Spec::Fury) && s.bot->GetShapeshiftForm() != FORM_BERSERKERSTANCE
-            && (st == State::Aoe || st == State::Burst || st == State::Execute || st == State::Maintain))
+        //   [2026-11-01 站长口径·B] 门槛从"Aoe/Burst/Execute/Maintain"放宽到"**有目标就纠**"：
+        //     引擎的战士策略里有一张 "battle stance" buff 动作（见 WarriorStrategy 的 BUFF_ACTION），
+        //     它在状态机 Decline 的 tick 里会把姿态改回战斗姿态。姿态切换会把怒气压到
+        //     "姿态/战术掌握"保留值（`SpellAuras.cpp` 的 FORM_*STANCE 分支；没点天赋 = 0）⇒
+        //     实测 fury 120 秒 berserker stance 51 次 + battle stance 50 次（101 个 GCD）而
+        //     嗜血只有 4 次、dps=335.8。Recover（怒气 < enter）正是引擎最常插手的档位，
+        //     所以这里必须把 Recover 也包进来，纠姿态才能收敛。
+        if ((m->spec == Spec::Fury) && s.target && st != State::Idle
+            && s.bot->GetShapeshiftForm() != FORM_BERSERKERSTANCE)
         {
             if (TryCastSelf(ai, m, s, "berserker stance"))
             {
@@ -6179,6 +6268,23 @@ namespace ai
         }
 
         MeleeLogTick(m, s, st);
+
+        // [2026-11-01 站长口径·B] **假人场景里战士不给引擎留缝**（Decline → HoldWait）。
+        //   病根：引擎在状态机 Decline 的 tick 里照常跑（`m_fsmCastLock` 只在 fsmHandled 时合上），
+        //   而它的战士策略里挂着 "battle stance" 的 buff 动作（缺就补）。狂暴战要求 berserker stance
+        //   ⇒ 引擎一切回战斗姿态，状态机下一拍再切回狂暴；核心的姿态切换把怒气压到
+        //   "姿态/战术掌握"保留值（`SpellAuras.cpp` 的 FORM_*STANCE 分支；无天赋 = 0）
+        //   ⇒ **每次切换怒气清零**。
+        //   实测 fury mode=5 120 秒：`top=2458:51,2457:50,30335:4,1719:1`
+        //   （berserker 51 + battle 50 = 101 个 GCD 全花在姿态上，嗜血只有 4 次）、dps=335.8；
+        //   同轮 melee=98 ⇒ 白字没被饿着，是**怒气被切没了**，不是技能优先级问题。
+        //   处置：场景内（`SkipEngine`）且已贴到近战位时，本 tick 一律登记"有意等"，
+        //   引擎整 tick 不跑 ⇒ 姿态不再被它改。副本/线上没有场景登记 ⇒ 这段一个字节不生效。
+        if (result == TickResult::Decline && s.target
+            && s.dist <= float(TP(m, "range_melee", 6.5))
+            && dpsfsm::SkipEngine(s.bot->GetGUIDLow()))
+            result = HoldWait(m, "scenario-no-engine");
+
         return result;
     }
 
@@ -12559,6 +12665,9 @@ namespace ai
             //   于是远程 bot 永远不挥刀 -> 不进战斗 -> 状态机拒绝运行 -> 死锁（实测整场 incombat=0）。
             //   只要有可攻击目标就进来，由状态机自己放出第一发伤害技能来起战斗。
             // 假人场景：没有 victim 就自己咬上去（否则远程 bot 永远不造成伤害 ⇒ 不进战斗 ⇒ 死锁）
+            //   [2026-11-01 站长口径·A] 再加一道"目标对不对"的守卫：引擎在 Decline 的 tick 里
+            //   会把 victim 换成同场的另一只仿真 bot，一旦换错就再也回不来（实测 arcane 整轮 dps 326.8）。
+            EnforceScenarioVictim(ai);
             if (!bot->GetVictim())
                 EngageScenarioTarget(ai);
 

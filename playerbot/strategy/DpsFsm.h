@@ -232,6 +232,14 @@ namespace ai
         // 假人场景：没有 victim 时自己咬上去（只对"声明过的场景目标"生效，副本里不改变行为）
         bool EngageScenarioTarget(PlayerbotAI* ai);
 
+        // [2026-11-01 站长口径·A] **场景目标守卫**：假人场景里"只能打自己这堆木桩"。
+        //   病根（实测 `[DUMMY] id=22 spec=arcane`）：引擎在状态机 Decline 的那些 tick 里自己挑目标，
+        //   把 victim 换成了**同场的另一只 bot**（`victim=Nenrus victimGuid=51`），之后 90 秒
+        //   dps 恒 0（`dps=326.8`），而自己那堆木桩一直活着。
+        //   这里每个 tick 校正一次：victim 不在本轮 `s_scenarioTargets` 里 ⇒ `CombatStop` 后重新咬自己的。
+        //   非场景 bot 直接返回 false（副本里一个字节都不变）。
+        bool EnforceScenarioVictim(PlayerbotAI* ai);
+
         // 假人场景里状态机已经全权处理技能：让引擎这一步不要再插自己的施法（避免抢 GCD）。
         //   副本里返回 false（引擎照常跑），保证走位/打断/救人不受影响。
         bool SkipEngine(uint32 guid);
