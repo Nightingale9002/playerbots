@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
 #include <fstream>
 #include <map>
@@ -52,6 +53,11 @@ namespace ai
                 //   （术士 Prep 的日志就成了 `state=?`，验收脚本没法按状态切）；只补名字，不动行为。
                 case State::Prep:     return "Prep";
                 case State::Flee:     return "Flee";
+                // [2026-11-01 站长口径] 治疗四状态（HealCore）
+                case State::Dispel:    return "Dispel";
+                case State::Emergency: return "Emergency";
+                case State::Tank:      return "Tank";
+                case State::Raid:      return "Raid";
             }
             return "?";
         }
@@ -102,6 +108,38 @@ namespace
     struct BotMem;
 
     Spec DetectSpecByTalentsImpl(PlayerbotAI* ai, BotMem* m);
+
+    // ==================================================================================
+    // [2026-11-01 站长口径] **HealCore** 的两块记忆（四治疗共用）
+    // ----------------------------------------------------------------------------------
+    // HealWatch —— 每个"病人"一份**受伤速率**窗口：预读的唯一输入。
+    //   口径：`heal_rate_window_ms`(3000) 内的掉落速率（HP 点/秒）。只累计**血量下降**的增量，
+    //   不累计回复（自己和别的治疗抬起来的血不算"受伤"）⇒ 自己治疗不会污染速率。
+    //   窗口没走满 / 一直没掉血 ⇒ rate=0 ⇒ 退化回"掉血才加"（站长口径的兜底）。
+    // HealPending —— 一次已经放出去、还没落地的治疗：落地后再读一次血量，结算
+    //   `eff = min(理论治疗量, maxHp - 落地前hp)`。**这是估算值**（见 HealFlushPending 注释）。
+    // ==================================================================================
+    struct HealWatch
+    {
+        uint32 prevHp = 0;      // 上一次采样到的血量（HP 点）
+        uint32 prevAt = 0;      // 上一次采样的毫秒时刻
+        uint32 dmgAcc = 0;      // 本窗口累计掉血（HP 点）
+        uint32 winStart = 0;    // 本窗口起点（毫秒）
+        float  rate = 0.0f;     // 上一次结算出的受伤速率（HP 点/秒）
+    };
+
+    struct HealPending
+    {
+        bool   active = false;
+        ObjectGuid tgt;
+        uint32 spellId = 0;
+        char   name[40] = {};
+        int32  theory = 0;      // 理论治疗量（EffectBasePoints × 系数 + 治疗强度）
+        uint32 startAt = 0;     // 开始施法的毫秒时刻
+        uint32 castEndAt = 0;   // 预计落地时刻（startAt + 实际读条）
+        uint32 preHp = 0;       // **落地前**最后一次采样到的血量（估算有效量的基准）
+        float  hp0Pct = 0.0f;   // 施法开始时的血量百分比
+    };
 
     struct BotMem
     {
@@ -382,6 +420,28 @@ namespace
         //   1 = 变完还剩 >= 该比例（允许变身）/ 0 = 会被蓝量门挡住（这次改成等一跳）。
         //   只用于 `[DPSFSM-DRUID] ... shiftGate=` 的 A/B 取证，不参与别的决策。
         int    drShiftGate = 0;
+        // [2026-11-01 站长口径] **治疗（HealCore，四治疗共用）** —— 只装"病人状态 + 统计"，
+        //   配置（技能名/阈值）在 HealCfgFor() 那张表里，不在这里。
+        //   healWatch   —— guid → 受伤速率窗口（预读的唯一输入，见 HealWatch 注释）；
+        //   healPending —— 已经放出去、还没落地的**一次**治疗（治疗都是单目标，不需要队列）；
+        //   healCasts/healEff/healTheory/healOver —— 本场累计（验收数字，只写不参与决策）；
+        //   hps*Win     —— 最近 10 秒窗口的累计（[DPSFSM-HPS] 用，打一条清一次）；
+        //   lastHealLog / lastHpsLog —— 两条日志各自的节流（WorldTimer 毫秒）；
+        //   healTargetGuid —— 本 tick 选中的病人（只用于日志/诊断，不跨 tick 做决策）。
+        std::map<uint32, HealWatch> healWatch;
+        HealPending healPending;
+        uint32 healCasts = 0;
+        uint32 healEff = 0;
+        uint32 healTheory = 0;
+        uint32 healOver = 0;
+        uint32 hpsWinStart = 0;
+        uint32 hpsWinEff = 0;
+        uint32 hpsWinTheory = 0;
+        uint32 hpsWinOver = 0;
+        uint32 hpsWinCasts = 0;
+        uint32 lastHealLog = 0;
+        uint32 lastHpsLog = 0;
+        uint32 healTargetGuid = 0;
     };
 
     std::mutex s_disabledMutex;
@@ -394,6 +454,12 @@ namespace
     //   s_scenarioRun 在 ClearScenarioTargets / 空目标集时会被抹掉，抹掉后再登记同一个 runId 会
     //   被误判成"新一轮"而二次重置（多打一条 [DPSFSM-RESET]）。runId 单调递增，这张表只增不减。
     std::map<uint32, uint32> s_resetRun;
+    // [2026-11-01 站长口径] 治疗场景：治疗者 guid → 病人集合 / 主坦 guid / 登记它的 runId。
+    //   与 s_scenarioTargets 分开，是因为语义不同（"要治谁" ≠ "要打谁"），而且治疗者
+    //   往往**没有**敌对目标 —— 复用同一张表会让 EngageScenarioTarget 把治疗者拽去咬人。
+    std::map<uint32, std::set<ObjectGuid>> s_healTargets;
+    std::map<uint32, uint32> s_healTank;
+    std::map<uint32, uint32> s_healRun;
     std::map<uint32, uint32> s_petLogAt;                         // [2026-10-31] guid → 上次打 [DPSFSM-PET] 周期日志的毫秒时刻
     std::map<uint32, uint32> s_petStuckAt;                       // [2026-10-31] guid → "在追但贴不上且没在动"的起始毫秒时刻
 
@@ -3405,7 +3471,11 @@ namespace ai
         bool SkipEngine(uint32 guid)
         {
             std::lock_guard<std::mutex> lock(s_disabledMutex);
-            return s_scenarioTargets.find(guid) != s_scenarioTargets.end();
+            // [2026-11-01 站长口径] 治疗场景也算"场景接管"：治疗者没有假人可打，
+            //   `s_scenarioTargets` 里不会有它 —— 但引擎同样必须让位（否则它自己也在加血，
+            //   HPS 就分不清是谁放的了）。
+            return s_scenarioTargets.find(guid) != s_scenarioTargets.end()
+                || s_healTargets.find(guid) != s_healTargets.end();
         }
 
         // 这个专精是不是近战（决定 bot->Attack 的 meleeAttack 参数：远程职业传 true 会走去平砍）
@@ -3655,6 +3725,17 @@ namespace ai
             m->drShiftAt = 0;
             m->drTarget = ObjectGuid();
             m->drEngagedAt = 0;
+            // [2026-11-01 站长口径] 治疗侧：速率窗口/待结算治疗/统计也必须跨轮清零 ——
+            //   上一轮的 healWatch 会把"还在流血"的旧斜率带进来（预读会凭空提前），
+            //   统计不清则 [DPSFSM-HPS] 的第一条窗口把上一轮的数字算进这一轮。
+            m->healWatch.clear();
+            m->healPending = HealPending();
+            m->healCasts = m->healEff = m->healTheory = m->healOver = 0;
+            m->hpsWinStart = 0;
+            m->hpsWinEff = m->hpsWinTheory = m->hpsWinOver = m->hpsWinCasts = 0;
+            m->lastHealLog = 0;
+            m->lastHpsLog = 0;
+            m->healTargetGuid = 0;
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
                 name = "guid=" + std::to_string(guid);
@@ -3699,6 +3780,70 @@ namespace ai
                 return;      // 这条是新一轮登记的，别动
             s_scenarioTargets.erase(guid);
             s_scenarioRun.erase(guid);
+        }
+
+        // [2026-11-01 站长口径] 治疗场景的目标分配：见 DpsFsm.h → SetScenarioHealTargets()。
+        //   runId 变化 = 新一轮 ⇒ 清掉上一轮残留的速率窗口/统计（同一局的重复登记不清）。
+        void SetScenarioHealTargets(uint32 healerGuid, std::vector<ObjectGuid> const& healTargets,
+                                    uint32 mainTankGuid, uint32 runId)
+        {
+            bool newRun = false;
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                auto it = s_healRun.find(healerGuid);
+                newRun = (it == s_healRun.end() || it->second != runId);
+                s_healRun[healerGuid] = runId;
+                if (healTargets.empty())
+                {
+                    s_healTargets.erase(healerGuid);
+                    s_healTank.erase(healerGuid);
+                }
+                else
+                {
+                    s_healTargets[healerGuid] = std::set<ObjectGuid>(healTargets.begin(), healTargets.end());
+                    s_healTank[healerGuid] = mainTankGuid;
+                }
+            }
+            if (newRun)
+            {
+                BotMem* m = Mem(healerGuid);
+                m->healWatch.clear();
+                m->healPending = HealPending();
+                m->healCasts = m->healEff = m->healTheory = m->healOver = 0;
+                m->hpsWinStart = 0;
+                m->hpsWinEff = m->hpsWinTheory = m->hpsWinOver = m->hpsWinCasts = 0;
+                m->lastHealLog = 0;
+                m->lastHpsLog = 0;
+            }
+        }
+
+        void ClearScenarioHealTargets(uint32 healerGuid, uint32 runId)
+        {
+            {
+                std::lock_guard<std::mutex> lock(s_disabledMutex);
+                auto it = s_healRun.find(healerGuid);
+                if (it == s_healRun.end())
+                    return;
+                if (runId && it->second != runId)
+                    return;
+                s_healTargets.erase(healerGuid);
+                s_healTank.erase(healerGuid);
+                s_healRun.erase(healerGuid);
+            }
+            // [2026-11-01 站长口径] 收尾汇总：把**本轮 HealCore 自己的账**打一条，验收/报告直接取它。
+            //   为什么不只用核心的 `botHealingDone`：HoT（恢复）的跳治疗、以及过疗，
+            //   两套口径不完全一致；这里给的是"本状态机算出来的理论量/估算有效量/溢出"。
+            //   放在锁外：`Mem()` 自己拿 s_memMutex，别把两把锁叠在一起（避免将来加出死锁）。
+            BotMem* m = Mem(healerGuid);
+            if (!m)
+                return;
+            std::string name;
+            if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, healerGuid), name) || name.empty())
+                name = "guid=" + std::to_string(healerGuid);
+            double const overPct = m->healTheory
+                ? 100.0 * double(m->healOver) / double(m->healTheory) : 0.0;
+            sLog.outError("[DPSFSM-HPS-SUM] %s casts=%u heal=%u eff=%u over=%u overheal=%.0f%% runId=%u",
+                name.c_str(), m->healCasts, m->healTheory, m->healEff, m->healOver, overPct, runId);
         }
 
         int PackCount(Player* bot, float range)
@@ -8969,6 +9114,721 @@ namespace ai
         return TickResult::Decline;
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] **HealCore —— 四治疗共用的一套治疗状态机**
+    // --------------------------------------------------------------------------
+    //   状态：Idle → Prep(自身 buff) → Dispel(分配的驱散，最高优先) → Emergency → Tank
+    //         → Raid(团队) → Recover(蓝 < recover_mana 只放最省的)
+    //   四治疗（神圣牧/戒律牧/神圣骑/恢复萨/恢复德）**只差一张配置表**：`HealCfgFor()`。
+    //   现在只填了神圣牧一行，其余返回 nullptr ⇒ TickHealFsm 直接 Decline（不改变 legacy 行为）。
+    //
+    //   三条站长口径在这里落地：
+    //   ① **预读**：用目标最近 `heal_rate_window_ms`(3000) 的**受伤速率**外推
+    //      `预计落地血量 = hp - rate × 读条`；落地时会低于阈值 ⇒ **现在起手**。
+    //      读不到速率（窗口没满/一直没掉血）⇒ 退化成"掉血才加"（逐 tick 比阈值）。
+    //   ② **治疗术降级（rank）**：按缺口选"能覆盖缺口的**最小**等级"往上试
+    //      （缺口 = 目标血量 - 目标血量目标值；`rank_safety` < 1 表示理论值先打折再比，
+    //      默认 1.0 = 不打折）。用 `SpellIdAtRank` + 每等级的**实际**治疗量
+    //      （`EffectBasePoints × 系数 + 治疗强度`，见 HealTheory()）。
+    //   ③ **救急**：目标 < `emergency_hp`(35%) ⇒ 先交大 CD（守护之魂/痛苦压制，若学会），不省蓝。
+    //
+    //   ⚠️ 本服给战士坦克套盾**不会断怒气**（核心自定义行为，DESIGN_dps_fsm_graphs.md §12），
+    //      所以 `power word: shield` 在坦克身上可以正常用，不需要回避。
+    // ==========================================================================
+    struct HealCfg
+    {
+        char const* tag;          // 专精名（日志用）
+        char const* renew;        // 常驻 HoT
+        char const* bigHeal;      // 大治疗（按 rank 降级/升级的那一个）
+        char const* flashHeal;    // 救急
+        char const* shield;       // 盾（可空）
+        char const* groupHeal;    // 群体治疗（小队集中掉血）
+        char const* groupHeal2;   // 第二个群体治疗（可空）
+        char const* linkHeal;     // 自己与队友同时告急（可空）
+        char const* dispelMagic;  // 驱散魔法（可空）
+        char const* cureDisease;  // 驱散疾病（可空）
+        char const* emergencyA;   // 大 CD（守护之魂 / 痛苦压制，可空）
+        char const* emergencyB;
+        char const* selfBuffA;    // 自身 buff（心灵之火）
+        char const* selfBuffB;    // 团队 buff（真言术：韧）
+    };
+
+    // [2026-11-01 站长口径] 神圣牧配置表。**只此一行**：其余治疗专精还没有表 ⇒ Decline。
+    static HealCfg const kHealPriestHoly =
+    {
+        "holy priest",
+        "renew",                    // 坦克：renew 常驻
+        "greater heal",             // 坦克：低级维持 → 预判尖刺用高级（rank 由缺口选）
+        "flash heal",               // 濒死
+        "power word: shield",       // 濒死（本服不断怒气，可正常用）
+        "prayer of healing",        // 小队集中掉血
+        "circle of healing",        // 若学会（41 点天赋，没点就解析成 0，自动跳过）
+        "binding heal",             // 自己与队友同时告急
+        "dispel magic",
+        "cure disease",
+        "guardian spirit",          // 大 CD（天赋，没学会就算了）
+        "pain suppression",         // 戒律系顺带学会也能用（神圣牧一般不点，解析 0 即跳过）
+        "inner fire",
+        "power word: fortitude",
+    };
+
+    // 专精 → 配置表。**判职业**：`Spec::Holy` 同时是"圣骑士·神圣"和"牧师·神圣"，
+    //   只看 spec 会把神圣骑也塞进这套牧师技能表（解析全 0 ⇒ 整场空转）。见 DpsFsm.h 说明。
+    static HealCfg const* HealCfgFor(uint32 cls, Spec spec)
+    {
+        if (cls == CLASS_PRIEST && spec == Spec::Holy)
+            return &kHealPriestHoly;
+        return nullptr;
+    }
+
+    // 一个"病人"的现场读数（HealCollectTargets 填）
+    struct HealTgt
+    {
+        Unit* u = nullptr;
+        float hpPct = 0.0f;
+        uint32 hp = 0;
+        uint32 maxHp = 0;
+        float rate = 0.0f;      // 最近窗口的受伤速率（HP 点/秒；0 = 读不到 ⇒ 退化"掉血才加"）
+        bool tank = false;      // 是不是"分配的主坦"
+    };
+
+    static uint32 HealSafeNow()
+    {
+        uint32 const ms = WorldTimer::getMSTime();
+        return ms ? ms : 1;
+    }
+
+    // 受伤速率：窗口内只累计**血量下降**的增量（自己的治疗不算"受伤"）。
+    //   窗口走满 `windowMs` 结算一次，得到"HP 点/秒"；窗口没满就沿用上一次结算值。
+    static float HealSampleRate(BotMem* m, Unit* u, uint32 now, uint32 windowMs)
+    {
+        if (!u)
+            return 0.0f;
+        uint32 const guid = u->GetGUIDLow();
+        HealWatch& w = m->healWatch[guid];
+        uint32 const hp = u->GetHealth();
+        if (!w.prevAt)
+        {
+            w.prevAt = now;
+            w.winStart = now;
+            w.prevHp = hp;
+            return 0.0f;
+        }
+        if (hp < w.prevHp)
+            w.dmgAcc += (w.prevHp - hp);
+        w.prevHp = hp;
+        w.prevAt = now;
+        uint32 const span = WorldTimer::getMSTimeDiff(w.winStart, now);
+        if (windowMs && span >= windowMs)
+        {
+            w.rate = float(w.dmgAcc) * 1000.0f / float(span);
+            w.dmgAcc = 0;
+            w.winStart = now;
+        }
+        return w.rate;
+    }
+
+    // 一个法术对**这个目标**的理论治疗量：EffectBasePoints × 系数 + 治疗强度。
+    //   系数口径与核心 `Spell::EffectHeal` 一致：`CalculateSimpleValue()`（= BasePoints + BaseDice）
+    //   加 `EffectRealPointsPerLevel × 施法者等级`，再走 `SpellHealingBonusDone`（含治疗强度/天赋）。
+    //   ⚠️ 这只是**理论值**：暴击、过疗、减益（降低受到治疗）都不在里面 ——
+    //      `[DPSFSM-HEAL]` 的 eff 才是落地后的估算有效量。
+    static int32 HealTheory(Player* bot, Unit* tgt, uint32 spellId)
+    {
+        SpellEntry const* entry = spellId ? sServerFacade.LookupSpellInfo(spellId) : nullptr;
+        if (!entry || !bot || !tgt)
+            return 0;
+        int32 total = 0;
+        for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            // 直接治疗（神圣牧的强效/快速/治疗祷言）
+            if (entry->Effect[i] == SPELL_EFFECT_HEAL || entry->Effect[i] == SPELL_EFFECT_HEAL_MECHANICAL)
+            {
+                int32 base = entry->CalculateSimpleValue(SpellEffectIndex(i));
+                base += int32(entry->EffectRealPointsPerLevel[i] * float(bot->GetLevel()));
+                if (base <= 0)
+                    continue;
+                total += int32(bot->SpellHealingBonusDone(tgt, entry, SpellEffectIndex(i), base, HEAL));
+                continue;
+            }
+            // HoT（神圣牧的恢复）：理论量 = 每跳 × 跳数（duration / amplitude）。
+            //   ⚠️ 它**不是**落地瞬间的治疗量，而是整条 HoT 的累计值 —— 所以 `over`（溢出）
+            //      对 HoT 只是粗略估计（HoF 会被后续治疗顶掉一部分），日志里按技能名可分辨。
+            if (entry->Effect[i] == SPELL_EFFECT_APPLY_AURA
+                && entry->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_HEAL)
+            {
+                int32 base = entry->CalculateSimpleValue(SpellEffectIndex(i));
+                base += int32(entry->EffectRealPointsPerLevel[i] * float(bot->GetLevel()));
+                if (base <= 0)
+                    continue;
+                int32 const perTick = int32(bot->SpellHealingBonusDone(tgt, entry, SpellEffectIndex(i), base, HEAL));
+                int32 const amplitude = int32(entry->EffectAmplitude[i]);
+                int32 const duration = int32(::GetSpellDuration(entry));
+                int32 ticks = 1;
+                if (amplitude > 0 && duration > 0)
+                    ticks = duration / amplitude;
+                if (ticks < 1)
+                    ticks = 1;
+                total += perTick * ticks;
+            }
+        }
+        return total;
+    }
+
+    // 按缺口挑 rank：**能覆盖缺口的最小等级**往上试。
+    //   `safety` < 1 = 理论值先打折再比（更保守，宁可高一档）。
+    //   没有一档覆盖得住（缺口比满级还大）⇒ 直接用最高 rank。
+    static uint32 HealPickRank(PlayerbotAI* ai, BotMem* m, Unit* tgt, char const* name,
+                               int32 deficit, double safety, int32* outTheory)
+    {
+        uint32 const top = SpellId(ai, ai->GetBot(), m, name, false);
+        if (!top)
+            return 0;
+        if (deficit <= 0)
+            return 0;
+
+        SpellChainNode const* node = sSpellMgr.GetSpellChainNode(top);
+        uint32 const topRank = node ? uint32(node->rank) : 1u;
+        if (topRank <= 1)
+        {
+            if (outTheory)
+                *outTheory = HealTheory(ai->GetBot(), tgt, top);
+            return top;
+        }
+
+        double const safetyMul = (safety > 0.05 && safety <= 1.0) ? safety : 1.0;
+        uint32 bestId = top;
+        int32 bestTheory = 0;
+        for (uint32 rank = 1; rank <= topRank; ++rank)
+        {
+            uint32 const id = SpellIdAtRank(ai, m, name, rank, false);
+            if (!id)
+                continue;
+            int32 const theory = HealTheory(ai->GetBot(), tgt, id);
+            if (theory <= 0)
+                continue;
+            if (double(theory) * safetyMul >= double(deficit))
+            {
+                if (outTheory)
+                    *outTheory = theory;
+                return id;          // 最小能覆盖的那一档
+            }
+            bestId = id;
+            bestTheory = theory;    // 一直没覆盖住 ⇒ 记住最高档
+        }
+        if (outTheory)
+            *outTheory = bestTheory;
+        return bestId;
+    }
+
+    // 按**具体 id** 施法（rank 选出来的是 id，不是名字）。
+    //   ⚠️ 为什么不复用 `CastChecked()`：那个入口只收名字、一律顶到最高 rank，
+    //      而"治疗术降级"要的正是**低级**强效治疗术。失败退避/朝向/记录口径与 CastChecked 一致。
+    static bool HealCastId(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 id, char const* name, Unit* target)
+    {
+        if (!id || !Ready(s.bot, id))
+            return false;
+        time_t const now = time(nullptr);
+        auto it = m->failUntil.find(id);
+        if (it != m->failUntil.end() && now < it->second)
+            return false;
+
+        Unit* tgt = target ? target : s.bot;
+        if (tgt != s.bot)
+            s.bot->SetFacingToObject(tgt);   // 核心的 CastSpellBody 会因"背对"先转向再放弃这一手
+
+        SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+        if (!ai->CanCastSpell(id, tgt, 0, false, nullptr, false, false, false, &res))
+        {
+            bool const selfFix = (res == SPELL_FAILED_TARGET_FRIENDLY)
+                || (res == SPELL_FAILED_TARGET_ENEMY && tgt != s.bot);
+            if (selfFix)
+            {
+                SpellCastResult const r2 = s.bot->CastSpell(s.bot, id, uint32(TRIGGERED_NONE));
+                if (r2 == SPELL_CAST_OK)
+                {
+                    ++m->castCount;
+                    m->lastOk[id] = now;
+                    m->lastCastId = id;
+                    m->castThisTick = true;
+                    PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+                    return true;
+                }
+                res = r2;
+            }
+            bool const waiting = (res == SPELL_FAILED_NO_POWER || res == SPELL_FAILED_OUT_OF_RANGE
+                || res == SPELL_FAILED_LINE_OF_SIGHT || res == SPELL_FAILED_NOT_READY);
+            m->failUntil[id] = now + (waiting ? 1 : 2);
+            (void)name;
+            return false;
+        }
+
+        if (tgt != s.bot)
+        {
+            s.bot->SetFacingToObject(tgt);
+            SpellCastResult const r2 = s.bot->CastSpell(tgt, id, uint32(TRIGGERED_NONE));
+            if (r2 != SPELL_CAST_OK)
+            {
+                m->failUntil[id] = now;      // 不退避，下一 tick 立刻重试
+                return false;
+            }
+            PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        }
+        else if (!ai->CastSpell(id, tgt))
+            return false;
+
+        ++m->castCount;
+        m->lastOk[id] = now;
+        m->lastCastId = id;
+        m->castThisTick = true;
+        return true;
+    }
+
+    // 采集"病人"：场景分配的（假人实测）优先；没有分配就扫队伍成员（副本里的正常路径）。
+    //   去重 + 只要活着的、在同一个地图上、够得着的。
+    static void HealCollectTargets(PlayerbotAI* ai, BotMem* m, Snapshot& s, std::vector<HealTgt>& out)
+    {
+        Player* bot = s.bot;
+        float const range = float(TP(m, "heal_range", 35.0));
+
+        std::set<ObjectGuid> ids;
+        uint32 tankGuid = 0;
+        {
+            std::lock_guard<std::mutex> lock(s_disabledMutex);
+            auto it = s_healTargets.find(bot->GetGUIDLow());
+            if (it != s_healTargets.end())
+                ids = it->second;
+            auto tj = s_healTank.find(bot->GetGUIDLow());
+            if (tj != s_healTank.end())
+                tankGuid = tj->second;
+        }
+
+        std::vector<Unit*> units;
+        if (!ids.empty())
+        {
+            for (ObjectGuid const& g : ids)
+            {
+                Player* p = sObjectMgr.GetPlayer(g);
+                if (p && p->IsInWorld() && p != bot)
+                    units.push_back(p);
+            }
+        }
+        else if (Group* group = bot->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->getSource();
+                if (member && member != bot && member->IsInWorld())
+                    units.push_back(member);
+            }
+        }
+
+        // 速率窗口要在**每个 tick** 都喂（哪怕这一 tick 不出手），否则"最近 3 秒掉血速率"
+        //   永远是启动时那一段的读数，预读会彻底失效。
+        for (Unit* u : units)
+        {
+            if (!u->IsAlive())
+                continue;
+            if (bot->GetMap() != u->GetMap())
+                continue;
+            HealTgt h;
+            h.u = u;
+            h.hp = u->GetHealth();
+            h.maxHp = u->GetMaxHealth() ? u->GetMaxHealth() : 1;
+            h.hpPct = 100.0f * float(h.hp) / float(h.maxHp);
+            h.rate = HealSampleRate(m, u, HealSafeNow(), uint32(TP(m, "heal_rate_window_ms", 3000.0)));
+            {
+                Player* mp = u->IsPlayer() ? static_cast<Player*>(u) : nullptr;
+                h.tank = (tankGuid && u->GetGUIDLow() == tankGuid)
+                    || (!tankGuid && mp && PlayerbotAI::IsTank(mp));
+            }
+            bool const reachable = bot->IsWithinDistInMap(u, range) && bot->IsWithinLOSInMap(u, true);
+            if (!reachable)
+                continue;
+            out.push_back(h);
+        }
+    }
+
+    // 落地结算：[DPSFSM-HEAL] 每次治疗落点一条（节流 1 秒）。
+    //   ⚠️ **这是估算值**：`eff` 按 `min(理论治疗量, maxHp - 落地前hp)` 算 —— 即"这一发
+    //      理论上最多能填多少空血"。它把暴击、降低受到治疗之类的修正全部忽略，
+    //      真实有效量以 `botHealingDone`（核心 `Unit::DealHeal` 的 gain）为准。
+    //      `preHp` 取施法完成前最后一次采样，所以"落地前hp"本身也有一个 tick 的粒度误差。
+    static void HealFlushPending(PlayerbotAI* ai, BotMem* m, Snapshot& s, uint32 now)
+    {
+        if (!m->healPending.active)
+            return;
+        if (s.casting)
+        {
+            // 读条中：持续刷新"落地前血量"（最后一次采样最接近落地瞬间）
+            if (Unit* u = s.bot->GetMap() ? s.bot->GetMap()->GetUnit(m->healPending.tgt) : nullptr)
+                m->healPending.preHp = u->GetHealth();
+            return;
+        }
+        if (now < m->healPending.castEndAt)
+            return;
+
+        HealPending& p = m->healPending;
+        Unit* u = s.bot->GetMap() ? s.bot->GetMap()->GetUnit(p.tgt) : nullptr;
+        if (u)
+        {
+            uint32 const maxHp = u->GetMaxHealth() ? u->GetMaxHealth() : 1;
+            uint32 const hp1 = u->GetHealth();
+            int32 eff = p.theory;
+            int32 const room = int32(maxHp) - int32(p.preHp);
+            if (eff > room)
+                eff = room;
+            if (eff < 0)
+                eff = 0;
+            int32 over = p.theory - eff;
+            if (over < 0)
+                over = 0;
+
+            m->healCasts += 1;
+            m->healEff += uint32(eff);
+            m->healTheory += uint32(p.theory > 0 ? p.theory : 0);
+            m->healOver += uint32(over);
+            m->hpsWinCasts += 1;
+            m->hpsWinEff += uint32(eff);
+            m->hpsWinTheory += uint32(p.theory > 0 ? p.theory : 0);
+            m->hpsWinOver += uint32(over);
+
+            if (!m->lastHealLog || WorldTimer::getMSTimeDiff(m->lastHealLog, now) >= 1000)
+            {
+                m->lastHealLog = now;
+                sLog.outError("[DPSFSM-HEAL] %s cast=%s tgt=%s hp0=%.0f%% hp1=%.0f%% heal=%d eff=%d over=%d",
+                    s.bot->GetName(), p.name[0] ? p.name : "-", u->GetName(),
+                    double(p.hp0Pct), double(100.0f * float(hp1) / float(maxHp)),
+                    int(p.theory), int(eff), int(over));
+            }
+        }
+        (void)ai;
+        p.active = false;
+    }
+
+    // 汇总：[DPSFSM-HPS] 每 10 秒一条（hps = 估算有效量/窗口秒数，overheal = 估算溢出占比，
+    //   hpm = 每分钟有效治疗）。同样**是估算值**，与核心 botHealingDone 会有小差异。
+    static void HealLogHps(BotMem* m, Snapshot& s, uint32 now)
+    {
+        if (!m->hpsWinStart)
+        {
+            m->hpsWinStart = now;
+            return;
+        }
+        if (WorldTimer::getMSTimeDiff(m->hpsWinStart, now) < 10000)
+            return;
+
+        double const sec = double(WorldTimer::getMSTimeDiff(m->hpsWinStart, now)) / 1000.0;
+        double const hps = sec > 0.01 ? double(m->hpsWinEff) / sec : 0.0;
+        double const overPct = m->hpsWinTheory
+            ? 100.0 * double(m->hpsWinOver) / double(m->hpsWinTheory) : 0.0;
+        sLog.outError("[DPSFSM-HPS] %s hps=%.0f overheal=%.0f%% hpm=%.0f casts=%u eff=%u heal=%u",
+            s.bot->GetName(), hps, overPct, hps * 60.0, m->hpsWinCasts, m->hpsWinEff, m->hpsWinTheory);
+
+        m->hpsWinStart = now;
+        m->hpsWinEff = m->hpsWinTheory = m->hpsWinOver = m->hpsWinCasts = 0;
+    }
+
+    // 有没有"该我驱散"的负面效果：分配给谁就驱散谁（神圣牧 = 团队 + 驱散）。
+    //   `heal_role` 3 = 只做驱散；0/1/2 都允许驱散（站长口径：神圣牧 = 团队 + 驱散，驱散优先级最高）。
+    static bool HealTryDispel(PlayerbotAI* ai, BotMem* m, Snapshot& s, HealCfg const* cfg,
+                              std::vector<HealTgt> const& list)
+    {
+        if (!cfg->dispelMagic && !cfg->cureDisease)
+            return false;
+        for (HealTgt const& h : list)
+        {
+            if (!h.u)
+                continue;
+            if (cfg->dispelMagic && ai->HasAuraToDispel(h.u, DISPEL_MAGIC))
+            {
+                if (CastChecked(ai, m, s, cfg->dispelMagic, h.u))
+                {
+                    m->state = State::Dispel;
+                    return true;
+                }
+            }
+            if (cfg->cureDisease && ai->HasAuraToDispel(h.u, DISPEL_DISEASE))
+            {
+                if (CastChecked(ai, m, s, cfg->cureDisease, h.u))
+                {
+                    m->state = State::Dispel;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 单目标治疗：预读 + rank 降级 + 记 pending。返回 true = 本 tick 出了手。
+    //   `targetPct` = 这个目标的治疗阈值（主坦比团队更保守）；`hpGoalPct` = 治到多少算够。
+    static bool HealOneTarget(PlayerbotAI* ai, BotMem* m, Snapshot& s, HealCfg const* cfg,
+                              HealTgt const& h, double targetPct, double hpGoalPct, bool lowMana,
+                              State st)
+    {
+        if (!h.u || !h.maxHp)
+            return false;
+
+        uint32 const now = HealSafeNow();
+        double const maxHp = double(h.maxHp);
+        double const hpNow = double(h.hp);
+        double const rate = double(h.rate);       // HP 点/秒（0 = 读不到速率）
+
+        // 先按"大治疗"的实际读条做预读（读条时长受急速/天赋影响，用 CastMsWithMod 同一口径）。
+        int const castMs = CastMsWithMod(ai, m, s, cfg->bigHeal, 2500);
+        double const lead = double(castMs) / 1000.0;
+        double const predicted = hpNow - rate * lead;     // 预计落地时的血量
+        double const predictedPct = 100.0 * predicted / maxHp;
+
+        // 窗口里读不到速率（rate == 0）⇒ 退化"掉血才加"：直接看当前血量。
+        bool const needNow = (rate > 0.5) ? (predictedPct < targetPct) : (h.hpPct < targetPct);
+        if (!needNow)
+            return false;
+
+        // 缺口 = "治到 hpGoal" 还差多少（预读落地血量算）；至少 1 点，避免 0 缺口仍出手。
+        double const goalHp = maxHp * hpGoalPct / 100.0;
+        double deficitD = goalHp - predicted;
+        if (deficitD < 1.0)
+            deficitD = 1.0;
+
+        // 蓝 < recover_mana ⇒ 只放最省的：rank 1、不用盾、不用群体治疗
+        int32 theory = 0;
+        uint32 id = 0;
+        if (lowMana)
+            id = SpellIdAtRank(ai, m, cfg->bigHeal, 1, false);
+        else
+            id = HealPickRank(ai, m, h.u, cfg->bigHeal,
+                int32(deficitD), TP(m, "rank_safety", 1.0), &theory);
+        if (!id)
+            return false;
+        if (!theory)
+            theory = HealTheory(s.bot, h.u, id);
+
+        // 记 pending（落地后再结算）：hp0 是施法开始时的血量百分比。
+        char const* spellName = cfg->bigHeal;
+        int const actualCastMs = CastMsWithMod(ai, m, s, spellName, castMs);
+        if (HealCastId(ai, m, s, id, spellName, h.u))
+        {
+            HealPending& p = m->healPending;
+            p.active = true;
+            p.tgt = h.u->GetObjectGuid();
+            p.spellId = id;
+            snprintf(p.name, sizeof(p.name), "%s", spellName);
+            p.theory = theory;
+            p.startAt = now;
+            p.castEndAt = now + uint32(actualCastMs > 0 ? actualCastMs : 0);
+            p.preHp = h.hp;
+            p.hp0Pct = h.hpPct;
+            m->healTargetGuid = h.u->GetGUIDLow();
+            m->state = st;
+            return true;
+        }
+        return false;
+    }
+
+    // 按**名字**放一发并记账（不需要选 rank 的那些：盾 / 快速治疗 / 群体治疗 / HoT）。
+    static bool HealCastNamed(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name,
+                              HealTgt const& h, State st)
+    {
+        if (!name || !h.u)
+            return false;
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
+        if (!id)
+            return false;
+        int32 const theory = HealTheory(s.bot, h.u, id);
+        int const castMs = CastMsWithMod(ai, m, s, name, 1500);
+        if (!HealCastId(ai, m, s, id, name, h.u))
+            return false;
+        uint32 const now = HealSafeNow();
+        HealPending& p = m->healPending;
+        p.active = true;
+        p.tgt = h.u->GetObjectGuid();
+        p.spellId = id;
+        snprintf(p.name, sizeof(p.name), "%s", name);
+        p.theory = theory;
+        p.startAt = now;
+        p.castEndAt = now + uint32(castMs > 0 ? castMs : 0);
+        p.preHp = h.hp;
+        p.hp0Pct = h.hpPct;
+        m->healTargetGuid = h.u->GetGUIDLow();
+        m->state = st;
+        return true;
+    }
+
+    // Prep：没人需要治疗时补自身/团队 buff（低优先，绝不抢治疗的 GCD）。
+    static bool HealPrep(PlayerbotAI* ai, BotMem* m, Snapshot& s, HealCfg const* cfg)
+    {
+        if (cfg->selfBuffA && AuraStacks(ai, s.bot, m, cfg->selfBuffA, s.bot) == 0)
+        {
+            if (TryCastSelf(ai, m, s, cfg->selfBuffA))
+            {
+                m->state = State::Prep;
+                return true;
+            }
+        }
+        if (cfg->selfBuffB && AuraStacks(ai, s.bot, m, cfg->selfBuffB, s.bot) == 0)
+        {
+            if (TryCastSelf(ai, m, s, cfg->selfBuffB))
+            {
+                m->state = State::Prep;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ==========================================================================
+    // HealCore 主入口（mode=5、神圣牧）
+    // ==========================================================================
+    ai::dpsfsm::TickResult TickHealFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+        HealCfg const* cfg = HealCfgFor(s.bot->getClass(), m->spec);
+        if (!cfg)
+            return TickResult::Decline;
+
+        uint32 const now = HealSafeNow();
+
+        // 病人现场（同时喂速率窗口 —— 哪怕这一 tick 不出手也必须喂）
+        std::vector<HealTgt> list;
+        HealCollectTargets(ai, m, s, list);
+
+        // 落地结算 + 10 秒汇总（都只写统计，不影响决策）
+        HealFlushPending(ai, m, s, now);
+        HealLogHps(m, s, now);
+
+        double const lowManaPct = TP(m, "recover_mana", 20.0);
+        bool const lowMana = s.power < lowManaPct;
+        int const role = int(TP(m, "heal_role", 0.0) + 0.5);    // 0=auto 1=tank 2=raid 3=dispel
+        double const emergencyHp = TP(m, "emergency_hp", 35.0);
+        double const tankPct = TP(m, "heal_tank_target", 85.0);
+        double const raidPct = TP(m, "heal_target", 80.0);
+        double const goalPct = TP(m, "heal_cap", 90.0);
+
+        if (list.empty())
+        {
+            // 没有病人：先补 buff；蓝紧就喝药，然后交回引擎（喝水/魔杖归它）
+            if (HealPrep(ai, m, s, cfg))
+                return TickResult::Acted;
+            if (lowMana && UseManaPotion(m, s))
+                return TickResult::Acted;
+            m->state = State::Idle;
+            return TickResult::Decline;
+        }
+
+        // 读条中：这一手还没落地，别插技能（Hold 的合法理由）
+        if (s.casting)
+            return HoldWait(m, "healing");
+
+        // ---- ① 驱散（最高优先）----
+        if (role != 2 && HealTryDispel(ai, m, s, cfg, list))
+            return TickResult::Acted;
+        if (role == 3)
+            return TickResult::Decline;    // 只做驱散的分配：加血不归我
+
+        // ---- ② 救急（< emergency_hp：开大 CD，不省蓝）----
+        HealTgt const* lowest = nullptr;
+        for (HealTgt const& h : list)
+            if (!lowest || h.hpPct < lowest->hpPct)
+                lowest = &h;
+        if (lowest && lowest->hpPct < emergencyHp)
+        {
+            // 大 CD 先交（守护之魂 → 痛苦压制；没学会的解析成 0 ⇒ 自动跳过）
+            if (role != 1)
+            {
+                if (cfg->emergencyA && CastChecked(ai, m, s, cfg->emergencyA, lowest->u))
+                {
+                    m->state = State::Emergency;
+                    return TickResult::Acted;
+                }
+                if (cfg->emergencyB && CastChecked(ai, m, s, cfg->emergencyB, lowest->u))
+                {
+                    m->state = State::Emergency;
+                    return TickResult::Acted;
+                }
+            }
+            // 盾（本服坦克套盾不会断怒气，可正常用）；盾上已经有了就直接快速治疗
+            if (cfg->shield && !lowMana
+                && TargetAuraRemain(ai, s.bot, m, cfg->shield, lowest->u) <= 0)
+            {
+                if (HealCastNamed(ai, m, s, cfg->shield, *lowest, State::Emergency))
+                    return TickResult::Acted;
+            }
+            if (HealCastNamed(ai, m, s, cfg->flashHeal, *lowest, State::Emergency))
+                return TickResult::Acted;
+        }
+
+        // ---- ③ 主坦维护（只盯"分配的主坦"）----
+        if (role != 2)
+        {
+            for (HealTgt const& h : list)
+            {
+                if (!h.tank)
+                    continue;
+                // renew 常驻：剩余 < `renew_refresh_ms` 才续（别每 tick 重挂）
+                if (cfg->renew && !lowMana && h.hpPct < 95.0f)
+                {
+                    int const remain = TargetAuraRemain(ai, s.bot, m, cfg->renew, h.u);
+                    if (remain < int(TP(m, "renew_refresh_ms", 3000.0)))
+                    {
+                        if (HealCastNamed(ai, m, s, cfg->renew, h, State::Tank))
+                            return TickResult::Acted;
+                    }
+                }
+                // 预读 + rank 降级（低级强效维持 → 高级强效顶尖刺）
+                if (HealOneTarget(ai, m, s, cfg, h, tankPct, goalPct, lowMana, State::Tank))
+                    return TickResult::Acted;
+            }
+        }
+
+        // ---- ④ 团队 ----
+        if (role != 1)
+        {
+            // 群体治疗：小队里**多个人**同时掉血才值得（单人掉血放群体治疗是纯浪费蓝）
+            if (!lowMana && cfg->groupHeal)
+            {
+                int const need = int(TP(m, "group_heal_count", 3.0));
+                double const groupHp = TP(m, "group_heal_hp", 85.0);
+                int hurt = 0;
+                for (HealTgt const& h : list)
+                    if (h.hpPct < groupHp)
+                        ++hurt;
+                if (hurt >= need && s.selfHp < groupHp + 5.0)
+                {
+                    if (HealCastNamed(ai, m, s, cfg->groupHeal, *lowest, State::Raid))
+                        return TickResult::Acted;
+                }
+            }
+            // 联结治疗：自己与队友同时告急（只治一个 GCD 能救两个）
+            if (cfg->linkHeal && !lowMana && lowest && lowest->u != s.bot
+                && s.selfHp < 60.0f && lowest->hpPct < 60.0f)
+            {
+                if (HealCastNamed(ai, m, s, cfg->linkHeal, *lowest, State::Raid))
+                    return TickResult::Acted;
+            }
+            // 其余队友：血量最低者优先（预读 + rank 降级 同一套）
+            std::vector<HealTgt> sorted(list);
+            std::sort(sorted.begin(), sorted.end(),
+                [](HealTgt const& a, HealTgt const& b) { return a.hpPct < b.hpPct; });
+            for (HealTgt const& h : sorted)
+            {
+                if (h.tank)
+                    continue;                      // 主坦已经在上面的 Tank 状态处理过
+                if (HealOneTarget(ai, m, s, cfg, h, raidPct, goalPct, lowMana, State::Raid))
+                    return TickResult::Acted;
+            }
+        }
+
+        // ---- ⑤ 没人需要治疗：buff / 蓝 -----
+        if (HealPrep(ai, m, s, cfg))
+            return TickResult::Acted;
+        if (lowMana && UseManaPotion(m, s))
+            return TickResult::Acted;
+
+        m->state = lowMana ? State::Recover : State::Idle;
+        return TickResult::Decline;
+    }
+
     bool Tick(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -9003,6 +9863,61 @@ namespace ai
             if (hbDue)
                 m->hbLast = hbNow ? hbNow : 1;
 
+            // [2026-11-01 站长口径] **专精判定上移到所有"必须进战斗"的门之前**。
+            //   原来它排在 no-victim / 坦奶让位之后 ⇒ 治疗分支根本走不到（治疗者常常没有 victim）。
+            //   判定本身与位置无关（纯天赋/法术书判定，自带 5 秒节流），DPS 侧行为不受影响。
+            {
+                time_t const nowT = time(nullptr);
+                if (m->spec == Spec::Unknown || !m->specCheckedAt || nowT - m->specCheckedAt >= 5)
+                {
+                    m->specCheckedAt = nowT;
+                    m->spec = DetectSpec(ai);
+                }
+            }
+
+            // ==================================================================
+            // [2026-11-01 站长口径] **治疗派发（mode=5 · 神圣牧 · HealCore）**
+            //   放在三道门之前：
+            //     ① `no-victim`（治疗者没有敌人也要工作）；
+            //     ② `stunned/rooted`（治疗者被定身也该继续奶，核心会自己处理读条）；
+            //     ③ `坦/奶让位`（这一条本来就把所有治疗职业挡在 DPS 状态机外）。
+            //   只接**牧师·神圣**：`Spec::Holy` 同时是圣骑士神圣，必看职业。
+            //   mode != 5 ⇒ 原样落回 legacy（legacy 引擎的加血逻辑一个字节不动）。
+            // ==================================================================
+            if (bot->getClass() == CLASS_PRIEST && m->spec == Spec::Holy)
+            {
+                bool healDerived = false;
+                DecisionMode const healMode = ResolveMode(m, healDerived);
+                if (healMode == DecisionMode::Fsm)
+                {
+                    m->mode = int(healMode);
+                    if (!m->modeLogged)
+                    {
+                        m->modeLogged = true;
+                        sLog.outError("[DPSFSM-MODE] %s spec=%s mode=%d(%s) heal=1",
+                            bot->GetName(), SpecName(m->spec), int(healMode), DecisionModeName(healMode));
+                    }
+                    if (!bot->IsStandState())
+                        bot->SetStandState(UNIT_STAND_STATE_STAND);
+                    ++m->tickCount;
+                    Snapshot hs;
+                    BuildSnapshot(ai, m, hs);
+                    ai::dpsfsm::TickResult const hr = TickHealFsm(ai, m, hs);
+                    ManaLogTick(m, bot);
+                    switch (hr)
+                    {
+                        case ai::dpsfsm::TickResult::Acted:
+                            return true;
+                        case ai::dpsfsm::TickResult::Hold:
+                            m->holdThisTick = true;
+                            return true;
+                        case ai::dpsfsm::TickResult::Decline:
+                        default:
+                            return false;
+                    }
+                }
+            }
+
             // [2026-10-29 诊断结论] 原来只认 IsInCombat()：本核心里"有目标但还没造成/受到伤害"不算战斗，
             //   于是远程 bot 永远不挥刀 -> 不进战斗 -> 状态机拒绝运行 -> 死锁（实测整场 incombat=0）。
             //   只要有可攻击目标就进来，由状态机自己放出第一发伤害技能来起战斗。
@@ -9036,15 +9951,7 @@ namespace ai
                     return false;
             }
 
-            // 专精每 5 秒重判一次：假人场景/命令行动态换专精时，缓存的旧专精会让技能表全错
-            {
-                time_t const nowT = time(nullptr);
-                if (m->spec == Spec::Unknown || !m->specCheckedAt || nowT - m->specCheckedAt >= 5)
-                {
-                    m->specCheckedAt = nowT;
-                    m->spec = DetectSpec(ai);
-                }
-            }
+            // 专精每 5 秒重判一次（**已在上面上移**，见"专精判定上移"注释：治疗分支必须排在门之前）
 
             // [2026-10-29 站长口径] 之前做的仇恨门不能因为状态机被绕过：
             //   门禁与 AttackAction 完全同一份实现（WaitingForTankThreat），不复制判断。

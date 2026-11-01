@@ -287,6 +287,23 @@ uint32 stuckFightCleared = 0;
             //   只看 120 秒总数会把"起手爆发 / 掉蓝段 / 空窗"平均掉，也容易被噪声带偏。
             uint32 lastWinMs = 0;
             uint64 lastWinDmg = 0;
+            // [2026-11-01 站长口径] **治疗实测通道（heal_test=1，默认关）**。
+            //   为什么需要：DPS 那套木桩没有伤害来源，治疗无从触发（治疗者会站着空转）。
+            //   这里造一个"只对指定主坦"的周期伤害源（**不碰任何战斗逻辑**）：
+            //   每 `heal_tick_ms` 直接扣主坦的血，速率 = `heal_dps` 点/秒 ⇒ 掉血速率可控、可复现。
+            //   `heal_test=1` 出现在 armsfile 的臂参数里才打开，现有 DPS 测试完全不受影响。
+            bool   healTest = false;
+            uint32 healTankGuid = 0;        // 被治疗的主坦（第二个 bot）
+            double healDps = 0.0;           // 主坦掉血速率（HP 点/秒；0 = 按 heal_pct 自动算）
+            double healPct = 5.0;           // 自动口径：每秒扣 maxHp 的百分比
+            uint32 healDmgAt = 0;           // 上一次扣血的毫秒时刻
+            uint32 healDmgTotal = 0;        // 累计对主坦造成的伤害（诊断用）
+            ObjectGuid healDummyGuid;       // 主坦的"真 target"木桩（只为让它常驻战斗状态）
+            uint32 healTankLoginAt = 0;     // 主坦登录等待的起点（0 = 还没开始等）
+            uint32 healFloorPct = 25;       // 主坦血量地板（%）：掉到这里就不再扣，避免打死主坦
+            uint64 heal0 = 0;               // 基线：healer->botHealingDone
+            uint32 healTankHp0 = 0;         // 主坦起始血量（报告用）
+            bool   healInCombatDone = false;
         };
 
         std::vector<DummyRun> s_dummies;
@@ -373,6 +390,23 @@ uint32 stuckFightCleared = 0;
             { 16188.0f, 16354.0f, 18.5f, 5.6723f, 20.3f },  // shadow
         };
 
+        // [2026-11-01 站长口径] **治疗专精单独一张表**：治疗不需要木桩堆（`s_specPiles`），
+        //   它要的是"一个稳定掉血的主坦" ⇒ 不能塞进 `s_specKeys`（那张表与 17 个堆心
+        //   一一对应，`dummyall` 会按长度校验）。`FindSpecKey` 两张表都查。
+        //   `holy` = 牧师·神圣（premade `pve heal holy`，天赋树 tab=1）。
+        SpecKey const s_healSpecKeys[] =
+        {
+            { "holy", CLASS_PRIEST, "holy", "discipline", "shadow", 1, "pve heal holy" },
+        };
+
+        bool IsHealSpecKey(std::string const& key)
+        {
+            for (auto const& k : s_healSpecKeys)
+                if (key == k.key)
+                    return true;
+            return false;
+        }
+
         SpecPileSpot const* PileSpotForSpec(std::string const& key)
         {
             uint32 const n = uint32(sizeof(s_specKeys) / sizeof(s_specKeys[0]));
@@ -386,6 +420,9 @@ uint32 stuckFightCleared = 0;
         SpecKey const* FindSpecKey(std::string const& key)
         {
             for (auto const& k : s_specKeys)
+                if (key == k.key)
+                    return &k;
+            for (auto const& k : s_healSpecKeys)
                 if (key == k.key)
                     return &k;
             return nullptr;
@@ -3397,6 +3434,21 @@ uint32 stuckFightCleared = 0;
                                 d.bisPending.push_back(std::make_pair(f[0].GetUInt8(), f[1].GetUInt32()));
                             } while (bres->NextRow());
                         }
+                        // [2026-11-01 站长口径] **没有静态 BIS 行的专精必须退回 EquipGearBest**。
+                        //   上面刚把装备槽清空，若该 cls/spec 在 `ai_playerbot_bis_gear` 里没有行
+                        //   （治疗专精目前都没有：表里只有 17 个 DPS 专精），`bisPending` 为空 ⇒
+                        //   这件 bot 会**裸装**跑完整轮：实测神圣牧 GS=112、sp=561，
+                        //   治疗量只有满配的零头，HPS/溢出率全部不可比。
+                        if (d.bisPending.empty())
+                        {
+                            PlayerbotFactory fac0(bot, 70);
+                            fac0.EquipGearBest();
+                            bot->UpdateAllStats();
+                            sLog.outError("[DUMMY] id=%u spec=%s 静态 BIS 表没有该专精 ⇒ 退回 EquipGearBest"
+                                "（sp=%d GS=%u）", d.id, d.spec.c_str(),
+                                int(bot->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE)),
+                                bot->GetPlayerbotAI() ? bot->GetPlayerbotAI()->GetEquipGearScore(bot, false, false) : 0);
+                        }
                         // [2026-10-30 实测] 17 个 bot 一起排队"每 tick 穿一件"时，40 秒窗口内经常还没排到
                         //   主手（slot 15）就开打了 ⇒ 空手 dps 10~20。主手必须**立刻**穿上，其余再流水。
                         for (auto k = d.bisPending.begin(); k != d.bisPending.end(); ++k)
@@ -3480,6 +3532,23 @@ uint32 stuckFightCleared = 0;
                             17962,  // Conflagrate
                             17364,  // Stormstrike
                             25454,  // Earth Shock
+                            // [2026-11-01 站长口径] **治疗技能（神圣牧）必须把各 rank 都教会**：
+                            //   "治疗术降级"就是按缺口挑**低级**强效治疗术，`SpellIdAtRank()` 要能在
+                            //   法术链上往回走、并且 `HasSpell()` 为真才放得出来。实测这个 bot 只学了
+                            //   Greater Heal rank1(2060) ⇒ 每一手都是同一档，降级根本无从验证。
+                            //   按 SpellFamilyName 过滤（见下面），对别的职业没有任何影响。
+                            2060, 10963, 10964, 10965, 25210, 25314, 25213,        // Greater Heal 1..7
+                            2061, 9472, 9473, 9474, 10915, 10916, 10917, 25233, 25235,   // Flash Heal
+                            139, 6074, 6075, 6076, 6077, 10927, 10928, 10929, 25315, 25221, // Renew
+                            17, 592, 600, 3747, 6065, 6066, 10898, 10899, 10900, 10901, 25217, 25218, // Power Word: Shield
+                            596, 996, 10960, 10961, 25308, 25316,                  // Prayer of Healing
+                            34861, 34863, 34864, 34865, 34866,                      // Circle of Healing
+                            32546,                                                  // Binding Heal
+                            527, 988, 15090,                                        // Dispel Magic
+                            528, 2870, 28133,                                       // Cure Disease
+                            588, 602, 1006, 7128, 10951, 10952, 25431,              // Inner Fire
+                            1243, 1244, 1245, 2791, 10937, 10938,                   // Power Word: Fortitude
+                            33206,                                                  // Pain Suppression
                         };
                         // [2026-10-30 站长口径] **法术书是唯一来源**：只允许教"本职业法术族 + 通用"的技能。
                         //   之前这段不分类别地给每只 bot 塞了 22 个技能，导致：
@@ -3667,6 +3736,14 @@ uint32 stuckFightCleared = 0;
             {
                 messages.push_back("dummy: 不认识的专精 '" + key + "'"
                     "（fire/frost/arcane/arms/fury/combat/assassination/bm/marks/affliction/destro/enhance/elemental/feral/balance/ret/shadow）");
+                return false;
+            }
+            // [2026-11-01 站长口径] 治疗专精**不走单个木桩场景**（它需要"稳定掉血的主坦"）：
+            //   用 `.rndbot sim armsfile <targets> <seconds> <file>`，文件里写 `holy:heal_test=1,heal_dps=500`。
+            if (IsHealSpecKey(key))
+            {
+                messages.push_back("dummy: '" + key + "' 是治疗专精，请用 armsfile 的治疗通道："
+                    "文件里写 holy:heal_test=1,heal_dps=500（默认 mode=5；对照 legacy 用 mode=3）");
                 return false;
             }
 
@@ -3993,24 +4070,58 @@ uint32 stuckFightCleared = 0;
                         d.overrides[arm.key] = arm.value;
                     }
 
+                // [2026-11-01 站长口径] **治疗臂**：`holy:heal_test=1,heal_dps=500`。
+                //   治疗不需要木桩堆（DPS 那套木桩没有伤害来源，治疗无从触发）⇒ 走
+                //   "一个稳定掉血的主坦 + 一个治疗者"的通道；`heal_test` 默认关，
+                //   不带它的臂仍然是原来的 DPS 臂，行为一个字节不变。
+                {
+                    auto const ht = d.overrides.find("heal_test");
+                    bool const wantHeal = IsHealSpecKey(arm.spec->key)
+                        || (ht != d.overrides.end() && ht->second >= 1.0);
+                    if (wantHeal)
+                    {
+                        d.healTest = true;
+                        d.spec = "holy";
+                        d.meleeSpec = false;
+                        d.standDist = 18.0f;
+                        auto const dpsIt = d.overrides.find("heal_dps");
+                        if (dpsIt != d.overrides.end())
+                            d.healDps = dpsIt->second;
+                        auto const pctIt = d.overrides.find("heal_pct");
+                        if (pctIt != d.overrides.end())
+                            d.healPct = pctIt->second;
+                        auto const flIt = d.overrides.find("heal_floor");
+                        if (flIt != d.overrides.end())
+                            d.healFloorPct = uint32(flIt->second);
+                        // 固定站位：与单专精假人同一个已知平地（不铺木桩，只用这块地）
+                        d.x = DUMMY_SPOT_X;
+                        d.y = DUMMY_SPOT_Y;
+                        d.z = DUMMY_SPOT_Z;
+                        d.pileSet = true;
+                    }
+                }
+
                 // 自己一堆（与 dummyall 同一张场地表）：假人摆在 pileX/pileY，
                 //   bot 站到 standAngle 方向 standDist 码处，z 用实测地面高度。
-                SpecPileSpot const* spot = PileSpotForSpec(arm.spec->key);
-                if (!spot)
+                SpecPileSpot const* spot = d.healTest ? nullptr : PileSpotForSpec(arm.spec->key);
+                if (!spot && !d.healTest)
                 {
                     skipped += std::string(skipped.empty() ? "" : ",") + arm.label;
                     continue;
                 }
-                d.centerPile = true;
-                d.sharedPile = false;
-                d.pileX = spot->x;
-                d.pileY = spot->y;
-                d.pileZ = spot->z;
-                d.pileSet = true;
-                d.ringAngle = spot->standAngle;
-                d.x = spot->x + PILE_DUMMY_R + cos(spot->standAngle) * d.standDist;
-                d.y = spot->y + sin(spot->standAngle) * d.standDist;
-                d.z = spot->standZ;
+                if (!d.healTest)
+                {
+                    d.centerPile = true;
+                    d.sharedPile = false;
+                    d.pileX = spot->x;
+                    d.pileY = spot->y;
+                    d.pileZ = spot->z;
+                    d.pileSet = true;
+                    d.ringAngle = spot->standAngle;
+                    d.x = spot->x + PILE_DUMMY_R + cos(spot->standAngle) * d.standDist;
+                    d.y = spot->y + sin(spot->standAngle) * d.standDist;
+                    d.z = spot->standZ;
+                }
 
                 if (d.waitingLogin)
                 {
@@ -4305,6 +4416,20 @@ uint32 stuckFightCleared = 0;
                 extra += bot->IsInCombat() ? "1" : "0";
                 extra += " victim=";
                 extra += (bot->GetVictim() ? bot->GetVictim()->GetName() : "-");
+                // [2026-11-01 站长口径] 治疗实测的收尾数字：有效治疗量以核心 `botHealingDone`
+                //   （`Unit::DealHeal` 的 gain，即**真实有效量**）为准，与 FSM 自己的估算值分开报。
+                if (d.healTest)
+                {
+                    uint64 const hdone = bot->botHealingDone > d.heal0 ? bot->botHealingDone - d.heal0 : 0;
+                    double const hsec = d.durationMs / 1000.0;
+                    extra += " heal=" + std::to_string((unsigned long long)hdone);
+                    extra += " hps=" + std::to_string(uint32(hsec > 0.0 ? double(hdone) / hsec : 0.0));
+                    extra += " tankguid=" + std::to_string(d.healTankGuid);
+                    Player* tk = d.healTankGuid ? FindPlayerAny(d.healTankGuid) : nullptr;
+                    if (tk)
+                        extra += " tankHp=" + std::to_string(uint32(tk->GetHealthPercent())) + "%";
+                    extra += " mode=" + std::to_string(d.overrides.count("mode") ? int(d.overrides["mode"]) : -1);
+                }
             }
             double const sec = d.durationMs / 1000.0;
             double const total = double(dmg + pet);
@@ -4315,6 +4440,7 @@ uint32 stuckFightCleared = 0;
                 top.empty() ? "-" : top.c_str());
 
             dpsfsm::ClearScenarioTargets(d.guid, d.id);
+            dpsfsm::ClearScenarioHealTargets(d.guid, d.id);
             dpsfsm::ClearParamOverrides(d.guid);
             // 收尾：撤假人 + 停手
             if (bot && bot->IsInWorld())
@@ -4330,6 +4456,243 @@ uint32 stuckFightCleared = 0;
                 }
                 bot->CombatStopWithPets(true);
             }
+        }
+
+        // ==========================================================================
+        // [2026-11-01 站长口径] **治疗实测通道**（`heal_test=1`）
+        //
+        //   要解决的是"治疗无从触发"：DPS 那套木桩没有伤害来源，治疗者会站着空转。
+        //   这里造一个**只对指定主坦**生效的周期伤害源（选项 b）：
+        //     · 不碰任何战斗逻辑（不改假人 AI、不让假人反击）⇒ 不会影响同时在跑的 DPS 测试；
+        //     · 直接按 `heal_dps` 点/秒扣主坦的血，掉落速率完全可控、可复现；
+        //     · 到 `heal_floor`（默认 25%）就停止扣血 ⇒ 主坦不会被打死，整轮可跑满。
+        //   治疗者这一侧：把主坦登记成**场景病人 + 主坦**（dpsfsm::SetScenarioHealTargets），
+        //   并每秒把治疗者标成"在战斗" —— 引擎的施法闸（PlayerbotAI::DoNextAction 里
+        //   `m_fsmCastLock = fsmOwnsBot && (IsInCombat() || GetVictim())`）才会合上，
+        //   否则引擎自己也在放治疗，HPS 就分不清是谁放的了。
+        // ==========================================================================
+        //   返回 true = 这一轮已结束（已经 ReportDummy，调用方负责从 s_dummies 里摘掉）。
+        bool TickHealTest(DummyRun& d, Player* bot, uint32 now)
+        {
+            Player* tank = d.healTankGuid ? FindPlayerAny(d.healTankGuid) : nullptr;
+            if (tank && (!tank->IsInWorld() || !tank->IsAlive() || tank == bot))
+                tank = nullptr;
+
+            if (!tank)
+            {
+                // 优先挑一个**已经在线的**坦克职业 bot（战士/圣骑士/德鲁伊）
+                static uint32 const kTankCls[] = { CLASS_WARRIOR, CLASS_PALADIN, CLASS_DRUID };
+                std::set<uint32> used;
+                used.insert(d.guid);
+                for (uint32 cls : kTankCls)
+                {
+                    if (Player* p = FindOnlineBotOfClass(cls, used))
+                    {
+                        tank = p;
+                        break;
+                    }
+                }
+                // 没有在线的：拉一个候选上线（只拉一次，等 60 秒）
+                if (!tank && !d.healTankLoginAt)
+                {
+                    std::vector<Candidate> pool = LoadCandidates(60, {});
+                    for (auto const& c : pool)
+                    {
+                        if (c.cls != CLASS_WARRIOR || c.guid == d.guid)
+                            continue;
+                        uint32 const accountId = sObjectMgr.GetPlayerAccountIdByGUID(GuidOf(c.guid));
+                        if (!accountId)
+                            continue;
+                        d.healTankGuid = c.guid;
+                        sRandomPlayerbotMgr.AddPlayerBot(c.guid, accountId);
+                        d.healTankLoginAt = now ? now : 1;
+                        sLog.outError("[HEAL-TEST] id=%u 主坦 guid=%u 登录中…", d.id, c.guid);
+                        break;
+                    }
+                }
+                if (!tank)
+                {
+                    if (d.healTankLoginAt && now - d.healTankLoginAt > 60000)
+                    {
+                        ReportDummy(d, bot, "aborted(no-tank)");
+                        return true;
+                    }
+                    return false;
+                }
+                d.healTankGuid = tank->GetGUIDLow();
+                d.healInCombatDone = false;
+            }
+
+            // 首次就位：站位 + 登记病人 + 取基线
+            if (!d.healInCombatDone || d.healTankGuid != tank->GetGUIDLow())
+            {
+                d.healInCombatDone = true;
+                d.healTankGuid = tank->GetGUIDLow();
+                if (bot->GetMapId() != d.mapId)
+                    bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
+                if (tank->IsMounted())
+                    tank->Unmount();
+                tank->CombatStopWithPets(true);
+                // 主坦站在治疗者东侧 6 码（治疗射程 40，6 码保证 LOS/射程都不成为变量）
+                tank->TeleportTo(d.mapId, d.x + 6.0f, d.y, d.z, 3.14f);
+                tank->SetHealthPercent(100.0f);
+                if (uint32 const mm = tank->GetMaxPower(POWER_MANA))
+                    tank->SetPower(POWER_MANA, mm);
+
+                // [2026-11-01 站长口径] **给主坦一个真 target（木桩）**：
+                //   只是"扣血"不够 —— 不在战斗里时 bot 会**自己吃食物回血**（实测约 200 点/秒，
+                //   正好抵掉半个伤害源，HPS 全是噪声：dmgTotal=16249 而 healer 的 botHealingDone 只有 7506，
+                //   差额被主坦自己的进食吃掉了）。给它一个敌对木桩当 victim ⇒ 常驻战斗状态，
+                //   进食/回血那套全部不触发，掉血只剩我们这一路。
+                //   木桩本身仍是 STUNNED|PACIFIED（不还手、不移动），不改变任何战斗逻辑。
+                {
+                    Creature* c = bot->SummonCreature(190014, d.x + 6.0f, d.y, d.z, 0.0f,
+                        TEMPSPAWN_TIMED_OR_DEAD_DESPAWN, d.durationMs + 120000, false, false, 0, 14);
+                    if (c)
+                    {
+                        c->setFaction(14);
+                        c->GetCombatManager().SetEvadeState(EVADE_NONE);
+                        c->GetCombatManager().StopEvade();
+                        c->GetMotionMaster()->MoveIdle();
+                        c->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_STUNNED | UNIT_FLAG_PACIFIED);
+                        c->SetMaxHealth(5000000);
+                        c->SetHealth(c->GetMaxHealth());
+                        d.dummies.clear();
+                        d.dummies.push_back(c->GetObjectGuid());
+                    }
+                    else
+                        sLog.outError("[HEAL-TEST] id=%u 主坦木桩召唤失败（entry=190014 模板不存在？）", d.id);
+                }
+                d.healDummyGuid = d.dummies.empty() ? ObjectGuid() : d.dummies[0];
+
+                std::vector<ObjectGuid> targets;
+                targets.push_back(tank->GetObjectGuid());
+                // [2026-11-01 站长口径] **组队是两种口径能对照的前提**：
+                //   legacy（mode=3）那套引擎只会治**队友**（`party member to heal`），
+                //   不成队的话它一个人都不治 ⇒ 对照变成"状态机 vs 什么都不做"（实测 mode=3 整轮 heal=0）。
+                //   所以这里真配对：治疗者当队长、主坦入队。队伍只用于"谁来治谁"，不改任何战斗逻辑。
+                if (!bot->GetGroup() && !tank->GetGroup())
+                {
+                    Group* grp = new Group();
+                    bool ok = false;
+                    if (grp->AddLeaderInvite(bot))
+                    {
+                        grp->RemoveInvite(bot);
+                        if (grp->Create(bot->GetObjectGuid(), bot->GetName()))
+                        {
+                            sObjectMgr.AddGroup(grp);
+                            grp->AddMember(tank->GetObjectGuid(), tank->GetName());
+                            ok = true;
+                        }
+                    }
+                    if (!ok)
+                        delete grp;
+                    sLog.outError("[HEAL-TEST] id=%u %s：%s(队长) + %s", d.id,
+                        ok ? "已组队（legacy 对照需要）" : "组队失败（legacy 对照可能 0 治疗）",
+                        bot->GetName(), tank->GetName());
+                }
+                // 只有 mode=5（状态机）才登记"场景病人"——登记会让引擎让位（SkipEngine），
+                // legacy 对照必须把引擎放出来，否则它一次治疗都放不出（实测 heal=0 / casts=0）。
+                bool const fsmMode = (d.overrides.count("mode") && d.overrides["mode"] >= 4.5);
+                if (fsmMode)
+                    dpsfsm::SetScenarioHealTargets(d.guid, targets, tank->GetGUIDLow(), d.id);
+
+                // [2026-11-01 站长口径] 掉血速率：**优先用 heal_dps（HP 点/秒）**；
+                //   没给就按 `heal_pct`（默认 5%/秒 的主坦血量）自动算 —— 这样同一套参数
+                //   在裸装/毕业装的坦克身上都是"同一比例的伤害"，可跨轮比较。
+                uint32 const tankMaxHp = tank->GetMaxHealth();
+                if (d.healDps <= 0.0)
+                    d.healDps = double(tankMaxHp) * d.healPct / 100.0;
+
+                d.heal0 = bot->botHealingDone;
+                d.healTankHp0 = tank->GetHealth();
+                d.healDmgAt = now ? now : 1;
+                d.startMs = now;
+                // 报告基线（治疗通道不走 SpawnDummies，那几个基线在这里补）
+                d.dmg0 = bot->botDamageDealt;
+                d.pet0 = bot->botPetDamageDealt;
+                d.melee0 = bot->botMeleeHits;
+                d.casts0 = bot->botCasts;
+                d.spells0 = bot->botSpellCounts;
+                sLog.outError("[HEAL-TEST] id=%u 开跑：healer=%s(tab=%u premade=[%s]) tank=%s guid=%u maxHp=%u "
+                    "dps=%.0f点/秒 floor=%u%% 时长=%us mode=%.0f",
+                    d.id, bot->GetName(), uint32(d.tab), d.premade.c_str(), tank->GetName(),
+                    tank->GetGUIDLow(), tankMaxHp, d.healDps, d.healFloorPct, d.durationMs / 1000,
+                    d.overrides.count("mode") ? d.overrides["mode"] : 0.0);
+                return false;
+            }
+
+            // 治疗者保持在战斗中（引擎施法闸的输入）；已在本轮里就只补标志
+            if (!bot->IsInCombat())
+                bot->SetInCombatState(false, nullptr);
+
+            // 主坦必须**一直咬着木桩**：脱战就会自己进食回血，把伤害源的账彻底搅乱
+            Creature* hd = (tank->GetMap() && d.healDummyGuid) ? tank->GetMap()->GetCreature(d.healDummyGuid) : nullptr;
+            if (hd && hd->IsAlive())
+            {
+                if (hd->GetCombatManager().IsInEvadeMode())
+                {
+                    hd->GetCombatManager().SetEvadeState(EVADE_NONE);
+                    hd->GetCombatManager().StopEvade();
+                }
+                if (tank->GetVictim() != hd)
+                    tank->Attack(hd, true);
+                // 被拖走就拉回木桩边上（木桩不动，主坦必须留在近战范围）
+                if (!tank->IsWithinDist3d(hd->GetPositionX(), hd->GetPositionY(), hd->GetPositionZ(), 10.0f))
+                {
+                    tank->CombatStopWithPets(true);
+                    tank->TeleportTo(d.mapId, hd->GetPositionX() + 2.0f, hd->GetPositionY(), hd->GetPositionZ(), 3.14f);
+                    tank->Attack(hd, true);
+                }
+            }
+
+            // 稳定掉血：按 heal_dps 点/秒扣，扣到地板为止
+            if (now - d.healDmgAt >= 500)
+            {
+                uint32 const spanMs = WorldTimer::getMSTimeDiff(d.healDmgAt, now);
+                d.healDmgAt = now;
+                uint32 const maxHp = tank->GetMaxHealth();
+                uint32 const floorHp = uint32(double(maxHp) * double(d.healFloorPct) / 100.0);
+                uint32 const cur = tank->GetHealth();
+                int32 dmg = int32(d.healDps * double(spanMs) / 1000.0);
+                if (dmg < 1)
+                    dmg = 1;
+                if (cur > floorHp)
+                {
+                    if (uint32(dmg) > cur - floorHp)
+                        dmg = int32(cur - floorHp);
+                    if (!tank->IsInCombat())
+                        tank->SetInCombatState(false, nullptr);
+                    tank->ModifyHealth(-dmg);
+                    d.healDmgTotal += uint32(dmg);
+                }
+            }
+
+            // 主坦被人拽走就拉回来（治疗射程/视线是这个场景唯一的变量，不能被它污染）
+            if (!tank->IsWithinDist3d(d.x + 6.0f, d.y, d.z, 12.0f))
+                tank->TeleportTo(d.mapId, d.x + 6.0f, d.y, d.z, 3.14f);
+            if (!bot->IsWithinDist3d(d.x, d.y, d.z, 12.0f))
+                bot->TeleportTo(d.mapId, d.x, d.y, d.z, 0.0f);
+
+            if (now - d.startMs >= d.durationMs)
+            {
+                ReportDummy(d, bot, "done");
+                return true;
+            }
+            // [2026-11-01 诊断] 每 10 秒一条：主坦血量 / 累计扣血 / 实际掉血速率。
+            //   用来区分"伤害源没生效"和"治疗真的顶住了"（二者在 HPS 上看不出区别）。
+            if (!d.lastPulseMs || WorldTimer::getMSTimeDiff(d.lastPulseMs, now) >= 10000)
+            {
+                d.lastPulseMs = now;
+                double const esec = double(WorldTimer::getMSTimeDiff(d.startMs, now)) / 1000.0;
+                sLog.outError("[HEAL-TEST-DIAG] id=%u tank=%s hp=%u/%u(%.0f%%) dmgTotal=%u elapsed=%.0fs "
+                    "dps=%.0f healer_power=%.0f%% healerHp=%.0f%%",
+                    d.id, tank->GetName(), tank->GetHealth(), tank->GetMaxHealth(),
+                    double(tank->GetHealthPercent()), d.healDmgTotal, esec,
+                    esec > 0.5 ? double(d.healDmgTotal) / esec : 0.0,
+                    double(bot->GetPowerPercent()), double(bot->GetHealthPercent()));
+            }
+            return false;
         }
 
         void TickDummies(uint32 now)
@@ -4361,6 +4724,22 @@ uint32 stuckFightCleared = 0;
 
                 if (!d.setupDone)
                     ApplyDummySetup(d, bot);
+
+                // [2026-11-01 站长口径] 治疗通道：**不走木桩堆那条路**（它需要假人、接战、平砍），
+                //   只做"主坦稳定掉血 + 治疗者按 HealCore 加血"。收尾由它自己 Report。
+                if (d.healTest)
+                {
+                    bool const finished = TickHealTest(d, bot, now);
+                    if (finished)
+                    {
+                        dpsfsm::ClearScenarioHealTargets(d.guid, d.id);
+                        dpsfsm::ClearParamOverrides(d.guid);
+                        it = s_dummies.erase(it);
+                        continue;
+                    }
+                    ++it;
+                    continue;
+                }
 
                 // [2026-10-30] 单组场景（`.rndbot sim dummy`）没在启动时给堆心：按老规矩摆在 bot 东侧
                 //   standDist 码处（ApplyDummySetup 刚算好近战/远程的 standDist）。dummyall/arms 已自带堆心。
@@ -5221,7 +5600,8 @@ uint32 stuckFightCleared = 0;
             if (args.size() < 4)
             {
                 messages.push_back("用法：.rndbot sim armsfile <targets> <seconds> <file>"
-                    "（文件每行一个 spec:key=value,... 或 spec:@，# 开头为注释）");
+                    "（文件每行一个 spec:key=value,... 或 spec:@，# 开头为注释；"
+                    "治疗实测写 holy:heal_test=1,heal_dps=500[,mode=5|3]）");
                 return messages;
             }
             uint32 targets = uint32(atoi(args[1].c_str()));

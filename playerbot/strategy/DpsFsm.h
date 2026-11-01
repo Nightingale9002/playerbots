@@ -26,9 +26,16 @@ namespace ai
                         //   （先算窗口放得下什么：寒冰箭 → 瞬发 → 卡秒奥冲 → 确实放不进才 Hold），
                         //   绝不"等 debuff 掉到 500ms"。规则表见 DpsFsm.cpp → TickArcaneMaintain()。
             Recover,    // 资源/血量不足，回蓝回血
-            Execute     // [2026-10-31 站长口径] 战士斩杀窗口：目标血 <= execute_hp（默认 20%）
+            Execute,    // [2026-10-31 站长口径] 战士斩杀窗口：目标血 <= execute_hp（默认 20%）
                         //   单列一个状态，是为了让"低血段只打斩杀"这件事在状态表上看得见，
                         //   而不是藏在 Maintain 里被猛击/致死抢走怒气（legacy 实测低血木桩仍只出致死）。
+            // [2026-11-01 站长口径] 治疗状态（HealCore，四治疗共用；DPS 专精永远不会进这四个）：
+            //   Dispel    —— 分配的驱散，优先级最高（有可驱散的负面效果就先驱散再谈加血）
+            //   Emergency —— 有人 < emergency_hp(35%)：先交大 CD（守护之魂/痛苦压制），再盾/快速治疗
+            //   Tank      —— 只盯**分配的主坦**：renew 常驻 → 低级强效维持 → 预判尖刺用高级强效
+            //   Raid      —— 其余队友：血量最低者优先 / 小队集中掉血用群体治疗
+            //   另有 Recover（蓝 < recover_mana：只放最省的）与 Prep（自身 buff）沿用既有状态。
+            Dispel, Emergency, Tank, Raid
         };
 
         enum class Spec
@@ -124,6 +131,16 @@ namespace ai
         // 只清自己那一轮（同一只 bot 被复用时，上一轮的收尾不能把新一轮的目标集清掉）
         void ClearScenarioTargets(uint32 guid, uint32 runId = 0);
 
+        // [2026-11-01 站长口径] **治疗场景的目标分配**（假人实测用；副本里走 Group 成员）。
+        //   为什么单独一张表：治疗者的"病人"不是敌对目标，`SetScenarioTargets()` 那套是给
+        //   "我要打谁"用的（pack 统计 / 自动咬上去）；治疗这边要的是"我要治谁 + 谁是主坦"。
+        //   healTargets 为空 ⇒ HealCore 退回扫 `bot->GetGroup()` 的队员（副本里的正常路径）。
+        //   mainTankGuid = 0 ⇒ 主坦由 `PlayerbotAI::IsTank(member)` 现场判。
+        //   runId 语义与 SetScenarioTargets 一致（变化 = 新一轮，清掉上一轮的速率窗口/统计）。
+        void SetScenarioHealTargets(uint32 healerGuid, std::vector<ObjectGuid> const& healTargets,
+                                    uint32 mainTankGuid, uint32 runId = 0);
+        void ClearScenarioHealTargets(uint32 healerGuid, uint32 runId = 0);
+
         // [2026-11-01 站长口径] 新一轮假人场景开始 ⇒ 把上一轮残留的 FSM 记忆清干净。
         //   根因：`s_mem` 是 per-guid 常驻的（SimScenario 只重置 HP/蓝），状态机自己的记忆没人管 ——
         //   上一轮可能停在 planStep=5（寒冰箭相位）或刚打完爆发的 lastBurst/burstUntil，
@@ -201,6 +218,12 @@ namespace ai
         //       / Aoe(hurricane) / Burst(目标<burst_hp：饰品→force of nature) / Maintain
         //       （moonfire → insect swarm 按 refresh_dot 续，starfire 填充；移动/蓝紧改 wrath）。
         //   见 DpsFsm.cpp → TickDruidFsm() / TickFeralFsm() / TickBalanceFsm()。
+        //
+        // [2026-11-01 站长口径] **治疗侧（HealCore）**：`mode=5` 目前只接**神圣牧**（牧师·神圣）。
+        //   状态：Idle → Prep(自身 buff) → Dispel(分配的驱散，最高优先) → Emergency → Tank → Raid → Recover。
+        //   四治疗只差"配置表"（DpsFsm.cpp → HealCfgFor()），戒律/神圣骑/恢复萨/恢复德仍是 Decline。
+        //   派发在"必须进战斗 / 必须有 victim / 坦奶让位"三道门**之前**：治疗者没有敌人也要工作。
+        //   见 DpsFsm.cpp → TickHealFsm() / HealCfgFor()。
         bool Tick(PlayerbotAI* ai);
     }
 }
