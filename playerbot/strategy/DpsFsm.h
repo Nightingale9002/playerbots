@@ -246,11 +246,22 @@ namespace ai
         //       （moonfire → insect swarm 按 refresh_dot 续，starfire 填充；移动/蓝紧改 wrath）。
         //   见 DpsFsm.cpp → TickDruidFsm() / TickFeralFsm() / TickBalanceFsm()。
         //
-        // [2026-11-01 站长口径] **治疗侧（HealCore）**：`mode=5` 目前只接**神圣牧**（牧师·神圣）。
-        //   状态：Idle → Prep(自身 buff) → Dispel(分配的驱散，最高优先) → Emergency → Tank → Raid → Recover。
-        //   四治疗只差"配置表"（DpsFsm.cpp → HealCfgFor()），戒律/神圣骑/恢复萨/恢复德仍是 Decline。
+        // [2026-11-01 站长口径] **治疗侧（HealCore）**：`mode=5` 接**四治疗**——
+        //   牧师·神圣 / 圣骑士·神圣 / 萨满·恢复 / 德鲁伊·恢复（**戒律牧继续 Decline**）。
+        //   骨架共用：Idle → Prep(自身 buff/形态/水盾) → Dispel(最高优先) → Emergency → Tank → Raid → Recover。
+        //   三套"辅助功能"配置表在 DpsFsm.cpp → HealCfgFor()，只差技能名与阈值：
+        //     神圣牧 = 反应式工具箱（强效降级 + 盾 + 祷言 + 治疗之环）；
+        //     神圣骑 = 光之优雅为轴的预读单刷（低级圣光术续 grace、6 级闪现填充、震击救急、
+        //              **几乎没有群疗** ⇒ Raid 只做有限支援）；
+        //     恢复萨 = 治疗链为核心（受伤人数 ≥2 就 chain heal）、大地之盾给主坦、水盾常驻自己、
+        //              治疗之道用低等级治疗波叠 3 层、图腾复用 DPS 侧的 ShTotemNeed 子系统。
+        //   **恢复德是另一种模型**（`hotModel=true`，见 DpsFsm.cpp → TickHealHot()）：
+        //     IDLE 判据从"掉血才加 + 预读读条"换成 **"HoT 剩余时间 + 受伤速率"**；
+        //     坦克三层生命绽放是绝对轴心（层数/剩余不足就补，不看血量），
+        //     优先级 = 三层花不断档 > 回春 > 愈合的 HoT，救急只有 swiftmend 与
+        //     自然迅捷 + 治疗之触（临时切出树形态），另加宁静/激活。
         //   派发在"必须进战斗 / 必须有 victim / 坦奶让位"三道门**之前**：治疗者没有敌人也要工作。
-        //   见 DpsFsm.cpp → TickHealFsm() / HealCfgFor()。
+        //   见 DpsFsm.cpp → TickHealFsm() / TickHealHot() / HealCfgFor()。
         //
         // [2026-11-01 站长口径] **坦克侧（第 1 层：仇恨/生存/嘲讽/加怪）**：`mode=5` 目前只接
         //   **防护战（战士 · `Spec::Protection`）** 与 **熊德（德鲁伊 · `Spec::Feral` 且熊形态/坦克场景）**。

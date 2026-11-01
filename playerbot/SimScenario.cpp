@@ -414,10 +414,19 @@ uint32 stuckFightCleared = 0;
         // [2026-11-01 站长口径] **治疗专精单独一张表**：治疗不需要木桩堆（`s_specPiles`），
         //   它要的是"一个稳定掉血的主坦" ⇒ 不能塞进 `s_specKeys`（那张表与 17 个堆心
         //   一一对应，`dummyall` 会按长度校验）。`FindSpecKey` 两张表都查。
-        //   `holy` = 牧师·神圣（premade `pve heal holy`，天赋树 tab=1）。
+        //   四治疗各一行（HealCore 四套配置，见 DpsFsm.cpp → HealCfgFor()）：
+        //     holy  = 牧师·神圣（premade `pve heal holy`，tab=1）
+        //     hpal  = 圣骑士·神圣（premade `pve holy`，tab=0）
+        //     rsham = 萨满·恢复（premade `pve resto`，tab=2）
+        //     rdruid= 德鲁伊·恢复（premade `pve resto`，tab=2）
+        //   ⚠ key 必须**互不相同**：`Spec::Holy` / `Spec::Restoration` 在状态机那边是靠
+        //     "职业 + 专精"这一对区分的，臂这边靠 key + cls（FindSpecKey 按 key 查 cls）。
         SpecKey const s_healSpecKeys[] =
         {
-            { "holy", CLASS_PRIEST, "holy", "discipline", "shadow", 1, "pve heal holy" },
+            { "holy",  CLASS_PRIEST,  "holy",        "discipline", "shadow",      1, "pve heal holy" },
+            { "hpal",  CLASS_PALADIN, "holy",        "protection", "retribution", 0, "pve holy" },
+            { "rsham", CLASS_SHAMAN,  "restoration", "elemental",  "enhancement", 2, "pve resto" },
+            { "rdruid",CLASS_DRUID,   "restoration", "balance",    "feral",       2, "pve resto" },
         };
 
         // [2026-11-01 站长口径] **坦克专精单独一张表**（理由与治疗那张一样）：
@@ -3425,7 +3434,9 @@ uint32 stuckFightCleared = 0;
                         || d.cls == CLASS_PRIEST
                         || (d.cls == CLASS_DRUID && d.spec == "balance")
                         || (d.cls == CLASS_SHAMAN && d.spec == "elemental")
-                        || (d.cls == CLASS_PALADIN && d.spec == "holy"));
+                        || (d.cls == CLASS_PALADIN && d.spec == "holy")
+                        // [2026-11-01 站长口径] 四个治疗臂都算"法系"：拿法伤/治疗装 + 法力药水
+                        || IsHealSpecKey(d.spec));
                     // [2026-10-29 站长口径] 装备要"从数据库里挑 **GS 最高、且满足命中要求** 的那套"。
                     //   做法：`EquipGearBest()` 本来就是从 item_template 按专精挑装（唯一随机的是品质），
                     //   所以把它当**候选生成器**：反复重摇，只在"命中达到该专精上限"的候选里保留 GS 最高的那套；
@@ -3617,6 +3628,44 @@ uint32 stuckFightCleared = 0;
                             588, 602, 1006, 7128, 10951, 10952, 25431,              // Inner Fire
                             1243, 1244, 1245, 2791, 10937, 10938,                   // Power Word: Fortitude
                             33206,                                                  // Pain Suppression
+                            // [2026-11-01 站长口径] **另外三个治疗同理**：配置表里"按缺口降级"、
+                            //   "低等级技能"（4 级圣光术续光之优雅、1 级治疗波叠治疗之道、
+                            //   6 级愈合填充）都要**低 rank 真的在法术书里**才放得出来
+                            //   （`SpellIdAtRank()` 走法术链，`Ready()` 还要 `HasSpell()`）。
+                            //   同样按 SpellFamilyName 过滤 ⇒ 对别的职业没有任何影响。
+                            635, 639, 647, 1026, 1042, 3472, 10328, 10329, 25292, 27135, 27136, // Holy Light 1..11
+                            19750, 19939, 19940, 19941, 19942, 19943, 27137,      // Flash of Light 1..7
+                            20473, 20929, 20930, 27174, 33072,                     // Holy Shock 1..5
+                            4987,                                                   // Cleanse
+                            465, 10290, 643, 10291, 1032, 10292, 10293, 27149,     // Devotion Aura 1..8
+                            19742, 19850, 19852, 19853, 19854, 25290, 27142,       // Blessing of Wisdom 1..7
+                            // 恢复萨（Shaman family 11）
+                            331, 332, 547, 913, 939, 959, 8005, 10395, 10396, 25357, 25391, 25396, // Healing Wave 1..12
+                            8004, 8008, 8010, 10466, 10467, 10468, 25420,         // Lesser Healing Wave 1..7
+                            1064, 10622, 10623, 25422, 25423,                      // Chain Heal 1..5
+                            974, 32593, 32594,                                     // Earth Shield 1..3
+                            24398, 33736,                                          // Water Shield 1..2
+                            29206, 29205, 29202,                                   // Healing Way 1..3
+                            526, 8946,                                             // Cure Poison
+                            5394, 6375, 6377, 10462, 10463, 25567,                 // Healing Stream Totem
+                            5675, 10495, 10496, 10497, 25570,                      // Mana Spring Totem
+                            8071, 8154, 8155, 10406, 10407, 10408, 25508, 25509,   // Stoneskin Totem
+                            8075, 8160, 8161, 10442, 25361, 25528,                 // Strength of Earth Totem
+                            8835, 10627, 25359,                                    // Grace of Air Totem
+                            2895,                                                  // Wrath of Air Totem
+                            30706,                                                 // Totem of Wrath
+                            // 恢复德（Druid family 7）
+                            33763,                                                 // Lifebloom
+                            774, 1058, 1430, 2090, 2091, 3627, 8910, 9839, 9840, 9841, 25299, 26981, 26982, // Rejuvenation
+                            8936, 8938, 8939, 8940, 8941, 9750, 9856, 9857, 9858, 26980,          // Regrowth
+                            5185, 5186, 5187, 5188, 5189, 6778, 8903, 9758, 9888, 9889, 25297, 26978, 26979, // Healing Touch
+                            18562,                                                 // Swiftmend
+                            17116,                                                 // Nature's Swiftness
+                            740, 8918, 9862, 9863, 26983,                          // Tranquility
+                            29166,                                                 // Innervate
+                            33891,                                                 // Tree of Life Form
+                            2893, 14253,                                           // Abolish Poison
+                            1126, 5232, 6756, 5234, 8907, 9884, 9885, 26990,       // Mark of the Wild
                         };
                         // [2026-10-30 站长口径] **法术书是唯一来源**：只允许教"本职业法术族 + 通用"的技能。
                         //   之前这段不分类别地给每只 bot 塞了 22 个技能，导致：
@@ -3706,10 +3755,15 @@ uint32 stuckFightCleared = 0;
             }
             // 近战要贴脸、远程要离 18 码（猎人有 8 码死角），否则状态机整场卡在 Approach
             {
-                bool const melee = (d.cls == CLASS_WARRIOR || d.cls == CLASS_ROGUE
-                    || (d.cls == CLASS_PALADIN && d.spec != "holy")
-                    || (d.cls == CLASS_DRUID && d.spec == "feral")
-                    || (d.cls == CLASS_SHAMAN && d.spec == "enhance"));
+                // [2026-11-01 站长口径] **治疗专精一律按远程站位**（18 码），哪怕职业本身是近战职业
+                //   （神圣骑）：治疗者贴脸会把自己的走位/读条暴露在怪的顺劈里，而且 heal_test 场景
+                //   已经按 18 码铺过场地。判据用 key（`hpal/rsham/rdruid/holy` 四个 key 都在
+                //   `s_healSpecKeys` 里），不看职业名。
+                bool const melee = !IsHealSpecKey(d.spec)
+                    && (d.cls == CLASS_WARRIOR || d.cls == CLASS_ROGUE
+                        || (d.cls == CLASS_PALADIN && d.spec != "holy")
+                        || (d.cls == CLASS_DRUID && d.spec == "feral")
+                        || (d.cls == CLASS_SHAMAN && d.spec == "enhance"));
                 d.standDist = melee ? 3.0f : 18.0f;
                 d.meleeSpec = melee;
             }
@@ -4165,7 +4219,11 @@ uint32 stuckFightCleared = 0;
                     if (wantHeal)
                     {
                         d.healTest = true;
-                        d.spec = "holy";
+                        // [2026-11-01 站长口径] **不要写死 "holy"**：那是牧师神圣的 key，
+                        //   这里必须保留本臂自己的 key（holy/hpal/rsham/rdruid）——
+                        //   它决定天赋 premade、静态 BIS 查询（治疗没有行 ⇒ 退回 EquipGearBest）
+                        //   以及报告里的 spec= 字段。写死会把三个新专精全标成神圣牧。
+                        d.spec = arm.spec->key;
                         d.meleeSpec = false;
                         d.standDist = 18.0f;
                         auto const dpsIt = d.overrides.find("heal_dps");
@@ -4609,8 +4667,20 @@ uint32 stuckFightCleared = 0;
         //   返回 true = 这一轮已结束（已经 ReportDummy，调用方负责从 s_dummies 里摘掉）。
         bool TickHealTest(DummyRun& d, Player* bot, uint32 now)
         {
+            // [2026-11-01 站长口径·实测修] **传送飞行途中什么都不做**。
+            //   根因（gdb 栈）：`WorldObject::GetMap()` 在 `m_currMap` 为空时直接 assert 关服
+            //   （日志最后一行就是 `GetMap(): m_currMap`），而传送（尤其同图 near-teleport）
+            //   在"发出 TeleportTo 之后、玩家的 HandleTeleportAck 之前"这一段 `GetMap()` 是空的。
+            //   复现路径：`ApplyDummySetup` 刚把 bot 传送到场地 → 同一/下一 tick 就进治疗通道就位 →
+            //   `bot->SummonCreature()`（内部调 GetMap）⇒ 崩服。实测 mode=3 的神圣骑臂连着崩两次，
+            //   而同一代码路径的神圣牧臂只是没撞上这个时间窗。
+            //   这里统一在入口等传送落地：不在世界 / 正在传送 ⇒ 这一 tick 直接返回，下一 tick 再来。
+            if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported())
+                return false;
+
             Player* tank = d.healTankGuid ? FindPlayerAny(d.healTankGuid) : nullptr;
-            if (tank && (!tank->IsInWorld() || !tank->IsAlive() || tank == bot))
+            // 主坦在传送途中也算"暂时不可用"（同一个 GetMap 断言：后面要用 tank->GetMap() 找木桩）
+            if (tank && (!tank->IsInWorld() || !tank->IsAlive() || tank == bot || tank->IsBeingTeleported()))
                 tank = nullptr;
 
             if (!tank)
@@ -4647,6 +4717,19 @@ uint32 stuckFightCleared = 0;
                 }
                 if (!tank)
                 {
+                    // [2026-11-01 站长口径·实测修] **别在"主坦只是正在传送"时把它当成丢了**。
+                    //   原来只要 `!tank->IsInWorld()` 就判 tank=nullptr ⇒ 掉进"重挑主坦"分支，
+                    //   `d.healInCombatDone=false` ⇒ 下面**重新就位**：主坦被传送回原点 +
+                    //   `SetHealthPercent(100)` + 新召唤一只木桩 + **重取基线 heal0**。
+                    //   实测（神圣骑 mode=5）就是这样把 45 秒里的有效治疗反复清零：
+                    //   主坦血量被莫名拉回 100%、`heal=0`、`casts` 只有 1~3 次。
+                    //   传送是场景自己触发的（"被拖走就拉回来"），不是主坦没了 ⇒ 等它回来即可。
+                    if (d.healTankGuid)
+                    {
+                        if (Player* prev = FindPlayerAny(d.healTankGuid))
+                            if (prev != bot && prev->IsAlive())
+                                return false;
+                    }
                     if (d.healTankLoginAt && now - d.healTankLoginAt > 60000)
                     {
                         ReportDummy(d, bot, "aborted(no-tank)");
@@ -4659,7 +4742,9 @@ uint32 stuckFightCleared = 0;
             }
 
             // 首次就位：站位 + 登记病人 + 取基线
-            if (!d.healInCombatDone || d.healTankGuid != tank->GetGUIDLow())
+            //   [2026-11-01 站长口径·实测修] **一次运行只做一次**：只有"这一轮还没有就位"才走。
+            //   原来的条件里还带了 `d.healTankGuid != tank->GetGUIDLow()`，配合上面的误判会反复就位。
+            if (!d.healInCombatDone)
             {
                 d.healInCombatDone = true;
                 d.healTankGuid = tank->GetGUIDLow();
@@ -4758,8 +4843,17 @@ uint32 stuckFightCleared = 0;
             }
 
             // 治疗者保持在战斗中（引擎施法闸的输入）；已在本轮里就只补标志
+            // [2026-11-01 站长口径·实测修] **只调 SetInCombatState 不够**：
+            //   它的战斗计时器只对 "PvP 或 非玩家单位" 刷新（`Unit::SetInCombatState` 里
+            //   `if (PvP || creatureNotInCombat) TriggerCombatTimer()`），治疗者是玩家、又没有敌人
+            //   ⇒ `m_combatTimer` 一直是 0，下一个 `CombatManager::Update` 就判 `HandleExitCombat`
+            //   把战斗清掉。实测（神圣骑 heal_test）`[DPSFSM-HEALDBG] incombat=0` 恒成立 ⇒
+            //   引擎的施法闸 `m_fsmCastLock = fsmOwnsBot && (IsInCombat() || GetVictim())` 永远不合 ⇒
+            //   状态机 Decline 的那些 tick 里引擎自己给主坦放闪现（45 秒 11 次、10022 点治疗量），
+            //   HPS 分不清是谁放的。这里把计时器一并刷新，让"在战斗中"真正常驻。
             if (!bot->IsInCombat())
                 bot->SetInCombatState(false, nullptr);
+            bot->GetCombatManager().TriggerCombatTimer(false);
 
             // 主坦必须**一直咬着木桩**：脱战就会自己进食回血，把伤害源的账彻底搅乱
             Creature* hd = (tank->GetMap() && d.healDummyGuid) ? tank->GetMap()->GetCreature(d.healDummyGuid) : nullptr;

@@ -446,6 +446,18 @@ namespace
         uint32 lastHealLog = 0;
         uint32 lastHpsLog = 0;
         uint32 healTargetGuid = 0;
+        // [2026-11-01 站长口径] **奶德 HoT 模型** 专用记忆（其它治疗恒 0，不参与决策）：
+        //   hotLastLog —— [DPSFSM-HOT] 的 10 秒节流；
+        //   hotRolls   —— 本场"补花次数"（lifebloom 真正放出去的次数，验收"三花不断档"）；
+        //   hotTgt     —— 最近一次补花/铺 HoT 的目标（只给日志用）；
+        //   hotNsUsed  —— 自然迅捷+治疗之触 交出去过几次（验收救急路径有没有走到）。
+        uint32 hotLastLog = 0;
+        uint32 hotRolls = 0;
+        uint32 hotTgt = 0;
+        uint32 hotNsUsed = 0;
+        // [2026-11-01 站长口径] 坦克常驻 HoT/护盾（大地之盾）上一次**真的挂上去**的时刻：
+        //   只用来做"最多每 tank_hot_recast_ms 挂一次"的节流，防止读取口径出岔子时把 GCD 全烧在重挂上。
+        uint32 healTankHotAt = 0;
         // [2026-11-01 站长口径] **坦克（第 1 层：仇恨/生存/嘲讽/加怪）** 专用记忆。
         //   Survival 的输入是**受伤速率**，不是当前血量 ⇒ 自己按血量差做速率估计：
         //     tankHpAt / tankHp —— 上一次采样的毫秒时刻与血量；
@@ -3759,6 +3771,12 @@ namespace ai
             m->lastHealLog = 0;
             m->lastHpsLog = 0;
             m->healTargetGuid = 0;
+            // [2026-11-01 站长口径] 奶德 HoT 记忆同样跨轮清零（三花/补花次数不能带进下一轮）
+            m->hotLastLog = 0;
+            m->hotRolls = 0;
+            m->hotTgt = 0;
+            m->hotNsUsed = 0;
+            m->healTankHotAt = 0;
             std::string name;
             if (!sObjectMgr.GetPlayerNameByGUID(ObjectGuid(HIGHGUID_PLAYER, guid), name) || name.empty())
                 name = "guid=" + std::to_string(guid);
@@ -3837,6 +3855,11 @@ namespace ai
                 m->hpsWinEff = m->hpsWinTheory = m->hpsWinOver = m->hpsWinCasts = 0;
                 m->lastHealLog = 0;
                 m->lastHpsLog = 0;
+                m->hotLastLog = 0;
+                m->hotRolls = 0;
+                m->hotTgt = 0;
+                m->hotNsUsed = 0;
+                m->healTankHotAt = 0;
             }
         }
 
@@ -7359,6 +7382,11 @@ namespace ai
         bool enhance = false;
         bool inAoe = false;      // 群架：火焰槽换成 magma（增强）/ magma（元素）
         bool twist = false;      // 图腾舞开（只影响空气槽，由 ShTickTwist 单独处理）
+        // [2026-11-01 站长口径] **恢复萨**也走这套图腾子系统（HealCore 调 ShTickTotems）：
+        //   不加新记账、不重写 ShTotemNeed，只多一档"按小队类型选图腾"的口径。
+        bool resto = false;
+        bool restoMelee = false; // 本小队近战居多 ⇒ 优雅/大地之力；否则 空气之怒/石甲
+        bool restoHealStream = false; // 水槽改用治疗之泉（默认法力之泉）
     };
 
     // 这一槽这一手**该插哪个**图腾（nullptr = 这槽不插）。
@@ -7402,6 +7430,30 @@ namespace ai
                     return c.inAoe ? "magma totem" : "searing totem";
                 case TOTEM_SLOT_WATER: return "mana spring totem";
                 case TOTEM_SLOT_AIR:   return c.twist ? "grace of air totem" : "windfury totem";
+            }
+            return nullptr;
+        }
+        // [2026-11-01 站长口径] **恢复萨的图腾组**（按小队类型，不按伤害类型）：
+        //   空气 法系 wrath of air / 近战 grace of air；火 totem of wrath（没有就 searing）；
+        //   水 mana spring / healing stream；大地 stoneskin / strength。
+        //   ⚠ 火焰槽这里**不放火元素新星**：治疗者不该把 GCD 花在召唤物上。
+        if (c.resto)
+        {
+            switch (slot)
+            {
+                case TOTEM_SLOT_EARTH:
+                    if ((s.bot->isFeared() || s.bot->HasAuraType(SPELL_AURA_MOD_CONFUSE))
+                        && ShHasTotem(ai, m, s, "tremor totem"))
+                        return "tremor totem";               // 被控先解控（与元素萨同一条）
+                    return c.restoMelee ? "strength of earth totem" : "stoneskin totem";
+                case TOTEM_SLOT_FIRE:
+                    return ShHasTotem(ai, m, s, "totem of wrath") ? "totem of wrath" : "searing totem";
+                case TOTEM_SLOT_WATER:
+                    return c.restoHealStream ? "healing stream totem" : "mana spring totem";
+                case TOTEM_SLOT_AIR:
+                    return c.restoMelee
+                        ? (ShHasTotem(ai, m, s, "grace of air totem") ? "grace of air totem" : "windfury totem")
+                        : (ShHasTotem(ai, m, s, "wrath of air totem") ? "wrath of air totem" : "grace of air totem");
             }
             return nullptr;
         }
@@ -9215,48 +9267,221 @@ namespace ai
     // ==========================================================================
     struct HealCfg
     {
-        char const* tag;          // 专精名（日志用）
-        char const* renew;        // 常驻 HoT
-        char const* bigHeal;      // 大治疗（按 rank 降级/升级的那一个）
-        char const* flashHeal;    // 救急
-        char const* shield;       // 盾（可空）
-        char const* groupHeal;    // 群体治疗（小队集中掉血）
-        char const* groupHeal2;   // 第二个群体治疗（可空）
-        char const* linkHeal;     // 自己与队友同时告急（可空）
-        char const* dispelMagic;  // 驱散魔法（可空）
-        char const* cureDisease;  // 驱散疾病（可空）
-        char const* emergencyA;   // 大 CD（守护之魂 / 痛苦压制，可空）
-        char const* emergencyB;
-        char const* selfBuffA;    // 自身 buff（心灵之火）
-        char const* selfBuffB;    // 团队 buff（真言术：韧）
+        // ---- 通用项（神圣牧按下表原样填，行为一个字节不变）----
+        char const* tag = "-";            // 专精名（日志用）
+        char const* renew = nullptr;      // 常驻 HoT
+        char const* bigHeal = nullptr;    // 大治疗（按 rank 降级/升级的那一个）
+        char const* flashHeal = nullptr;  // 救急
+        char const* shield = nullptr;     // 盾（可空）
+        char const* groupHeal = nullptr;  // 群体治疗（小队集中掉血）
+        char const* groupHeal2 = nullptr; // 第二个群体治疗（可空）
+        char const* linkHeal = nullptr;   // 自己与队友同时告急（可空）
+        char const* dispelMagic = nullptr; // 驱散魔法（可空）
+        char const* cureDisease = nullptr; // 驱散疾病（可空）
+        char const* emergencyA = nullptr; // 大 CD（守护之魂 / 痛苦压制，可空）
+        char const* emergencyB = nullptr;
+        char const* selfBuffA = nullptr;  // 自身 buff（心灵之火）
+        char const* selfBuffB = nullptr;  // 团队 buff（真言术：韧）
+        // ---- [2026-11-01 站长口径] 另外三个治疗带来的差异项 ----
+        //   这组字段的默认值 = "神圣牧没有这些能力"，所以神牧那一行照旧不用填。
+        char const* curePoison = nullptr;      // 驱散中毒（奶萨 cure poison / 奶骑 cleanse / 奶德 abolish poison）
+        char const* filler = nullptr;          // 常规填充（省蓝小治疗）：**缺口小**的时候用它
+        int  fillerRank = 0;                   // filler 用第几级（0 = 最高级；奶骑闪现取 6 级）
+        double fillerDeficitPct = 20.0;        // 缺口 < 最大血量的这个百分比 ⇒ 用 filler 而不是 bigHeal
+        char const* instantHeal = nullptr;     // 唯一瞬发直接治疗（奶骑 holy shock）
+        char const* tankHot = nullptr;         // 坦克常驻 HoT/护盾（奶萨 earth shield / 奶德 lifebloom）
+        int  tankHotStack = 1;                 // 坦克 HoT 想要的层数（奶德三花 = 3）
+        char const* selfHot = nullptr;         // 自己身上的常驻（奶萨 water shield）
+        char const* graceAura = nullptr;       // 必须维持的自身增益（奶骑 light's grace）
+        int  graceRefreshRank = 0;             // 用第几级 bigHeal 刷它（奶骑 4 级圣光术）
+        char const* chainHeal = nullptr;       // 治疗链（奶萨；队伍里受伤人数 ≥ chain_heal_count 就它）
+        char const* hotFill = nullptr;         // HoT 填充（奶德 低等级 regrowth，与满级 HoT 共存）
+        int  hotFillRank = 0;
+        char const* finisher = nullptr;        // 兑现 HoT 的瞬抬（奶德 swiftmend）
+        char const* bigCdInstant = nullptr;    // 大救急的前置瞬发（奶德 nature's swiftness）
+        char const* bigCdHeal = nullptr;       // 大救急的治疗本体（奶德 healing touch）
+        char const* groupChannel = nullptr;    // 引导式团疗（奶德 tranquility）
+        char const* selfDraw = nullptr;        // 回蓝（奶德 innervate，给自己）
+        char const* form = nullptr;            // 形态维护（奶德 tree of life）
+        uint8 formId = 0;                      // 形态编号（FORM_TREE）
+        bool hotModel = false;                 // true ⇒ **HoT 模型**：判据换"剩余时间 + 受伤速率"，不用预读
+        bool totems = false;                   // 维护图腾（复用萨满 DPS 侧的 ShTotemNeed 子系统）
+        bool hwStack = false;                  // 治疗之道叠层（奶萨：低等级治疗波快速叠满 3 层）
     };
 
-    // [2026-11-01 站长口径] 神圣牧配置表。**只此一行**：其余治疗专精还没有表 ⇒ Decline。
+    // [2026-11-01 站长口径] 神圣牧配置表（**原样不动**，C++20 指代初始化只是为了加字段不再动它）。
     static HealCfg const kHealPriestHoly =
     {
-        "holy priest",
-        "renew",                    // 坦克：renew 常驻
-        "greater heal",             // 坦克：低级维持 → 预判尖刺用高级（rank 由缺口选）
-        "flash heal",               // 濒死
-        "power word: shield",       // 濒死（本服不断怒气，可正常用）
-        "prayer of healing",        // 小队集中掉血
-        "circle of healing",        // 若学会（41 点天赋，没点就解析成 0，自动跳过）
-        "binding heal",             // 自己与队友同时告急
-        "dispel magic",
-        "cure disease",
-        "guardian spirit",          // 大 CD（天赋，没学会就算了）
-        "pain suppression",         // 戒律系顺带学会也能用（神圣牧一般不点，解析 0 即跳过）
-        "inner fire",
-        "power word: fortitude",
+        .tag = "holy priest",
+        .renew = "renew",                    // 坦克：renew 常驻
+        .bigHeal = "greater heal",           // 坦克：低级维持 → 预判尖刺用高级（rank 由缺口选）
+        .flashHeal = "flash heal",           // 濒死
+        .shield = "power word: shield",      // 濒死（本服不断怒气，可正常用）
+        .groupHeal = "prayer of healing",    // 小队集中掉血
+        .groupHeal2 = "circle of healing",   // 若学会（41 点天赋，没点就解析成 0，自动跳过）
+        .linkHeal = "binding heal",          // 自己与队友同时告急
+        .dispelMagic = "dispel magic",
+        .cureDisease = "cure disease",
+        .emergencyA = "guardian spirit",     // 大 CD（天赋，没学会就算了）
+        .emergencyB = "pain suppression",    // 戒律系顺带学会也能用（神圣牧一般不点，解析 0 即跳过）
+        .selfBuffA = "inner fire",
+        .selfBuffB = "power word: fortitude",
+    };
+
+    // [2026-11-01 站长口径] **神圣骑（Holy Paladin）：光之优雅为轴的预读单刷**
+    //   · 光之优雅（圣光术 2.5s→2.0s）必须不断档 ⇒ 缺口小时用**低等级圣光术（4 级）**去刷它
+    //     （判据在 HealOneTarget 里：缺口小 ⇒ 本来要走 filler，此时若 graceAura 将掉就改放 4 级圣光术，
+    //      这一发既补了缺口又续了 buff，绝不为了续 buff 在满血坦克身上空刷）；
+    //   · 常规填充 = 6 级闪现（蓝耗极低）；大缺口 = 预读高级圣光术（rank 由缺口选）；
+    //   · 救急/移动 = 神圣震击（唯一瞬发直接治疗）；驱散 = 清洁（魔法/毒/疾病一个法术全包）；
+    //   · **几乎没有群疗** ⇒ groupHeal/groupHeal2 都留空，Raid 状态只做"闪现/震击"级别的有限支援。
+    static HealCfg const kHealPaladinHoly =
+    {
+        .tag = "holy paladin",
+        .bigHeal = "holy light",             // 大缺口：预读高级圣光术
+        .flashHeal = "holy shock",           // 救急/移动：唯一瞬发
+        .dispelMagic = "cleanse",            // 清洁：魔法
+        .cureDisease = "cleanse",            // 清洁：疾病
+        .selfBuffA = "blessing of wisdom",
+        .selfBuffB = "devotion aura",
+        .curePoison = "cleanse",             // 清洁：中毒
+        .filler = "flash of light",          // 常规填充 6 级闪现
+        .fillerRank = 6,
+        .fillerDeficitPct = 18.0,
+        .instantHeal = "holy shock",
+        .graceAura = "light's grace",
+        .graceRefreshRank = 4,               // 缺口小时用 4 级圣光术刷新光之优雅
+    };
+
+    // [2026-11-01 站长口径] **恢复萨（Restoration Shaman）：治疗链为核心**
+    //   · 主技能 chain heal：队伍里受伤人数 ≥ `chain_heal_count`(2) 时用它（简化版的"串最多目标"）；
+    //     链子不好用时：次级治疗波（1.5s）抢缺口 → 治疗波（2.5s）集中刷坦克；
+    //   · 治疗之道：低等级治疗波快速叠满 3 层（`hw_stack_enabled`，默认 1）；
+    //   · 水盾**必须常驻自己**（主要回蓝）／大地之盾给主坦；
+    //   · 图腾复用 DPS 侧子系统（ShTotemNeed / ShCastTotem / ShTickTotems），**不重新记账**；
+    //   · 驱散：cure poison / cure disease。
+    static HealCfg const kHealShamanResto =
+    {
+        .tag = "resto shaman",
+        .bigHeal = "healing wave",           // 集中刷坦克（2.5s）
+        .flashHeal = "lesser healing wave",  // 1.5s 抢缺口
+        .cureDisease = "cure disease",
+        .curePoison = "cure poison",
+        .filler = "lesser healing wave",
+        .fillerDeficitPct = 30.0,
+        .tankHot = "earth shield",           // 大地之盾给主坦
+        .tankHotStack = 1,
+        .selfHot = "water shield",           // 水盾常驻自己
+        .chainHeal = "chain heal",
+        .totems = true,
+        .hwStack = true,
+    };
+
+    // [2026-11-01 站长口径] **恢复德（Restoration Druid）：HoT 模型，不用预读**
+    //   · 三层生命绽放（lifebloom）是**绝对轴心**：`tankHotStack = 3`，只在"层数不足 / 剩余不足"时补，
+    //     补花之间留 4.5~5.5 秒自由 GCD（每 1 秒跳一次、持续 7 秒）；
+    //   · 优先级：三层花不断档 > 回春 > 愈合的 HoT；GCD 冲突时先保花；
+    //   · 树形态不能放治疗之触 ⇒ 中等伤害用**低等级 regrowth** 填充（低等级 HoT 不覆盖满级 HoT）；
+    //   · 救急只有两张牌：swiftmend（兑现在跳的 HoT）／自然迅捷 + 治疗之触（临时切出树形态）；
+    //   · 宁静 = 可预见的持续团队伤害窗口；激活**给自己**（约 15% 蓝就开）；
+    //   · ⚠ 本库没有德鲁伊"野性成长"（TBC 不存在），这里也不写。
+    static HealCfg const kHealDruidResto =
+    {
+        .tag = "resto druid",
+        .renew = "rejuvenation",             // 优先级第 2
+        .bigHeal = "healing touch",          // 只在大救急（自然迅捷）里用
+        .flashHeal = "swiftmend",            // 救急：兑现目标身上在跳的 HoT
+        .curePoison = "abolish poison",
+        .tankHot = "lifebloom",              // 坦克三花
+        .tankHotStack = 3,
+        .hotFill = "regrowth",               // 树形态下的中等伤害填充
+        .hotFillRank = 6,                    // 低等级 HoT 与满级 HoT 共存
+        .finisher = "swiftmend",
+        .bigCdInstant = "nature's swiftness",
+        .bigCdHeal = "healing touch",
+        .groupChannel = "tranquility",
+        .selfDraw = "innervate",
+        .form = "tree of life",              // ⚠ DB 名是 "Tree of Life"（不是 "... Form"），见 spell_template
+        .formId = FORM_TREE,
+        .hotModel = true,
     };
 
     // 专精 → 配置表。**判职业**：`Spec::Holy` 同时是"圣骑士·神圣"和"牧师·神圣"，
-    //   只看 spec 会把神圣骑也塞进这套牧师技能表（解析全 0 ⇒ 整场空转）。见 DpsFsm.h 说明。
+    //   `Spec::Restoration` 同时是"萨满·恢复"和"德鲁伊·恢复" —— 只看 spec 会把两张不同的
+    //   技能表塞错人（解析全 0 ⇒ 整场空转）。**戒律牧照旧不给表 ⇒ Decline**（站长口径）。
     static HealCfg const* HealCfgFor(uint32 cls, Spec spec)
     {
         if (cls == CLASS_PRIEST && spec == Spec::Holy)
             return &kHealPriestHoly;
+        if (cls == CLASS_PALADIN && spec == Spec::Holy)
+            return &kHealPaladinHoly;
+        if (cls == CLASS_SHAMAN && spec == Spec::Restoration)
+            return &kHealShamanResto;
+        if (cls == CLASS_DRUID && spec == Spec::Restoration)
+            return &kHealDruidResto;
         return nullptr;
+    }
+
+    // [2026-11-01 站长口径] **光之优雅（圣骑）的剩余时间**。
+    //   坑：这个 buff 是天赋（31833/31835/31836，duration = -1 的被动光环）**proc 出来**的
+    //   31834，而 `spell_chain` 里没有 31834 那几行 ⇒ `TargetAuraRemain("light's grace")`
+    //   只能看到天赋被动光环（永久 = 999999），永远判成"不用刷"。
+    //   这里按固定 id 直接读 buff 的剩余；永久光环（天赋被动）一律跳过。
+    static int HealGraceLeft(Player* bot)
+    {
+        if (!bot)
+            return 0;
+        static uint32 const kIds[] = { 31834, 31835, 31836, 31833 };
+        int best = 0;
+        for (uint32 id : kIds)
+        {
+            SpellAuraHolder* h = bot->GetSpellAuraHolder(id);
+            if (!h)
+                continue;
+            int const d = h->GetAuraDuration();
+            if (d < 0)                 // 天赋被动光环（永久）不是"光之优雅"本体
+                continue;
+            if (d > best)
+                best = d;
+        }
+        return best;
+    }
+
+    // [2026-11-01 站长口径] **治疗之道（奶萨）的层数**。
+    //   坑：天赋 29206/29205/29202（Rank 1/2/3）只有 `ADD_TARGET_TRIGGER`，真正挂在**目标**身上的
+    //   那个 buff 是 **29203**，而 29203 的 `SpellFamilyName = 0` ⇒ 它和天赋不在同一条法术链上
+    //   ⇒ `AuraStacks("healing way", 坦克)` 恒 0，"叠满 3 层"永远判不成立（实测 45 秒里
+    //   1 级治疗波被连放 18~21 次，HPS 只有 70~151）。这里按固定 id 读层数。
+    static int HealHealingWayStacks(Unit* u)
+    {
+        if (!u)
+            return 0;
+        return int(u->GetAuraCount(29203));
+    }
+
+    // [2026-11-01 站长口径] **大地之盾（奶萨）在不在主坦身上**：按固定 id 读，不靠法术链。
+    //   理由与治疗之道/光之优雅同一类：`TargetAuraRemain("earth shield", 坦克)` 依赖
+    //   `SpellId()` 解析出的那条链，一旦链上少了某一级（本服 `spell_chain` 里 earth shield
+    //   没有行，只能靠技能书兜底），就会报"没有盾" ⇒ **每个 GCD 都在重挂盾**
+    //   （实测有一轮 45 秒挂了 23 次大地之盾：主坦 70%、有效治疗 30、FSM 只记账 1 次）。
+    //   三个 rank 全探一遍，取最大剩余。
+    static int HealEarthShieldLeft(Unit* u)
+    {
+        if (!u)
+            return 0;
+        static uint32 const kIds[] = { 974, 32593, 32594 };
+        int best = 0;
+        for (uint32 id : kIds)
+        {
+            SpellAuraHolder* h = u->GetSpellAuraHolder(id);
+            if (!h)
+                continue;
+            int const d = h->GetAuraDuration();
+            int const remain = d < 0 ? 999999 : d;
+            if (remain > best)
+                best = remain;
+        }
+        return best;
     }
 
     // 一个"病人"的现场读数（HealCollectTargets 填）
@@ -9612,7 +9837,7 @@ namespace ai
     static bool HealTryDispel(PlayerbotAI* ai, BotMem* m, Snapshot& s, HealCfg const* cfg,
                               std::vector<HealTgt> const& list)
     {
-        if (!cfg->dispelMagic && !cfg->cureDisease)
+        if (!cfg->dispelMagic && !cfg->cureDisease && !cfg->curePoison)
             return false;
         for (HealTgt const& h : list)
         {
@@ -9629,6 +9854,15 @@ namespace ai
             if (cfg->cureDisease && ai->HasAuraToDispel(h.u, DISPEL_DISEASE))
             {
                 if (CastChecked(ai, m, s, cfg->cureDisease, h.u))
+                {
+                    m->state = State::Dispel;
+                    return true;
+                }
+            }
+            // [2026-11-01 站长口径] 恢复萨要驱中毒（cure poison）；神圣骑的 cleanse 三类全包、奶德 abolish poison。
+            if (cfg->curePoison && ai->HasAuraToDispel(h.u, DISPEL_POISON))
+            {
+                if (CastChecked(ai, m, s, cfg->curePoison, h.u))
                 {
                     m->state = State::Dispel;
                     return true;
@@ -9672,18 +9906,57 @@ namespace ai
         // 蓝 < recover_mana ⇒ 只放最省的：rank 1、不用盾、不用群体治疗
         int32 theory = 0;
         uint32 id = 0;
+        char const* spellName = cfg->bigHeal;
+
+        // [2026-11-01 站长口径] **缺口小 ⇒ 先用 filler（省蓝的小治疗）**，缺口大才用 bigHeal。
+        //   神牧没有 filler ⇒ 直接走原来的 rank 降级分支（行为一个字节不变）。
+        //   奶骑：filler = 6 级闪现；奶萨：filler = 次级治疗波（1.5s 抢缺口）。
+        bool const smallGap = cfg->filler
+            && deficitD < maxHp * TP(m, "filler_deficit_pct", cfg->fillerDeficitPct) / 100.0;
         if (lowMana)
+        {
             id = SpellIdAtRank(ai, m, cfg->bigHeal, 1, false);
+        }
+        else if (smallGap)
+        {
+            // `fillerRank > 0` ⇒ 固定用那一级（奶骑：站长口径点名的"6/7 级闪现"，不改）；
+            // `fillerRank == 0` ⇒ 按**缺口降级**挑最小能用的一档（奶萨的"次级治疗波抢缺口"：
+            //   实测固定满级次级治疗波在 85%~90% 的坦克身上溢出 44~47%，换小缺口能省一半蓝）。
+            if (cfg->fillerRank > 0)
+                id = SpellIdAtRank(ai, m, cfg->filler, uint32(cfg->fillerRank), false);
+            else
+                id = HealPickRank(ai, m, h.u, cfg->filler, int32(deficitD),
+                    TP(m, "rank_safety", 1.0), &theory);
+            spellName = cfg->filler;
+            // [2026-11-01 站长口径] **奶骑：光之优雅不能断档**。
+            //   缺口小时的这一发本来就走 filler（闪现），若此刻光之优雅将掉/已掉，就把这一发换成
+            //   `graceRefreshRank` 级圣光术 —— 同样是"补这个小缺口"，但顺带把 2.5s→2.0s 的增益续上。
+            //   满血坦克上绝不为了续 buff 空刷（needNow 已经在上面把门守住了）。
+            if (cfg->graceAura && cfg->graceRefreshRank > 0)
+            {
+                int const graceLeft = HealGraceLeft(s.bot);
+                if (graceLeft < int(TP(m, "grace_refresh_ms", 2000.0)))
+                {
+                    uint32 const lid = SpellIdAtRank(ai, m, cfg->bigHeal, uint32(cfg->graceRefreshRank), false);
+                    if (lid)
+                    {
+                        id = lid;
+                        spellName = cfg->bigHeal;
+                    }
+                }
+            }
+        }
         else
+        {
             id = HealPickRank(ai, m, h.u, cfg->bigHeal,
                 int32(deficitD), TP(m, "rank_safety", 1.0), &theory);
+        }
         if (!id)
             return false;
         if (!theory)
             theory = HealTheory(s.bot, h.u, id);
 
         // 记 pending（落地后再结算）：hp0 是施法开始时的血量百分比。
-        char const* spellName = cfg->bigHeal;
         int const actualCastMs = CastMsWithMod(ai, m, s, spellName, castMs);
         if (HealCastId(ai, m, s, id, spellName, h.u))
         {
@@ -9736,6 +10009,25 @@ namespace ai
     // Prep：没人需要治疗时补自身/团队 buff（低优先，绝不抢治疗的 GCD）。
     static bool HealPrep(PlayerbotAI* ai, BotMem* m, Snapshot& s, HealCfg const* cfg)
     {
+        // [2026-11-01 站长口径] 形态维护（奶德：树形态是常态；自然迅捷+治疗之触后会临时切出去，
+        //   治疗之触落地后的第一个 Prep 就把形态补回来）。非德鲁伊 cfg->form 为空 ⇒ 跳过。
+        if (cfg->form && cfg->formId && s.bot->GetShapeshiftForm() != cfg->formId)
+        {
+            if (TryCastSelf(ai, m, s, cfg->form))
+            {
+                m->state = State::Prep;
+                return true;
+            }
+        }
+        // 水盾（奶萨）：主要回蓝，**必须常驻自己身上**
+        if (cfg->selfHot && AuraStacks(ai, s.bot, m, cfg->selfHot, s.bot) == 0)
+        {
+            if (TryCastSelf(ai, m, s, cfg->selfHot))
+            {
+                m->state = State::Prep;
+                return true;
+            }
+        }
         if (cfg->selfBuffA && AuraStacks(ai, s.bot, m, cfg->selfBuffA, s.bot) == 0)
         {
             if (TryCastSelf(ai, m, s, cfg->selfBuffA))
@@ -9756,7 +10048,326 @@ namespace ai
     }
 
     // ==========================================================================
-    // HealCore 主入口（mode=5、神圣牧）
+    // [2026-11-01 站长口径] **恢复萨的图腾维护**（一次 tick 最多补一个，占一个 GCD）
+    //   口径来源：站长 2026-11-01 的"图腾必须自己记账"——复用 DPS 侧已经做通的
+    //   `ShTotemNeed()` / `ShCastTotem()` / `ShTickTotems()`（`GetTotemGuid(slot)` 不可靠，
+    //   见 KNOWN_ISSUES §10.53），这里**只做"按小队类型选哪一组"**这一件事。
+    //   · 空气：近战居多 → 风之优雅；法系居多 → 空气之怒（没学就优雅）；
+    //   · 大地：近战居多 → 大地之力；法系 → 石甲；
+    //   · 火焰：愤怒图腾（没有就灼热）；水：法力之泉（`totem_water_healing=1` 才用治疗之泉）。
+    // ==========================================================================
+    static bool HealTickTotems(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (!m || !s.bot)
+            return false;
+        // 近战人数 ≥ `totem_melee_min`(2) 就按"近战小队"配图腾，否则按"法系小队"。
+        ShTotemCtx c;
+        c.resto = true;
+        c.restoMelee = ShMeleeInParty(ai, s.bot) >= int(TP(m, "totem_melee_min", 2.0));
+        c.restoHealStream = TP(m, "totem_water_healing", 0.0) >= 1.0;
+        return ShTickTotems(ai, m, s, c, HealSafeNow());
+    }
+
+    // [2026-11-01 站长口径] `[DPSFSM-HOT]`：奶德专用，每 10 秒一条。
+    //   字段固定（脚本可直接切）：lb=三花层数、lbLeft=花的剩余毫秒、rej=回春剩余、
+    //   reg=愈合 HoT 剩余、rolls=本场补花次数。**坦克**是这三个 HoT 的载体，取分配的主坦
+    //   （没有主坦就取血量最低的病人），只写日志、不参与决策。
+    static void HealLogHot(PlayerbotAI* ai, BotMem* m, Snapshot& s, HealCfg const* cfg,
+                           std::vector<HealTgt> const& list, uint32 now)
+    {
+        if (!m->hotLastLog)
+        {
+            m->hotLastLog = now;
+            return;
+        }
+        if (WorldTimer::getMSTimeDiff(m->hotLastLog, now) < 10000)
+            return;
+        m->hotLastLog = now;
+
+        Unit* tank = nullptr;
+        for (HealTgt const& h : list)
+        {
+            if (h.tank)
+            {
+                tank = h.u;
+                break;
+            }
+        }
+        if (!tank && !list.empty())
+            tank = list.front().u;
+
+        int lb = 0, lbLeft = 0, rej = 0, reg = 0;
+        if (tank)
+        {
+            lb = AuraStacks(ai, s.bot, m, cfg->tankHot, tank);
+            lbLeft = TargetAuraRemain(ai, s.bot, m, cfg->tankHot, tank);
+            rej = TargetAuraRemain(ai, s.bot, m, cfg->renew, tank);
+            reg = TargetAuraRemain(ai, s.bot, m, cfg->hotFill, tank);
+        }
+        sLog.outError("[DPSFSM-HOT] %s lb=%d lbLeft=%d rej=%d reg=%d rolls=%u",
+            s.bot->GetName(), lb, lbLeft, rej, reg, m->hotRolls);
+    }
+
+    // ==========================================================================
+    // [2026-11-01 站长口径] **奶德：HoT 模型（不用预读）**
+    //
+    //   为什么不能复用 HealCore 的"掉血才加 + 预读读条"：奶德的吞吐建立在**伤害到来之前 HoT
+    //   已经在跳**上；等血线掉了才起手，它既没有瞬发爆发也没有坦克定向大治疗，只会一直被动。
+    //   所以判据换成 **"剩余时间 + 受伤速率"**：
+    //     · 坦克的三层生命绽放**不看血量**：层数不足 / 剩余 < `lifebloom_refresh_ms` 就补
+    //       （每 1 秒跳一次、持续 7 秒 ⇒ 三层挂满后每次补花之间剩 4.5~5.5 秒自由 GCD）；
+    //     · 其它队友：`预计落地血量 = hp - rate × hot_lead_sec`；低于阈值就先铺 HoT（预铺），
+    //       而不是等它掉下来；
+    //     · 优先级：三层花不断档 > 回春 > 愈合的 HoT；GCD 冲突时**先保花**。
+    //   救急只有两张牌：swiftmend（兑现目标身上在跳的 HoT，留给血线还在往下走的目标）、
+    //   自然迅捷 + 治疗之触（**必须切出树形态**，放完由 Prep 切回来）。
+    //   宁静 = 可预见的持续团队伤害窗口；激活给自己、约 15% 蓝就开（不要等见底）。
+    // ==========================================================================
+    static ai::dpsfsm::TickResult TickHealHot(PlayerbotAI* ai, BotMem* m, Snapshot& s, HealCfg const* cfg,
+                                              std::vector<HealTgt> const& list, uint32 now)
+    {
+        using ai::dpsfsm::TickResult;
+        Player* bot = s.bot;
+
+        double const lowManaPct = TP(m, "recover_mana", 20.0);
+        bool const lowMana = s.power < lowManaPct;
+        double const emergencyHp = TP(m, "emergency_hp", 35.0);
+        double const nsHp = TP(m, "hot_ns_hp", 20.0);
+        double const tankPct = TP(m, "heal_tank_target", 85.0);
+        double const raidPct = TP(m, "heal_target", 80.0);
+        int const role = int(TP(m, "heal_role", 0.0) + 0.5);
+
+        // 最危险的目标（救急用）
+        HealTgt const* lowest = nullptr;
+        for (HealTgt const& h : list)
+            if (!lowest || h.hpPct < lowest->hpPct)
+                lowest = &h;
+
+        // ---- ① 激活（给自己，约 15% 就开；放在最前面：它是回蓝，不占治疗节奏）----
+        if (cfg->selfDraw && role != 3 && s.power < TP(m, "innervate_mana", 15.0)
+            && TargetAuraRemain(ai, bot, m, cfg->selfDraw, bot) <= 0)
+        {
+            if (TryCastSelf(ai, m, s, cfg->selfDraw))
+            {
+                m->state = State::Recover;
+                return TickResult::Acted;
+            }
+        }
+
+        bool const emergency = (lowest && lowest->hpPct < emergencyHp);
+
+        // ---- ② 第一层：坦克"三花"不断档（最高优先，只关心花的计时器）----
+        //   ⚠ 唯一的例外：**有人在救急线以下时把这一手让给救急**（救急是瞬发牌，晚一个 GCD
+        //     可能就是一条命）。站长口径的"GCD 冲突时先保花"说的是 花 vs 回春/愈合，不是 花 vs 救急。
+        if (!emergency && role != 2)
+        {
+            for (HealTgt const& h : list)
+            {
+                if (!h.tank)
+                    continue;
+                int const want = cfg->tankHotStack > 0 ? cfg->tankHotStack : 3;
+                int const stacks = AuraStacks(ai, bot, m, cfg->tankHot, h.u);
+                int const left = TargetAuraRemain(ai, bot, m, cfg->tankHot, h.u);
+                int const refreshMs = int(TP(m, "lifebloom_refresh_ms", 2500.0));
+                // [DPSFSM-HOTDIAG] `hot_diag=1` 时的取证（默认关）：技能 id / 层数 / 三种读法
+                if (TP(m, "hot_diag", 0.0) >= 1.0)
+                {
+                    static uint32 s_hdAt = 0;
+                    uint32 const hnow = HealSafeNow();
+                    if (!s_hdAt || WorldTimer::getMSTimeDiff(s_hdAt, hnow) >= 3000)
+                    {
+                        s_hdAt = hnow;
+                        uint32 const lid = SpellId(ai, bot, m, cfg->tankHot, false);
+                        sLog.outError("[DPSFSM-HOTDIAG] %s tgt=%s id=%u stacks=%d left=%d has=%d cnt=%d "
+                            "casterAura=%u form=%u manaLow=%d",
+                            bot->GetName(), h.u->GetName(), lid, stacks, left,
+                            h.u->HasAura(33763) ? 1 : 0, int(h.u->GetAuraCount(33763)),
+                            AuraStacks(ai, bot, m, cfg->tankHot, bot),
+                            uint32(bot->GetShapeshiftForm()), lowMana ? 1 : 0);
+                    }
+                }
+                if (stacks < want || left < refreshMs)
+                {
+                    if (HealCastNamed(ai, m, s, cfg->tankHot, h, State::Tank))
+                    {
+                        ++m->hotRolls;
+                        m->hotTgt = h.u->GetGUIDLow();
+                        return TickResult::Acted;
+                    }
+                }
+            }
+        }
+
+        // ---- ③ 第二层：救急（swiftmend → 自然迅捷 + 治疗之触）----
+        if (emergency)
+        {
+            HealTgt const& t = *lowest;
+            bool const falling = t.rate > 0.5f;
+            // ③-a 迅捷治愈：**只在目标身上真有在跳的 HoT 时**可用（它消耗回春/愈合换瞬抬）；
+            //   留给"血线正在快速下降"的目标 —— 平稳掉血时留着它更值。
+            if (cfg->finisher && falling
+                && (TargetAuraRemain(ai, bot, m, "rejuvenation", t.u) > 0
+                    || TargetAuraRemain(ai, bot, m, cfg->hotFill, t.u) > 0))
+            {
+                if (HealCastNamed(ai, m, s, cfg->finisher, t, State::Emergency))
+                {
+                    m->hotTgt = t.u->GetGUIDLow();
+                    return TickResult::Acted;
+                }
+            }
+            // ③-b 自然迅捷 + 治疗之触：真正的最后一口气。树形态**放不了治疗之触** ⇒ 先切出去。
+            if (t.hpPct < nsHp && cfg->bigCdInstant && cfg->bigCdHeal)
+            {
+                if (cfg->form && cfg->formId && bot->GetShapeshiftForm() == cfg->formId)
+                {
+                    bot->RemoveSpellsCausingAura(SPELL_AURA_MOD_SHAPESHIFT);
+                    m->castThisTick = true;
+                    m->state = State::Emergency;
+                    return TickResult::Acted;      // 切形态不占 GCD，下一 tick 接着放
+                }
+                if (AuraStacks(ai, bot, m, cfg->bigCdInstant, bot) == 0)
+                {
+                    if (TryCastSelf(ai, m, s, cfg->bigCdInstant))
+                    {
+                        m->state = State::Emergency;
+                        return TickResult::Acted;
+                    }
+                }
+                else if (HealCastNamed(ai, m, s, cfg->bigCdHeal, t, State::Emergency))
+                {
+                    ++m->hotNsUsed;
+                    m->hotTgt = t.u->GetGUIDLow();
+                    return TickResult::Acted;
+                }
+            }
+            // ③-c 没有可兑现的 HoT：先把 HoT 铺上去（回春优先），让下一跳先顶着
+            if (TargetAuraRemain(ai, bot, m, cfg->renew, t.u) <= 0
+                && HealCastNamed(ai, m, s, cfg->renew, t, State::Emergency))
+                return TickResult::Acted;
+            if (HealCastNamed(ai, m, s, cfg->hotFill, t, State::Emergency))
+                return TickResult::Acted;
+        }
+
+        // ---- ④ 第三层：填充（坦克回春/愈合续期 → 可预见团队伤害预铺）----
+        //   预铺判据 = 剩余时间 + 受伤速率：`预计落地血量 = hp - rate × hot_lead_sec`。
+        double const leadSec = TP(m, "hot_lead_sec", 3.0);
+        int const rejRefresh = int(TP(m, "renew_refresh_ms", 3000.0));
+        int const regRefresh = int(TP(m, "regrowth_refresh_ms", 3000.0));
+
+        // 坦克：三层花已经在上面的第一层保住了，这里补回春/愈合（低优先，先看剩余时间）
+        if (role != 2)
+        {
+            for (HealTgt const& h : list)
+            {
+                if (!h.tank)
+                    continue;
+                double const predictedPct = 100.0 * (double(h.hp) - double(h.rate) * leadSec)
+                    / double(h.maxHp ? h.maxHp : 1);
+                bool const want = (h.hpPct < tankPct) || (h.rate > 0.5f && predictedPct < tankPct);
+                if (!want)
+                    break;
+                if (cfg->renew && !lowMana
+                    && TargetAuraRemain(ai, bot, m, cfg->renew, h.u) < rejRefresh)
+                {
+                    if (HealCastNamed(ai, m, s, cfg->renew, h, State::Tank))
+                        return TickResult::Acted;
+                }
+                // 愈合的 HoT：用**低等级**填充（低等级 HoT 不覆盖满级 HoT，可共存）
+                if (cfg->hotFill && !lowMana
+                    && TargetAuraRemain(ai, bot, m, cfg->hotFill, h.u) < regRefresh)
+                {
+                    uint32 const id = cfg->hotFillRank > 0
+                        ? SpellIdAtRank(ai, m, cfg->hotFill, uint32(cfg->hotFillRank), false)
+                        : SpellId(ai, bot, m, cfg->hotFill, false);
+                    if (id && HealCastId(ai, m, s, id, cfg->hotFill, h.u))
+                    {
+                        HealPending& p = m->healPending;
+                        p.active = true;
+                        p.tgt = h.u->GetObjectGuid();
+                        p.spellId = id;
+                        snprintf(p.name, sizeof(p.name), "%s", cfg->hotFill);
+                        p.theory = HealTheory(bot, h.u, id);
+                        p.startAt = now;
+                        p.castEndAt = now + uint32(TP(m, "hot_fill_cast_ms", 2000.0));
+                        p.preHp = h.hp;
+                        p.hp0Pct = h.hpPct;
+                        m->healTargetGuid = h.u->GetGUIDLow();
+                        m->state = State::Tank;
+                        return TickResult::Acted;
+                    }
+                }
+                break;
+            }
+        }
+
+        // 团队：预铺（不是反应）—— 按"剩余时间 + 受伤速率"决定先给谁挂 HoT
+        if (role != 1 && !lowMana)
+        {
+            std::vector<HealTgt> sorted(list);
+            std::sort(sorted.begin(), sorted.end(),
+                [](HealTgt const& a, HealTgt const& b) { return a.hpPct < b.hpPct; });
+
+            // 宁静：可预见的**持续**团队伤害窗口内提前引导（受伤人数够多 + 有速率才开）
+            if (cfg->groupChannel)
+            {
+                int const need = int(TP(m, "tranq_count", 4.0));
+                int hurt = 0;
+                for (HealTgt const& h : sorted)
+                    if (h.hpPct < raidPct - 5.0)
+                        ++hurt;
+                if (hurt >= need
+                    && s.bot->GetShapeshiftForm() == cfg->formId
+                    && TargetAuraRemain(ai, bot, m, cfg->groupChannel, bot) <= 0)
+                {
+                    if (HealCastNamed(ai, m, s, cfg->groupChannel, *lowest, State::Raid))
+                        return TickResult::Acted;
+                }
+            }
+
+            for (HealTgt const& h : sorted)
+            {
+                double const predictedPct = 100.0 * (double(h.hp) - double(h.rate) * leadSec)
+                    / double(h.maxHp ? h.maxHp : 1);
+                // 预铺：预计会更低就先铺；HoT 剩余还够就等（不重复铺同一条 HoT）
+                if (predictedPct >= raidPct && h.hpPct >= raidPct)
+                    continue;
+                if (cfg->renew && TargetAuraRemain(ai, bot, m, cfg->renew, h.u) < rejRefresh)
+                {
+                    if (HealCastNamed(ai, m, s, cfg->renew, h, State::Raid))
+                        return TickResult::Acted;
+                }
+                if (cfg->hotFill && TargetAuraRemain(ai, bot, m, cfg->hotFill, h.u) < regRefresh)
+                {
+                    uint32 const id = cfg->hotFillRank > 0
+                        ? SpellIdAtRank(ai, m, cfg->hotFill, uint32(cfg->hotFillRank), false)
+                        : SpellId(ai, bot, m, cfg->hotFill, false);
+                    if (id && HealCastId(ai, m, s, id, cfg->hotFill, h.u))
+                    {
+                        HealPending& p = m->healPending;
+                        p.active = true;
+                        p.tgt = h.u->GetObjectGuid();
+                        p.spellId = id;
+                        snprintf(p.name, sizeof(p.name), "%s", cfg->hotFill);
+                        p.theory = HealTheory(bot, h.u, id);
+                        p.startAt = now;
+                        p.castEndAt = now + uint32(TP(m, "hot_fill_cast_ms", 2000.0));
+                        p.preHp = h.hp;
+                        p.hp0Pct = h.hpPct;
+                        m->healTargetGuid = h.u->GetGUIDLow();
+                        m->state = State::Raid;
+                        return TickResult::Acted;
+                    }
+                }
+            }
+        }
+
+        m->state = lowMana ? State::Recover : State::Idle;
+        return TickResult::Decline;
+    }
+
+    // ==========================================================================
+    // HealCore 主入口（mode=5：神圣牧 / 神圣骑 / 恢复萨 / 恢复德）
+    //   四治疗共用这套骨架；差异全在 HealCfgFor() 那张表 + 奶德的 hotModel 分支。
     // ==========================================================================
     ai::dpsfsm::TickResult TickHealFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
@@ -9774,6 +10385,8 @@ namespace ai
         // 落地结算 + 10 秒汇总（都只写统计，不影响决策）
         HealFlushPending(ai, m, s, now);
         HealLogHps(m, s, now);
+        if (cfg->hotModel)
+            HealLogHot(ai, m, s, cfg, list, now);
 
         double const lowManaPct = TP(m, "recover_mana", 20.0);
         bool const lowMana = s.power < lowManaPct;
@@ -9785,7 +10398,18 @@ namespace ai
 
         if (list.empty())
         {
-            // 没有病人：先补 buff；蓝紧就喝药，然后交回引擎（喝水/魔杖归它）
+            // 没有病人：先补图腾/形态/自身 HoT，再补 buff；蓝紧就喝药，然后交回引擎（喝水/魔杖归它）
+            if (cfg->totems && HealTickTotems(ai, m, s))
+                return TickResult::Acted;
+            if (cfg->selfDraw && s.power < TP(m, "innervate_mana", 15.0)
+                && TargetAuraRemain(ai, s.bot, m, cfg->selfDraw, s.bot) <= 0)
+            {
+                if (TryCastSelf(ai, m, s, cfg->selfDraw))
+                {
+                    m->state = State::Recover;
+                    return TickResult::Acted;
+                }
+            }
             if (HealPrep(ai, m, s, cfg))
                 return TickResult::Acted;
             if (lowMana && UseManaPotion(m, s))
@@ -9803,6 +10427,10 @@ namespace ai
             return TickResult::Acted;
         if (role == 3)
             return TickResult::Decline;    // 只做驱散的分配：加血不归我
+
+        // ---- ①.6 **奶德：换一个模型**（HoT 预铺，判据是"剩余时间 + 受伤速率"，不用预读）----
+        if (cfg->hotModel)
+            return TickHealHot(ai, m, s, cfg, list, now);
 
         // ---- ② 救急（< emergency_hp：开大 CD，不省蓝）----
         HealTgt const* lowest = nullptr;
@@ -9836,6 +10464,11 @@ namespace ai
                 return TickResult::Acted;
         }
 
+        // ---- ②.5 图腾（恢复萨）：空槽/快到期就补一个，占一个 GCD ----
+        //   排在这里（救急之后、主坦维护之前）：救急永远先；图腾是"顺手补"，一次 tick 最多一个。
+        if (cfg->totems && HealTickTotems(ai, m, s))
+            return TickResult::Acted;
+
         // ---- ③ 主坦维护（只盯"分配的主坦"）----
         if (role != 2)
         {
@@ -9843,6 +10476,52 @@ namespace ai
             {
                 if (!h.tank)
                     continue;
+                // [2026-11-01 站长口径] 大地之盾（奶萨）：给主坦挂上，没了就补（9 层，挂上就不管）
+                //   判据 = **固定 id 直接读**（HealEarthShieldLeft），不靠法术链；
+                //   另外加一道"最多每 `tank_hot_recast_ms`(5000) 挂一次"的闸：万一读取口径再出岔子，
+                //   也不至于把整轮的 GCD 全花在重挂盾上（实测有一轮 45 秒挂了 23 次大地之盾）。
+                if (cfg->tankHot && !lowMana
+                    && HealEarthShieldLeft(h.u) <= 0
+                    && (!m->healTankHotAt
+                        || WorldTimer::getMSTimeDiff(m->healTankHotAt, now) >= uint32(TP(m, "tank_hot_recast_ms", 5000.0))))
+                {
+                    if (HealCastNamed(ai, m, s, cfg->tankHot, h, State::Tank))
+                    {
+                        m->healTankHotAt = now;
+                        return TickResult::Acted;
+                    }
+                }
+                // [2026-11-01 站长口径] **治疗之道（奶萨）**：开怪前/高压期用**低等级治疗波**
+                //   快速叠满 3 层（`hw_stack_enabled` 默认 1）。只在坦克真的在掉血时叠
+                //   （满血坦克上叠层是纯过疗），叠满后下面的治疗波会吃到这个增益。
+                if (cfg->hwStack && TP(m, "hw_stack_enabled", 1.0) >= 1.0
+                    && !lowMana && (h.hpPct < 95.0f || h.rate > 0.5f))
+                {
+                    int const wantSt = int(TP(m, "hw_stack_max", 3.0));
+                    int const stacks = HealHealingWayStacks(h.u);
+                    if (stacks < wantSt)
+                    {
+                        uint32 const hwId = SpellIdAtRank(ai, m, cfg->bigHeal,
+                            uint32(TP(m, "hw_stack_rank", 1.0)), false);
+                        int const castMs = CastMsWithMod(ai, m, s, cfg->bigHeal, 2500);
+                        if (hwId && HealCastId(ai, m, s, hwId, cfg->bigHeal, h.u))
+                        {
+                            HealPending& p = m->healPending;
+                            p.active = true;
+                            p.tgt = h.u->GetObjectGuid();
+                            p.spellId = hwId;
+                            snprintf(p.name, sizeof(p.name), "%s", cfg->bigHeal);
+                            p.theory = HealTheory(s.bot, h.u, hwId);
+                            p.startAt = now;
+                            p.castEndAt = now + uint32(castMs > 0 ? castMs : 0);
+                            p.preHp = h.hp;
+                            p.hp0Pct = h.hpPct;
+                            m->healTargetGuid = h.u->GetGUIDLow();
+                            m->state = State::Tank;
+                            return TickResult::Acted;
+                        }
+                    }
+                }
                 // renew 常驻：剩余 < `renew_refresh_ms` 才续（别每 tick 重挂）
                 if (cfg->renew && !lowMana && h.hpPct < 95.0f)
                 {
@@ -9862,6 +10541,21 @@ namespace ai
         // ---- ④ 团队 ----
         if (role != 1)
         {
+            // [2026-11-01 站长口径] **治疗链（奶萨主技能）**：队伍里受伤人数 ≥ `chain_heal_count`(2)
+            //   就放 chain heal（简化版的"串到最多受伤目标"：落点选血量最低的那个）。
+            if (!lowMana && cfg->chainHeal && lowest)
+            {
+                int hurt = 0;
+                double const chainHp = TP(m, "chain_heal_hp", 92.0);
+                for (HealTgt const& h : list)
+                    if (h.hpPct < chainHp)
+                        ++hurt;
+                if (hurt >= int(TP(m, "chain_heal_count", 2.0)))
+                {
+                    if (HealCastNamed(ai, m, s, cfg->chainHeal, *lowest, State::Raid))
+                        return TickResult::Acted;
+                }
+            }
             // 群体治疗：小队里**多个人**同时掉血才值得（单人掉血放群体治疗是纯浪费蓝）
             if (!lowMana && cfg->groupHeal)
             {
@@ -10344,15 +11038,23 @@ namespace ai
             }
 
             // ==================================================================
-            // [2026-11-01 站长口径] **治疗派发（mode=5 · 神圣牧 · HealCore）**
+            // [2026-11-01 站长口径] **治疗派发（mode=5 · HealCore）**
             //   放在三道门之前：
             //     ① `no-victim`（治疗者没有敌人也要工作）；
             //     ② `stunned/rooted`（治疗者被定身也该继续奶，核心会自己处理读条）；
             //     ③ `坦/奶让位`（这一条本来就把所有治疗职业挡在 DPS 状态机外）。
-            //   只接**牧师·神圣**：`Spec::Holy` 同时是圣骑士神圣，必看职业。
+            //   **四治疗各一张配置表**（HealCfgFor），这里只判"职业 + 专精"这一对：
+            //     · 牧师 · 神圣；· 圣骑士 · 神圣；· 萨满 · 恢复；· 德鲁伊 · 恢复。
+            //   ⚠ 必须看职业：`Spec::Holy` 同时是圣骑士/牧师，`Spec::Restoration` 同时是萨满/德鲁伊。
+            //   **戒律牧照旧 Decline**（没有配置表 ⇒ TickHealFsm 第一行就返回 Decline）。
             //   mode != 5 ⇒ 原样落回 legacy（legacy 引擎的加血逻辑一个字节不动）。
             // ==================================================================
-            if (bot->getClass() == CLASS_PRIEST && m->spec == Spec::Holy)
+            bool const healSpec =
+                (bot->getClass() == CLASS_PRIEST && m->spec == Spec::Holy)
+                || (bot->getClass() == CLASS_PALADIN && m->spec == Spec::Holy)
+                || (bot->getClass() == CLASS_SHAMAN && m->spec == Spec::Restoration)
+                || (bot->getClass() == CLASS_DRUID && m->spec == Spec::Restoration);
+            if (healSpec)
             {
                 bool healDerived = false;
                 DecisionMode const healMode = ResolveMode(m, healDerived);
@@ -10381,7 +11083,19 @@ namespace ai
                             return true;
                         case ai::dpsfsm::TickResult::Decline:
                         default:
-                            return false;
+                            // [2026-11-01 站长口径·实测修] **治疗者的"Decline"也要报
+                            //   "本 tick 由我接管"**（返回 true），理由在 PlayerbotAI::UpdateAIInternal：
+                            //     `fsmHandled = dpsfsm::Tick(this)`；`fsmOwnsBot = fsmHandled && SkipEngine()`
+                            //     ⇒ 只有"状态机这一 tick 做了事"时引擎的**施法闸**才合上。
+                            //   治疗者绝大多数 tick 都是"现在没人需要加血"（Decline），于是闸门一直是开的 ⇒
+                            //   引擎那一 tick 自己给主坦放治疗。实测（神圣骑 heal_test, mode=5）：
+                            //   状态机 45 秒只记到 6 次治疗 7336，而 `botHealingDone` 是 17022
+                            //   —— 另外 11 次（`top=27137:10`）全是引擎的闪现，HPS 根本分不清是谁放的。
+                            //   改成返回 true 只动"这一 tick 谁占着施法权"：`skipEngine` 仍要求
+                            //   `DidCastThisTick`（真放了技能），所以**走位/追击照旧归引擎**；
+                            //   而且在副本里 `SkipEngine()` 恒假（没有场景登记）⇒ `fsmOwnsBot` 仍为假，
+                            //   真实游戏行为一个字节不变。
+                            return true;
                     }
                 }
             }
