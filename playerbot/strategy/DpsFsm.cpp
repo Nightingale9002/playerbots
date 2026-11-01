@@ -5877,9 +5877,88 @@ namespace ai
         return HoldWait(m, "autoshot-window");
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] **任务 A：猎人自动射击（75）由状态机自己维持**
+    //   事故：mode=5 独占战斗施法权之后，引擎的 `ranged` 策略不再跑，而状态机没接手
+    //   ⇒ 自动射击（top 里的 75）整场消失：120 秒 dps 766.7 → 267.9、casts 108 → 58。
+    //   口径：自动射击是猎人的"平砍"，**优先级最高**（先于稳固/多重/奥射），每 tick 只做一件事
+    //   —— 没挂着就补挂、挂着就一点不动它（重挂会吃掉 0.5s 起手，所以绝不每 tick 重挂）。
+    //   为什么直接走核心 `Unit::CastSpell`：本模块里**根本没有名为 "auto shot" 的引擎动作**
+    //   （`DoSpecificAction("auto shot")` 一直是空转，自动射击此前靠 `ranged` 策略挂），
+    //   而核心 `Spell::GetCurrentSpellType()` 对 `IsAutoRepeat()` 的法术返回
+    //   CURRENT_AUTOREPEAT_SPELL ⇒ 这一发 CastSpell 就登记了自动重复槽，之后
+    //   `Unit::_UpdateAutoRepeatSpell()` 按武器速度自己续射（每发还自增 `botSpellCounts[75]`，
+    //   `top=75:..` 就是这么来的）。
+    //   两个挂上之后才成立的前提（都是核心 `_UpdateAutoRepeatSpell()` 里判的）：
+    //     · `UNIT_FIELD_TARGET` 必须是可攻击的敌人，否则当场 InterruptSpell —— 而
+    //       PlayerbotAI::CastSpellBody 结束时会恢复旧选择（常是 bot 自己）⇒ 这里对准 victim；
+    //     · 不能正在移动 / 正在读条（那两种情况下挂了也不飞，等下一 tick）。
+    //   参数：`hunter_auto_shot`（默认 1，可关）。
+    // ==========================================================================
+    bool HunterEnsureAutoShot(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        if (TP(m, "hunter_auto_shot", 1.0) < 1.0)
+            return false;
+
+        Player* bot = s.bot;
+        if (!bot || !bot->IsAlive() || !s.target || !s.target->IsAlive())
+            return false;
+
+        // 已经挂着：这就是想要的稳态，什么都不做（挂着就一直飞）
+        if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+            return true;
+
+        // 8 码内是猎人死角；移动中/读条中挂上也立即被核心打断
+        if (s.dist < 8.0f || bot->IsMoving())
+            return false;
+        if (bot->IsNonMeleeSpellCasted(false, false, true))
+            return false;
+
+        // 战斗中保持对准 victim（见上面第 1 条前提）
+        if (bot->GetVictim() != s.target)
+            bot->SetSelectionGuid(s.target->GetObjectGuid());
+
+        uint32 const id = SpellId(ai, bot, m, "auto shot", false);
+        if (!id)
+            return false;
+
+        SpellCastResult res = bot->CastSpell(s.target, id, uint32(TRIGGERED_NONE));
+        bool on = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
+
+        if (!on)
+        {
+            // 兜底 ①：状态机的统一施法入口（自己转向/站直 + 记 failUntil，日志有据可查）
+            if (TryCast(ai, m, s, "auto shot", s.target))
+                on = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
+        }
+        if (!on)
+        {
+            // 兜底 ②：旧调用留着（某些策略集里确实注册过同名动作），也是最后一条可诊断的路
+            ai->DoSpecificAction("auto shot", Event(), true);
+            on = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
+        }
+
+        if (TP(m, "hunter_diag", 0.0) >= 1.0)
+        {
+            uint32 const nowSec = uint32(time(nullptr));
+            if (m->lastEngageLog + 10 <= nowSec)
+            {
+                m->lastEngageLog = nowSec;
+                sLog.outError("[DPSFSM-AUTO] %s 自动射击: res=%d registered=%d dist=%.1f moving=%d casting=%d",
+                    bot->GetName(), int(res), on ? 1 : 0, s.dist, bot->IsMoving() ? 1 : 0,
+                    bot->IsNonMeleeSpellCasted(false, false, true) ? 1 : 0);
+            }
+        }
+        return on;
+    }
+
     ai::dpsfsm::TickResult TickHunterFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         using ai::dpsfsm::TickResult;
+
+        // [2026-11-01 站长口径] 任务 A：自动射击优先级最高（= 猎人的平砍）。
+        //   每 tick 先确保它在飞；它不占 GCD、不结束本 tick（挂上之后照样可以放稳固/多重/奥射）。
+        HunterEnsureAutoShot(ai, m, s);
 
         // [2026-10-31 站长口径] **宠物生命周期守卫放在状态机之前**：宠物在不在，直接决定
         //   兽王的杀戮命令能不能出现（`[DUMMY] ... pet=0` 就是这条链断了）。
@@ -5962,12 +6041,10 @@ namespace ai
         //   都会被顶掉。只要没挂着就立刻重挂（自动射击不吃 GCD），这一步必须在 Tick 末尾，
         //   否则中间那 0.5 秒起手会把自动射击饿死。
         // ------------------------------------------------------------------
-        if (s.target && !s.moving && s.dist >= 8.0f
-            && !s.bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
-        {
-            if (!TryCast(ai, m, s, "auto shot", s.target))
-                ai->DoSpecificAction("auto shot", Event(), true);
-        }
+        //   [2026-11-01] 与 Tick 开头的调用合并成同一个实现（HunterEnsureAutoShot），
+        //   这里是"本轮施法之后立刻补挂"的那一次：核心每次施法前都会
+        //   InterruptSpell(CURRENT_AUTOREPEAT_SPELL)，不补挂就每挂最多一发。
+        HunterEnsureAutoShot(ai, m, s);
 
         // [2026-10-31] `hunter_diag=1` 时的窗口取证（默认关，2 秒一条）：
         //   平射剩余 / 平射落地 / 稳固窗口 / 自动射击是否挂着 / 本 tick 放出了什么。
