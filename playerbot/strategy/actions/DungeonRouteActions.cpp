@@ -815,23 +815,27 @@ bool DungeonRoutePullAction::Execute(Event& event)
     Event pullEvent("attack anything", creature->GetObjectGuid());
     if (ai->DoSpecificAction("pull my target", pullEvent, true))
     {
-        // [2026-10-24 修] `pull my target` 在"找不到可拉位置"时会**先移动**但返回 true（见 PullRequestAction），
-        //   以前这里直接当"起手成功"，于是 553/557 站在拉怪点 act=pull my target 却永远不进战斗。
-        //   现在确认真的打起来了才算起手。
+        // [2026-11-02 根因修复] `pull my target` 内部是 `PullRequestAction`：它先 `RequestPull`、
+        //   再 `ai->OnCombatStarted()` —— **引擎在本 tick 内就切到 COMBAT 引擎**。而本动作
+        //   (`DungeonRoutePullAction`) 只注册在非战斗引擎里 ⇒ 下一 tick 起本动作**不会再被执行**。
+        //   原来的写法是"等确认真的打起来（engaged）再记 PullBegin"，可那一刻永远等不到：
+        //   起手是通用 PullStrategy / attack anything 完成的，于是 `[PULLED]` 恒为 0、
+        //   pullrec 拿不到 ord、`pullBackPending` 也没挂上（实测 5 人队整轮 0 次 PullBegin）。
+        //   现在改为**决定拉这一只的那一刻**就落记录（后面三条腿——已开打 / 10 码强制 / 继续接近——
+        //   都不影响这条记录）；拉失败由 pullFailCount 处理，不会因为早记而误判。
+        dungeonroute::PullBegin(bot, *route, target);
+
         bool const engaged = creature->IsInCombat() ||
             (bot->GetVictim() && bot->GetVictim()->GetObjectGuid() == creature->GetObjectGuid());
         if (engaged)
-        {
-            dungeonroute::PullBegin(bot, *route, target);
             return true;
-        }
+
         // 还没打起来：如果已经很近了，直接强制开怪，别在"拉怪动作"里空转
         if (bot->GetDistance(creature) <= 10.0f)
         {
             bot->Attack(creature, true);
             sLog.outError("[ENGAGE] %s 近距离强制开怪 target=%s(entry=%u) dist=%.1f（pull 只移动没开怪）",
                 bot->GetName(), creature->GetName(), creature->GetEntry(), bot->GetDistance(creature));
-            dungeonroute::PullBegin(bot, *route, target);
             return true;
         }
         if (!st.pullDbgAt || WorldTimer::getMSTimeDiff(st.pullDbgAt, nowMs ? nowMs : 1) >= 3000)

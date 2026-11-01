@@ -42,6 +42,7 @@
 #include "Maps/SpawnGroup.h"
 #include <algorithm>
 #include <mutex>       // [2026-10-25] 固化路线生成的跨线程互斥
+#include <unordered_map>   // [DRIVEFAIL 2026-11-02] ShouldDrive 失败原因的节流表（guidLow -> 上次打印时刻）
 
 namespace dungeonroute
 {
@@ -5288,18 +5289,68 @@ namespace dungeonroute
         return false;
     }
 
+    // [DRIVEFAIL 2026-11-02] 可观测性补丁：ShouldDrive() 每处 return false 都打一条带"门名"的日志。
+    //   原来外部只能看到 driver=(-)，分不清被哪一道门挡住。这里**只加观测**，不改任何判断。
+    //   节流：同一只 bot（guidLow）每 10 秒最多一条 —— ShouldDrive 每 tick 都被调，不节流会刷屏。
+    //   bot 可能为 nullptr（函数开头 ai 为空的分支），此时按 key=0 记录、名字打 "?"。
+    inline void LogDriveFail(Player* bot, char const* reason)
+    {
+        uint32 const nowMsRaw = WorldTimer::getMSTime();
+        uint32 const nowMs = nowMsRaw ? nowMsRaw : 1;   // 0 当 1，避免和"从未打印过"的哨兵撞车
+        uint32 const key = bot ? bot->GetGUIDLow() : 0;
+
+        static std::mutex s_lock;
+        static std::unordered_map<uint32, uint32> s_lastMs;
+        {
+            std::lock_guard<std::mutex> guard(s_lock);
+            std::unordered_map<uint32, uint32>::const_iterator it = s_lastMs.find(key);
+            if (it != s_lastMs.end() && WorldTimer::getMSTimeDiff(it->second, nowMs) < 10000)
+                return;
+            s_lastMs[key] = nowMs;
+        }
+
+        char const* name = (bot && bot->GetName()) ? bot->GetName() : "?";
+        sLog.outError("[DRIVEFAIL] %s reason=%s", name, reason);
+    }
+
     inline bool ShouldDrive(PlayerbotAI* ai)
     {
         if (!RouteEnabled())
+        {
+            LogDriveFail(nullptr, "route-disabled");
             return false;
+        }
 
         Player* bot = ai ? ai->GetBot() : nullptr;
-        if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() || !bot->IsAlive())
+        // [DRIVEFAIL] 原为一条 `!bot || !IsInWorld() || IsBeingTeleported() || !IsAlive()` 短路链，
+        //   这里按**同样的顺序、同样的短路语义**逐步展开，只为让日志能指出是哪一道门（行为不变）。
+        if (!bot)
+        {
+            LogDriveFail(nullptr, "no-bot");
             return false;
+        }
+        if (!bot->IsInWorld())
+        {
+            LogDriveFail(bot, "not-in-world");
+            return false;
+        }
+        if (bot->IsBeingTeleported())
+        {
+            LogDriveFail(bot, "teleporting");
+            return false;
+        }
+        if (!bot->IsAlive())
+        {
+            LogDriveFail(bot, "dead");
+            return false;
+        }
 
         // [自动进本 2026-10-18] 不在本里 ⇒ 发起"带队伍进本"，本 tick 不推进路线
         if (!dungeonrun::MaybeEnterDungeon(bot, RouteRuntimeSwitch()))
+        {
+            LogDriveFail(bot, "not-entered");
             return false;
+        }
         if (bot->IsInCombat())
         {
             // [GHOST-FIGHT 2026-10-27] 只剩战斗标记（没有 victim、队伍/宠物也没被任何怪打）时，
@@ -5312,17 +5363,24 @@ namespace dungeonroute
             if (!ghost)
             {
                 st.ghostCombatSince = 0;
+                LogDriveFail(bot, "combat");
                 return false;
             }
             if (!st.ghostCombatSince)
                 st.ghostCombatSince = nowMs ? nowMs : 1;
             if (WorldTimer::getMSTimeDiff(st.ghostCombatSince, nowMs ? nowMs : 1) < 10000)
+            {
+                LogDriveFail(bot, "ghost-wait");
                 return false;
+            }
         }
         else
             StateOf(bot).ghostCombatSince = 0;
         if (!PlayerbotAI::IsTank(bot))
+        {
+            LogDriveFail(bot, "not-tank");
             return false;
+        }
 
         // [2026-10-28 站长口径] **全员一起行动**：脱战且有人阵亡/掉队 ⇒ 停住等。
         //   这里只置状态、不推进；"等太久就把全队拉到坦克身边（summon）"由 SimScenario 负责。
@@ -5335,20 +5393,35 @@ namespace dungeonroute
             {
                 if (!rst.regroupSince)
                     rst.regroupSince = nowMs ? nowMs : 1;
+                LogDriveFail(bot, "regroup-wait");
                 return false;
             }
         }
 
         Map* map = bot->GetMap();
         if (!map || (!map->IsDungeon() && !map->IsRaid()))
+        {
+            LogDriveFail(bot, "not-dungeon");
             return false;
+        }
 
         MapRoute const* route = GetMapRoute(map->GetId());
-        if (!route || route->waves.empty())
+        if (!route)
+        {
+            LogDriveFail(bot, "no-route");
             return false;
+        }
+        if (route->waves.empty())
+        {
+            LogDriveFail(bot, "route-empty");
+            return false;
+        }
         // [自动进本] 自动进本模式下允许未 verified 的图
         if (!route->verified && !dungeonrun::AllowUnverified(RouteRuntimeSwitch()))
+        {
+            LogDriveFail(bot, "unverified");
             return false;
+        }
 
         if (Group* group = bot->GetGroup())
         {
@@ -5360,9 +5433,15 @@ namespace dungeonroute
                 if (PlayerbotAI::IsTank(m))
                 {
                     if (!m->GetPlayerbotAI())                     // 真人坦克：让真人拉
+                    {
+                        LogDriveFail(bot, "human-tank");
                         return false;
+                    }
                     if (m->GetGUIDLow() < bot->GetGUIDLow())      // 别的 bot 坦克更小：让它拉
+                    {
+                        LogDriveFail(bot, "other-tank");
                         return false;
+                    }
                 }
             }
         }
