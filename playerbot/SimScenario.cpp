@@ -325,6 +325,12 @@ uint32 stuckFightCleared = 0;
             uint32 tankDiagAt = 0;          // [TANK-TEST-DIAG] 10 秒节流
             bool   tankSetupDone = false;   // 假人/竞争 bot 是否已就位
             uint32 tankTauntBase = 0;       // 嘲讽次数的基线（按法术 id 计，两种 mode 都可比）
+            // [2026-11-01 站长口径·防护骑] "把最后一只怪交给抢仇恨的 DPS" 是否已经做过：
+            //   只做一次（之后每 tick 的"没 victim 就补咬主坦"不会把它抢回来 —— victim 活着就不碰）。
+            //   为什么要做：主坦一开打就把每只怪都咬住，**Taunt/Pickup 两个状态永远进不去**
+            //   （实测第 1/2 轮 `taunts=0 pickups=0`，而 victim 全程只有 tank）。防骑的
+            //   `righteous defense` 还要求"被打的是友方玩家" ⇒ 必须真的让怪先咬 DPS。
+            bool   tankRivalEngaged = false;
         };
 
         std::vector<DummyRun> s_dummies;
@@ -432,15 +438,26 @@ uint32 stuckFightCleared = 0;
         // [2026-11-01 站长口径] **坦克专精单独一张表**（理由与治疗那张一样）：
         //   不塞进 `s_specKeys` —— 那张表与 17 个堆心一一对应，`dummyall` 按长度校验，
         //   而且坦克不需要"一堆木桩"，需要的是"会打人的敌人 + 仇恨竞争"。
-        //   第一层只做这两个（站长口径）：**防护战** + **熊德**；防骑留到后面（理由见 DpsFsm.cpp
-        //   → TickTankFsm() 上面的说明：TBC 防骑没有真嘲讽、核心仇恨是地面 AoE）。
+        //   第一层：**防护战** + **熊德** + **[2026-11-01 站长口径] 防护骑（protpal）**。
+        //   防骑与战/熊共用同一张坦克图，只换动作表（见 DpsFsm.cpp → TankKind::PaladinProt）。
         //   enable = 让 DetectSpec 认出来的策略名（德鲁伊用 "bear"，其 Spec 仍是 Feral，
-        //   坦克/猫由**当前形态**区分；premade = 配置里的 `AiPlayerbot.PremadeSpecName.<cls>.<n>`）。
+        //   坦克/猫由**当前形态**区分；圣骑士用 "protection"，与惩戒骑的 "retribution" 互斥）；
+        //   premade = 配置里的 `AiPlayerbot.PremadeSpecName.<cls>.<n>`。
+        //   ⚠ protpal 的 premade 就是本服配置里**真实存在**的那一行：
+        //     `AiPlayerbot.PremadeSpecName.2.2 = pve prot`
+        //     （`AiPlayerbot.PremadeSpecLink.2.2.70 = -0530513350002152021551-05205` ⇒ 0/53/5，
+        //      防护系 53 点，`holy shield` 与 41 点的 `avenger's shield` 都在里面）。
+        //   找不到这个 premade 时的兜底见 `ApplyDummySetup()` 的 "protpal 强设防护天赋" 那一段。
         SpecKey const s_tankSpecKeys[] =
         {
-            { "prot", CLASS_WARRIOR, "protection", "arms", "fury", 2, "pve prot" },
-            { "bear", CLASS_DRUID,   "bear",       "balance", "restoration", 1, "pve dps feral tank" },
+            { "prot",    CLASS_WARRIOR, "protection", "arms",        "fury",   2, "pve prot" },
+            { "bear",    CLASS_DRUID,   "bear",       "balance",     "restoration", 1, "pve dps feral tank" },
+            { "protpal", CLASS_PALADIN, "protection", "retribution", "holy",   1, "pve prot" },
         };
+        // [2026-11-01 站长口径] protpal 的**兜底天赋名**（别的服/别的 conf 里 premade 可能不叫
+        //   "pve prot"）：先按这些名字精确找，再退到"名字里带 prot 的 pve 那一套"。
+        //   本服 conf 里 2.2/2.3 都叫 "pve prot" ⇒ 第一项就命中，兜底永远用不上（但要有）。
+        char const* const s_protpalFallbackPremades[] = { "pve prot", "pve tank", "pve prot (mit)" };
 
         bool IsTankSpecKey(std::string const& key)
         {
@@ -3424,8 +3441,66 @@ uint32 stuckFightCleared = 0;
                         break;
                     }
                     if (!applied)
-                        sLog.outError("[DUMMY] id=%u spec=%s 没找到 premade 天赋 [%s]，保留原天赋",
-                            d.id, d.spec.c_str(), d.premade.c_str());
+                    {
+                        // [2026-11-01 站长口径·防护骑] **protpal 的兜底**：本服 conf 里
+                        //   `AiPlayerbot.PremadeSpecName.2.2 = pve prot` 是真实存在的，正常走不到这里；
+                        //   但别的服/别的 conf 可能没有这个名字，而"随机 bot 的天赋"会让
+                        //   `DetectSpec()` 判不出 `Spec::Protection` ⇒ 坦克图根本不会被派发（整轮空转）。
+                        //   所以按 `s_protpalFallbackPremades` 依次找，再退到"名字里带 prot 的 pve 那一套"，
+                        //   命中就立刻 resetTalents + ApplyTalents；一条都找不到才保留原天赋并**如实说明**。
+                        bool forced = false;
+                        if (d.spec == "protpal")
+                        {
+                            auto tryApply = [&](TalentPath& path) -> bool
+                            {
+                                if (path.talentSpec.empty())
+                                    return false;
+                                TalentSpec& ts = path.talentSpec.back();
+                                std::ostringstream out;
+                                bot->resetTalents(true);
+                                ts.ApplyTalents(bot, &out);
+                                sLog.outError("[DUMMY] id=%u spec=protpal premade=[%s] 没找到 ⇒ "
+                                    "强设防护天赋 [%s]（tab=%u）", d.id, d.premade.c_str(),
+                                    path.name.c_str(), uint32(d.tab));
+                                return true;
+                            };
+                            for (char const* want : s_protpalFallbackPremades)
+                            {
+                                for (auto& path : specs.talentPath)
+                                {
+                                    if (path.name != want)
+                                        continue;
+                                    forced = tryApply(path);
+                                    if (forced)
+                                        break;
+                                }
+                                if (forced)
+                                    break;
+                            }
+                            if (!forced)
+                            {
+                                // 最后一档：名字里带 "prot"、且不是 pvp 的圣骑士 premade（conf 里的名字
+                                //   一律小写，所以这里不做大小写归一；再不行就算了，别硬塞随机天赋）。
+                                for (auto& path : specs.talentPath)
+                                {
+                                    if (path.name.find("prot") == std::string::npos
+                                        || path.name.find("pvp") != std::string::npos)
+                                        continue;
+                                    forced = tryApply(path);
+                                    if (forced)
+                                        break;
+                                }
+                            }
+                            if (!forced)
+                                sLog.outError("[DUMMY] id=%u spec=protpal 圣骑士 premade 里**没有任何** "
+                                    "防护天赋（找过 %s / *prot*），保留原天赋 ⇒ DetectSpec 可能判不出 "
+                                    "Spec::Protection，本轮坦克图不会接管（如实在报告里写清楚）",
+                                    d.id, d.premade.c_str());
+                        }
+                        if (!forced)
+                            sLog.outError("[DUMMY] id=%u spec=%s 没找到 premade 天赋 [%s]，保留原天赋",
+                                d.id, d.spec.c_str(), d.premade.c_str());
+                    }
 
                     // 装备：`EquipGearBest` 的品质是按等级段 urand 出来的 ⇒ 会摇到很差的组合
                     //   （实测火法 sp 只有 669、野性德 ap 3360 但没智力）。这里给一个**属性下限**，
@@ -3881,7 +3956,7 @@ uint32 stuckFightCleared = 0;
             {
                 messages.push_back("dummy: '" + key + "' 是坦克专精，请用 armsfile 的坦克通道："
                     "文件里写 prot:tank_test=1,tank_test_adds=2[,tank_test_dps=1][,mode=5|3]"
-                    "（bear 同理；默认 mode=5，对照 legacy 用 mode=3）");
+                    "（bear / protpal 同理；默认 mode=5，对照 legacy 用 mode=3）");
                 return false;
             }
 
@@ -4246,7 +4321,7 @@ uint32 stuckFightCleared = 0;
                 // [2026-11-01 站长口径] **坦克臂**：`prot:tank_test=1,tank_test_adds=2,tank_test_dps=1`。
                 //   坦克不需要木桩堆（DPS 木桩不还手 ⇒ 仇恨/嘲讽/生存全都触发不了）⇒ 走
                 //   "会打人的敌人 + 可选 DPS 竞争者"的通道。`tank_test` 默认关：不带它的臂
-                //   仍然是原来的 DPS 臂，行为一个字节不变。专精键（prot/bear）本身也算开着，
+                //   仍然是原来的 DPS 臂，行为一个字节不变。专精键（prot/bear/protpal）本身也算开着，
                 //   这样 `.rndbot sim armsfile` 里写 `prot:tank_test=1` 与 `prot:@` 都能跑。
                 {
                     bool const wantTank = IsTankSpecKey(arm.spec->key);
@@ -4941,7 +5016,10 @@ uint32 stuckFightCleared = 0;
         // 嘲讽类法术的固定 TBC id（355 Taunt / 6795 Growl / 5209 Challenging Roar）。
         //   按 id 数而不是按 FSM 自己的计数器：legacy（mode=3）是**引擎**放的嘲讽，
         //   FSM 计数器恒 0 ⇒ 只有按法术 id 数，两种 mode 的"嘲讽次数"才是同一把尺子。
-        static uint32 const s_tankTauntIds[] = { 355, 6795, 5209 };
+        //   [2026-11-01 站长口径·防护骑] 加上 31789 Righteous Defense（防骑唯一的真嘲讽）。
+        //   62124 Hand of Reckoning 在 TBC 库里**不存在**（查过 spell_template：无此行），
+        //   这里先挂着 —— 将来库里补了、或换 WotLK 库，计数自动生效；现在恒 0 不影响任何判定。
+        static uint32 const s_tankTauntIds[] = { 355, 6795, 5209, 31789, 62124 };
 
         uint64 TankTauntCasts(Player* bot, DummyRun const& d)
         {
@@ -4966,6 +5044,11 @@ uint32 stuckFightCleared = 0;
         //   一条批里只有坦克自己上线 ⇒ 永远没有仇恨竞争、嘲讽/加怪接管测不到（实测第 1 轮
         //   `tank_test_dps=1` 但 "没有可用的 DPS bot"）。所以**没有在线的就从候选池拉一个上线**
         //   （与 StartArms 给坦克登录走同一条路 `sRandomPlayerbotMgr.AddPlayerBot()`）。
+        //   [2026-11-01 站长口径·防护骑] **必须和主坦同阵营**：防骑的 `righteous defense` 是
+        //   `TARGET_UNIT_TARGET_FRIENDLY` 的"把咬他的怪转给我"，对**敌对玩家**根本放不出
+        //   （核心 `RighteousDefense::OnCheckTarget` 要 `PLAYER_CONTROLLED` 或 `CanAssistSpell`）。
+        //   实测第 1 轮：主坦 Amdern 是矮人（联盟）、抢仇恨的 DPS 是 Zhenzi 巨魔（部落）⇒
+        //   嘲讽路径永远走不到（`taunts=0`）。战/熊的 taunt 对敌对目标也能用，所以这条历来没暴露。
         uint32 PickTankRivalGuid(Player* tank)
         {
             static uint32 const kCls[] = { CLASS_MAGE, CLASS_WARLOCK, CLASS_HUNTER,
@@ -4973,21 +5056,47 @@ uint32 stuckFightCleared = 0;
             std::set<uint32> used;
             if (tank)
                 used.insert(tank->GetGUIDLow());
-            for (uint32 cls : kCls)
-                if (Player* p = FindOnlineBotOfClass(cls, used))
-                    return p->GetGUIDLow();
-            std::vector<Candidate> pool = LoadCandidates(60, {});
-            for (uint32 cls : kCls)
+            // 同阵营优先：第 1 遍严格同阵营，第 2 遍任意阵营兜底
+            //   （一个同阵营的都没有时，仍然保留"有仇恨竞争"这个前提 —— 比整轮没竞争更接近要测的东西）。
+            for (int wantSame = 1; wantSame >= 0; --wantSame)
             {
-                for (auto const& c : pool)
+                for (uint32 cls : kCls)
                 {
-                    if (c.cls != cls || (tank && c.guid == tank->GetGUIDLow()))
-                        continue;
-                    uint32 const accountId = sObjectMgr.GetPlayerAccountIdByGUID(GuidOf(c.guid));
-                    if (!accountId)
-                        continue;
-                    sRandomPlayerbotMgr.AddPlayerBot(c.guid, accountId);
-                    return c.guid;
+                    PlayerBotMap& bots = sRandomPlayerbotMgr.GetAllBots();
+                    for (auto const& kv : bots)
+                    {
+                        Player* p = kv.second;
+                        if (!p || !p->IsInWorld() || !p->IsAlive() || !p->GetPlayerbotAI())
+                            continue;
+                        if (p->getClass() != cls || p->GetLevel() < 60 || used.count(p->GetGUIDLow()))
+                            continue;
+                        if (wantSame && tank && p->GetTeam() != tank->GetTeam())
+                            continue;
+                        return p->GetGUIDLow();
+                    }
+                }
+            }
+            std::vector<Candidate> pool = LoadCandidates(60, {});
+            // [2026-11-01 实测] 冷启动时**一个随机 bot 都不在线**（RandomBotAutologin 0）⇒ 上面
+            //   两遍扫都空、一定走到这里；所以候选池也必须按阵营过滤，否则又会拉一个敌对 bot 上来
+            //   （实测第 1 轮：主坦矮人、抢仇恨的是巨魔 ⇒ 防骑嘲讽永远放不出）。
+            //   阵营用与核心同一条口径：`Player::TeamForRace(race)`（别自己写 race 表）。
+            for (int wantSame = 1; wantSame >= 0; --wantSame)
+            {
+                for (uint32 cls : kCls)
+                {
+                    for (auto const& c : pool)
+                    {
+                        if (c.cls != cls || (tank && c.guid == tank->GetGUIDLow()))
+                            continue;
+                        if (wantSame && tank && Player::TeamForRace(c.race) != tank->GetTeam())
+                            continue;
+                        uint32 const accountId = sObjectMgr.GetPlayerAccountIdByGUID(GuidOf(c.guid));
+                        if (!accountId)
+                            continue;
+                        sRandomPlayerbotMgr.AddPlayerBot(c.guid, accountId);
+                        return c.guid;
+                    }
                 }
             }
             return 0;
@@ -5141,6 +5250,25 @@ uint32 stuckFightCleared = 0;
                             rival->Attack(c, rivalMelee);
                     }
                 }
+                // [2026-11-01 站长口径·防护骑] **把最后一只怪真的交给 DPS 咬住**（只做一次）：
+                //   不做这一步，主坦开打就把每只怪都咬死了 ⇒ `Taunt`/`Pickup` 永远进不去，
+                //   防骑的 `righteous defense`（要求"被打的是友方玩家"）也就无从验证。
+                //   留在 DPS 身上的那只怪不会被上面的"没 victim 就补咬主坦"抢回去（victim 活着就不碰）。
+                if (!d.tankRivalEngaged && rival->IsInWorld() && !d.dummies.empty())
+                {
+                    if (Creature* c = map->GetCreature(d.dummies.back()))
+                    {
+                        if (c->IsAlive())
+                        {
+                            if (c->AI())
+                                c->AI()->AttackStart(rival);
+                            c->SetInCombatWith(rival);
+                            d.tankRivalEngaged = true;
+                            sLog.outError("[TANK-TEST] id=%u 仇恨竞争：把最后一只怪交给 %s 咬住"
+                                "（主坦丢仇恨/加怪通道才有得测）", d.id, rival->GetName());
+                        }
+                    }
+                }
             }
 
             // 主坦被拖走就拉回来（走位不归坦克 FSM；这里只保证场景变量可控）
@@ -5177,13 +5305,19 @@ uint32 stuckFightCleared = 0;
                 }
                 dpsfsm::TankStats ts;
                 dpsfsm::GetTankStats(d.guid, ts);
+                // [2026-11-01 站长口径·防护骑] 嘲讽**来源**字段：`taunt=rd|reckoning`。
+                //   rd 再细分 direct（按站长口径直接对敌人放）/ help（退到对 victim 放的真实语义），
+                //   因为 TBC 核心的 `Righteous Defence` 只认友方目标（取证见 DpsFsm.cpp 的大段注释）。
+                //   `taunts=` 仍是**按法术 id** 数的总次数（mode=5 与 mode=3 唯一可比的尺子）。
                 sLog.outError("[TANK-TEST-DIAG] id=%u tank=%s hp=%u/%u(%.0f%%) mode=%d adds=%d onme=%d "
-                    "taunts=%llu fsmTaunts=%u pickups=%u surv=%u deaths=%u lead=%.2f victims=[%s ]",
+                    "taunts=%llu fsmTaunts=%u pickups=%u surv=%u deaths=%u lead=%.2f "
+                    "tauntsrc=rd:%u(direct:%u,help:%u),reck:%u victims=[%s ]",
                     d.id, tank->GetName(), tank->GetHealth(), tank->GetMaxHealth(),
                     double(tank->GetHealthPercent()),
                     d.overrides.count("mode") ? int(d.overrides["mode"]) : -1,
                     nAdds, onMe, (unsigned long long)TankTauntCasts(tank, d), ts.taunts,
-                    ts.pickups, ts.survivals, d.tankDeaths, double(worstLead), victims.c_str());
+                    ts.pickups, ts.survivals, d.tankDeaths, double(worstLead),
+                    ts.tauntRd, ts.tauntRdDirect, ts.tauntRdHelp, ts.tauntReck, victims.c_str());
             }
 
             if (now - d.startMs >= d.durationMs)

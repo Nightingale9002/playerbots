@@ -160,11 +160,21 @@ namespace ai
 
         // [2026-11-01 站长口径] 坦克验收计数（嘲讽 / 加怪接管 / 保命次数）。
         //   只写进日志与报告，不参与任何决策；由假人场景每 10 秒取一次。
+        //   [2026-11-01 站长口径·防护骑] 嘲讽要能分清**来源**（验收要用 `taunt=rd|reckoning`）：
+        //     tauntRd       —— `righteous defense` 真的放出去（含两种打法，细分见下两行）；
+        //     tauntRdDirect —— 其中"按站长口径**直接对敌人**放"成功的次数（核心支持重定向后自然增长）；
+        //     tauntRdHelp   —— 其中"对正在被打的友方目标放"成功的次数（TBC 核心的真实语义）；
+        //     tauntReck     —— `hand of reckoning` 放出去的次数（TBC 库里没有这个 id ⇒ 正常恒 0）。
+        //   战/熊不吃这四个字段（`tauntRd*`/`tauntReck` 恒 0，`taunts` 照旧）。
         struct TankStats
         {
             uint32 taunts = 0;      // 真的放出去的嘲讽次数（对"在打别人"的目标）
             uint32 pickups = 0;     // 加怪接管次数（嘲讽或远程拉成功）
-            uint32 survivals = 0;   // 保命技（盾墙/破釜/狂暴回复/生存本能）放出去次数
+            uint32 survivals = 0;   // 保命技（盾墙/破釜/狂暴回复/生存本能/圣盾术）放出去次数
+            uint32 tauntRd = 0;
+            uint32 tauntRdDirect = 0;
+            uint32 tauntRdHelp = 0;
+            uint32 tauntReck = 0;
         };
         void GetTankStats(uint32 guid, TankStats& out);
 
@@ -263,10 +273,20 @@ namespace ai
         //   派发在"必须进战斗 / 必须有 victim / 坦奶让位"三道门**之前**：治疗者没有敌人也要工作。
         //   见 DpsFsm.cpp → TickHealFsm() / TickHealHot() / HealCfgFor()。
         //
-        // [2026-11-01 站长口径] **坦克侧（第 1 层：仇恨/生存/嘲讽/加怪）**：`mode=5` 目前只接
-        //   **防护战（战士 · `Spec::Protection`）** 与 **熊德（德鲁伊 · `Spec::Feral` 且熊形态/坦克场景）**。
-        //   状态：Idle → Prep(防御姿态/熊形态) → Survival(按预期伤害) → Pickup(加怪) → Taunt(丢仇恨) → Maintain。
-        //   防骑（圣骑士 · `Spec::Protection`）继续 Decline —— 理由见 DpsFsm.cpp → TickTankFsm() 上面的说明。
+        // [2026-11-01 站长口径] **坦克侧（第 1 层：仇恨/生存/嘲讽/加怪）**：`mode=5` 接
+        //   **防护战（战士 · `Spec::Protection`）**、**熊德（德鲁伊 · `Spec::Feral` 且熊形态/坦克场景）**
+        //   与 **[2026-11-01 站长口径] 防护骑（圣骑士 · `Spec::Protection`）**。
+        //   状态：Idle → Prep(防御姿态/熊形态/正义之怒+光环) → Survival(按预期伤害) → Pickup(加怪)
+        //         → Taunt(丢仇恨) → Maintain。
+        //   防骑与战/熊**共用同一张图，只换动作表**（`DpsFsm.cpp → TankKind::PaladinProt`）：
+        //     Prep     : righteous fury（缺则补）→ holy shield → devotion aura（光环二选一按已有光环判断）
+        //     Taunt    : righteous defense（站长口径"直接对敌人放"；放不出退到对 victim 放）
+        //                → hand of reckoning（若学会）
+        //     Pickup   : avenger's shield（弹射由法术自身处理）→ judgement → 嘲讽
+        //     Maintain : 多目标 consecration → holy shield（掉了补）→ avenger's shield → judgement
+        //                → seal of righteousness + hammer of the righteous（若学会）
+        //     Survival : divine protection → holy shield；`tank_surv_emerg` 第二档 lay on hands
+        //   ⚠ 惩戒骑（`Spec::Retribution`）走 `TickRetFsm()`，与这里**互斥**（派发处按职业+专精这一对判）。
         //   ⚠ 走位/拉怪路线/波次/boss 换嘲**不归 FSM**（DESIGN §14.3：只消费，不重造）。
         bool Tick(PlayerbotAI* ai);
     }

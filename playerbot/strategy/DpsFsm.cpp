@@ -471,6 +471,28 @@ namespace
         uint32 tankTaunts = 0;
         uint32 tankPickups = 0;
         uint32 tankSurvivals = 0;
+        // [2026-11-01 站长口径·防护骑] 嘲讽**来源**计数（验收字段 `taunt=rd|reckoning` 的出处）：
+        //   tankTauntRd     —— righteous defense 放出去的总次数（= direct + help）；
+        //   tankTauntRdDir  —— 其中"按站长口径直接对敌人放"成功（核心支持重定向后这一段自然增长）；
+        //   tankTauntRdHelp —— 其中"对正在被打的友方目标放"成功（TBC 核心的真实语义）；
+        //   tankTauntReck   —— hand of reckoning 放出去（TBC 库里没有这个 id ⇒ 正常恒 0）。
+        //   tankLastTauntSrc —— 最近一次成功嘲讽的来源短名（只给 [DPSFSM-TANK] 用）。
+        uint32 tankTauntRd = 0;
+        uint32 tankTauntRdDir = 0;
+        uint32 tankTauntRdHelp = 0;
+        uint32 tankTauntReck = 0;
+        char const* tankLastTauntSrc = "none";
+        uint32 tankRdLogAt = 0;         // "对敌人直接放被拒"诊断的 30 秒节流
+        // [2026-11-01 站长口径·防护骑] **"可能不存在"的两个技能只解析一次**：
+        //   `hammer of the righteous`(53595) 与 `hand of reckoning`(62124) 在 TBC 库里都不存在，
+        //   `SpellId()` 的负缓存每 5 秒会重解析一次并打一条 `[DPSFSM-IDS] reparse`（实测刷屏）。
+        //   这两个 id 一个场景内不会变 ⇒ 解析一次记下来（0 = 不会/不存在，之后直接跳过）。
+        bool palOptIdsDone = false;
+        uint32 palHammerId = 0;
+        uint32 palReckId = 0;
+        // 防护骑保命技"为什么没放出去"的节流（**按法术 id 分**：DP 与圣疗同一 tick 都会失败，
+        //   共用一个时间戳会把第二条说明吞掉 —— 实测圣疗的失败原因一次都没打出来过）。
+        std::map<uint32, uint32> tankSurvLogAt;
     };
 
     std::mutex s_disabledMutex;
@@ -3922,6 +3944,14 @@ namespace ai
             m->tankTaunts = 0;
             m->tankPickups = 0;
             m->tankSurvivals = 0;
+            // [2026-11-01 站长口径·防护骑] 嘲讽**来源**计数同样是"这一轮的"，必须一起清零 ——
+            //   否则 `[TANK-TEST-DIAG]` 的 `tauntsrc=rd:N` 是跨轮累加（实测 mode=3 那两轮还在报
+            //   前两轮防骑的 rd:2，分不清本轮到底嘲讽了几次、用哪种）。
+            m->tankTauntRd = 0;
+            m->tankTauntRdDir = 0;
+            m->tankTauntRdHelp = 0;
+            m->tankTauntReck = 0;
+            m->tankLastTauntSrc = "none";
             m->tankHpAt = 0;
             m->tankHp = 0;
             m->tankDmgRate = 0.0f;
@@ -3952,6 +3982,10 @@ namespace ai
             out.taunts = it->second->tankTaunts;
             out.pickups = it->second->tankPickups;
             out.survivals = it->second->tankSurvivals;
+            out.tauntRd = it->second->tankTauntRd;
+            out.tauntRdDirect = it->second->tankTauntRdDir;
+            out.tauntRdHelp = it->second->tankTauntRdHelp;
+            out.tauntReck = it->second->tankTauntReck;
         }
 
         void SetBotForceDps(uint32 guid, bool on)
@@ -10619,7 +10653,7 @@ namespace ai
     //   威胁数据与 DPS 侧**同一份**：`Unit::getThreatManager().getThreat()`（即 Snapshot 的
     //     `myThreat`/`tankThreat` 来源，见 BuildSnapshot），不另建一套威胁模型。
     //
-    //   为什么**防骑留到后面**（第一层只做防护战 + 熊德）：
+    //   为什么第 1 层先做防护战 + 熊德（这段是历史，保留以便回溯）：
     //     ① TBC 圣骑士**没有战士那种嘲讽**（`taunt` 是战士技能）。防骑的"接怪"是
     //        `righteous defense`：要先选**队友**、再把他身上的 3 只怪转过来，是"双目标的换嘲"，
     //        语义比"对一只怪 taunt"复杂得多，先把单目标路径做扎实；
@@ -10627,13 +10661,51 @@ namespace ai
     //        落点/弹射目标属于"选位置/选目标"（§14.3 第 3 层），当前这层只有单体 target + 自身中心技；
     //     ③ 防骑的 `righteous fury` + `holy shield` 是"先开姿态再叠盾"的耦合，验收口径也不同
     //        （仇恨来源以神圣伤害为主），等前两个纯近战坦克的威胁/生存口径跑通后再接。
+    //
+    //   [2026-11-01 站长口径] **防护骑现在接进同一张图（只换动作表）**：
+    //     站长口径原文："`righteous defense` 直接对敌人释放即可，核心会自己处理重定向
+    //     （不需要先选队友）" ⇒ 所以防骑与战/熊共用骨架，分叉只在 `TankKind::PaladinProt`。
+    //     ⚠ **实测修正（本次取证的硬事实，别当没看见）**：这条口径与本地核心不符 ——
+    //       `Spell/Scripting/ClassScripts/Paladin.cpp → RighteousDefense::OnCheckTarget()`
+    //       要求目标 `UNIT_FLAG_PLAYER_CONTROLLED` 或 `caster->CanAssistSpell(target)`；
+    //       而 `RighteousDefense::OnEffectExecute()` 读的是 **unitTarget->getAttackers()**
+    //       （"谁在打这个**友方**单位"）⇒ 对敌人释放必然被拒（`SPELL_FAILED_BAD_TARGETS`）。
+    //       TBC 库里也**没有** `hand of reckoning`（62124 不存在），`hammer of the righteous` 同理。
+    //       所以嘲讽按"站长口径优先、失败回落真实语义"三档（`PalTaunt`）：
+    //         ① 先按站长口径**对敌人直接放**（成功即记 `rd`；核心哪天加了重定向，这条自动生效）；
+    //         ② 放不出时退到 TBC 的真实语义：对**正在被打的那个友方目标**放，核心把咬他的最多
+    //            3 只怪转给施法者（记 `rd_help`，验收字段 `tauntsrc` 里分得清）；
+    //         ③ 再不行才 `hand of reckoning`（若学会；库里没有 ⇒ SpellId=0 直接跳过）。
+    //
+    //   防护骑动作表（站长口径 2026-11-01；阈值一律走 `TP()`）：
+    //     Prep     : righteous fury（缺则补）→ holy shield → devotion aura
+    //                （光环"二选一"：身上已有任意圣骑士光环就不再换，见 `PalAuraUp`）
+    //     Taunt    : `PalTaunt()`（rd → rd_help → reckoning）
+    //     Pickup   : avenger's shield（弹射由法术自身处理）→ judgement → 嘲讽
+    //     Maintain : 多目标 consecration → holy shield（掉了补）→ avenger's shield
+    //                → judgement（蓝 < `prot_mana_low` 时只留最省的）→ seal of righteousness
+    //                + hammer of the righteous（若学会）
+    //     Survival : 按预期伤害触发 → divine protection → holy shield；
+    //                `tank_surv_emerg` 第二档 lay on hands（圣疗只留给"真的要死"）
     // ==========================================================================
     enum class TankKind
     {
         None = 0,
         WarriorProt,    // 战士 · 防护（Spec::Protection + CLASS_WARRIOR）
-        Bear            // 德鲁伊 · 野性且熊形态（Spec::Feral 里猫/熊共用，用形态区分）
+        Bear,           // 德鲁伊 · 野性且熊形态（Spec::Feral 里猫/熊共用，用形态区分）
+        PaladinProt     // [2026-11-01 站长口径] 圣骑士 · 防护（Spec::Protection + CLASS_PALADIN）
     };
+
+    char const* TankKindName(TankKind k)
+    {
+        switch (k)
+        {
+            case TankKind::WarriorProt: return "war";
+            case TankKind::Bear:        return "bear";
+            case TankKind::PaladinProt: return "protpal";
+            default:                    return "-";
+        }
+    }
 
     // [2026-11-01 实测修] 70 级的熊是**巨熊形态**（`FORM_DIREBEAR = 0x08`），不是 `FORM_BEAR = 0x05`。
     //   只判 FORM_BEAR 会让坦克图永远认为"还没变熊" ⇒ 卡在 Prep、一次仇恨技都不放
@@ -10660,6 +10732,11 @@ namespace ai
         if (bot->getClass() == CLASS_DRUID && m->spec == Spec::Feral
             && (TankIsBearForm(bot) || IsScenarioTank(bot->GetGUIDLow())))
             return TankKind::Bear;
+        // [2026-11-01 站长口径] **防护骑**：`Spec::Protection` 同时是战士/圣骑士 ⇒ 必须看职业。
+        //   惩戒骑是 `Spec::Retribution`（走 TickRetFsm），两个分支互斥、谁也不进谁的图。
+        //   没有形态/姿态可等 ⇒ 不需要"按形态区分"的额外标记（与德鲁伊不同）。
+        if (bot->getClass() == CLASS_PALADIN && m->spec == Spec::Protection)
+            return TankKind::PaladinProt;
         return TankKind::None;
     }
 
@@ -10732,6 +10809,300 @@ namespace ai
         }
     }
 
+    // ==========================================================================
+    // [2026-11-01 站长口径] **防护骑动作表**（细节与两条嘲讽路径见 TickTankFsm 上面的大段注释）
+    //
+    //   复用（不重新发明）：`AuraStacks`（自身 buff 的"任意 rank 叠层"查询）、`TryCastSelf`
+    //     （自身增益）、`CastFirst`（吃名字的目标技能）、`SpellId`/`SpellIdAtRank`
+    //     （蓝量降级与 1 级奉献）、`CastSelfCenteredId`（自身中心 AoE，惩戒/神圣骑已共用）、
+    //     `Ready`/`GcdActive`、`TP`。
+    // ==========================================================================
+
+    // 自身某个 buff 在不在（按名字 → 最高 rank，链条自动覆盖各 rank；与 AuraStacks 同一份解析）
+    bool PalBuffUp(PlayerbotAI* ai, Player* bot, BotMem* m, char const* name)
+    {
+        return AuraStacks(ai, bot, m, name, bot) > 0;
+    }
+
+    // [2026-11-01 站长口径] 光环"二选一"的判据：**按已有光环判断** —— bot 身上已经有任意一个
+    //   圣骑士光环（虔诚/惩戒/专注/暗影/冰霜/火焰抗性）就**不再换**，避免把惩戒光环/专注光环顶掉。
+    //   （防护骑默认给虔诚光环，但那只是"一个都没挂"时的默认值，不是优先级。）
+    bool PalAuraUp(PlayerbotAI* ai, Player* bot, BotMem* m)
+    {
+        static char const* kPalAuras[] = {
+            "devotion aura", "retribution aura", "concentration aura",
+            "shadow resistance aura", "frost resistance aura", "fire resistance aura"
+        };
+        for (char const* n : kPalAuras)
+            if (PalBuffUp(ai, bot, m, n))
+                return true;
+        return false;
+    }
+
+    // 圣印（审判的弹药）：任意一种圣印挂着就算"有"（审判给的是当前圣印的那一发）
+    bool PalAnySealUp(PlayerbotAI* ai, Player* bot, BotMem* m)
+    {
+        static char const* kSeals[] = {
+            "seal of righteousness", "seal of wisdom", "seal of command", "seal of blood",
+            "seal of vengeance", "seal of the crusader", "seal of justice", "seal of light"
+        };
+        for (char const* n : kSeals)
+            if (PalBuffUp(ai, bot, m, n))
+                return true;
+        return false;
+    }
+
+    // 缺才补（buff 在就不再放，省 GCD）：返回 true = 这一 tick 放了
+    bool PalKeepBuff(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        if (!m || !s.bot || PalBuffUp(ai, s.bot, m, name))
+            return false;
+        return TryCastSelf(ai, m, s, name);
+    }
+
+    // [2026-11-01 站长口径·防护骑] 两个"TBC 库里可能不存在"的技能（`hammer of the righteous` /
+    //   `hand of reckoning`）只解析一次：`SpellId()` 对解析不出来的名字是**负缓存 + 5 秒重解析**，
+    //   每 tick 问一次就会让 `[DPSFSM-IDS] reparse` 刷屏（实测每个名字每 5 秒一条）。
+    //   这里一次判定就够：这个场景里"会不会"不会变。
+    void PalOptionalIds(PlayerbotAI* ai, BotMem* m)
+    {
+        if (!m || m->palOptIdsDone)
+            return;
+        m->palOptIdsDone = true;
+        m->palHammerId = SpellId(ai, ai->GetBot(), m, "hammer of the righteous", false);
+        m->palReckId = SpellId(ai, ai->GetBot(), m, "hand of reckoning", false);
+        if (!m->palHammerId || !m->palReckId)
+            sLog.outError("[DPSFSM-TANK] %s 防护骑可选技能：hammer of the righteous=%u "
+                "hand of reckoning=%u（0 = 本服法术表里没有/没学会，对应动作自动跳过）",
+                ai->GetBot()->GetName(), m->palHammerId, m->palReckId);
+    }
+
+    // [2026-11-01 站长口径] **直接对敌人放**的施法入口（嘲讽专用）。
+    //   为什么不走 CastChecked：`righteous defense` 在核心里的目标类型是
+    //   `TARGET_UNIT_TARGET_FRIENDLY(21)`，`ai->CanCastSpell(敌方目标)` 必然拒，
+    //   而 CastChecked 的"自修复"分支会把它改打自己 ⇒ 永远放不出、也看不到真实结果。
+    //   这里按站长口径**原样对敌人 CastSpell**，成功/失败如实返回：成功记 `rd`（核心将来支持
+    //   重定向时这条直接生效），失败由调用方回落到真实语义，并留一条 30 秒节流的诊断。
+    bool PalCastOnEnemyRaw(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name, Unit* enemy)
+    {
+        if (!m || !s.bot || !enemy || !enemy->IsAlive())
+            return false;
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
+        if (!id || !Ready(s.bot, id))
+            return false;
+        SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+        if (entry && s.bot->HasGCD(entry))
+            return false;                     // GCD 没转完：这一手放不出，等下一 tick
+        s.bot->SetFacingToObject(enemy);
+        SpellCastResult const res = s.bot->CastSpell(enemy, id, uint32(TRIGGERED_NONE));
+        if (res != SPELL_CAST_OK)
+        {
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32 const safeNow = nowMs ? nowMs : 1;
+            if (!m->tankRdLogAt || WorldTimer::getMSTimeDiff(m->tankRdLogAt, safeNow) >= 30000)
+            {
+                m->tankRdLogAt = safeNow;
+                sLog.outError("[DPSFSM-TANK] %s %s 对敌人直接放被拒：id=%u result=%d"
+                    "（核心要求友方目标 ⇒ 回落'对 victim 放'的真实语义）",
+                    s.bot->GetName(), name, id, int(res));
+            }
+            return false;
+        }
+        ++m->castCount;
+        m->castThisTick = true;
+        m->lastOk[id] = time(nullptr);
+        m->lastCastId = id;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        return true;
+    }
+
+    // [2026-11-01 站长口径] 防护骑的嘲讽：三档（对敌人直接放 → 对 victim 放 → hand of reckoning）。
+    //   `src` 回填验收字段（rd / rd_help / reckoning）。
+    //   ⚠ 第 ② 档是**真实语义**，不是替代口径：核心 `RighteousDefense::OnEffectExecute()` 做的事
+    //     就是"把 unitTarget 身上的 attackers 最多转 3 只给施法者" ⇒ unitTarget 必须是
+    //     **正在被这些怪打的友方单位**（= enemy 的 victim），否则这一发没有语义。
+    bool PalTaunt(PlayerbotAI* ai, BotMem* m, Snapshot& s, Unit* enemy, char const** src)
+    {
+        if (!m || !enemy || !enemy->IsAlive())
+            return false;
+
+        // ① 站长口径：直接对敌人放
+        if (PalCastOnEnemyRaw(ai, m, s, "righteous defense", enemy))
+        {
+            ++m->tankTauntRd;
+            ++m->tankTauntRdDir;
+            m->tankLastTauntSrc = "rd";
+            if (src) *src = "rd";
+            return true;
+        }
+
+        // ② TBC 真实语义：对"正在被这只怪打"的友方目标放（核心把 attackers 转过来）
+        Unit* victim = enemy->GetVictim();
+        if (victim && victim != s.bot && victim->IsAlive() && victim->IsInWorld()
+            && !sServerFacade.IsHostileTo(s.bot, victim))
+        {
+            if (TryCast(ai, m, s, "righteous defense", victim))
+            {
+                ++m->tankTauntRd;
+                ++m->tankTauntRdHelp;
+                m->tankLastTauntSrc = "rd_help";
+                if (src) *src = "rd_help";
+                return true;
+            }
+        }
+        else if (victim && victim != s.bot && victim->IsAlive() && victim->IsInWorld())
+        {
+            // [2026-11-01 实测] 双档都放不出时**说清楚为什么**（30 秒节流）：绝大多数是
+            //   "抢仇恨的 DPS 与主坦敌对"（假人场景随机 bot 跨阵营）——
+            //   righteous defense 是友方目标法术，对敌对玩家不存在"重定向"这回事。
+            //   场景侧的修法：`SimScenario.cpp → PickTankRivalGuid()` 要求同阵营。
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32 const safeNow = nowMs ? nowMs : 1;
+            if (!m->tankRdLogAt || WorldTimer::getMSTimeDiff(m->tankRdLogAt, safeNow) >= 30000)
+            {
+                m->tankRdLogAt = safeNow;
+                sLog.outError("[DPSFSM-TANK] %s righteous defense 无法重定向：victim=%s 对我是敌对/"
+                    "不可协助（友方目标法术），本轮嘲讽只能靠对目标直接放",
+                    s.bot->GetName(), victim->GetName());
+            }
+        }
+
+        // ③ 没有/放不出 ⇒ hand of reckoning（若学会）。TBC 库里没有 62124 ⇒ id=0，直接跳过
+        //    （id 只解析一次，见 `PalOptionalIds()` —— 否则负缓存每 5 秒重解析会刷屏）。
+        if (m->palReckId && TryCast(ai, m, s, "hand of reckoning", enemy))
+        {
+            ++m->tankTauntReck;
+            m->tankLastTauntSrc = "reckoning";
+            if (src) *src = "reckoning";
+            return true;
+        }
+        return false;
+    }
+
+    // [2026-11-01 实测修] **自身保命技直接按 id 放**（`divine protection` 498 / `lay on hands` 633）。
+    //   为什么不用 TryCastSelf：`CastChecked` 对"名字没解析出来 / 已会但 CD / CanCastSpell 拒绝"
+    //   全都是**静默 false**，于是出现"Survival 进了两次、一次都没放出去、日志里查不到原因"
+    //   （实测某一轮 `surv=0`，主坦 20%→12% 被打死）。这里走与 `CastSelfCenteredId` 同一条路
+    //   （核心 `Unit::CastSpell(self)`），失败按 10 秒节流记一条**带 result 码**的诊断。
+    bool PalCastSelfRaw(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* name)
+    {
+        if (!m || !s.bot)
+            return false;
+        uint32 const id = SpellId(ai, s.bot, m, name, false);
+        auto noteFail = [&](char const* why, int result)
+        {
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32 const safeNow = nowMs ? nowMs : 1;
+            uint32& last = m->tankSurvLogAt[id];
+            if (!last || WorldTimer::getMSTimeDiff(last, safeNow) >= 10000)
+            {
+                last = safeNow;
+                sLog.outError("[DPSFSM-TANK] %s 保命技 %s 放不出：%s id=%u result=%d hp=%.0f",
+                    s.bot->GetName(), name, why, id, result, double(s.bot->GetHealthPercent()));
+            }
+            return false;
+        };
+        if (!id)
+            return noteFail("没学会/本服没有这个技能", 0);
+        if (!s.bot->HasSpell(id))
+            return noteFail("法术书里没有", 0);
+        // ⚠ 注意：核心 `WorldObject::IsSpellReady()` **把公共冷却也算进去**
+        //   （`if (!m_cooldownMap.IsGlobalCooldownExpired(now)) return false;`）⇒ 这里 false
+        //   多半只是"GCD 还在转"，不是真的在 CD 里。Survival 档遇到这种情况**不能就这样交回 Maintain**
+        //   （那一手会被仇恨循环拿去放奉献/审判，GCD 永远轮不到保命技）⇒ 调用方改成 Hold 等下一 tick。
+        if (!s.bot->IsSpellReady(id))
+            return noteFail("公共冷却/技能冷却中", 0);
+        SpellEntry const* entry = sServerFacade.LookupSpellInfo(id);
+        if (entry && s.bot->HasGCD(entry))
+            return false;                   // GCD 没转完：这一手放不出，等下一 tick（不算失败）
+        SpellCastResult const res = s.bot->CastSpell(s.bot, id, uint32(TRIGGERED_NONE));
+        if (res != SPELL_CAST_OK)
+            return noteFail("核心拒绝", int(res));
+        ++m->castCount;
+        m->castThisTick = true;
+        m->lastOk[id] = time(nullptr);
+        m->lastCastId = id;
+        PlayerbotAI::RecordSpellCast(s.bot->GetObjectGuid(), id);
+        return true;
+    }
+
+    // Prep：righteous fury（缺则补）→ holy shield → 光环（二选一按已有光环判断）。
+    //   返回 true = 这一 tick 放了准备技；`done` = 该补的都齐了（调用方据此退回 Maintain）。
+    //   ⚠ holy shield 在 Prep 里只当"开打前垫一层"，日常维持归 Maintain（它 10 秒一掉，
+    //     放在 Prep 优先级里会把 Taunt/Pickup 的窗口整个吃掉 —— 实测口径：Preparation 只用长 buff 判）。
+    bool PalPrep(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool& done)
+    {
+        done = false;
+        if (!PalBuffUp(ai, s.bot, m, "righteous fury"))
+        {
+            if (TryCastSelf(ai, m, s, "righteous fury"))
+                return true;
+            return false;                     // 学不会/放不出：不假装补上了，交给调用方退回 Maintain
+        }
+        if (PalKeepBuff(ai, m, s, "holy shield"))
+            return true;
+        if (!PalAuraUp(ai, s.bot, m) && TryCastSelf(ai, m, s, "devotion aura"))
+            return true;
+        done = true;
+        return false;
+    }
+
+    // 防护骑的"还要不要 Prep"：只判**长 buff**（正义之怒 / 光环），不拿 10 秒一掉的圣盾当条件。
+    bool PalNeedPrep(PlayerbotAI* ai, Player* bot, BotMem* m)
+    {
+        if (!m || !bot)
+            return false;
+        return !PalBuffUp(ai, bot, m, "righteous fury") || !PalAuraUp(ai, bot, m);
+    }
+
+    // 防护骑的仇恨循环（Maintain）。返回 true = 这一 tick 放了技能。
+    //   顺序 = 站长口径：多目标 consecration → holy shield（掉了补）→ avenger's shield
+    //          → judgement → seal of righteousness + hammer of the righteous（若学会）。
+    //   蓝量：`prot_mana_low`（默认 25%）以下**只留最省的**（审判/圣印/锤子），
+    //        奉献降级到 1 级（与惩戒同一套 `consecration_rank` 口径），复仇者之盾整场停
+    //        （30 秒 CD 的大蓝耗技，蓝紧时把 GCD 让给嘲讽/审判）。
+    bool PalMaintain(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool aoe)
+    {
+        bool acted = false;
+        double const lowManaPct = TP(m, "prot_mana_low", 25.0);
+        bool const lowMana = (double(s.power) < lowManaPct);
+
+        // ① 多目标：奉献（地面 AoE 由技能自身处理落点；`CastSelfCenteredId` 与惩戒/神圣骑同一条路）
+        if (aoe && !lowMana)
+        {
+            uint32 const consMax = SpellId(ai, s.bot, m, "consecration", false);
+            if (consMax && CastSelfCenteredId(ai, m, s, consMax, "consecration"))
+                acted = true;
+        }
+        // ①b 蓝紧时的 1 级奉献：只为了"每只怪都吃到仇恨"，不为了伤害
+        if (!acted && aoe && lowMana && s.power >= float(TP(m, "prot_mana_floor", 10.0)))
+        {
+            double const consRank = TP(m, "consecration_rank", 1.0);
+            uint32 const cons1 = SpellIdAtRank(ai, m, "consecration",
+                uint32(consRank < 1.0 ? 1 : int(consRank)), false);
+            if (cons1 && CastSelfCenteredId(ai, m, s, cons1, "consecration"))
+                acted = true;
+        }
+        // ② 神圣之盾：掉了就补（10 秒周期，挡格/仇恨都靠它）
+        if (!acted && PalKeepBuff(ai, m, s, "holy shield"))
+            acted = true;
+        // ③ 复仇者之盾：弹射由法术自身处理；蓝紧时停
+        if (!acted && !lowMana && CastFirst(ai, m, s, { "avenger's shield" }))
+            acted = true;
+        // ④ 圣印没挂就先挂（审判必须有圣印，否则核心直接拒）
+        if (!acted && !PalAnySealUp(ai, s.bot, m) && TryCastSelf(ai, m, s, "seal of righteousness"))
+            acted = true;
+        // ⑤ 审判（10 秒 CD、不吃蓝 ⇒ 蓝紧时也照打）
+        if (!acted && CastFirst(ai, m, s, { "judgement" }))
+            acted = true;
+        // ⑥ 单体填充：锤子（若学会；TBC 没有 53595 ⇒ id=0 自动跳过）→ 圣印兜底
+        if (!acted && m->palHammerId && CastFirst(ai, m, s, { "hammer of the righteous" }))
+            acted = true;
+        if (!acted && PalKeepBuff(ai, m, s, "seal of righteousness"))
+            acted = true;
+        return acted;
+    }
+
     ai::dpsfsm::TickResult TickTankFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         Player* bot = s.bot;
@@ -10742,6 +11113,9 @@ namespace ai
         uint32 const nowMs = WorldTimer::getMSTime();
         uint32 const now = nowMs ? nowMs : 1;
         TankSampleTaken(m, bot, now);
+        // [2026-11-01 站长口径·防护骑] 可选技能 id 一次结算（见 PalOptionalIds()）
+        if (kind == TankKind::PaladinProt)
+            PalOptionalIds(ai, m);
 
         // 敌人列表与 pack 统计/场景目标同一份过滤：假人场景只有"声明过的假人"，
         //   副本里退回"附近可攻击目标"（不改变原行为）。
@@ -10771,10 +11145,15 @@ namespace ai
             else if (d < freshDist) { freshDist = d; fresh = u; }
         }
 
-        // ---- ① Prep：姿态 / 形态（没有敌人也要补，开打前先站对）----
+        // ---- ① Prep：姿态 / 形态 / 长 buff（没有敌人也要补，开打前先站对）----
         bool needPrep = false;
         if (kind == TankKind::WarriorProt)
             needPrep = (bot->GetShapeshiftForm() != FORM_DEFENSIVESTANCE);
+        else if (kind == TankKind::PaladinProt)
+            // [2026-11-01 站长口径] 防骑没有姿态/形态，"站对"= 正义之怒 + 光环（长 buff）；
+            //   神圣之盾 10 秒一掉，**不**拿它当 Prep 条件（否则 Taunt/Pickup 的窗口会被 Prep 吃掉），
+            //   它的日常维持归 Maintain（`PalMaintain` ②）。
+            needPrep = PalNeedPrep(ai, bot, m);
         else
             needPrep = !TankIsBearForm(bot);
 
@@ -10810,6 +11189,12 @@ namespace ai
                 {
                     acted = TryCastSelf(ai, m, s, "defensive stance");
                 }
+                else if (kind == TankKind::PaladinProt)
+                {
+                    // [2026-11-01 站长口径] 防骑：righteous fury（缺则补）→ holy shield → 光环
+                    bool prepDone = false;
+                    acted = PalPrep(ai, m, s, prepDone);
+                }
                 else
                 {
                     // 已经挂着变形光环却仍判"不在熊形态"时别再刷（与猫德同一条防刷保护）
@@ -10831,6 +11216,35 @@ namespace ai
                     if (CastFirst(ai, m, s, { "shield wall" })) { ++m->tankSurvivals; acted = true; }
                     else if (CastFirst(ai, m, s, { "last stand" })) { ++m->tankSurvivals; acted = true; }
                 }
+                else if (kind == TankKind::PaladinProt)
+                {
+                    // [2026-11-01 站长口径] 防骑：divine protection → `tank_surv_emerg` 第二档
+                    //   lay on hands（**圣疗只留给"真的要死"**）→ holy shield（掉了补）。
+                    //   ⚠ 顺序是实测修正：原来把 holy shield 放在圣疗前面，而神圣之盾 10 秒一掉，
+                    //   于是"真的要死"那一刻总是先用一次 GCD 补盾、圣疗永远轮不到 ——
+                    //   实测第 1 轮主坦 15% 血被两只怪打死（deaths=1），日志里 `lay on hands`
+                    //   一次都没被问过。现在 veryLow 时圣疗**先于**补盾。
+                    if (PalCastSelfRaw(ai, m, s, "divine protection")) { ++m->tankSurvivals; acted = true; }
+                    else if (veryLow && TP(m, "tank_loh", 1.0) >= 1.0
+                        && PalCastSelfRaw(ai, m, s, "lay on hands"))
+                    {
+                        ++m->tankSurvivals;
+                        acted = true;
+                    }
+                    else if (PalKeepBuff(ai, m, s, "holy shield"))
+                        acted = true;
+                    // [2026-11-01 实测修] **保命技这一手放不出时 Hold，不交回 Maintain**：
+                    //   核心 `IsSpellReady()` 把 GCD 也算进去，而坦克几乎每个 GCD 都在放仇恨技 ⇒
+                    //   "进 Survival 那一刻 GCD 正好在转"是常态。原来直接退回 Maintain，那一手就被
+                    //   仇恨循环拿去放奉献/审判（把 GCD 继续占住），保命技永远轮不到 ——
+                    //   实测第 4/6 轮 `divine protection` id=5573 一次都没放出去、主坦 18%→14%→死。
+                    //   Hold 只空这一手，下一 tick GCD 一转好就真放（`holdIntent` 已登记）。
+                    if (!acted && GcdLocked(s))
+                    {
+                        m->state = State::Survival;
+                        return HoldWait(m, "pal-survival-gcd");
+                    }
+                }
                 else
                 {
                     if (CastFirst(ai, m, s, { "frenzied regeneration" })) { ++m->tankSurvivals; acted = true; }
@@ -10850,7 +11264,19 @@ namespace ai
                 // ① 新怪已经在打别人（DPS 先手/加怪）⇒ 嘲讽最快
                 if (freshDist <= float(TP(m, "tank_taunt_range", 28.0)) && fresh->GetVictim())
                 {
-                    if (CastFirst(ai, m, s, { tauntName }, fresh))
+                    // [2026-11-01 站长口径] 防骑没有 taunt/growl：走 `PalTaunt()` 的三档（rd 优先）
+                    if (kind == TankKind::PaladinProt)
+                    {
+                        char const* tsrc = nullptr;
+                        if (PalTaunt(ai, m, s, fresh, &tsrc))
+                        {
+                            ++m->tankTaunts;
+                            ++m->tankPickups;
+                            acted = true;
+                            break;
+                        }
+                    }
+                    else if (CastFirst(ai, m, s, { tauntName }, fresh))
                     {
                         ++m->tankTaunts;
                         ++m->tankPickups;
@@ -10858,10 +11284,17 @@ namespace ai
                         break;
                     }
                 }
-                // ② 远程拉：战士 投掷/射击；熊 精灵之火（凶猛）—— 拉进近战位再叠仇恨
+                // ② 远程拉：战士 投掷/射击；熊 精灵之火（凶猛）；防骑 复仇者之盾 → 审判
+                //    [2026-11-01 站长口径] 复仇者之盾的**弹射由法术自身处理**（不在这里选第二目标）；
+                //    CD 中就审判（10 秒、不吃蓝），再不行回落到嘲讽（上面 ① 已经试过一次）。
                 if (kind == TankKind::WarriorProt)
                 {
                     if (CastFirst(ai, m, s, { "shoot", "throw" }, fresh)) { ++m->tankPickups; acted = true; }
+                }
+                else if (kind == TankKind::PaladinProt)
+                {
+                    if (CastFirst(ai, m, s, { "avenger's shield" }, fresh)) { ++m->tankPickups; acted = true; }
+                    else if (CastFirst(ai, m, s, { "judgement" }, fresh)) { ++m->tankPickups; acted = true; }
                 }
                 else if (CastFirst(ai, m, s, { "faerie fire (feral)" }, fresh)) { ++m->tankPickups; acted = true; }
                 // ③ 拉不到（没远程/够不着）：按常规仇恨打，交给上层走位去接触
@@ -10876,6 +11309,23 @@ namespace ai
                     break;
                 }
                 // **只对"确实在打别人"的目标嘲讽**（站点口径：对已经在自己身上的目标无效）
+                if (kind == TankKind::PaladinProt)
+                {
+                    // [2026-11-01 站长口径] 防骑：righteous defense（对目标直接放，放不出退真实语义）
+                    //   → hand of reckoning（若学会）。两条都不行就照常打仇恨（嘲讽不是唯一手段）。
+                    if (lostDist <= float(TP(m, "tank_taunt_range", 28.0)))
+                    {
+                        char const* tsrc = nullptr;
+                        if (PalTaunt(ai, m, s, lost, &tsrc))
+                        {
+                            ++m->tankTaunts;
+                            acted = true;
+                            break;
+                        }
+                    }
+                    st = State::Maintain;
+                    break;
+                }
                 if (lostDist <= float(TP(m, "tank_taunt_range", 28.0))
                     && CastFirst(ai, m, s, { tauntName }, lost))
                 {
@@ -10935,6 +11385,12 @@ namespace ai
                         acted = true;
                 }
             }
+            else if (kind == TankKind::PaladinProt)
+            {
+                // [2026-11-01 站长口径] 防骑：动作表见 `PalMaintain()`（多目标奉献 → 圣盾 →
+                //   复仇者之盾 → 审判 → 圣印/锤子；蓝 < `prot_mana_low` 只留最省的几手）。
+                acted = PalMaintain(ai, m, s, aoe);
+            }
             else
             {
                 // 熊：横扫（多目标）→ 裂伤(6s) → 割伤(叠 5) → 割伤/槌击填充
@@ -10968,14 +11424,20 @@ namespace ai
         LogTransition(ai, m, s, st);
 
         // ---- ④ 验收日志：每 10 秒一条（字段固定，脚本可直接切）----
+        //   [2026-11-01 站长口径·防护骑] 新增两个字段，**只加不改**（旧脚本按前缀切也能继续用）：
+        //     kind=   —— 这一轮按哪张动作表跑（war / bear / protpal）；
+        //     taunt=  —— 最近一次**真的放出去**的嘲讽来源（rd / rd_help / reckoning / none）。
+        //                战/熊恒 none（它们的 taunt/growl 由 `CastFirst` 直接放，来源单一不必细分）；
+        //                防骑 rd = 按站长口径直接对敌人放成功，rd_help = 退到"对 victim 放"成功。
         if (!m->tankLastLog || WorldTimer::getMSTimeDiff(m->tankLastLog, now) >= 10000)
         {
             m->tankLastLog = now;
             int nAdds = 0;
             float worstLead = 0.0f, minMine = 0.0f;
             TankLead(bot, adds, nAdds, worstLead, minMine);
-            sLog.outError("[DPSFSM-TANK] %s state=%s adds=%d onme=%d lead=%.2f hp=%.0f inc=%.0f",
-                bot->GetName(), ai::dpsfsm::StateName(m->state), nAdds, onMe, double(worstLead),
+            sLog.outError("[DPSFSM-TANK] %s state=%s kind=%s taunt=%s adds=%d onme=%d lead=%.2f hp=%.0f inc=%.0f",
+                bot->GetName(), ai::dpsfsm::StateName(m->state), TankKindName(kind), m->tankLastTauntSrc,
+                nAdds, onMe, double(worstLead),
                 double(bot->GetHealthPercent()), double(m->tankDmgRate));
             (void)minMine;      // 只做诊断预留（"最少的那只怪有多少仇恨"），不进日志格式
         }
@@ -11101,17 +11563,20 @@ namespace ai
             }
 
             // ==================================================================
-            // [2026-11-01 站长口径] **坦克派发（mode=5 · 防护战 / 熊德 · 第 1 层）**
+            // [2026-11-01 站长口径] **坦克派发（mode=5 · 防护战 / 熊德 / 防护骑 · 第 1 层）**
             //   放在三道门**之前**，理由与治疗派发同一组：
-            //     ① `no-victim`：坦克常常在开打前就要补姿态/变熊（Prep），加怪接管也要在
+            //     ① `no-victim`：坦克常常在开打前就要补姿态/变熊/补正义之怒（Prep），加怪接管也要在
             //        "自己没有 victim" 时先嘲讽/远程拉（Pickup）；
             //     ② `stunned/rooted`：被控时核心自己处理，坦克的保命/嘲讽没有额外语义；
             //     ③ `坦/奶让位`：那道门本来就把所有坦克挡在 DPS 状态机外 —— 坦克图必须排在它之前。
-            //   **只接防护战 + 熊德**：圣骑士 `Spec::Protection`（防骑）不在这张图里 ⇒ 继续 Decline
-            //   （legacy `TickPaladin` 对非惩戒直接返回 false）。mode != 5 ⇒ 原样落回 legacy。
+            //   [2026-11-01 站长口径] **防护骑接进来了**：`CLASS_PALADIN && Spec::Protection`
+            //   与惩戒骑的 `Spec::Retribution`（走 TickRetFsm）**并存但不混** —— 这里按
+            //   "职业 + 专精"这一对判，`TankKindOf()` 再兜一次（Spec::Protection 战士/圣骑士同值）。
+            //   mode != 5 ⇒ 原样落回 legacy（`TickPaladin` 对非惩戒直接返回 false）。
             // ==================================================================
             if ((bot->getClass() == CLASS_WARRIOR && m->spec == Spec::Protection)
-                || (bot->getClass() == CLASS_DRUID && m->spec == Spec::Feral))
+                || (bot->getClass() == CLASS_DRUID && m->spec == Spec::Feral)
+                || (bot->getClass() == CLASS_PALADIN && m->spec == Spec::Protection))
             {
                 TankKind const tk = TankKindOf(ai, m);
                 if (tk != TankKind::None)
@@ -11279,8 +11744,9 @@ namespace ai
             bool const mageFsm = (m->spec == Spec::Frost || m->spec == Spec::Arcane
                 || m->spec == Spec::Fire);
             // [2026-11-01 站长口径] 惩戒骑接进 mode=5（第七张职业图）：`TickRetFsm`。
-            //   **只接 Retribution**：Protection/Holy 继续走 legacy `TickPaladin`（并在那里 Decline），
-            //   mode=0/1/2/3/4 的惩戒也照旧走 `TickPaladin`，行为不变。
+            //   **只接 Retribution**：Protection 已经在**上面的坦克派发**里接管（防骑）、
+            //   Holy 走治疗派发（神圣骑），这里都不碰；mode=0/1/2/3/4 的惩戒照旧走
+            //   legacy `TickPaladin`，行为不变。
             bool const retFsm = (m->spec == Spec::Retribution);
             // [2026-11-01 站长口径] 萨满接进 mode=5（第八张职业图）：`TickShamanFsm`。
             //   **元素 / 增强**进图；**恢复（Restoration）不做 DPS**（治疗以后单独做）⇒ 不进图，
