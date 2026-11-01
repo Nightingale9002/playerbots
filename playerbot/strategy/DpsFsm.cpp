@@ -3,6 +3,11 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/actions/AttackAction.h"
+// [2026-11-02 PERF] 共享扫描要**直接**做一次网格遍历（而不是每个 bot 各取一遍 `possible targets`），
+//   过滤口径复用 PossibleTargetsValue::IsValid（与 `possible targets` 逐条一致）。
+#include "playerbot/strategy/values/PossibleTargetsValue.h"
+#include "Grids/GridNotifiers.h"
+#include "Grids/GridNotifiersImpl.h"
 #include "Grids/CellImpl.h"
 #include "Maps/Map.h"
 #include "Entities/Pet.h"           // [2026-10-31 站长口径] 猎人宠物生命周期守卫要现场建宠物（Pet::Create）
@@ -17,6 +22,7 @@
 #include "Movement/MoveSpline.h"    // 诊断用：pet->movespline->Finalized()（Unit.h 里只有前向声明）
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -543,6 +549,29 @@ namespace
         uint32 lastDmgLog = 0;                      // [DPSFSM-DMG] 的 10 秒节流
         // ---- [2026-11-01 站长口径] B. NearbyEnemy 的日志节流 ----
         uint32 lastNearLog = 0;                     // [DPSFSM-NEAR] 的 10 秒节流
+        // ---- [2026-11-02 PERF] 三道闸门 + 300ms 缓存 + 度量 ----
+        //   闸门 B：上次**真正做出决策**的时刻（毫秒）。读条/GCD 那两 tick 不推进它 ——
+        //   否则 GCD 一转好还要再白等 100ms。
+        uint32 lastDecisionMs = 0;
+        //   本 tick 是否过了全部闸门（只给度量用：avg_us 只统"真决策"，不被早退稀释）
+        bool decisionThisTick = false;
+        //   闸门 C：快照里那批**贵数据**（pack/engaged/仇恨/nearby）的统一缓存（300ms）。
+        //   ⚠️ 缓存带 target 指纹：换目标必须立刻重算（仇恨/nearby 都是"对当前目标"的口径）。
+        uint32 scanCacheAt = 0;
+        bool scanCacheValid = false;
+        ObjectGuid scanCacheTarget;
+        int cPack10 = 0, cPack30 = 0, cEng10 = 0, cEng30 = 0;
+        float cMyThreat = 0.0f, cTankThreat = 0.0f;
+        bool cTankAlive = false;
+        std::vector<Snapshot::NearbyEnemy> cNearby;
+        //   度量（`[DPSFSM-PERF]` 每 30 秒一条）：
+        //     perfSumUs/perfMaxUs —— 决策耗时（微秒，std::chrono）；perfDecisions —— 决策次数；
+        //     perfScans —— 这只 bot **实际**发动过的扫描次数（共享刷新 + 回退自扫）。
+        uint32 perfLogAt = 0;
+        uint64 perfSumUs = 0;
+        uint32 perfMaxUs = 0;
+        uint32 perfDecisions = 0;
+        uint32 perfScans = 0;
     };
 
     std::mutex s_disabledMutex;
@@ -1119,6 +1148,111 @@ namespace
         return u->GetVictim() != nullptr;
     }
 
+    // ==========================================================================
+    // [2026-11-02 PERF·共享扫描] 一个副本实例 300ms 只做一次"可能的敌对目标"扫描
+    // --------------------------------------------------------------------------
+    // 病根（实测）：bot AI 全在 mangosd **世界线程**里跑，而 `BuildSnapshot` 每 tick 至少 4 次
+    //   `CountHostilesNear`，每次都要重新取一遍 `possible targets` —— 那是
+    //   `Cell::VisitAllObjects` 全网格遍历 + 每单位 `PossibleTargetsValue::IsValid()`
+    //   （含 `CanFreeAttack`）。250 bot 时决策延迟从 ~0.5s 涨到数秒 ⇒ 治疗/坦克反应不过来
+    //   （同图 600s 死 2~3 → 900s 死 365）。
+    //
+    // 做法（站长口径 ②）：
+    //   · key = **`mapId << 32 | instanceId`** —— 不同副本实例**绝不共用**；换图/换实例 = 换 key，
+    //     旧条目自然失效（另加时间过期，见 scan_interval_ms）；
+    //   · 一批里**第一个到达的 bot 抢刷新权**做一次网格遍历，其余 bot 直接读同一份 guid 列表；
+    //   · 每个消费者用**自己的**地图把 guid 解成 Unit*，再按**自己的**距离 / 场景目标 / 进战过滤
+    //     —— 过滤口径与旧 `possible targets` 那份逐条一致（IsValid 是同一个函数）；
+    //   · 为什么存 guid 不存 Unit*：怪的指针可能在 300ms 内失效（despawn），guid 每次现解更安全；
+    //   · 距离护栏：扫描半径 `scan_radius`(默认 60)，只有 `距离(自己, 扫描中心) + need <= scan_radius`
+    //     才敢复用 —— 保证"我可能看到的怪"一个不漏；够不上就**回退**自己扫一次（宁可贵，不丢怪），
+    //     而且回退时**不**抢刷新权（否则 25 个 bot 互相覆盖，谁也复用不到）。
+    // ==========================================================================
+    struct SharedScan
+    {
+        uint32 atMs = 0;
+        float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+        std::vector<ObjectGuid> units;
+    };
+    std::mutex s_scanMutex;
+    std::map<uint64, SharedScan> s_scanByInstance;
+
+    uint64 InstanceScanKey(Player* bot)
+    {
+        return (uint64(bot->GetMapId()) << 32) | uint64(bot->GetInstanceId() & 0xFFFFFFFFu);
+    }
+
+    void ScanHostilesOnce(Player* bot, float radius, std::vector<ObjectGuid>& out)
+    {
+        std::list<Unit*> targets;
+        MaNGOS::AnyUnitInObjectRangeCheck check(bot, radius);
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(targets, check);
+        Cell::VisitAllObjects(bot, searcher, radius);
+        for (std::list<Unit*>::iterator it = targets.begin(); it != targets.end(); ++it)
+        {
+            Unit* u = *it;
+            if (!u || u->GetTypeId() != TYPEID_UNIT)
+                continue;
+            // 与 `possible targets` 逐条一致：存活 / 敌对 / 可攻击 / 可见（非战斗目标才查视线）/ 可自由接近
+            if (!ai::PossibleTargetsValue::IsValid(u, bot, false))
+                continue;
+            out.push_back(u->GetObjectGuid());
+        }
+    }
+
+    // 取（必要时刷新）本实例的共享敌对列表；false = 用不了共享（调用方回退旧路径）。
+    bool SharedHostiles(PlayerbotAI* ai, Player* bot, float need, std::vector<Unit*>& out)
+    {
+        if (!ai || !bot || !bot->IsInWorld() || !bot->GetMap() || ai->GetBot() != bot)
+            return false;
+        BotMem* m = Mem(bot->GetGUIDLow());
+        uint32 nowMs = WorldTimer::getMSTime();
+        if (!nowMs)
+            nowMs = 1;
+        uint32 const interval = uint32(TP(m, "scan_interval_ms", 300.0));
+        if (!interval)                        // 0 = 关掉共享扫描（A/B 用，回旧路径）
+            return false;
+        float const radius = float(TP(m, "scan_radius", 60.0));
+        if (need > radius || radius <= 0.0f)
+            return false;
+
+        Map* map = bot->GetMap();
+        uint64 const key = InstanceScanKey(bot);
+
+        std::lock_guard<std::mutex> lock(s_scanMutex);
+        SharedScan& e = s_scanByInstance[key];
+        bool const fresh = (e.atMs != 0 && WorldTimer::getMSTimeDiff(e.atMs, nowMs) < interval);
+        if (fresh)
+        {
+            float const dx = bot->GetPositionX() - e.cx;
+            float const dy = bot->GetPositionY() - e.cy;
+            float const dz = bot->GetPositionZ() - e.cz;
+            float const lim = radius - need;
+            if (dx * dx + dy * dy + dz * dz > lim * lim)
+                return false;                 // 离扫描中心太远：为保证不漏怪，自己去扫（不抢刷新权）
+        }
+        else
+        {
+            // 抢到刷新权：锁内做一次网格遍历（~一次老 `possible targets` 的代价 / 300ms / 实例）
+            e.atMs = nowMs;
+            e.cx = bot->GetPositionX();
+            e.cy = bot->GetPositionY();
+            e.cz = bot->GetPositionZ();
+            e.units.clear();
+            ScanHostilesOnce(bot, radius, e.units);
+            ++m->perfScans;
+        }
+
+        out.clear();
+        out.reserve(e.units.size());
+        for (size_t i = 0; i < e.units.size(); ++i)
+        {
+            if (Unit* u = map->GetUnit(e.units[i]))
+                out.push_back(u);
+        }
+        return true;
+    }
+
     int CountHostilesNear(PlayerbotAI* ai, Player* bot, float range, std::vector<Unit*>* out = nullptr,
                           bool engagedOnly = false)
     {
@@ -1135,13 +1269,26 @@ namespace
         }
         if (!bot || !bot->GetMap() || !ai)
             return 0;
-        auto* value = ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid>>("possible targets");
-        if (!value)
-            return 0;
-        int n = 0;
-        for (ObjectGuid const& guid : value->Get())
+
+        // [2026-11-02 PERF] 候选列表优先走**共享扫描**（一个实例 300ms 一次）；
+        //   够不上（离扫描中心太远 / 共享被关）才回退旧路径：自己取一遍 `possible targets`。
+        std::vector<Unit*> list;
+        if (!SharedHostiles(ai, bot, range, list))
         {
-            Unit* u = bot->GetMap()->GetUnit(guid);
+            auto* value = ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid>>("possible targets");
+            if (!value)
+                return 0;
+            ++Mem(bot->GetGUIDLow())->perfScans;
+            for (ObjectGuid const& guid : value->Get())
+            {
+                if (Unit* u = bot->GetMap()->GetUnit(guid))
+                    list.push_back(u);
+            }
+        }
+
+        int n = 0;
+        for (Unit* u : list)
+        {
             if (!u || !u->IsAlive() || u->GetTypeId() != TYPEID_UNIT)
                 continue;
             if (bot->GetDistance(u) > range)
@@ -1405,6 +1552,46 @@ namespace
         return ms;
     }
 
+    // ==========================================================================
+    // [2026-11-02 PERF] 猎人自动射击时间轴的**观测**单独抽出来
+    // --------------------------------------------------------------------------
+    // 为什么：闸门 A（读条/GCD 中）会跳过整张快照，而平射恰好发生在 GCD 窗口里。
+    //   观测窗口一旦被拉长到两发，`autoShotInterval` 就记成 ~4s ⇒ `autoRemainMs` 全错
+    //   ⇒ 猎人 Maintain 的排程（"这一手能塞进平射窗口吗"）整体漂移。
+    //   所以这一小段（只读两个计数，极便宜）在**所有** tick 上都要跑，包括被闸门挡住的 tick。
+    // ==========================================================================
+    void HunterObserveAutoShot(Player* bot, BotMem* m)
+    {
+        if (!bot || !m)
+            return;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        uint32 const shotCount = uint32(bot->botSpellCounts[75]);
+        bool const repeatPresent = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
+        if (shotCount != m->autoShotCount)
+        {
+            // 观测周期：只有 ≥1000ms 的间隔才算"平射冷却"（核心 2s，打断后约 2.5s）；
+            //   重挂后第一发的 ~500ms 起手不算周期，观测完把间隔恢复成核心默认 2000。
+            if (m->autoShotCount && m->autoShotAt)
+            {
+                uint32 const delta = WorldTimer::getMSTimeDiff(m->autoShotAt, safeNow);
+                if (delta >= 1000 && delta <= 6000)
+                    m->autoShotInterval = delta;
+                else if (delta < 1000)
+                    m->autoShotInterval = 2000;
+            }
+            m->autoShotCount = shotCount;
+            m->autoShotAt = safeNow;
+        }
+        else if (repeatPresent && !m->autoRepeatWasPresent)
+        {
+            // 刚重挂上：核心先走 0.5s 起手（m_AutoRepeatFirstCast），第一发约 500ms 后
+            m->autoShotAt = safeNow;
+            m->autoShotInterval = 500;
+        }
+        m->autoRepeatWasPresent = repeatPresent;
+    }
+
     void BuildSnapshot(PlayerbotAI* ai, BotMem* m, Snapshot& s)
     {
         Player* bot = ai->GetBot();
@@ -1447,46 +1634,88 @@ namespace
             s.dist = bot->GetDistance(s.target);
         }
 
-        s.pack10 = CountHostilesNear(ai, bot, 10.0f);
-        s.pack30 = CountHostilesNear(ai, bot, 30.0f);
-        // [2026-11-02 修] "已进战"计数（仅 AoE 判据用；参数关掉时不跑这两条扫描）。
-        if (TP(m, "aoe_require_engaged", 1.0) >= 1.0)
+        // ==================================================================
+        // [2026-11-02 PERF] 闸门 C：**贵数据统一 300ms 缓存**（站长口径：与真人反应时间同量级）
+        //   贵 = 敌对计数（老路径 = 每项一次全网格遍历）、仇恨、nearby 列表（每只怪还要刷 DoT 剩余）。
+        //   便宜且必须每 tick 新的（血量/资源/读条/距离/猎人时间轴）在上面已经现算。
+        //   ⚠️ 缓存带 target 指纹：换目标必重算（threat/nearby 都是"对当前目标"的口径）。
+        //   ⚠️ 救急判断（低血/近身）不走这里：它们读的是上面那几个直接字段，不受缓存影响。
+        //   `snapshot_cache_ms=0` 可整体回滚成旧行为（每 tick 全量算）。
+        // ==================================================================
+        uint32 const snapNowMs = WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1;
+        uint32 const cacheMs = uint32(TP(m, "snapshot_cache_ms", 300.0));
+        ObjectGuid const snapTargetGuid = s.target ? s.target->GetObjectGuid() : ObjectGuid();
+        bool const countsFresh = cacheMs && m->scanCacheValid && m->scanCacheAt
+            && m->scanCacheTarget == snapTargetGuid
+            && WorldTimer::getMSTimeDiff(m->scanCacheAt, snapNowMs) < cacheMs;
+        if (countsFresh)
         {
-            s.engaged10 = CountEngagedHostilesNear(ai, bot, 10.0f);
-            s.engaged30 = CountEngagedHostilesNear(ai, bot, 30.0f);
+            s.pack10 = m->cPack10;
+            s.pack30 = m->cPack30;
+            s.engaged10 = m->cEng10;
+            s.engaged30 = m->cEng30;
+            s.myThreat = m->cMyThreat;
+            s.tankThreat = m->cTankThreat;
+            s.tankAlive = m->cTankAlive;
         }
-
-        // [2026-10-31 站长口径] 仇恨三档的输入：自己 / 坦克对**同一个目标**的威胁值。
-        //   坦克认定直接复用 PlayerbotAI::IsTank（与 AttackAction 同一份口径），不自己按职业/天赋猜；
-        //   没有队伍、队伍里没坦克、坦克和我不打同一个目标 ⇒ tankAlive=false / tankThreat=0
-        //   ⇒ EvalThreat 恒 Open（假人场景绝不能因为"没仇恨"把 DPS 卡住）。
-        s.myThreat = 0.0f;
-        s.tankThreat = 0.0f;
-        s.tankAlive = false;
-        if (s.target)
+        else
         {
-            // [2026-11-01 实测修正] **方向反了**：bot->getThreatManager() 是"我自己的威胁表"
-            //   （玩家侧根本没有条目，恒 0）；正确读法是"目标（怪）的威胁表里我对它的值"。
-            //   旧写法让 myThreat/tankThreat 双双为 0 ⇒ EvalThreat 恒 Open ⇒ 仇恨纪律整段空转。
-            s.myThreat = s.target->getThreatManager().getThreat(bot);
-            if (Group* group = bot->GetGroup())
+            s.pack10 = CountHostilesNear(ai, bot, 10.0f);
+            s.pack30 = CountHostilesNear(ai, bot, 30.0f);
+            // [2026-11-02 修] "已进战"计数（仅 AoE 判据用；参数关掉时不跑这两条扫描）。
+            if (TP(m, "aoe_require_engaged", 1.0) >= 1.0)
             {
-                Player* tank = nullptr;
-                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                s.engaged10 = CountEngagedHostilesNear(ai, bot, 10.0f);
+                s.engaged30 = CountEngagedHostilesNear(ai, bot, 30.0f);
+            }
+            else
+            {
+                s.engaged10 = 0;
+                s.engaged30 = 0;
+            }
+
+            // [2026-10-31 站长口径] 仇恨三档的输入：自己 / 坦克对**同一个目标**的威胁值。
+            //   坦克认定直接复用 PlayerbotAI::IsTank（与 AttackAction 同一份口径），不自己按职业/天赋猜；
+            //   没有队伍、队伍里没坦克、坦克和我不打同一个目标 ⇒ tankAlive=false / tankThreat=0
+            //   ⇒ EvalThreat 恒 Open（假人场景绝不能因为"没仇恨"把 DPS 卡住）。
+            s.myThreat = 0.0f;
+            s.tankThreat = 0.0f;
+            s.tankAlive = false;
+            if (s.target)
+            {
+                // [2026-11-01 实测修正] **方向反了**：bot->getThreatManager() 是"我自己的威胁表"
+                //   （玩家侧根本没有条目，恒 0）；正确读法是"目标（怪）的威胁表里我对它的值"。
+                //   旧写法让 myThreat/tankThreat 双双为 0 ⇒ EvalThreat 恒 Open ⇒ 仇恨纪律整段空转。
+                s.myThreat = s.target->getThreatManager().getThreat(bot);
+                if (Group* group = bot->GetGroup())
                 {
-                    Player* member = ref->getSource();
-                    if (member && member != bot && sServerFacade.IsAlive(member) && PlayerbotAI::IsTank(member))
+                    Player* tank = nullptr;
+                    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
                     {
-                        tank = member;
-                        break;
+                        Player* member = ref->getSource();
+                        if (member && member != bot && sServerFacade.IsAlive(member) && PlayerbotAI::IsTank(member))
+                        {
+                            tank = member;
+                            break;
+                        }
+                    }
+                    if (tank)
+                    {
+                        s.tankAlive = true;
+                        s.tankThreat = s.target->getThreatManager().getThreat(tank);   // 同一条修正：从怪的威胁表里读
                     }
                 }
-                if (tank)
-                {
-                    s.tankAlive = true;
-                    s.tankThreat = s.target->getThreatManager().getThreat(tank);   // 同一条修正：从怪的威胁表里读
-                }
             }
+            m->cPack10 = s.pack10;
+            m->cPack30 = s.pack30;
+            m->cEng10 = s.engaged10;
+            m->cEng30 = s.engaged30;
+            m->cMyThreat = s.myThreat;
+            m->cTankThreat = s.tankThreat;
+            m->cTankAlive = s.tankAlive;
+            m->scanCacheTarget = snapTargetGuid;
+            m->scanCacheAt = snapNowMs;
+            m->scanCacheValid = true;
         }
 
         // [2026-10-31] 猎人时间轴字段：只在猎人 spec 计算（别的职业不碰这几个成员，
@@ -1497,34 +1726,11 @@ namespace
             //   ⚠️ `getAttackTimer(RANGED_ATTACK)` 在本核心是**死值**（见 BotMem 里的取证注释），
             //   只保留原始值进诊断；真正可用的剩余时间由"自动射击计数 + 观测周期"反推。
             uint32 const rawTimer = bot->getAttackTimer(RANGED_ATTACK);
-            bool const repeatPresent = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
             uint32 const nowMs = WorldTimer::getMSTime();
             uint32 const safeNow = nowMs ? nowMs : 1;
-
-            // 核心每发自动射击都会在 `_UpdateAutoRepeatSpell` 里 ++botSpellCounts[75]
-            uint32 const shotCount = uint32(bot->botSpellCounts[75]);
-            if (shotCount != m->autoShotCount)
-            {
-                // 观测周期：只有 ≥1000ms 的间隔才算"平射冷却"（核心 2s，打断后约 2.5s）；
-                //   重挂后第一发的 ~500ms 起手不算周期，观测完把间隔恢复成核心默认 2000。
-                if (m->autoShotCount && m->autoShotAt)
-                {
-                    uint32 const delta = WorldTimer::getMSTimeDiff(m->autoShotAt, safeNow);
-                    if (delta >= 1000 && delta <= 6000)
-                        m->autoShotInterval = delta;
-                    else if (delta < 1000)
-                        m->autoShotInterval = 2000;
-                }
-                m->autoShotCount = shotCount;
-                m->autoShotAt = safeNow;
-            }
-            else if (repeatPresent && !m->autoRepeatWasPresent)
-            {
-                // 刚重挂上：核心先走 0.5s 起手（m_AutoRepeatFirstCast），第一发约 500ms 后
-                m->autoShotAt = safeNow;
-                m->autoShotInterval = 500;
-            }
-            m->autoRepeatWasPresent = repeatPresent;
+            bool const repeatPresent = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) != nullptr;
+            // [2026-11-02 PERF] 观测逻辑抽到 HunterObserveAutoShot()（闸门 A 的 tick 也要跑它）
+            HunterObserveAutoShot(bot, m);
 
             if (!repeatPresent || !m->autoShotAt)
                 s.autoRemainMs = 0;
@@ -1560,7 +1766,15 @@ namespace
         // [2026-11-01 站长口径] **B. NearbyEnemy**：只在多目标专精里填（别的专精第一行就 return），
         //   紧随其后打 [DPSFSM-NEAR]（10 秒节流、前 3 只）。放在快照的最后，是为了让"填表"与
         //   "用表"看到**同一份**局面（多目标铺场直接读 s.nearby，不再自己去扫一遍）。
-        BuildNearbyEnemies(ai, m, s);
+        //   [2026-11-02 PERF] 与上面同一份 300ms 缓存：每只怪还要刷一遍 DoT 剩余（`TargetAuraRemain`
+        //   按法术链逐个 GetSpellAuraHolder），250 bot 时这笔账比网格遍历还贵。
+        if (countsFresh)
+            s.nearby = m->cNearby;
+        else
+        {
+            BuildNearbyEnemies(ai, m, s);
+            m->cNearby = s.nearby;
+        }
         NearbyLogTick(m, s);
     }
 
@@ -12729,6 +12943,7 @@ namespace ai
             // [2026-11-01 站长口径] "有意空着"的登记也每 tick 重来：`HoldWait()` 只对本 tick 有效，
             //   Tick() 的兜底读它（见派发处"Hold 的通用兜底"）。
             m->holdIntent = nullptr;
+            m->decisionThisTick = false;    // [2026-11-02 PERF] 度量：本 tick 是否真的做出了决策
             ReloadTune();
 
             // [2026-11-01 站长口径] A. **per-spell 伤害账本**（每 tick 结算一次，10 秒出一次账）：
@@ -12738,9 +12953,56 @@ namespace ai
             DmgLogTick(m, bot);
 
             uint32 const hbNow = WorldTimer::getMSTime();
-            bool const hbDue = (!m->hbLast || WorldTimer::getMSTimeDiff(m->hbLast, hbNow ? hbNow : 1) >= 10000);
+            // [2026-11-02 PERF] 心跳从 10s 改 **30s**：250 bot 时 10s 一条 = 25 行/秒的 I/O，
+            //   而且这行要拼 victim 名字/光环表大小，全在**世界线程**里做。
+            bool const hbDue = (!m->hbLast || WorldTimer::getMSTimeDiff(m->hbLast, hbNow ? hbNow : 1) >= 30000);
             if (hbDue)
                 m->hbLast = hbNow ? hbNow : 1;
+
+            // ==================================================================
+            // [2026-11-02 PERF] **闸门 A + B：所有专精共用的唯一入口**
+            // ------------------------------------------------------------------
+            // 病根：每个专精的派发各建一次 `BuildSnapshot()`，而快照里最贵的是敌对扫描
+            //   （老路径 = 每 tick 4 次全网格遍历）。读条中和 GCD 里**什么技能都插不进去**，
+            //   所以这两类 tick 连快照都不该建。
+            //   A. `casting || HasGCD(nullptr)` ⇒ 立即返回：
+            //      ⚠ 这是"占住施法闸门 + 立即返回"，**不是** Hold：返回 false 后，
+            //      `Tick()` 里 mode=5 战斗中仍会 `owns=true`（`fsm_own_cast_combat`），
+            //      引擎照样不许施法，但走位/平追/喝水照旧归引擎。
+            //   B. 100ms 节流：即使 GCD 空着，决策也不必比真人手速更快。
+            //      `lastDecisionMs` 只在**真的做决策**时推进（读条/GCD 那两类不推进），
+            //      所以 GCD 一转好第一 tick 立刻就能决策，不会白等。
+            //   `decision_throttle_ms=0` / `gate_gcd=0` 可分别回滚这两道闸（A/B 用）。
+            // ==================================================================
+            if (m->mode == int(DecisionMode::Fsm))
+            {
+                bool const gateGcd = TP(m, "gate_gcd", 1.0) >= 1.0;
+                if (gateGcd)
+                {
+                    bool const castingNow = bot->IsNonMeleeSpellCasted(false, false, true);
+                    bool const gcdNow = bot->HasGCD(nullptr);
+                    if (castingNow || gcdNow)
+                    {
+                        // [2026-11-02 PERF] 猎人平射观测**不能**跟着快照一起跳过（见
+                        //   HunterObserveAutoShot 的注释：观测窗口拉长会把 autoRemainMs 算错）。
+                        if (IsHunterSpec(m->spec))
+                            HunterObserveAutoShot(bot, m);
+                        // 这里**不调 NoteBail**：读条/GCD 是每 tick 的常态，而 NoteBail 按"原因变化
+                        // 且 5 秒内没打过"才输出 ⇒ 三个原因来回切会变成刷屏（250 bot × 世界线程）。
+                        return false;
+                    }
+                }
+                uint32 const gateNowMs = WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1;
+                uint32 const throttleMs = uint32(TP(m, "decision_throttle_ms", 100.0));
+                if (throttleMs && m->lastDecisionMs
+                    && WorldTimer::getMSTimeDiff(m->lastDecisionMs, gateNowMs) < throttleMs)
+                {
+                    // 同上：节流是常态，不调 NoteBail（否则与 gate-casting 交替刷屏）
+                    return false;
+                }
+                m->lastDecisionMs = gateNowMs;
+                m->decisionThisTick = true;          // 度量：[DPSFSM-PERF] 只统"真决策"
+            }
 
             // [2026-11-01 站长口径] **专精判定上移到所有"必须进战斗"的门之前**。
             //   原来它排在 no-victim / 坦奶让位之后 ⇒ 治疗分支根本走不到（治疗者常常没有 victim）。
@@ -13093,6 +13355,15 @@ namespace ai
 
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
+                // [2026-11-02 PERF] ④ **快速返回**：扫描已经拿到结论（附近一个活着的敌对都没有、
+                //   自己也没有 victim）⇒ 立刻 Decline，不再往每个专精的候选表里逐项做
+                //   射程/冷却/资源检查（那些检查每 tick 要做几十次 SpellId + HasGCD 查询）。
+                //   只在这个"确定没事可做"的局面下早退，任何有目标的局面行为不变。
+                if (!s.target && s.pack30 <= 0)
+                {
+                    NoteBail(bot, "no-hostiles");
+                    return false;
+                }
                 // [2026-10-31 站长口径] 三态返回：Acted=我出手了；Hold=我有意空着（引擎也别插）；
                 //   Decline=我不处理，交回引擎（走位/追击/开怪/喝水）。
                 //   改成 if/else 链而不是嵌套三元：专精越加越多，三元的括号已经很难数
@@ -13217,6 +13488,8 @@ namespace ai
     //   返回值 = "这一 tick 谁占着**施法闸门**"，不等于"我放了技能"（后者是 DidCastThisTick）。
     bool Tick(PlayerbotAI* ai)
     {
+        // [2026-11-02 PERF] 决策耗时用 steady_clock（毫秒级 getMSTime 量不出微秒口径）
+        auto const perfT0 = std::chrono::steady_clock::now();
         bool const handled = TickInner(ai);
         if (!ai || !ai->GetBot())
             return handled;
@@ -13224,6 +13497,37 @@ namespace ai
         Player* bot = ai->GetBot();
         uint32 const guid = bot->GetGUIDLow();
         BotMem* m = Mem(guid);
+
+        // ---- [2026-11-02 PERF] 度量：每个 bot 每 30 秒一条 ----
+        //   `avg_us` 只统计**过了闸门**的真决策（读条/GCD/节流早退不计，否则会被稀释成个位数）；
+        //   `scans` = 这只 bot 实际发动的扫描次数（= 抢到共享刷新权 + 回退自扫），
+        //   用它和 `decisions` 的比值直接看出"共享扫描有没有真的把扫描摊薄"。
+        if (m->decisionThisTick)
+        {
+            long long const us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - perfT0).count();
+            m->perfSumUs += uint64(us);
+            if (uint32(us) > m->perfMaxUs)
+                m->perfMaxUs = uint32(us);
+            ++m->perfDecisions;
+            m->decisionThisTick = false;
+        }
+        {
+            uint32 const perfNow = WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1;
+            if (!m->perfLogAt)
+                m->perfLogAt = perfNow;
+            else if (WorldTimer::getMSTimeDiff(m->perfLogAt, perfNow) >= 30000)
+            {
+                uint32 const avg = m->perfDecisions ? uint32(m->perfSumUs / m->perfDecisions) : 0;
+                sLog.outError("[DPSFSM-PERF] %s avg_us=%u max_us=%u scans=%u decisions=%u",
+                    bot->GetName(), avg, m->perfMaxUs, m->perfScans, m->perfDecisions);
+                m->perfLogAt = perfNow;
+                m->perfSumUs = 0;
+                m->perfMaxUs = 0;
+                m->perfDecisions = 0;
+                m->perfScans = 0;
+            }
+        }
 
         bool derived = false;
         DecisionMode const mode = ResolveMode(m, derived);
