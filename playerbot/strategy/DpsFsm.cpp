@@ -419,6 +419,15 @@ namespace
         // [2026-11-01 站长口径] A. **脱战准备阶段**补过的图腾次数（`[DPSFSM-SH-PREP]` 的 #n）：
         //   开打前插了几个，就看正式计时前有几条 PREP 行 —— 这是 prep_seconds A/B 的直接证据。
         uint32 shPrepCasts = 0;
+        // [2026-11-02 站长口径] **全职业开打前准备**（`DpsFsm.cpp → TickPrep()`）的记账：
+        //   prepCasts    —— 本场准备动作成功次数（只写给日志/验收，不参与决策）；
+        //   prepFailAt   —— item → 上次**放失败**的时刻：5 秒内不再重试这一项
+        //                   （失败就跳过、继续下一项，绝不在准备阶段空转卡死整场）；
+        //   prepSkipLogAt —— item → 上次打 `skip reason=` 日志的时刻（同一 bot 同一 item 10 秒最多一条，
+        //                   但每个 item 的第一次失败一定可见 ⇒ 不静默）。
+        uint32 prepCasts = 0;
+        std::map<std::string, uint32> prepFailAt;
+        std::map<std::string, uint32> prepSkipLogAt;
         // 本场（= 同一个目标）的一次性开手：Aoe 起手只放一次火元素新星；开门准备只做一次
         bool   shAoeNova = false;
         ObjectGuid shTarget;
@@ -4702,6 +4711,11 @@ namespace ai
             m->shEarthShocks = 0;
             m->shTotemCasts = 0;
             m->shPrepCasts = 0;
+            // [2026-11-02 站长口径] 全职业准备（TickPrep）的记账也跨轮清零：
+            //   上一轮的失败退避/日志节流不能把新一轮的前几秒堵住。
+            m->prepCasts = 0;
+            m->prepFailAt.clear();
+            m->prepSkipLogAt.clear();
             m->shAoeNova = false;
             m->shTarget = ObjectGuid();
             m->shEngagedAt = 0;
@@ -11783,6 +11797,14 @@ namespace ai
     }
 
     // ==========================================================================
+    // [2026-11-02 站长口径] **统一准备入口**（定义在文件后面，三条派发路径共用）：
+    //   `TickPrepCore(..., inCombat)` = 唯一实现；`TickPrep()` = 脱战层；`TickUpkeep()` = 战斗层。
+    //   DPS / 治疗 / 坦克三条路径都调它，不再各自维护第二套 Prep（见本文件末尾）。
+    // ==========================================================================
+    ai::dpsfsm::TickResult TickPrepCore(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool inCombat);
+    ai::dpsfsm::TickResult TickUpkeep(PlayerbotAI* ai, BotMem* m, Snapshot& s);
+
+    // ==========================================================================
     // HealCore 主入口（mode=5：神圣牧 / 神圣骑 / 恢复萨 / 恢复德）
     //   四治疗共用这套骨架；差异全在 HealCfgFor() 那张表 + 奶德的 hotModel 分支。
     // ==========================================================================
@@ -11792,6 +11814,12 @@ namespace ai
         HealCfg const* cfg = HealCfgFor(s.bot->getClass(), m->spec);
         if (!cfg)
             return TickResult::Decline;
+
+        // [2026-11-02 站长口径] **战斗中维护走唯一入口**：心灵之火/韧/水盾/光环/野性印记这些
+        //   与 DPS/坦克同一张表（形态掉了、盾没了就补）。补上了占这一手；没补上才继续下面的
+        //   治疗逻辑 —— 只加这一条，治疗状态机本身的判据一行都不动。
+        if (TickUpkeep(ai, m, s) == TickResult::Acted)
+            return TickResult::Acted;
 
         uint32 const now = HealSafeNow();
 
@@ -12409,26 +12437,10 @@ namespace ai
         return true;
     }
 
-    // Prep：righteous fury（缺则补）→ holy shield → 光环（二选一按已有光环判断）。
-    //   返回 true = 这一 tick 放了准备技；`done` = 该补的都齐了（调用方据此退回 Maintain）。
-    //   ⚠ holy shield 在 Prep 里只当"开打前垫一层"，日常维持归 Maintain（它 10 秒一掉，
-    //     放在 Prep 优先级里会把 Taunt/Pickup 的窗口整个吃掉 —— 实测口径：Preparation 只用长 buff 判）。
-    bool PalPrep(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool& done)
-    {
-        done = false;
-        if (!PalBuffUp(ai, s.bot, m, "righteous fury"))
-        {
-            if (TryCastSelf(ai, m, s, "righteous fury"))
-                return true;
-            return false;                     // 学不会/放不出：不假装补上了，交给调用方退回 Maintain
-        }
-        if (PalKeepBuff(ai, m, s, "holy shield"))
-            return true;
-        if (!PalAuraUp(ai, s.bot, m) && TryCastSelf(ai, m, s, "devotion aura"))
-            return true;
-        done = true;
-        return false;
-    }
+    // [2026-11-02 站长口径] **防护骑的 Prep 已收敛进统一准备表**（`TickPrepCore` 的 paladin/Protection
+    //   分支：righteous fury → holy shield → 光环 → 圣印/祝福），这里不再保留第二套 `PalPrep()`
+    //   —— 删掉的就是原来那段"long buff 三件套"，避免同一 tick 两个地方抢着放同一个技能。
+    //   仍保留的唯一用途是给 `TickTankFsm` 判"要不要先站对"（只读，不放技能）。
 
     // 防护骑的"还要不要 Prep"：只判**长 buff**（正义之怒 / 光环），不拿 10 秒一掉的圣盾当条件。
     bool PalNeedPrep(PlayerbotAI* ai, Player* bot, BotMem* m)
@@ -12496,6 +12508,12 @@ namespace ai
         uint32 const nowMs = WorldTimer::getMSTime();
         uint32 const now = nowMs ? nowMs : 1;
         TankSampleTaken(m, bot, now);
+        // [2026-11-02 站长口径] **坦克的准备/维护也走唯一入口**（与 DPS/治疗同一张表）：
+        //   防御姿态 / 巨熊形态 / 正义之怒 / 神圣之盾 / 光环这些"掉了就补"的项由 `TickUpkeep()` 负责，
+        //   补上了就占这一手返回；**没补上就继续原来的仇恨/生存/嘲讽/加怪逻辑**（一行都没动，
+        //   所以补不出来绝不会卡住坦克循环 —— 原来的 `State::Prep` 兜底也是这个语义）。
+        if (TickUpkeep(ai, m, s) == TickResult::Acted)
+            return TickResult::Acted;
         // [2026-11-01 站长口径·防护骑] 可选技能 id 一次结算（见 PalOptionalIds()）
         if (kind == TankKind::PaladinProt)
             PalOptionalIds(ai, m);
@@ -12585,27 +12603,11 @@ namespace ai
                 break;
 
             case State::Prep:
-                if (kind == TankKind::WarriorProt)
-                {
-                    acted = TryCastSelf(ai, m, s, "defensive stance");
-                }
-                else if (kind == TankKind::PaladinProt)
-                {
-                    // [2026-11-01 站长口径] 防骑：righteous fury（缺则补）→ holy shield → 光环
-                    bool prepDone = false;
-                    acted = PalPrep(ai, m, s, prepDone);
-                }
-                else
-                {
-                    // 已经挂着变形光环却仍判"不在熊形态"时别再刷（与猫德同一条防刷保护）
-                    if (AuraStacks(ai, s.bot, m, "dire bear form", s.bot) > 0
-                        || AuraStacks(ai, s.bot, m, "bear form", s.bot) > 0)
-                        break;
-                    acted = TryCastSelf(ai, m, s, "dire bear form")
-                        || TryCastSelf(ai, m, s, "bear form");
-                }
-                if (!acted)
-                    st = (adds.empty() ? State::Idle : State::Maintain);   // 补不上就照常仇恨
+                // [2026-11-02 站长口径] **坦克 Prep 分支已删除**：形态/姿态/正义之怒/神圣之盾/光环
+                //   统一由本函数开头那一次 `TickUpkeep()` 负责。走到这里还判"没站对"= 这一 tick
+                //   补不上（GCD/退避/没学会）⇒ 照常打仇恨，绝不空转（原行为也是这样兜底的）。
+                acted = false;
+                st = (adds.empty() ? State::Idle : State::Maintain);
                 break;
 
             case State::Survival:
@@ -12943,6 +12945,594 @@ namespace ai
         st.gatedSeen = 0;
     }
 
+    // ==========================================================================
+    // [2026-11-02 站长口径] **全职业 准备(Prep) / 维护(Upkeep) 共用的一张表** —— `TickPrepCore()`
+    // --------------------------------------------------------------------------
+    // 病根：假人/副本都有"开打前"这一段（场景准备窗口 `prep_seconds` + 脱战），原来只有萨满
+    //   用上了（`ShTickTotemsPrep`）—— 冰甲、枭兽/猫/熊形态、姿态、圣印、恶魔护甲、宠物、
+    //   武器附魔、奥术智慧/韧/野性印记全靠战斗中顺手补，白花开打后的 GCD。
+    // 站长口径：准备窗口应该给**所有职业**的准备都写好；而且**形态会掉、盾会没、宠物会死、
+    //   圣印会消 —— 战斗中也要维护（Upkeep）**，不能只在脱战做。
+    //   两层结构（共用这一张表，判据只写一份）：
+    //     · `TickPrep()`   = 脱战 / 场景准备窗口：逐项补齐（一次一个 GCD）；
+    //     · `TickUpkeep()` = 战斗中：只做"当前缺失/即将到期"的项，优先级
+    //                        `救急 > 爆发 > Upkeep(形态/盾/图腾/宠物/圣印) > 常规循环`，
+    //                        由 `TickInner` 在专精战斗图**之前**调用（见 TickUpkeep 注释）。
+    // 六条纪律（都是踩过坑换来的）：
+    //   ① **一次只做一个动作**：一个 GCD 一项，成功就返回 Acted；
+    //   ② **缺什么补什么**：先读光环/形态/宠物/层数/到期时间，不缺就跳过（`SpellId()==0` 也跳过）；
+    //   ③ **失败就跳过、继续下一项，绝不 Decline 死循环**（踩过的坑：卡在 Prep 整场 0 输出）：
+    //      放失败记 `prepFailAt` 退避 5 秒，这一项不占 GCD，循环继续查后面的项；
+    //   ④ **失败必须有日志、不许静默**：
+    //        成功：`[DPSFSM-PREP] <bot> spec=<x> item=<name> ok incombat=<0|1>`
+    //        跳过：`[DPSFSM-PREP] <bot> spec=<x> item=<name> skip reason=<...> incombat=<0|1>`
+    //      reason 至少三类：`notlearned`（SpellId==0）/ `castfailed`（学会了但 TryCast 失败）/
+    //      `aura`（前置：光环已在 / 已满足）/ `cooldown`（该项刚失败，退避中）/ `noitem`
+    //      （前置物品没有：毒药/可召唤宠物）/ `fsm`（该项由专精自己的战斗图负责，本层不插）。
+    //      **同一 bot 同一 item 的失败日志 10 秒最多一条**（`prepSkipLogAt`），
+    //      但每个 item 的第一次失败一定打出来。
+    //   ⑤ 战斗中施法权始终在状态机：Upkeep 是状态机自己放，**不交回引擎**；放不出就 Decline
+    //      继续常规循环（Decline 在这里 = 本 tick 不占 GCD，不是把施法权让给引擎）。
+    //   ⑥ 开关：`prep_enable`（默认 1；0 = 关掉本入口）。返回 Acted 只在**真的放出了技能**时。
+    // ==========================================================================
+    ai::dpsfsm::TickResult TickPrepCore(PlayerbotAI* ai, BotMem* m, Snapshot& s, bool inCombat)
+    {
+        using ai::dpsfsm::TickResult;
+
+        if (!ai || !m || !s.bot || !s.bot->IsInWorld() || !s.bot->IsAlive())
+            return TickResult::Decline;
+        if (TP(m, "prep_enable", 1.0) < 1.0)
+            return TickResult::Decline;
+        // 脱战层只在脱战跑；维护层只在战斗里跑（两层共用同一张表，判据不重复写）
+        bool const fighting = (s.bot->IsInCombat() || s.bot->GetVictim() != nullptr);
+        if (inCombat != fighting)
+            return TickResult::Decline;
+        // 读条/GCD 中什么也插不进去（与闸门 A 同一口径）
+        if (s.casting || s.bot->HasGCD(nullptr))
+            return TickResult::Decline;
+        if (!s.bot->IsStandState())
+            s.bot->SetStandState(UNIT_STAND_STATE_STAND);
+
+        Player* bot = s.bot;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const now = nowMs ? nowMs : 1;
+
+        // ---- 日志：成功每次都打；跳过/失败按 item 10 秒节流（保证每种 item 至少一条）----
+        //   末尾 `incombat=` 是为了验收能分辨"脱战补齐"与"战斗中维护"（前缀格式不变）。
+        auto prepLog = [&](char const* item, char const* reason)
+        {
+            if (!reason)
+            {
+                ++m->prepCasts;
+                sLog.outError("[DPSFSM-PREP] %s spec=%s item=%s ok incombat=%d",
+                    bot->GetName(), SpecName(m->spec), item, inCombat ? 1 : 0);
+                return;
+            }
+            uint32& last = m->prepSkipLogAt[item];
+            if (last && WorldTimer::getMSTimeDiff(last, now) < 10000)
+                return;
+            last = now;
+            sLog.outError("[DPSFSM-PREP] %s spec=%s item=%s skip reason=%s incombat=%d",
+                bot->GetName(), SpecName(m->spec), item, reason, inCombat ? 1 : 0);
+        };
+
+        // 该项刚从"放失败"里退避出来没有？（5 秒；不挡后面的项）
+        auto blocked = [&](char const* item) -> bool
+        {
+            auto it = m->prepFailAt.find(item);
+            return it != m->prepFailAt.end() && WorldTimer::getMSTimeDiff(it->second, now) < 5000;
+        };
+        // 学会了没有（`SpellId()==0` ⇒ notlearned，跳过）
+        auto learned = [&](char const* item) -> bool
+        {
+            return SpellId(ai, bot, m, item, false) != 0;
+        };
+        // 自身准备项：放失败 → 5 秒退避 + 一条 castfailed；成功 → ok
+        auto prepSelf = [&](char const* item) -> bool
+        {
+            if (blocked(item))
+            {
+                prepLog(item, "cooldown");
+                return false;
+            }
+            if (!TryCastSelf(ai, m, s, item))
+            {
+                m->prepFailAt[item] = now;
+                prepLog(item, "castfailed");
+                return false;
+            }
+            m->prepFailAt.erase(item);
+            prepLog(item, nullptr);
+            return true;
+        };
+        auto prepSelfIfLearned = [&](char const* item) -> bool
+        {
+            if (!learned(item))
+            {
+                prepLog(item, "notlearned");
+                return false;
+            }
+            return prepSelf(item);
+        };
+        // 缺才补：自己身上已经有这个光环 ⇒ 跳过（reason=aura）
+        auto prepBuff = [&](char const* item) -> bool
+        {
+            if (AuraStacks(ai, bot, m, item, bot) > 0)
+            {
+                prepLog(item, "aura");
+                return false;
+            }
+            return prepSelfIfLearned(item);
+        };
+        // 队伍 buff：先自己，再队伍里缺这个 buff 的人（一次一个目标，一个 GCD）
+        auto prepGroupBuff = [&](char const* item) -> bool
+        {
+            if (blocked(item))
+            {
+                prepLog(item, "cooldown");
+                return false;
+            }
+            if (!learned(item))
+            {
+                prepLog(item, "notlearned");
+                return false;
+            }
+            if (AuraStacks(ai, bot, m, item, bot) == 0)
+            {
+                if (TryCastSelf(ai, m, s, item))
+                {
+                    m->prepFailAt.erase(item);
+                    prepLog(item, nullptr);
+                    return true;
+                }
+                m->prepFailAt[item] = now;
+                prepLog(item, "castfailed");
+                return false;
+            }
+            if (Group* group = bot->GetGroup())
+            {
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* member = ref->getSource();
+                    if (!member || member == bot || !member->IsAlive() || !member->IsInWorld()
+                        || member->GetMap() != bot->GetMap())
+                        continue;
+                    if (AuraStacks(ai, bot, m, item, member) > 0)
+                        continue;
+                    if (TryCast(ai, m, s, item, member))
+                    {
+                        m->prepFailAt.erase(item);
+                        prepLog(item, nullptr);
+                        return true;
+                    }
+                    m->prepFailAt[item] = now;
+                    prepLog(item, "castfailed");
+                    return false;
+                }
+            }
+            // 自己已有、队伍也都不缺 ⇒ 这一项没事可做（不占 GCD）
+            prepLog(item, "aura");
+            return false;
+        };
+
+        switch (bot->getClass())
+        {
+            // ---------------- 法师：护甲（按专精取能放的）→ 奥术智慧 ----------------
+            case CLASS_MAGE:
+            {
+                char const* armor[3] = { "ice armor", "molten armor", "mage armor" };
+                if (m->spec == Spec::Fire)
+                {
+                    armor[0] = "molten armor"; armor[1] = "mage armor"; armor[2] = "ice armor";
+                }
+                else if (m->spec == Spec::Arcane)
+                {
+                    armor[0] = "mage armor"; armor[1] = "ice armor"; armor[2] = "molten armor";
+                }
+                bool armorUp = false;
+                for (char const* n : armor)
+                    if (AuraStacks(ai, bot, m, n, bot) > 0) { armorUp = true; break; }
+                if (!armorUp)
+                {
+                    // 按专精顺序取**第一个学会了**的护甲；放不出就退到下一个（失败已留痕）
+                    for (char const* n : armor)
+                        if (learned(n) && prepSelf(n))
+                            return TickResult::Acted;
+                }
+                else
+                {
+                    prepLog(armor[0], "aura");
+                }
+                if (prepGroupBuff("arcane intellect"))
+                    return TickResult::Acted;
+                break;
+            }
+
+            // ---------------- 德鲁伊：形态（鸟=枭兽 / 猫=猫 / 熊=巨熊）→ 野性印记 ----------------
+            case CLASS_DRUID:
+            {
+                if (m->spec == Spec::Balance)
+                {
+                    if (bot->GetShapeshiftForm() == FORM_MOONKIN || DrHasAuraByName(bot, "moonkin form"))
+                        prepLog("moonkin form", "aura");
+                    else if (learned("moonkin form") && prepSelf("moonkin form"))
+                        return TickResult::Acted;
+                    else if (!learned("moonkin form"))
+                        prepLog("moonkin form", "notlearned");
+                }
+                else if (m->spec == Spec::Feral)
+                {
+                    // 坦克场景 / 已经是熊 ⇒ 熊形态，否则猫形态（与 TickTankFsm 的派发判据同一份）
+                    bool const bear = IsScenarioTank(bot->GetGUIDLow())
+                        || bot->GetShapeshiftForm() == FORM_BEAR
+                        || bot->GetShapeshiftForm() == FORM_DIREBEAR
+                        || DrHasAuraByName(bot, "dire bear form")
+                        || DrHasAuraByName(bot, "bear form");
+                    if (bear)
+                    {
+                        if (bot->GetShapeshiftForm() == FORM_BEAR || bot->GetShapeshiftForm() == FORM_DIREBEAR)
+                            prepLog("dire bear form", "aura");
+                        else if (learned("dire bear form") && prepSelf("dire bear form"))
+                            return TickResult::Acted;
+                        else if (learned("bear form") && prepSelf("bear form"))
+                            return TickResult::Acted;
+                        else if (!learned("dire bear form") && !learned("bear form"))
+                            prepLog("dire bear form", "notlearned");
+                    }
+                    else
+                    {
+                        if (bot->GetShapeshiftForm() == FORM_CAT || DrHasAuraByName(bot, "cat form"))
+                            prepLog("cat form", "aura");
+                        else if (learned("cat form") && prepSelf("cat form"))
+                            return TickResult::Acted;
+                        else if (!learned("cat form"))
+                            prepLog("cat form", "notlearned");
+                    }
+                }
+                if (prepGroupBuff("mark of the wild"))
+                    return TickResult::Acted;
+                break;
+            }
+
+            // ---------------- 牧师：暗影形态（暗牧）→ 心灵之火 → 真言术韧 ----------------
+            case CLASS_PRIEST:
+            {
+                if (m->spec == Spec::Shadow)
+                {
+                    if (AuraStacks(ai, bot, m, "shadowform", bot) > 0)
+                        prepLog("shadowform", "aura");
+                    else if (learned("shadowform") && prepSelf("shadowform"))
+                        return TickResult::Acted;
+                    else if (!learned("shadowform"))
+                        prepLog("shadowform", "notlearned");
+                }
+                if (prepBuff("inner fire"))
+                    return TickResult::Acted;
+                if (prepGroupBuff("power word: fortitude"))
+                    return TickResult::Acted;
+                break;
+            }
+
+            // ---------------- 萨满：四槽图腾（复用现成那套）→ 护盾 → 武器附魔（增强）----------------
+            case CLASS_SHAMAN:
+            {
+                if (m->spec == Spec::Elemental || m->spec == Spec::Enhancement)
+                {
+                    // ⚠ 图腾**不重写**：脱战直接复用 `ShTickTotemsPrep()`（三系口径/记账/日志都在里面）；
+                    //   战斗中图腾由萨满自己的战斗图（`ShTotemNeed` 的四条判据）维护 —— 这里不插，
+                    //   否则群架时会按单体图腾组重铺（inAoe 上下文只有战斗图知道）。
+                    if (inCombat)
+                    {
+                        prepLog("totems", "fsm");
+                    }
+                    else if (ShTickTotemsPrep(ai, m, s))
+                    {
+                        prepLog("totems", nullptr);
+                        return TickResult::Acted;
+                    }
+                    else
+                    {
+                        prepLog("totems", "aura");
+                    }
+                }
+                if (m->spec == Spec::Elemental)
+                {
+                    if (ShLightningShieldStacks(ai, m, s) > 0)
+                        prepLog("lightning shield", "aura");
+                    else if (learned("lightning shield") && prepSelf("lightning shield"))
+                        return TickResult::Acted;
+                    else if (!learned("lightning shield"))
+                        prepLog("lightning shield", "notlearned");
+                }
+                else if (m->spec == Spec::Enhancement || m->spec == Spec::Restoration)
+                {
+                    if (prepBuff("water shield"))
+                        return TickResult::Acted;
+                }
+                if (m->spec == Spec::Enhancement)
+                {
+                    // 武器附魔：主手没有临时附魔才抹；风怒武器 → 没有就石化武器（放不出跳过）
+                    Item* const mh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                    if (!mh)
+                        prepLog("windfury weapon", "noitem");
+                    else if (mh->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) != 0)
+                        prepLog("windfury weapon", "aura");
+                    else if (learned("windfury weapon") && prepSelf("windfury weapon"))
+                        return TickResult::Acted;
+                    else if (!learned("windfury weapon") && learned("rockbiter weapon")
+                        && prepSelf("rockbiter weapon"))
+                        return TickResult::Acted;
+                }
+                break;
+            }
+
+            // ---------------- 圣骑：圣印（按专精）→ 光环（已有不换）→ 祝福 ----------------
+            case CLASS_PALADIN:
+            {
+                if (!PalAnySealUp(ai, bot, m))
+                {
+                    char const* seal = "seal of righteousness";
+                    if (m->spec == Spec::Retribution)
+                        seal = (bot->GetTeam() == HORDE) ? "seal of blood" : "seal of command";
+                    else if (m->spec == Spec::Holy)
+                        seal = "seal of wisdom";
+                    if (learned(seal) && prepSelf(seal))
+                        return TickResult::Acted;
+                    if (strcmp(seal, "seal of righteousness") != 0 && learned("seal of righteousness")
+                        && prepSelf("seal of righteousness"))
+                        return TickResult::Acted;
+                    if (!learned(seal))
+                        prepLog(seal, "notlearned");
+                }
+                else
+                {
+                    prepLog("seal", "aura");
+                }
+                // [2026-11-02 站长口径·防护骑] **正义之怒 + 神圣之盾** 必须进通用表（Prep 与 Upkeep 两层）：
+                //   `righteous fury` 会被驱散 / 掉线重登后常见地掉；`holy shield` 同理。
+                //   与坦克路径（`TickTankFsm` 的 PalPrep，同一套"缺才补"判据）**对齐而不重复**：
+                //   坦克派发在 TickInner 里排在通用准备之前 ⇒ 同一 tick 不会两边抢着放同一个技能。
+                if (m->spec == Spec::Protection)
+                {
+                    if (PalBuffUp(ai, bot, m, "righteous fury"))
+                        prepLog("righteous fury", "aura");
+                    else if (learned("righteous fury") && prepSelf("righteous fury"))
+                        return TickResult::Acted;
+                    else if (!learned("righteous fury"))
+                        prepLog("righteous fury", "notlearned");
+                    if (prepBuff("holy shield"))
+                        return TickResult::Acted;
+                }
+                if (PalAuraUp(ai, bot, m))
+                    prepLog("devotion aura", "aura");
+                else if (learned("devotion aura") && prepSelf("devotion aura"))
+                    return TickResult::Acted;
+                else if (!learned("devotion aura"))
+                    prepLog("devotion aura", "notlearned");
+                char const* const blessing = (m->spec == Spec::Holy)
+                    ? "blessing of wisdom" : "blessing of might";
+                if (prepGroupBuff(blessing))
+                    return TickResult::Acted;
+                break;
+            }
+
+            // ---------------- 战士：姿态（按专精）→ 战斗怒吼（防护加盾牌格挡）----------------
+            case CLASS_WARRIOR:
+            {
+                if (m->spec == Spec::Protection)
+                {
+                    if (bot->GetShapeshiftForm() == FORM_DEFENSIVESTANCE)
+                        prepLog("defensive stance", "aura");
+                    else if (learned("defensive stance") && prepSelf("defensive stance"))
+                        return TickResult::Acted;
+                    else if (!learned("defensive stance"))
+                        prepLog("defensive stance", "notlearned");
+                    // 盾牌格挡：学会了才放（防御姿态下才有意义）
+                    if (bot->GetShapeshiftForm() == FORM_DEFENSIVESTANCE)
+                    {
+                        if (AuraStacks(ai, bot, m, "shield block", bot) > 0)
+                            prepLog("shield block", "aura");
+                        else if (learned("shield block") && prepSelf("shield block"))
+                            return TickResult::Acted;
+                        else if (!learned("shield block"))
+                            prepLog("shield block", "notlearned");
+                    }
+                }
+                else
+                {
+                    char const* const stanceName = (m->spec == Spec::Fury)
+                        ? "berserker stance" : "battle stance";
+                    ShapeshiftForm const want = (m->spec == Spec::Fury)
+                        ? FORM_BERSERKERSTANCE : FORM_BATTLESTANCE;
+                    if (bot->GetShapeshiftForm() == want)
+                        prepLog(stanceName, "aura");
+                    else if (learned(stanceName) && prepSelf(stanceName))
+                        return TickResult::Acted;
+                    else if (!learned(stanceName))
+                        prepLog(stanceName, "notlearned");
+                }
+                if (prepGroupBuff("battle shout"))
+                    return TickResult::Acted;
+                break;
+            }
+
+            // ---------------- 盗贼：主手毒药/磨刀石 → 潜行（非战斗系）----------------
+            case CLASS_ROGUE:
+            {
+                Item* const mh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                if (!mh)
+                {
+                    prepLog("poison", "noitem");
+                }
+                else if (mh->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) != 0)
+                {
+                    prepLog("poison", "aura");
+                }
+                else if (Item* const poison = ai->FindPoison())
+                {
+                    // 对**主手槽**抹毒（与 RogueActions 的 ApplyPoisonAction 同一条路径）
+                    ai->ImbueItem(poison, uint8(EQUIPMENT_SLOT_MAINHAND));
+                    prepLog("poison", nullptr);
+                    return TickResult::Acted;
+                }
+                else
+                {
+                    prepLog("poison", "noitem");
+                }
+                if (!inCombat && m->spec != Spec::Combat)
+                {
+                    if (AuraStacks(ai, bot, m, "stealth", bot) > 0)
+                        prepLog("stealth", "aura");
+                    else if (learned("stealth") && prepSelf("stealth"))
+                        return TickResult::Acted;
+                    else if (!learned("stealth"))
+                        prepLog("stealth", "notlearned");
+                }
+                break;
+            }
+
+            // ---------------- 猎人：宠物（复用 SummonPetIfNeeded）→ 守护 → 猎人印记 ----------------
+            case CLASS_HUNTER:
+            {
+                if (!PetPresent(s))
+                {
+                    // 复用现成的宠物生命周期守卫（call/revive/create 都在里面，自带 [DPSFSM-PET] 日志）
+                    if (HunterPetGuard(ai, m, s))
+                    {
+                        prepLog("pet", nullptr);
+                        return TickResult::Acted;
+                    }
+                    prepLog("pet", "noitem");
+                }
+                else
+                {
+                    prepLog("pet", "aura");
+                }
+                char const* const aspect = (m->spec == Spec::Survival)
+                    ? "aspect of the monkey" : "aspect of the hawk";
+                char const* const aspectAlt = (m->spec == Spec::Survival)
+                    ? "aspect of the hawk" : "aspect of the monkey";
+                static char const* const kAspects[] = {
+                    "aspect of the hawk", "aspect of the monkey", "aspect of the viper",
+                    "aspect of the cheetah", "aspect of the wolf", "aspect of the pack"
+                };
+                bool aspectUp = false;
+                for (char const* n : kAspects)
+                    if (AuraStacks(ai, bot, m, n, bot) > 0) { aspectUp = true; break; }
+                if (aspectUp)
+                {
+                    prepLog(aspect, "aura");
+                }
+                else if (learned(aspect) && prepSelf(aspect))
+                {
+                    return TickResult::Acted;
+                }
+                else if (learned(aspectAlt) && prepSelf(aspectAlt))
+                {
+                    return TickResult::Acted;
+                }
+                else if (!learned(aspect) && !learned(aspectAlt))
+                {
+                    prepLog(aspect, "notlearned");
+                }
+                // 猎人印记：要有目标才补（准备窗口里通常没有目标；有就打一发）
+                if (s.target && s.target->IsAlive())
+                {
+                    if (TargetAuraRemain(ai, bot, m, "hunter's mark", s.target) > 0)
+                        prepLog("hunter's mark", "aura");
+                    else if (learned("hunter's mark") && TryCast(ai, m, s, "hunter's mark", s.target))
+                    {
+                        prepLog("hunter's mark", nullptr);
+                        return TickResult::Acted;
+                    }
+                    else if (learned("hunter's mark"))
+                        prepLog("hunter's mark", "castfailed");
+                }
+                break;
+            }
+
+            // ---------------- 术士：恶魔护甲 → 召唤恶魔（复用 SummonPetIfNeeded）→ 灵魂链接 --------
+            case CLASS_WARLOCK:
+            {
+                if (prepBuff("fel armor"))
+                    return TickResult::Acted;
+                // 旧名字兜底（本服若只有 demon armor/demon skin）
+                if (AuraStacks(ai, bot, m, "fel armor", bot) == 0)
+                {
+                    if (prepBuff("demon armor"))
+                        return TickResult::Acted;
+                    if (AuraStacks(ai, bot, m, "demon armor", bot) == 0
+                        && prepBuff("demon skin"))
+                        return TickResult::Acted;
+                }
+                if (!PetPresent(s))
+                {
+                    char const* const petName = (m->spec == Spec::Demonology)
+                        ? "summon felguard" : "summon imp";
+                    if (SummonPetIfNeeded(ai, m, s, petName))
+                    {
+                        prepLog(petName, nullptr);
+                        return TickResult::Acted;
+                    }
+                    if (m->spec == Spec::Demonology && SummonPetIfNeeded(ai, m, s, "summon imp"))
+                    {
+                        prepLog("summon imp", nullptr);
+                        return TickResult::Acted;
+                    }
+                    prepLog(petName, "noitem");
+                }
+                else
+                {
+                    prepLog("pet", "aura");
+                }
+                // 灵魂链接（学会了、有宠物、光环不在才放）
+                if (learned("soul link"))
+                {
+                    if (AuraStacks(ai, bot, m, "soul link", bot) > 0)
+                        prepLog("soul link", "aura");
+                    else if (PetPresent(s) && prepSelf("soul link"))
+                        return TickResult::Acted;
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+
+        return TickResult::Decline;
+    }
+
+    // [2026-11-02 站长口径] **Prep 层**（脱战 / 场景准备窗口）：整张表逐项补齐。
+    ai::dpsfsm::TickResult TickPrep(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        return TickPrepCore(ai, m, s, false);
+    }
+
+    // [2026-11-02 站长口径] **Upkeep 层**（战斗中）：与 Prep **同一张表**，只做"当前缺失/即将过期"的项。
+    //   优先级（站长口径）：`救急 > 爆发 > Upkeep(形态/盾/图腾/宠物/圣印) > 常规循环`。
+    //   这里用**上一 tick 的状态**做近似：Flee/Burst/Execute/Emergency/Survival/Dispel/Taunt/Pickup
+    //   这些"救急/爆发"档位里**不插** Upkeep；其它档位（Maintain/Burn/Aoe/Approach/Instant/Prep/Idle）
+    //   先补再输出 ⇒ Upkeep 排在填充技之前。最多滞后一个 tick，不影响语义。
+    //   ⚠ 战斗中施法权始终在状态机（站长铁律）：Upkeep 自己放；失败只记日志、**绝不 Decline 死循环**，
+    //     放不出就把这一手还给本专精的战斗图（Decline = 继续常规循环，不是交回引擎）。
+    ai::dpsfsm::TickResult TickUpkeep(PlayerbotAI* ai, BotMem* m, Snapshot& s)
+    {
+        using ai::dpsfsm::TickResult;
+        if (!ai || !m || !s.bot)
+            return TickResult::Decline;
+        switch (m->state)
+        {
+            case State::Flee: case State::Burst: case State::Execute:
+            case State::Emergency: case State::Survival:
+            case State::Dispel: case State::Taunt: case State::Pickup:
+                return TickResult::Decline;    // 救急/爆发档：这一手让给它们
+            default:
+                break;
+        }
+        return TickPrepCore(ai, m, s, true);
+    }
+
     static bool TickInner(PlayerbotAI* ai)
         {
             if (!ai || !ai->GetBot())
@@ -13070,8 +13660,11 @@ namespace ai
                                 bot->SetStandState(UNIT_STAND_STATE_STAND);
                             Snapshot ps;
                             BuildSnapshot(ai, m, ps);
-                            // 萨满 = 四槽图腾（三系口径见 ShDesiredTotem）；别的职业这一窗口只让位
-                            if (ShTickTotemsPrep(ai, m, ps))
+                            // [2026-11-02 站长口径] **全职业准备**：窗口内按 `TickPrep()` 的专精表补
+                            //   （萨满的四槽图腾只是这张表的第一项，复用 `ShTickTotemsPrep()`）。
+                            //   每个 tick 只做一个动作；到点没补完也没关系 —— 窗口只负责"少花 GCD"，
+                            //   补不完的项开打后由各专精自己的战斗逻辑兜底。
+                            if (TickPrep(ai, m, ps) == ai::dpsfsm::TickResult::Acted)
                                 return true;
                         }
                         NoteBail(bot, "scenario-prep");
@@ -13202,9 +13795,12 @@ namespace ai
 
             // [2026-11-01 站长口径] A. **图腾属于准备阶段**：脱战（开打前 / 假人场景的准备窗口）
             //   就先把四槽插满，战斗中只按 `ShTotemNeed()` 的四条判据补。
+            //   [2026-11-02 站长口径] **扩成全职业**：这段改成调用统一的 `TickPrep()` ——
+            //   姿态/形态/圣印/护甲/宠物/武器附魔/队伍 buff 与萨满图腾一样，都在开打前补完；
+            //   每个 tick 只做一个动作，失败退避（绝不卡死）。战斗中不走这里。
             //   放在 `no-victim` 门之前 —— 脱战时状态机本来整轮让路，但"准备动作"必须照做。
-            //   只在 mode=5 的萨满·元素/增强上生效：mode=1/2/3/4 与 legacy 一个字节不变。
-            if (bot->getClass() == CLASS_SHAMAN && !bot->IsInCombat() && !bot->GetVictim())
+            //   只在 mode=5 生效：mode=1/2/3/4 与 legacy 一个字节不变。
+            if (!bot->IsInCombat() && !bot->GetVictim())
             {
                 bool prepDerived = false;
                 if (ResolveMode(m, prepDerived) == DecisionMode::Fsm)
@@ -13212,9 +13808,14 @@ namespace ai
                     m->mode = int(DecisionMode::Fsm);
                     if (!bot->IsStandState())
                         bot->SetStandState(UNIT_STAND_STATE_STAND);
+                    // [2026-11-02 PERF] 同上：准备动作不需要完整快照，避免脱战每 tick 做敌对扫描
                     Snapshot ps;
-                    BuildSnapshot(ai, m, ps);
-                    if (ShTickTotemsPrep(ai, m, ps))
+                    ps.bot = bot;
+                    ps.target = bot->GetVictim();
+                    ps.casting = bot->IsNonMeleeSpellCasted(false, false, true);
+                    ps.gcd = bot->HasGCD(nullptr);
+                    ps.power = bot->GetPowerPercent();   // 只给 [DPSFSM-SH-PREP] 的 mana= 用
+                    if (TickPrep(ai, m, ps) == ai::dpsfsm::TickResult::Acted)
                         return true;
                 }
             }
@@ -13327,6 +13928,27 @@ namespace ai
                 //   走 dpsvalue::CastId，不经过 CastChecked，所以统一在这里结算），模式之间口径一致 ⇒ 可比 DPM。
                 ManaLogTick(m, bot);
                 return handled;
+            }
+
+            // [2026-11-02 站长口径] **战斗中维护（Upkeep）**：与脱战 Prep **同一张表**
+            //   （`TickPrepCore(..., inCombat=true)`），只补"当前缺失/即将到期"的形态/盾/图腾/
+            //   宠物/圣印/buff。优先级 = `救急 > 爆发 > Upkeep > 常规循环`（见 TickUpkeep 的注释）；
+            //   放在**专精战斗图之前** ⇒ 先补再输出，且补不出来就 Decline 继续常规循环（绝不死循环）。
+            //   战斗中施法权始终在状态机：这里放出来的技能本身就是状态机放的，不交回引擎。
+            {
+                // [2026-11-02 PERF] Upkeep 只需要 `bot/target/casting`，**不建完整快照**
+                //   （BuildSnapshot 里最贵的是敌对扫描；这里每 tick 都跑，不能翻倍）。
+                Snapshot us;
+                us.bot = bot;
+                us.target = bot->GetVictim();
+                us.casting = bot->IsNonMeleeSpellCasted(false, false, true);
+                us.gcd = bot->HasGCD(nullptr);
+                ai::dpsfsm::TickResult const ur = TickUpkeep(ai, m, us);
+                if (ur == ai::dpsfsm::TickResult::Acted)
+                {
+                    ManaLogTick(m, bot);
+                    return true;
+                }
             }
 
             // [2026-10-31 S2] mode=5：显式状态图。冰法（试点）+ 猎人三系（兽王/射击/生存）
