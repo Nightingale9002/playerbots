@@ -258,9 +258,21 @@ namespace
         int    spWheelBeat = -1;
         int    spDots = 0;
         char const* spBeatAct = "-";
-        //   spIdsCheckedAt —— "法术缓存体检"的时刻（5 秒一次，见 TickShadowFsm 的说明）。
         //   spDiagAt       —— [DPSFSM-PRIEST-DIAG] 的 10 秒节流（`sp_diag=1` 才打）。
-        uint32 spIdsCheckedAt = 0;
+        // [2026-11-01 站长口径] **`ids` 缓存体检提到通用层**（见 SpellId() 上面的 IdsHealthTick）：
+        //   原先是暗牧路径专用的 `spIdsCheckedAt`，只救得了暗牧；同一个病（解析失败把 0 永久
+        //   缓存 ⇒ 某个技能整场不放）存在于全部 20 个 DPS 专精，所以在通用层做。字段：
+        //     idsCheckedAt —— 轮转体检的 5 秒节流（WorldTimer 毫秒；与 idsNegAt 分开计）；
+        //     idsCursor    —— 下一次要检查的条目下标（**一次只查一条**，绝不全表扫描）；
+        //     idsNegAt     —— 负缓存（解析成 0）**立刻重解析**的 5 秒节流；
+        //     lastIdsLog   —— `[DPSFSM-IDS] <bot> reparse <name>` 的 5 秒节流（验收要看，但别刷屏）；
+        //     holdIntent   —— 本 tick 专精**显式登记**的"有意空着"原因（`HoldWait()`）；
+        //                     Tick() 的 Hold 通用兜底读它：没登记且 GCD 没锁 ⇒ 降级 Decline。
+        uint32 idsCheckedAt = 0;
+        uint32 idsCursor = 0;
+        uint32 idsNegAt = 0;
+        uint32 lastIdsLog = 0;
+        char const* holdIntent = nullptr;
         uint32 spDiagAt = 0;
         // [2026-11-01 站长口径] 法师·火法（mode=5）专用（详见 DpsFsm.cpp 的“法师·火法”一节）：
         //   fireFbSinceScorch —— 自上次补灼烧以来**放出的火球数**：维护节奏的**主**判据
@@ -366,6 +378,10 @@ namespace
         uint32 drEngagedAt = 0;
         int    drFurorLoggedPeriod = 0;   // 首次确定 furor/period 的诊断只打一次
         uint32 drDiagAt = 0;              // `dr_diag=1` 时"等一跳/变身"判据的取证节流（2 秒一条）
+        // [2026-11-01 实测] `powershift_min_mana_pct`（默认 35）的判据结果：
+        //   1 = 变完还剩 >= 该比例（允许变身）/ 0 = 会被蓝量门挡住（这次改成等一跳）。
+        //   只用于 `[DPSFSM-DRUID] ... shiftGate=` 的 A/B 取证，不参与别的决策。
+        int    drShiftGate = 0;
     };
 
     std::mutex s_disabledMutex;
@@ -631,11 +647,84 @@ namespace
         return best;
     }
 
+    // ==================================================================================
+    // [2026-11-01 站长口径] **法术缓存体检（通用层）** —— 三个"整轮静默报废"的病之一。
+    //
+    //   现状：`BotMem::ids` 是"名字 → id"的**永久**缓存，`SpellId()` 解析失败时缓存的是 **0**
+    //   （负缓存）。假人场景每轮 respec（`arms`/`dummy` 的 respec=1），若某次解析正好落在
+    //   "天赋正在重排、法术书是空的"那一瞬，0 就被永久记下来 ⇒ 之后整轮（甚至整场）都认为
+    //   "没学会这个法术" ⇒ 该技能永远不放。暗牧那轮已经加过 5 秒一次的体检，但**只在暗牧路径**。
+    //   现在提到这里，对所有专精生效（`SpellId()` 是唯一入口）。
+    //
+    //   两条闸，保证开销可控（绝不每 tick 全表扫描）：
+    //     ① **轮转体检** `IdsHealthTick()`：5 秒节流，每次**只查一条**（`idsCursor` 轮转），
+    //        判据 = "缓存值 0" 或 "该 id 已不在法术书"（respec 换了 rank / 丢了法术）⇒ 删掉重解析；
+    //     ② **负缓存即时修** `SpellId()`：命中缓存值是 0 时，5 秒节流后立刻删掉重解析一次
+    //        （轮转要等好几窗口才轮到，整轮 45 秒里很可能永远等不到）。
+    //   两条路径都打 `[DPSFSM-IDS] <bot> reparse <name>`（5 秒节流）—— 验收就是看它在跑。
+    // ==================================================================================
+    void IdsNoteReparse(BotMem* m, Player* bot, char const* name, uint32 safeNow)
+    {
+        if (!m || !bot || !name)
+            return;
+        if (m->lastIdsLog && WorldTimer::getMSTimeDiff(m->lastIdsLog, safeNow) < 5000)
+            return;
+        m->lastIdsLog = safeNow;
+        sLog.outError("[DPSFSM-IDS] %s reparse %s", bot->GetName(), name);
+    }
+
+    // 轮转体检：5 秒一次、一次只查一条（成本可忽略）。被删掉的条目下一 tick 由 SpellId() 重解析。
+    void IdsHealthTick(Player* bot, BotMem* m)
+    {
+        if (!m || !bot || !bot->IsInWorld() || m->ids.empty())
+            return;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const safeNow = nowMs ? nowMs : 1;
+        if (m->idsCheckedAt && WorldTimer::getMSTimeDiff(m->idsCheckedAt, safeNow) < 5000)
+            return;
+        m->idsCheckedAt = safeNow;
+
+        uint32 idx = m->idsCursor;
+        if (idx >= uint32(m->ids.size()))
+            idx = 0;
+        std::map<std::string, uint32>::iterator it = m->ids.begin();
+        for (uint32 i = 0; i < idx && it != m->ids.end(); ++i)
+            ++it;
+        if (it == m->ids.end())
+            return;
+        // 游标前进一格（下个窗口查下一条）。条目被删时游标归零：表变了，从头来更稳。
+        m->idsCursor = idx + 1;
+
+        if (it->second && bot->HasSpell(it->second))
+            return;                     // 正缓存且仍在法术书：这条是健康的
+
+        std::string const name = it->first;
+        m->ids.erase(it);
+        m->idsCursor = 0;
+        IdsNoteReparse(m, bot, name.c_str(), safeNow);
+    }
+
     uint32 SpellId(PlayerbotAI* ai, Player* bot, BotMem* m, char const* name, bool warn = true)
     {
+        // [2026-11-01 站长口径] 体检放在**唯一入口**：任何专精第一次问某个名字都会顺带体检一条。
+        IdsHealthTick(bot, m);
+
         auto it = m->ids.find(name);
         if (it != m->ids.end())
-            return it->second;
+        {
+            if (it->second)
+                return it->second;
+
+            // 负缓存（解析成 0）：5 秒节流后**立刻**丢掉重解析一次（轮转体检太慢，等不到）。
+            //   节流未到点就先按 0 返回（与改造前的行为一致，不会每 tick 去扫法术书）。
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32 const safeNow = nowMs ? nowMs : 1;
+            if (m->idsNegAt && WorldTimer::getMSTimeDiff(m->idsNegAt, safeNow) < 5000)
+                return 0;
+            m->idsNegAt = safeNow;
+            m->ids.erase(it);
+            IdsNoteReparse(m, bot, name, safeNow);
+        }
 
         uint32 id = 0;
         if (auto* value = ai->GetAiObjectContext()->GetValue<uint32>("spell id", name))
@@ -754,6 +843,33 @@ namespace
     {
         SpellEntry const* entry = id ? sServerFacade.LookupSpellInfo(id) : nullptr;
         return entry && bot->HasGCD(entry);
+    }
+
+    // [2026-11-01 站长口径] **这一 tick 的 GCD 是不是真的锁着**（Hold 通用兜底的判据）。
+    //   两来源：
+    //     ① `s.casting`：正在读条/引导（此时谁也插不了技能）；
+    //     ② `WorldObject::HasGCD(nullptr)` = "GCD 分类表里还有条目没到期" ——
+    //        核心 `WorldObject::UpdateCooldowns()` 每 tick 会把过期的 GCD 删掉，所以
+    //        非空 ⇔ 确实还有一类 GCD 在转（`HasGCD(entry)` 是按 StartRecoveryCategory 查的同一张表）。
+    //   为什么不用 `s.gcd`：那是 Snapshot 里的字段，只有奥法那条路径按"填充技"算过，
+    //   别的专精恒 false ⇒ 拿它当兜底判据会让所有 Hold 都被降级，等于把猎人平射窗口直接废掉。
+    bool GcdLocked(Snapshot& s)
+    {
+        if (s.casting)
+            return true;
+        return s.bot && s.bot->HasGCD(nullptr);
+    }
+
+    // [2026-11-01 站长口径] 专精**显式登记**"这一手有意空着"的唯一入口（真正放不出的场合别用）。
+    //   只有"等资源 / 等相位 / 等平射窗口 / 等走位"这类**明知这一手放不出、但引擎插一脚会打乱
+    //   节奏**的场景才登记；技能表解析失败、条件不满足、真没技能可放，一律别登记 ⇒
+    //   Tick() 的兜底会把 Hold 降级成 Decline，把走位/喝水/魔杖还给引擎。
+    //   病根：一拍什么都放不出就 Hold ⇒ 引擎整 tick 被挡（实测暗牧/平衡整轮 45 秒 0 施法 0 伤害）。
+    ai::dpsfsm::TickResult HoldWait(BotMem* m, char const* why)
+    {
+        if (m)
+            m->holdIntent = why;
+        return ai::dpsfsm::TickResult::Hold;
     }
 
     // 某目标身上这个法术（任意 rank）的叠层总数
@@ -3520,7 +3636,12 @@ namespace ai
             m->spWheelBeat = -1;
             m->spDots = 0;
             m->spBeatAct = "-";
-            m->spIdsCheckedAt = 0;
+            // [2026-11-01 站长口径] 通用层 `ids` 体检的节流也跨轮清零：新一轮 respec 之后
+            //   第一条询问就该立刻体检，别被上一轮的 5 秒窗口拖住。
+            m->idsCheckedAt = 0;
+            m->idsCursor = 0;
+            m->idsNegAt = 0;
+            m->holdIntent = nullptr;
             m->spDiagAt = 0;
             // [2026-11-01 站长口径] 德鲁伊：**能量跳相位必须跨轮清零** ——
             //   上一轮的 drTickAt 停在哪里都是旧的相位，新一轮如果接着算，第一手就会按错误的
@@ -3961,14 +4082,18 @@ namespace ai
                 CommandPetAttack(s);
                 // [2026-10-31 站长口径] Hold 的测试通路：`burn_hold=1` 时本 tick **有意空着**
                 //   （用于验证 TickResult::Hold 真的能让引擎收手）。默认 0 ⇒ 行为与改造前一致。
+                //   [2026-11-01 站长口径] 走 `HoldWait()` 登记：这是**明确的有意空着**，
+                //   不能被 Tick() 的通用兜底降级（否则这个自检通路就失效了）。
                 if (TP(m, "burn_hold", 0.0) >= 1.0)
-                    return ai::dpsfsm::TickResult::Hold;
+                    return HoldWait(m, "burn_hold(test)");
                 // [2026-10-31 站长口径] 仇恨 Wait 档（Maintain）：**不施法、也不让引擎动**。
                 //   此时抢在坦克前面打，换来的是一只追着法师的怪（治疗多花蓝、坦克多花时间），
                 //   就像把家门让给了对方；等一下让坦克把仇恨拉开，比多打一发寒冰箭划算。
                 //   Throttle 档不 Hold：照常打低威胁填充（寒冰箭/冰枪），只是不开爆发、不用冰锥。
+                //   [2026-11-01] 登记为有意等（仇恨纪律）；降级成 Decline 会让引擎按它自己的
+                //   AttackAction 出手，抢在坦克前面 —— 这条是"有意等"而不是"没判清楚"。
                 if (threat == ThreatLevel::Wait)
-                    return ai::dpsfsm::TickResult::Hold;
+                    return HoldWait(m, "threat-wait");
                 // 平稳核心：寒冰箭是**唯一填充**（节能施法时也照打寒冰箭，不插别的）；
                 //   移动中读条会被取消 ⇒ 先试瞬发冰枪。
                 if (TP(m, "burn_lance_moving", 1.0) >= 1.0 && s.moving
@@ -4710,11 +4835,12 @@ namespace ai
         }
 
         // 2) 平射马上落地：只能打瞬发；奥射没好就**空着等这一发**（读稳固等于白送平射）
+        //    [2026-11-01 站长口径] 登记为有意等（平射时间轴窗口）：这一手的价值就是"什么都别放"。
         if (s.autoRemainMs <= land)
         {
             if (s.arcaneReady && TryCast(ai, m, s, "arcane shot", s.target))
                 return TickResult::Acted;
-            return TickResult::Hold;
+            return HoldWait(m, "autoshot-window");
         }
 
         // 3) 窗口放不下稳固、但够一发瞬发：多重 → 奥射 → 否则空着
@@ -4724,7 +4850,7 @@ namespace ai
                 return TickResult::Acted;
             if (s.arcaneReady && TryCast(ai, m, s, "arcane shot", s.target))
                 return TickResult::Acted;
-            return TickResult::Hold;
+            return HoldWait(m, "autoshot-window");
         }
 
         // 4) 窗口够：稳固填充（移动中读条会被取消 ⇒ 空着走位）
@@ -4732,7 +4858,7 @@ namespace ai
             return TickResult::Acted;
 
         // 5) 兜底：窗口不明/技能都没好 ⇒ 有意空着，别让引擎插一手把平射顶掉
-        return TickResult::Hold;
+        return HoldWait(m, "autoshot-window");
     }
 
     ai::dpsfsm::TickResult TickHunterFsm(PlayerbotAI* ai, BotMem* m, Snapshot& s)
@@ -5041,10 +5167,12 @@ namespace ai
             case State::Recover:
                 // 等怒气：什么都不放，而且**不让引擎插**（否则它会把怒气换成自己的技能）。
                 //   唯一例外是"没怒又够不着"：那就先让引擎把位置带过去，否则永远空等（0 怒 + 远距离 = 死锁）。
+                //   [2026-11-01 站长口径] 登记为有意等资源（战士每 tick 都 `SetFacingToObject`，
+                //   Hold 期间朝向不会冻住）；这一 tick 引擎插一手只会把怒气花在低价值技能上。
                 if (s.dist > float(TP(m, "range_melee", 6.5)))
                     result = TickResult::Decline;
                 else
-                    result = TickResult::Hold;
+                    result = HoldWait(m, "rage-wait");
                 break;
 
             case State::Aoe:
@@ -5167,7 +5295,7 @@ namespace ai
                     return TickResult::Acted;
                 return TickResult::Decline;     // 不在射程/条件不满足 ⇒ 交回引擎走位
             }
-            return TickResult::Hold;
+            return HoldWait(m, "combo-energy-wait");
         }
 
         // ③ 攒星：毁伤要求匕首 + 背后（随机 bot 经常不满足）⇒ 一定留邪恶攻击兜底，
@@ -5215,10 +5343,11 @@ namespace ai
             case State::Recover:
                 // 等能量：什么都不放、也不让引擎插（同战士的 Recover）；
                 //   够不着时例外（让引擎把位置带过去，别空等）。
+                //   [2026-11-01 站长口径] 登记为有意等资源（盗贼 tick 开头已 `SetFacingToObject`）。
                 if (s.dist > float(TP(m, "range_melee", 6.5)))
                     result = TickResult::Decline;
                 else
-                    result = TickResult::Hold;
+                    result = HoldWait(m, "energy-wait");
                 break;
 
             case State::Aoe:
@@ -5767,7 +5896,10 @@ namespace ai
                 else if (s.power >= float(TP(m, "recover_power", 12.0)))
                     result = dotSpec ? TickWarlockDotsMaintain(ai, m, s) : TickWarlockMaintain(ai, m, s);   // 蓝还够打：别把 GCD 空成 0 DPS
                 else
-                    result = TickResult::Hold;                // 蓝血都见底：等回蓝（不吃药就别动这一手）
+                    // [2026-11-01 站长口径] 登记为有意等资源：生命分流与药水都用不了、蓝血双低，
+                    //   这一手放什么都是白花。注意 Hold 会把引擎整 tick 一起挡住，所以只在这一格
+                    //   （Recover 的最后一档）登记；技能表正常时它下一 tick 就自己回到输出。
+                    result = HoldWait(m, "mana-wait");
                 break;
 
             case State::Aoe:
@@ -6329,7 +6461,7 @@ namespace ai
         //   换来的是一只追着法师的怪；火法还没有冰法那种减速自保）。
         //   Throttle 档照常打（火球是低威胁填充），只是不开爆发、不开群伤。
         if (threat == ThreatLevel::Wait)
-            return TickResult::Hold;
+            return HoldWait(m, "threat-wait");
 
         // ⑤ 移动中：只有瞬发打得出去（读条会被移动取消）⇒ 火焰冲击，不是火球
         if (s.moving)
@@ -6380,7 +6512,7 @@ namespace ai
         using ai::dpsfsm::TickResult;
 
         if (threat == ThreatLevel::Wait)
-            return TickResult::Hold;
+            return HoldWait(m, "threat-wait");
 
         // 斩杀轮（位 4）：冰冷血脉还在 CD ⇒ 先用急冷重置一次（一场一次，位 8 记账）
         if (m->fireBurstRound == 4 && FireColdSnap(ai, m, s))
@@ -7529,7 +7661,9 @@ namespace ai
                 else if (ssUp && CastFirst(ai, m, s, { "earth shock" }))
                     result = TickResult::Acted;
                 else if (!ssUp)
-                    result = TickResult::Hold;   // 风暴打击 debuff 不在、DoT 也在期：这一手**有意空着**等震击 CD
+                    // [2026-11-01 站长口径] 登记为有意等（震击共享 6 秒 CD、两条都用不上）：
+                    //   这一手放别的会把下一次震击预算打乱，等 CD 比硬放值。
+                    result = HoldWait(m, "shock-cd-wait");
             }
         }
 
@@ -8004,28 +8138,10 @@ namespace ai
         if (s.casting)
             return TickResult::Acted;
 
-        // [2026-11-01 实测自愈] **法术缓存体检**（5 秒一次，成本可忽略）：
-        //   `BotMem::ids` 是"名字 → id"的**永久缓存**（含负结果 0），而假人场景每轮都会 respec
-        //   （`arms`/`dummy` 的 respec=1）。如果某次解析正好落在"天赋正在重排、法术书是空的"那一瞬，
-        //   就会把 0 永久记下来 ⇒ 这一轮所有暗牧技能都解析成 0：轮上什么都不 due、
-        //   填充也拿不到 id、于是每拍都走 Hold，**引擎同时被挡住**（实测一轮 45 秒 0 施法 0 伤害，
-        //   而 victim/距离/存活全部正常）。这里把"解析成 0"或"已不在法术书里"的条目丢掉重解析。
-        static char const* kSpellNames[] = {
-            "shadow word: pain", "vampiric touch", "mind blast",
-            "shadow word: death", "mind flay", "fade", "shadowform"
-        };
-        if (!m->spIdsCheckedAt || WorldTimer::getMSTimeDiff(m->spIdsCheckedAt, safeNow) >= 5000)
-        {
-            m->spIdsCheckedAt = safeNow;
-            for (char const* n : kSpellNames)
-            {
-                auto it = m->ids.find(n);
-                if (it == m->ids.end())
-                    continue;
-                if (it->second == 0 || !s.bot->HasSpell(it->second))
-                    m->ids.erase(it);
-            }
-        }
+        // [2026-11-01 站长口径] **法术缓存体检已提到通用层**（`SpellId()` 上的 IdsHealthTick）：
+        //   这里原来有一份"5 秒一次、检查 7 个暗牧技能"的专用体检（当时只救了暗牧）。
+        //   同一个病存在于所有专精，所以搬走了 —— 通用层是轮转（一次一条）+ 负缓存即时修，
+        //   对暗牧的效果不减：0 缓存那条 5 秒内就会被重解析，不再需要这份局部表。
 
         ThreatLevel const threat = EvalThreat(m, s);
         State st = ShadowEval(ai, m, s, threat);
@@ -8129,7 +8245,9 @@ namespace ai
     //       · 裂伤 mangle：队里有熊形态德鲁伊 ⇒ 熊坦的裂伤 debuff 已经在，自己不补；
     //         读不到就按"没有"处理；`mangle_self=1` 强制自己补、`=0` 强制不补；
     //       · 变身蓝耗：只要"还够一次变身"就继续变；不够就走 Recover 喝法力药水
-    //         （`powershift_min_mana` 只作额外百分比下限，默认 0 = 只按"够一次变身"判）；
+    //         （原先只看"够不够一次变身"；[2026-11-01 实测] 新增 `powershift_min_mana_pct`
+    //          （默认 35）：**变完还剩多少蓝**低于该比例就不再变身、改等一跳 —— 实测每次变身
+    //          约 590 蓝，45 秒 10~11 次会把蓝抽干，必然进 Recover 喝药，dps 反而比 mode=3 低 5%）；
     //       · 都不行 ⇒ Hold 等 tick，并且每个 tick 都 `SetFacingToObject`（否则白字全 BAD_FACING）。
     //     星/终结技：割裂 5 星（`rip_refresh` 到期才补）；凶猛撕咬只在目标 ≤ `fb_hp`(25%) 用；
     //       rip 还在、血又不低时攒着（能量 ≥ `fb_dump_energy`(80) 才泄一手，避免回能溢出）。
@@ -8357,8 +8475,11 @@ namespace ai
 
         if (m->spec == Spec::Feral)
         {
-            sLog.outError("[DPSFSM-DRUID] %s spec=feral state=%s energy=%d tick=%d combo=%u powershifts=%u mana=%.0f",
-                s.bot->GetName(), StateName(st), s.energy, p.remainMs, uint32(s.combo), m->drShifts, s.power);
+            // [2026-11-01 实测] `shiftGate=` = `powershift_min_mana_pct` 这道门的本 tick 判定
+            //   （1 = 变完还剩够用的蓝、允许变身；0 = 蓝量门把变身挡住了，改走"等一跳"）。
+            sLog.outError("[DPSFSM-DRUID] %s spec=feral state=%s energy=%d tick=%d combo=%u powershifts=%u mana=%.0f shiftGate=%d",
+                s.bot->GetName(), StateName(st), s.energy, p.remainMs, uint32(s.combo), m->drShifts, s.power,
+                m->drShiftGate);
         }
         else
         {
@@ -8478,7 +8599,21 @@ namespace ai
         int const mangleCost  = DrPowerCost(ai, m, "mangle (cat)", 40);
         int const swipeCost   = DrPowerCost(ai, m, "swipe (cat)", 45);
         int const shiftCost   = DrPowerCost(ai, m, "cat form", 400);
-        bool const manaShiftOk = int(bot->GetPower(POWER_MANA)) >= shiftCost;
+        // [2026-11-01 实测] **变身换能量的蓝量门**（`powershift_min_mana_pct`，默认 35）：
+        //   实测 45 秒 10~11 次变身、每次约 590 蓝 ⇒ 蓝量必然见底、进 Recover 喝药，
+        //   dps 反而比 mode=3 低 5%。这里估算"变完还剩多少蓝"，低于该比例就**不再变身**
+        //   （改走"等一跳"分支），让蓝量不至于被变身抽干。
+        //   判据与核心同一条口径：花费取 `DrPowerCost()`（`spell_template.ManaCost` +
+        //   `ManaCostPercentage × GetCreateMana()`，也就是 `Spell::CalculatePowerCost` 的算法）。
+        uint32 const maxMana = bot->GetMaxPower(POWER_MANA);
+        int const curMana = int(bot->GetPower(POWER_MANA));
+        int const manaAfter = curMana - shiftCost;
+        int const shiftGatePct = int(TP(m, "powershift_min_mana_pct", 35.0));
+        float const manaAfterPct = (maxMana && manaAfter > 0)
+            ? 100.0f * float(manaAfter) / float(maxMana) : 0.0f;
+        bool const manaShiftOk = maxMana && manaAfter >= 0
+            && manaAfterPct >= float(shiftGatePct);
+        m->drShiftGate = manaShiftOk ? 1 : 0;      // 日志 shiftGate=（A/B 用）
 
         bool const reach = bot->CanReachWithMeleeAttack(s.target);
 
@@ -8503,7 +8638,9 @@ namespace ai
         }
         else if (st == State::Recover)
         {
-            result = TickResult::Hold;
+            // [2026-11-01 站长口径] 登记为有意等资源（蓝低到不能变身、能量又打不出下一手）：
+            //   猫每 tick 都 `SetFacingToObject`，Hold 期间朝向不会冻住。
+            result = HoldWait(m, "shift-mana-wait");
             if (UseManaPotion(m, s))
                 result = TickResult::Acted;
         }
@@ -8567,7 +8704,7 @@ namespace ai
             if (want && needBehind && !bot->IsFacingTargetsBack(s.target))
             {
                 GetBehind(ai, m, s);   // 只走位，不占 GCD；正面硬放 shred 会 BAD_FACING
-                result = TickResult::Hold;
+                result = HoldWait(m, "get-behind");
             }
             else if (afford)
             {
@@ -8575,17 +8712,20 @@ namespace ai
                 {
                     // [2026-11-01 站长口径] 清晰预兆这一发免费技**不在第二秒抢**：
                     //   多等一跳把它对齐到回能相位（否则后面每一手的 GCD 都会与跳相位错开）。
-                    result = TickResult::Hold;
+                    result = HoldWait(m, "cc-phase-wait");
                 }
                 else if (TryCast(ai, m, s, want, nullptr))
                     result = TickResult::Acted;
                 else
+                    // [2026-11-01 站长口径] **施法失败不登记**：这是"没放出去"而不是"有意等"，
+                    //   交给 Tick() 的通用兜底降级成 Decline，让引擎能走位/喝水（否则一发
+                    //   反复被拒的技能会把整轮锁成 0 施法）。
                     result = TickResult::Hold;
             }
             else if (waitingForRip)
             {
                 // 5 星但 rip 还没到期、血也不低：攒星攒能量，等 rip 掉了再补（硬放 bite 会白扔星）
-                result = TickResult::Hold;
+                result = HoldWait(m, "rip-wait");
             }
             else if (want)
             {
@@ -8604,12 +8744,14 @@ namespace ai
                 bool const shiftHelps = gain > 0 && (s.energy + gain + regen >= wantCost);
 
                 if (oneTickEnough)
-                    result = TickResult::Hold;      // 下一跳就够：等
+                    result = HoldWait(m, "energy-tick-wait");   // 下一跳就够：等
                 else if (m->drFuror && manaShiftOk && shiftHelps
                     && DrPowerShift(ai, m, s, p))
                     result = TickResult::Acted;
                 else
-                    result = TickResult::Hold;      // 没有激怒 / 蓝不够 / 变了也不够：等自然回能
+                    // [2026-11-01 站长口径] 登记为有意等资源：没有激怒 / 蓝被 `powershift_min_mana_pct`
+                    //   的门挡住 / 变了也不够 —— 一律等自然回能（绝不空放变身，那只会白花法力）。
+                    result = HoldWait(m, "energy-wait");
 
                 // `dr_diag=1`：取证"等一跳还是变身"这一判据（2 秒一条，默认关）
                 if (TP(m, "dr_diag", 0.0) >= 1.0
@@ -8617,10 +8759,10 @@ namespace ai
                 {
                     m->drDiagAt = safeNow;
                     sLog.outError("[DPSFSM-DRUID-DIAG] %s wheel want=%s cost=%d energy=%d tick=%dms "
-                        "oneTick=%d furor=%d gain=%d shiftHelps=%d manaOk=%d shifts=%u behind=%d",
+                        "oneTick=%d furor=%d gain=%d shiftHelps=%d manaOk=%d manaAfter=%.0f%% shiftGate=%d shifts=%u behind=%d",
                         bot->GetName(), want ? want : "-", wantCost, s.energy, p.remainMs,
                         oneTickEnough ? 1 : 0, m->drFuror ? 1 : 0, gain, shiftHelps ? 1 : 0,
-                        manaShiftOk ? 1 : 0, m->drShifts,
+                        manaShiftOk ? 1 : 0, double(manaAfterPct), m->drShiftGate, m->drShifts,
                         (s.target && bot->IsFacingTargetsBack(s.target)) ? 1 : 0);
                 }
             }
@@ -8851,6 +8993,9 @@ namespace ai
             // [2026-10-31 站长口径] Hold 只活一个 tick：本 tick 重新决定。
             //   上一 tick 的标记要一直留到引擎读（引擎的让位判断发生在 Tick 返回之后），所以在这里清、不在返回前清。
             m->holdThisTick = false;
+            // [2026-11-01 站长口径] "有意空着"的登记也每 tick 重来：`HoldWait()` 只对本 tick 有效，
+            //   Tick() 的兜底读它（见派发处"Hold 的通用兜底"）。
+            m->holdIntent = nullptr;
             ReloadTune();
 
             uint32 const hbNow = WorldTimer::getMSTime();
@@ -9013,6 +9158,16 @@ namespace ai
                 && (mageFsm || IsHunterSpec(m->spec) || warriorFsm || rogueFsm || warlockFsm || retFsm
                     || shamanFsm || priestFsm || druidFsm))
             {
+                // [2026-11-01 站长口径] **坐姿是通用事故，不是某个专精的私事**：
+                //   假人连跑时上一轮结束 bot 会坐下回蓝/休息，而 SimScenario 只重置血/蓝/能量、
+                //   不管站姿 ⇒ 下一轮核心 `Spell::CheckCast` 第一条就判
+                //   `SPELL_FAILED_NOT_STANDING(65)` ⇒ **整轮 0 施法 0 伤害**（实测 balance 每批
+                //   第 2 轮必现，诊断行里 `res=65`）。德鲁伊两条路径上原来各补过一次，现在提到这里，
+                //   进各专精之前统一做（站姿/躺姿才调，站着不调 —— 不产生多余的 SetStandState）。
+                //   站起来不是施法、不占 GCD，所以放在 BuildSnapshot 之前，无条件。
+                if (!bot->IsStandState())
+                    bot->SetStandState(UNIT_STAND_STATE_STAND);
+
                 Snapshot s;
                 BuildSnapshot(ai, m, s);
                 // [2026-10-31 站长口径] 三态返回：Acted=我出手了；Hold=我有意空着（引擎也别插）；
@@ -9045,6 +9200,16 @@ namespace ai
                         ? TickWarlockFsm(ai, m, s) : TickWarlockDotsFsm(ai, m, s);
                 // [2026-10-31 站长口径] 状态机本 tick 结束时结一次耗蓝账（10 秒节流，不每 tick 刷屏）
                 ManaLogTick(m, bot);
+                // [2026-11-01 站长口径] **Hold 的通用兜底（在派发层统一做，不再指望每个专精自己判）**：
+                //   只有 GCD 真被锁（`s.casting` 或 GCD 未转好）或专精**显式登记**了"有意等"
+                //   （`HoldWait()`）时 Hold 才成立；其余一律降级 Decline —— 让引擎继续走位/喝水/魔杖。
+                //   病根：一拍什么都放不出就 Hold ⇒ 引擎整 tick 被挡死（`skipEngine = fsmOwns &&
+                //   DidCastThisTick`，Hold 也算"占了这一手"）⇒ 实测暗牧/平衡出现整轮 45 秒
+                //   0 施法 0 伤害，而 victim/距离/蓝量全部正常。
+                //   `hold_strict=0` 可回滚到旧行为（A/B 用，默认 1）。
+                if (fsmResult == ai::dpsfsm::TickResult::Hold && !GcdLocked(s) && !m->holdIntent
+                    && TP(m, "hold_strict", 1.0) >= 1.0)
+                    fsmResult = ai::dpsfsm::TickResult::Decline;
                 switch (fsmResult)
                 {
                     case ai::dpsfsm::TickResult::Acted:
