@@ -354,6 +354,10 @@ namespace ai
         //     `fsm_own_cast_ooc`（默认 0；⚠ 置 1 目前不会真的挡住脱战施法 —— 闸门在
         //     PlayerbotAI::UpdateAIInternal 里只于 inCombat||victim 时合上，需要那边配合）。
         //   统计日志：`[FSM-CAST] bot=%s fsm=%u engine=%u blocked=%u inCombat=%d`（每 bot 30 秒）。
-        bool Tick(PlayerbotAI* ai);
+        // [2026-11-02 站长口径] **战斗内 AI 更新可以更密**：状态机每 tick 的开销已经压到 ~50-100µs，
+    //   而 bot AI 的更新间隔默认是 1 秒（`RandomBotUpdateInterval`）—— 打副本时反应太慢。
+    //   这里只回答"最近有没有 bot 在战斗"，由管理器据此把更新间隔切到更短的值。
+    bool RecentCombatBot();
+    bool Tick(PlayerbotAI* ai);
     }
 }

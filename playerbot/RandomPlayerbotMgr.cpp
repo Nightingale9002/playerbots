@@ -5,6 +5,7 @@
 #include "strategy/actions/ChangeTalentsAction.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "strategy/DpsFsm.h"   // [2026-11-02] 战斗内更密更新：RecentCombatBot()
 #include "strategy/values/LastMovementValue.h"
 #include "Accounts/AccountMgr.h"
 #include "Globals/ObjectMgr.h"
@@ -744,7 +745,13 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 elapsed, bool minimal)
     uint32 availableBotCount = availableBots.size();
     uint32 onlineBotCount = GetPlayerbotsAmount();
     
-    SetAIInternalUpdateDelay(sPlayerbotAIConfig.randomBotUpdateInterval);
+    // [2026-11-02 站长口径] **战斗内更密更新**：默认 1 秒一次对打副本太慢（GCD 1.5s，反应要在 1 秒内）。
+    //   状态机单次决策已压到 ~50-100µs，所以战斗里把间隔切到 `CombatUpdateInterval`（默认 250ms）是负担得起的；
+    //   脱战仍用 randomBotUpdateInterval，避免为了打本把整个世界线程拖慢。
+    uint32 const aiInterval = dpsfsm::RecentCombatBot()
+        ? sPlayerbotAIConfig.combatUpdateInterval
+        : sPlayerbotAIConfig.randomBotUpdateInterval;
+    SetAIInternalUpdateDelay(aiInterval);
 
     auto pmo = sPerformanceMonitor.start(PERF_MON_RNDBOT,
         onlineBotCount < maxAllowedBotCount ? "RandomPlayerbotMgr::Login" : "RandomPlayerbotMgr::UpdateAIInternal");

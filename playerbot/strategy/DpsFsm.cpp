@@ -572,9 +572,18 @@ namespace
         uint32 perfMaxUs = 0;
         uint32 perfDecisions = 0;
         uint32 perfScans = 0;
+        // [2026-11-02 站长口径] **调度延迟**：状态机两次被调用的间隔（ms）。
+        //   这才是"并发把一个 bot 拖慢多少"的直接指标：世界线程过载时，单次决策再便宜也没用，
+        //   因为 bot 根本轮不到，决策间隔会从 100ms 涨到秒级。
+        uint32 perfLastCallMs = 0;
+        uint64 perfGapSum = 0;
+        uint32 perfGapMax = 0;
+        uint32 perfGapCount = 0;
     };
 
     std::mutex s_disabledMutex;
+    // [2026-11-02] 最近一次"有 bot 在战斗"的时刻（ms），给战斗内更密更新用
+    std::atomic<uint32> s_lastCombatMs{0};
     std::set<uint32> s_disabled;      // A/B 对照：这些 guid 这一轮不走状态机
     std::set<uint32> s_forceDps;      // 假人测试：强制按 DPS 打（忽略坦/奶角色门）
     std::map<uint32, std::set<ObjectGuid>> s_scenarioTargets;   // guid → 这一轮"自己的"假人
@@ -13486,8 +13495,37 @@ namespace ai
 
     // [2026-11-01 站长口径] Tick() 的对外语义（见本函数上面的长注释）：
     //   返回值 = "这一 tick 谁占着**施法闸门**"，不等于"我放了技能"（后者是 DidCastThisTick）。
+    // [2026-11-02 站长口径] 最近 2 秒内有没有 bot 处于战斗：给"战斗内更密更新"用。O(1)。
+    bool RecentCombatBot()
+    {
+        uint32 const last = s_lastCombatMs.load();
+        if (!last)
+            return false;
+        uint32 const now = WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1;
+        return WorldTimer::getMSTimeDiff(last, now) < 2000;
+    }
+
     bool Tick(PlayerbotAI* ai)
     {
+        // [2026-11-02 PERF] **调度间隔**：先记"上一次被调用到现在过了多久"，
+        //   这是并发下的真实延迟（世界线程轮不到你时，这里会立刻变大）。
+        {
+            uint32 const callNow = WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1;
+            Player* cb = (ai ? ai->GetBot() : nullptr);
+            BotMem* gm = cb ? Mem(cb->GetGUIDLow()) : nullptr;
+            if (gm)
+            {
+                if (gm->perfLastCallMs)
+                {
+                    uint32 const gap = WorldTimer::getMSTimeDiff(gm->perfLastCallMs, callNow);
+                    gm->perfGapSum += gap;
+                    if (gap > gm->perfGapMax)
+                        gm->perfGapMax = gap;
+                    ++gm->perfGapCount;
+                }
+                gm->perfLastCallMs = callNow;
+            }
+        }
         // [2026-11-02 PERF] 决策耗时用 steady_clock（毫秒级 getMSTime 量不出微秒口径）
         auto const perfT0 = std::chrono::steady_clock::now();
         bool const handled = TickInner(ai);
@@ -13519,13 +13557,17 @@ namespace ai
             else if (WorldTimer::getMSTimeDiff(m->perfLogAt, perfNow) >= 30000)
             {
                 uint32 const avg = m->perfDecisions ? uint32(m->perfSumUs / m->perfDecisions) : 0;
-                sLog.outError("[DPSFSM-PERF] %s avg_us=%u max_us=%u scans=%u decisions=%u",
-                    bot->GetName(), avg, m->perfMaxUs, m->perfScans, m->perfDecisions);
+                uint32 const gapAvg = m->perfGapCount ? uint32(m->perfGapSum / m->perfGapCount) : 0;
+                sLog.outError("[DPSFSM-PERF] %s avg_us=%u max_us=%u scans=%u decisions=%u gap_avg_ms=%u gap_max_ms=%u",
+                    bot->GetName(), avg, m->perfMaxUs, m->perfScans, m->perfDecisions, gapAvg, m->perfGapMax);
                 m->perfLogAt = perfNow;
                 m->perfSumUs = 0;
                 m->perfMaxUs = 0;
                 m->perfDecisions = 0;
                 m->perfScans = 0;
+                m->perfGapSum = 0;
+                m->perfGapMax = 0;
+                m->perfGapCount = 0;
             }
         }
 
@@ -13534,6 +13576,8 @@ namespace ai
         m->mode = int(mode);
 
         bool const inCombat = bot->IsInCombat() || bot->GetVictim();
+        if (inCombat)
+            s_lastCombatMs.store(WorldTimer::getMSTime() ? WorldTimer::getMSTime() : 1);
         bool const fsmCast = DidCastThisTick(guid);
         bool const scenario = SkipEngine(guid);
 

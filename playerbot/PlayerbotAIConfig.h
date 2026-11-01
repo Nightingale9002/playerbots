@@ -187,6 +187,8 @@ public:
     bool randomBotAutoCreate;
     uint32 minRandomBots, maxRandomBots;
     uint32 randomBotUpdateInterval, randomBotCountChangeMinInterval, randomBotCountChangeMaxInterval;
+    // [2026-11-02 站长口径] 战斗内的 AI 更新间隔（默认 250ms）：打副本时 1 秒一次太慢。
+    uint32 combatUpdateInterval;
     bool randomBotTimedLogout, randomBotTimedOffline;
     uint32 minRandomBotInWorldTime, maxRandomBotInWorldTime;
     uint32 minRandomBotRandomizeTime, maxRandomBotRandomizeTime;
