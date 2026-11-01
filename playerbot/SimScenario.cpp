@@ -255,6 +255,7 @@ uint32 stuckFightCleared = 0;
             bool meleeSpec = false;   // 近战专精（决定 Attack(meleeAttack) 参数）
             uint32 pileOwner = 0;     // !=0：这一轮不自己召假人，共用这个 id 的假人堆
             float ringAngle = 0.0f;   // 共享堆时自己站的角度（一圈人围着打）
+            uint8 bisPhase = 3;       // [2026-11-01] 分阶段 BIS 选档（0=100~115 / 1=115~125 / 2=125~138 / 3=138~151）
             bool centerPile = false;  // true = 假人就摆在 (x,y)（共享堆的堆主）
             bool sharedPile = false;  // true = 这一轮的木桩是全队共用的，收尾时谁都不许删
             // [2026-10-30] 一堆一个专精后，**堆主也要站到自己那堆外面**（远程 18 码），
@@ -3358,9 +3359,19 @@ uint32 stuckFightCleared = 0;
             for (uint32 id : harmful)
                 bot->RemoveAurasDueToSpell(id);
 
-            sLog.outError("[DUMMY] %s 已重置 血=100 蓝=%u 能量=%u 怒=%u",
+            uint32 gearSig = 2166136261u;
+            uint32 gearSlots = 0;
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            {
+                Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                uint32 entry = it ? it->GetEntry() : 0;
+                if (entry)
+                    ++gearSlots;
+                gearSig = (gearSig ^ entry) * 16777619u;
+            }
+            sLog.outError("[DUMMY] %s 已重置 血=100 蓝=%u 能量=%u 怒=%u 装备=%u件 sig=%08x",
                 bot->GetName(), bot->GetPower(POWER_MANA), bot->GetPower(POWER_ENERGY),
-                bot->GetPower(POWER_RAGE));
+                bot->GetPower(POWER_RAGE), gearSlots, gearSig);
         }
 
         // ---- 训练假人场景 ----------------------------------------------------
@@ -3468,16 +3479,29 @@ uint32 stuckFightCleared = 0;
                             if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
                                 bot->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
 
-                        if (auto bres = WorldDatabase.PQuery(
-                                "SELECT slot, item_id FROM ai_playerbot_bis_gear WHERE cls=%u AND spec='%s' ORDER BY slot",
-                                (uint32)d.cls, d.spec.c_str()))
+                        // [2026-11-01 站长口径] **分阶段 BIS（dev/234）**：表里同一 (cls,spec) 有 4 个 phase 的行，
+                        //   必须按当前档过滤，否则每槽位返回 4 行 ⇒ bot 会按 4 倍件数排队穿装。
+                        //   `bis_phase`（臂参数，默认 3=138~151）选档；老表没有 phase 列时自动回落无条件查询。
+                        auto loadBis = [&d](bool withPhase)
                         {
+                            auto q = withPhase
+                                ? WorldDatabase.PQuery(
+                                      "SELECT slot, item_id FROM ai_playerbot_bis_gear WHERE cls=%u AND spec='%s' AND phase=%u ORDER BY slot",
+                                      (uint32)d.cls, d.spec.c_str(), (uint32)d.bisPhase)
+                                : WorldDatabase.PQuery(
+                                      "SELECT slot, item_id FROM ai_playerbot_bis_gear WHERE cls=%u AND spec='%s' ORDER BY slot",
+                                      (uint32)d.cls, d.spec.c_str());
+                            if (!q)
+                                return false;
                             do
                             {
-                                Field* f = bres->Fetch();
+                                Field* f = q->Fetch();
                                 d.bisPending.push_back(std::make_pair(f[0].GetUInt8(), f[1].GetUInt32()));
-                            } while (bres->NextRow());
-                        }
+                            } while (q->NextRow());
+                            return true;
+                        };
+                        if (!loadBis(true))
+                            loadBis(false);
                         // [2026-11-01 站长口径] **没有静态 BIS 行的专精必须退回 EquipGearBest**。
                         //   上面刚把装备槽清空，若该 cls/spec 在 `ai_playerbot_bis_gear` 里没有行
                         //   （治疗专精目前都没有：表里只有 17 个 DPS 专精），`bisPending` 为空 ⇒
@@ -3762,7 +3786,15 @@ uint32 stuckFightCleared = 0;
                 bot->Unmount();
 
             for (auto const& kv : d.overrides)
+            {
+                // [2026-11-01] 装备档位是场景参数，不进 FSM 的 TP 表（但它和 tp 用同一份 arm 语法）
+                if (kv.first == "bis_phase")
+                {
+                    d.bisPhase = uint8(kv.second < 0.0 ? 0.0 : (kv.second > 3.0 ? 3.0 : kv.second));
+                    continue;
+                }
                 dpsfsm::SetParamOverride(d.guid, kv.first.c_str(), kv.second);
+            }
             dpsfsm::SetBotEnabled(d.guid, d.useFsm);
             dpsfsm::SetBotForceDps(d.guid, true);   // 假人场景：坦/奶也按 DPS 打，测的是输出能力
             if (!d.armLabel.empty())
