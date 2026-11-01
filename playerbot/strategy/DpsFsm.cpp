@@ -428,6 +428,10 @@ namespace
         uint32 prepCasts = 0;
         std::map<std::string, uint32> prepFailAt;
         std::map<std::string, uint32> prepSkipLogAt;
+        // [2026-11-02 站长口径·不许兜底] 准备项的**累计失败次数**：只用于 `[DPSFSM-PREP-FAIL]`
+        //   日志的 fails=<n> 字段（10 秒一条，带 id/ready/can/res/form/mana/auras 根因判据）。
+        //   **不**做"失败 N 次就放弃/降级"—— 放不出来就每 tick 继续试 + 长鸣，把问题暴露出来。
+        std::map<std::string, uint32> prepFails;
         // 本场（= 同一个目标）的一次性开手：Aoe 起手只放一次火元素新星；开门准备只做一次
         bool   shAoeNova = false;
         ObjectGuid shTarget;
@@ -1104,6 +1108,69 @@ namespace
         if (m)
             m->holdIntent = why;
         return ai::dpsfsm::TickResult::Hold;
+    }
+
+    // [2026-11-02 站长口径·**不许兜底**] 准备项放不出来时：**持续尝试**（下一 tick 照试），
+    //   并且每 10 秒打一条带"原因 + 累计次数 + 上次状态"的错误日志；同时把根因判据全部抖出来，
+    //   便于直接定位（SpellId 是否为 0、是否就绪、CanCastSpell 结果码、当前形态、蓝量、身上光环名单）。
+    //   绝不做"连续 N 次就放弃/改人形"的静默降级 —— 那只会把问题藏起来。
+    void PrepLogCastFail(PlayerbotAI* ai, BotMem* m, Snapshot& s, char const* item, uint32 fails,
+        ai::dpsfsm::State lastState)
+    {
+        Player* bot = s.bot ? s.bot : (ai ? ai->GetBot() : nullptr);
+        if (!bot || !m)
+            return;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        uint32 const now = nowMs ? nowMs : 1;
+        std::string const key = std::string("fail:") + item;
+        uint32& last = m->prepSkipLogAt[key];
+        if (last && WorldTimer::getMSTimeDiff(last, now) < 10000)
+            return;
+        last = now;
+
+        uint32 const id = SpellId(ai, bot, m, item, false);
+        SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+        bool const can = id
+            ? ai->CanCastSpell(id, bot, 0, false, nullptr, false, false, false, &res) : false;
+        std::string auras;
+        for (auto const& itr : bot->GetSpellAuraHolderMap())
+        {
+            SpellAuraHolder* holder = itr.second;
+            SpellEntry const* proto = holder ? holder->GetSpellProto() : nullptr;
+            if (!proto || !proto->SpellName[0])
+                continue;
+            if (auras.size() > 180)
+                break;
+            if (!auras.empty())
+                auras += ",";
+            auras += proto->SpellName[0];
+        }
+        sLog.outError("[DPSFSM-PREP-FAIL] %s spec=%s item=%s fails=%u reason=%s last=%s "
+            "id=%u ready=%d can=%d res=%d form=%u mana=%.0f auras=[%s]",
+            bot->GetName(), ai::dpsfsm::SpecName(m->spec), item, fails,
+            id ? "castfailed" : "notlearned", ai::dpsfsm::StateName(lastState),
+            id, (id && bot->IsSpellReady(id)) ? 1 : 0, can ? 1 : 0, int(res),
+            uint32(bot->GetShapeshiftForm()), bot->GetPowerPercent(), auras.c_str());
+    }
+
+    // [2026-11-02 根因·实测] `[DPSFSM-PREP-FAIL]` 抓到的暗牧/鸟德/防骑"castfailed"其实都是
+    //   `res=63 SPELL_FAILED_NOT_READY`（GCD/分类冷却还差一点点），下一 tick 就能放出去
+    //   （日志实测：`fails=1` 后紧跟 `shadowform ok`）。这类是**瞬时未就绪**，不是"学不会/光环错了"，
+    //   所以：不计入 fails、不打 FAIL 长鸣（只记 skip reason=cooldown），下一 tick 照常重试。
+    //   真正的故障（核心拒绝/前置不满足）仍然每 10 秒一条 `[DPSFSM-PREP-FAIL]`，带完整根因判据。
+    bool PrepFailureTransient(PlayerbotAI* ai, Player* bot, uint32 id)
+    {
+        if (!ai || !bot || !id)
+            return false;
+        SpellCastResult res = SPELL_FAILED_DONT_REPORT;
+        ai->CanCastSpell(id, bot, 0, false, nullptr, false, false, false, &res);
+        return res == SPELL_FAILED_NOT_READY;
+    }
+
+    void PrepNoteOk(BotMem* m, char const* item)
+    {
+        if (m && item)
+            m->prepFails.erase(item);
     }
 
     // 某目标身上这个法术（任意 rank）的叠层总数
@@ -4716,6 +4783,7 @@ namespace ai
             m->prepCasts = 0;
             m->prepFailAt.clear();
             m->prepSkipLogAt.clear();
+            m->prepFails.clear();      // "连续 3 次放弃"只到本场结束：新一轮重新给机会
             m->shAoeNova = false;
             m->shTarget = ObjectGuid();
             m->shEngagedAt = 0;
@@ -9712,6 +9780,8 @@ namespace ai
         if (!s.target)
             return State::Idle;
         // Prep：暗影形态是整张图的前提（不在形态里既没有 15% 暗影加成，技能表也不对）
+        // [2026-11-02 站长口径·不许兜底] 缺形态就每 tick 都试（见 TickShadowFsm 的 Prep 处理），
+        //   这里**不做任何"放弃/改人形"的降级判断** —— 放不出来只有长鸣日志 + 继续尝试。
         if (SpellId(ai, s.bot, m, "shadowform", false)
             && AuraStacks(ai, s.bot, m, "shadowform", s.bot) == 0)
             return State::Prep;
@@ -9765,16 +9835,38 @@ namespace ai
         ShadowPlanBeat(ai, m, s, w);
 
         TickResult result = TickResult::Decline;
+
+        // [2026-11-02 站长口径·不许兜底] 缺暗影形态：**每 tick 都试**（成功才占这一手）；
+        //   放不出来**不放弃、不静默改人形**，而是：
+        //     ① 每 10 秒一条 `[DPSFSM-PREP-FAIL] ... fails=<n> reason=... id/ready/can/res/form/mana/auras`；
+        //     ② 这一 tick 的 GCD 没被占掉 ⇒ **继续按人形循环输出**（痛/触/心爆/鞭都不依赖形态），
+        //        下一 tick 仍会再试 —— 既不卡死整场，也不把问题藏起来。
+        if (st == State::Prep)
+        {
+            if (TryCastSelf(ai, m, s, "shadowform"))
+            {
+                PrepNoteOk(m, "shadowform");
+                m->spBeatAct = "form";
+                ShadowLogTick(ai, m, s, State::Prep, w, threat, safeNow);
+                return TickResult::Acted;
+            }
+            uint32 const sfId = SpellId(ai, s.bot, m, "shadowform", false);
+            if (PrepFailureTransient(ai, s.bot, sfId))
+            {
+                // 瞬时未就绪（实测 res=63 NOT_READY）：下一 tick 重试，不当作故障（也不计 fails）
+                m->spBeatAct = "form-wait";
+            }
+            else
+            {
+                uint32 const fails = ++m->prepFails["shadowform"];
+                PrepLogCastFail(ai, m, s, "shadowform", fails, State::Prep);
+                m->spBeatAct = "form-fail";
+            }
+            st = State::Maintain;      // 继续人形循环（不占 GCD、不静默降级）
+        }
+
         switch (st)
         {
-            case State::Prep:
-                if (TryCastSelf(ai, m, s, "shadowform"))
-                {
-                    m->spBeatAct = "form";
-                    result = TickResult::Acted;
-                }
-                break;
-
             case State::Approach:
                 result = TickResult::Decline;      // 走位归引擎
                 break;
@@ -10515,31 +10607,32 @@ namespace ai
         // ---- Prep：枭兽形态（没这个天赋的 bot 就在法师形态打，循环照旧） ----
         if (SpellId(ai, bot, m, "moonkin form", false) && bot->GetShapeshiftForm() != FORM_MOONKIN)
         {
-            // [2026-11-02 实测修] 两个死循环都在这段：
-            //   ① "有 moonkin form 光环但形态不是枭兽"直接 Decline ⇒ 整场死在 Prep（casts=0）；
-            //   ② 形态放不出来也每 tick Decline ⇒ 闸门把引擎一起关了 ⇒ 整场 0 输出。
-            //   新规则：成功=Acted；连续失败 3 次=放弃枭兽形态按人形打（月火/虫群/星火不依赖形态）；其它才 Decline。
+            // [2026-11-02 站长口径·**不许兜底**] 原"连续 3 次放不出 ⇒ 改按人形循环"已撤销：
+            //   放不出来就**每 tick 继续试**，并每 10 秒打一条 `[DPSFSM-PREP-FAIL]`（带 fails/
+            //   id/ready/can/res/form/mana/auras 的根因判据）。这一 tick 不占 GCD ⇒ 继续按人形
+            //   循环输出（月火/虫群/星火都不依赖形态），下一 tick 仍会再试 —— 不静默降级、不藏问题。
             bool const ok = TryCastSelf(ai, m, s, "moonkin form");
             if (ok)
             {
                 m->drFormFails = 0;
+                PrepNoteOk(m, "moonkin form");
                 LogTransition(ai, m, s, State::Prep);
                 DrLogTick(ai, m, s, State::Prep, p);
                 return TickResult::Acted;
             }
-            if (++m->drFormFails >= 3)
+            if (PrepFailureTransient(ai, bot, SpellId(ai, bot, m, "moonkin form", false)))
             {
-                if (m->drFormFails == 3)
-                    sLog.outError("[DPSFSM-DRUID] %s 枭兽形态连续 3 次放不出 ⇒ 改按人形循环输出", bot->GetName());
-                LogTransition(ai, m, s, State::Maintain);
-                DrLogTick(ai, m, s, State::Maintain, p);
+                // 瞬时未就绪（实测与暗牧同一个 res=63）：下一 tick 重试，不当作故障
+                m->drFormFails = 0;
             }
             else
             {
-                LogTransition(ai, m, s, State::Prep);
-                DrLogTick(ai, m, s, State::Prep, p);
-                return TickResult::Decline;
+                ++m->drFormFails;
+                PrepLogCastFail(ai, m, s, "moonkin form", m->drFormFails, State::Prep);
             }
+            LogTransition(ai, m, s, State::Prep);
+            DrLogTick(ai, m, s, State::Prep, p);
+            // 不 return：落到下面的正常循环（人形照打）
         }
 
         ThreatLevel const threat = EvalThreat(m, s);
@@ -12478,9 +12571,9 @@ namespace ai
             if (cons1 && CastSelfCenteredId(ai, m, s, cons1, "consecration"))
                 acted = true;
         }
-        // ② 神圣之盾：掉了就补（10 秒周期，挡格/仇恨都靠它）
-        if (!acted && PalKeepBuff(ai, m, s, "holy shield"))
-            acted = true;
+        // ② 神圣之盾：**移出 Maintain** —— [2026-11-02 站长口径] 神圣之盾统一由准备/维护入口
+        //   （`TickPrepCore` → paladin/Protection 的 `holy shield` 行）负责，判据只有一份，
+        //   避免两处各判一次、以后漂移（两条判据同时命中时靠 GCD 挡住，但那是巧合不是设计）。
         // ③ 复仇者之盾：弹射由法术自身处理；蓝紧时停
         if (!acted && !lowMana && CastFirst(ai, m, s, { "avenger's shield" }))
             acted = true;
@@ -13027,7 +13120,7 @@ namespace ai
         {
             return SpellId(ai, bot, m, item, false) != 0;
         };
-        // 自身准备项：放失败 → 5 秒退避 + 一条 castfailed；成功 → ok
+        // 自身准备项：放失败 → 5 秒退避后**继续尝试**（不放弃），并每 10 秒一条根因日志
         auto prepSelf = [&](char const* item) -> bool
         {
             if (blocked(item))
@@ -13038,10 +13131,19 @@ namespace ai
             if (!TryCastSelf(ai, m, s, item))
             {
                 m->prepFailAt[item] = now;
+                // 瞬时未就绪（res=NOT_READY）不算故障：不计数、不长鸣，下一 tick 重试
+                if (PrepFailureTransient(ai, bot, SpellId(ai, bot, m, item, false)))
+                {
+                    prepLog(item, "cooldown");
+                    return false;
+                }
+                uint32 const fails = ++m->prepFails[item];
+                PrepLogCastFail(ai, m, s, item, fails, State::Prep);
                 prepLog(item, "castfailed");
                 return false;
             }
             m->prepFailAt.erase(item);
+            PrepNoteOk(m, item);
             prepLog(item, nullptr);
             return true;
         };
@@ -13065,6 +13167,10 @@ namespace ai
             return prepSelfIfLearned(item);
         };
         // 队伍 buff：先自己，再队伍里缺这个 buff 的人（一次一个目标，一个 GCD）
+        //   [2026-11-02 修复] `mark of the wild` 一直 castfailed 的根因是**对够不着的队友施法**：
+        //   假人/副本里队友常常不在 30 码内（或不同图），以前照样每 5 秒试一次 ⇒ 全是 castfailed。
+        //   现在：够不着的队友**直接跳过**（分类记录 reason=range），一个都没有可施法的目标就
+        //   reason=range/aura，不占 GCD；连续 3 次放失败同样走"放弃"（与形态同一套）。
         auto prepGroupBuff = [&](char const* item) -> bool
         {
             if (blocked(item))
@@ -13082,13 +13188,22 @@ namespace ai
                 if (TryCastSelf(ai, m, s, item))
                 {
                     m->prepFailAt.erase(item);
+                    PrepNoteOk(m, item);
                     prepLog(item, nullptr);
                     return true;
                 }
                 m->prepFailAt[item] = now;
+                if (PrepFailureTransient(ai, bot, SpellId(ai, bot, m, item, false)))
+                {
+                    prepLog(item, "cooldown");
+                    return false;
+                }
+                uint32 const fails = ++m->prepFails[item];
+                PrepLogCastFail(ai, m, s, item, fails, State::Prep);
                 prepLog(item, "castfailed");
                 return false;
             }
+            bool allTooFar = false;
             if (Group* group = bot->GetGroup())
             {
                 for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
@@ -13099,19 +13214,33 @@ namespace ai
                         continue;
                     if (AuraStacks(ai, bot, m, item, member) > 0)
                         continue;
+                    // 够不着（> 30 码）⇒ 这个目标不占 GCD（不能每 tick 去撞 OUT_OF_RANGE）
+                    if (bot->GetDistance(member) > 30.0f)
+                    {
+                        allTooFar = true;
+                        continue;
+                    }
                     if (TryCast(ai, m, s, item, member))
                     {
                         m->prepFailAt.erase(item);
+                        PrepNoteOk(m, item);
                         prepLog(item, nullptr);
                         return true;
                     }
                     m->prepFailAt[item] = now;
+                    if (PrepFailureTransient(ai, bot, SpellId(ai, bot, m, item, false)))
+                    {
+                        prepLog(item, "cooldown");
+                        return false;
+                    }
+                    uint32 const fails = ++m->prepFails[item];
+                    PrepLogCastFail(ai, m, s, item, fails, State::Prep);
                     prepLog(item, "castfailed");
                     return false;
                 }
             }
-            // 自己已有、队伍也都不缺 ⇒ 这一项没事可做（不占 GCD）
-            prepLog(item, "aura");
+            // 自己已有、队伍里没有可施法目标 ⇒ 这一项没事可做（不占 GCD）
+            prepLog(item, allTooFar ? "range" : "aura");
             return false;
         };
 
