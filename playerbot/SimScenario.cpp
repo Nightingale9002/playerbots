@@ -1276,6 +1276,10 @@ uint32 stuckFightCleared = 0;
             uint32 nextTryAt = 0;
             std::vector<uint32> guids;
             size_t done = 0;
+            // [2026-11-02 站长口径] prepare 之后**不下线**：留着在线，随后 start 就能立刻组队。
+            //   否则 prepare 是"登录→制备→下线"，开图时还要再逐个登录（实测 150 秒窗口
+            //   只凑出 21 组 / 105 bot，登录速度成了并发的真正瓶颈）。
+            bool keepOnline = false;
         };
         PrepareState s_prepare;
 
@@ -1364,7 +1368,8 @@ uint32 stuckFightCleared = 0;
                 sLog.outError("[SIM] prepare ok guid=%u %s lv=%u cls=%u", guid, bot->GetName(),
                     bot->GetLevel(), (uint32)bot->getClass());
 
-                sRandomPlayerbotMgr.LogoutPlayerBot(guid);
+                if (!s_prepare.keepOnline)
+                    sRandomPlayerbotMgr.LogoutPlayerBot(guid);
                 ++s_prepare.done;
             }
 
@@ -6542,6 +6547,12 @@ uint32 stuckFightCleared = 0;
             if (count < 1) count = 1;
             if (count > 1000) count = 1000;   // [站长 2026-10-20] 每批 1000 个空壳
             StartPrepare(count, messages);
+            // [2026-11-02] `.rndbot sim prepare <n> keep` ⇒ 制备完不下线，留在线上供 start 直接组队。
+            if (args.size() > 2 && args[2] == "keep")
+            {
+                s_prepare.keepOnline = true;
+                messages.push_back("prepare keep=1：制备完成后保持在线（开图时不再重复登录）");
+            }
             return messages;
         }
 
