@@ -1153,7 +1153,10 @@ namespace
         s.tankAlive = false;
         if (s.target)
         {
-            s.myThreat = bot->getThreatManager().getThreat(s.target);
+            // [2026-11-01 实测修正] **方向反了**：bot->getThreatManager() 是"我自己的威胁表"
+            //   （玩家侧根本没有条目，恒 0）；正确读法是"目标（怪）的威胁表里我对它的值"。
+            //   旧写法让 myThreat/tankThreat 双双为 0 ⇒ EvalThreat 恒 Open ⇒ 仇恨纪律整段空转。
+            s.myThreat = s.target->getThreatManager().getThreat(bot);
             if (Group* group = bot->GetGroup())
             {
                 Player* tank = nullptr;
@@ -1169,7 +1172,7 @@ namespace
                 if (tank)
                 {
                     s.tankAlive = true;
-                    s.tankThreat = tank->getThreatManager().getThreat(s.target);
+                    s.tankThreat = s.target->getThreatManager().getThreat(tank);   // 同一条修正：从怪的威胁表里读
                 }
             }
         }
